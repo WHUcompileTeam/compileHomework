@@ -1,0 +1,9 @@
+int f() {
+  while (1) {
+    return 77;
+  }
+}
+
+int main() {
+  return f();
+}

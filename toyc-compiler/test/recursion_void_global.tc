@@ -1,0 +1,18 @@
+int g = 0;
+
+void add(int x) {
+  g = g + x;
+  return;
+}
+
+int fact(int n) {
+  if (n <= 1) {
+    return 1;
+  }
+  return n * fact(n - 1);
+}
+
+int main() {
+  add(fact(5));
+  return g;
+}

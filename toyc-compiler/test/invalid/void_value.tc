@@ -1,0 +1,7 @@
+void side() {
+  return;
+}
+
+int main() {
+  return side();
+}

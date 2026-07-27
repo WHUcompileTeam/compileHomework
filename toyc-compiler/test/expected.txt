@@ -1,0 +1,6 @@
+basic.tc 5
+control.tc 31
+functions.tc 85
+globals_shortcircuit.tc 42
+infinite_return.tc 77
+recursion_void_global.tc 120

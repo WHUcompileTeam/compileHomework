@@ -1,0 +1,6 @@
+(ocamlyacc grammar)
+
+(ocamllex lexer_impl)
+
+(library
+ (name toyc_compiler))

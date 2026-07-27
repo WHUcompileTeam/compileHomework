@@ -1,0 +1,9 @@
+int bad(int x) {
+  if (x) {
+    return 1;
+  }
+}
+
+int main() {
+  return bad(0);
+}
