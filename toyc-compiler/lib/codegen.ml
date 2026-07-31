@@ -163,6 +163,23 @@ let func_label ctx name =
   | Some f -> f.label
   | None -> raise (Error ("unknown function during codegen: " ^ name))
 
+let rec gen_simple ctx dst = function
+  | Int n ->
+      emitf ctx "    li %s, %Ld" dst n;
+      true
+  | Var name ->
+      load_binding ctx dst (lookup_var ctx name);
+      true
+  | Unary (op, e) ->
+      if gen_simple ctx dst e then (
+        (match op with
+        | UPlus -> ()
+        | UMinus -> emitf ctx "    neg %s, %s" dst dst
+        | UNot -> emitf ctx "    sltiu %s, %s, 1" dst dst);
+        true)
+      else false
+  | _ -> false
+
 let rec gen_expr ctx = function
   | Int n ->
       emitf ctx "    li t0, %Ld" n;
@@ -270,27 +287,27 @@ and gen_call ctx name args =
   if call_area > 0 then emitf ctx "    addi sp, sp, %d" call_area;
   push_reg ctx "a0"
 
+let gen_value ctx dst e =
+  if not (gen_simple ctx dst e) then (
+    gen_expr ctx e;
+    pop_reg ctx dst)
+
 let rec gen_stmt ctx = function
   | Block stmts -> gen_block ctx stmts
   | Empty -> ()
-  | Expr e ->
-      gen_expr ctx e;
-      pop_reg ctx "t0"
+  | Expr e -> gen_value ctx "t0" e
   | Assign (name, rhs) ->
-      gen_expr ctx rhs;
-      pop_reg ctx "t0";
+      gen_value ctx "t0" rhs;
       store_binding ctx "t0" (lookup_var ctx name)
   | Decl d ->
-      gen_expr ctx d.init;
-      pop_reg ctx "t0";
+      gen_value ctx "t0" d.init;
       let off = Hashtbl.find ctx.offsets d.ident.id in
       emitf ctx "    sw t0, %d(s0)" off;
       add_local ctx d.ident.name off
   | If (cond, then_s, else_s) ->
       let else_l = fresh_label ctx "else" in
       let end_l = fresh_label ctx "ifend" in
-      gen_expr ctx cond;
-      pop_reg ctx "t0";
+      gen_value ctx "t0" cond;
       emitf ctx "    beqz t0, %s" else_l;
       gen_stmt ctx then_s;
       emitf ctx "    j %s" end_l;
@@ -301,8 +318,7 @@ let rec gen_stmt ctx = function
       let start_l = fresh_label ctx "while" in
       let end_l = fresh_label ctx "wend" in
       emitf ctx "%s:" start_l;
-      gen_expr ctx cond;
-      pop_reg ctx "t0";
+      gen_value ctx "t0" cond;
       emitf ctx "    beqz t0, %s" end_l;
       ctx.break_labels <- end_l :: ctx.break_labels;
       ctx.continue_labels <- start_l :: ctx.continue_labels;
@@ -321,8 +337,7 @@ let rec gen_stmt ctx = function
       | [] -> raise (Error "continue outside loop"))
   | Return None -> emitf ctx "    j %s" ctx.epilogue
   | Return (Some e) ->
-      gen_expr ctx e;
-      pop_reg ctx "a0";
+      gen_value ctx "a0" e;
       emitf ctx "    j %s" ctx.epilogue
 
 and gen_block ctx stmts =
