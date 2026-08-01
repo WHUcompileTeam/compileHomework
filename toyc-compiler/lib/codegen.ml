@@ -180,10 +180,28 @@ let rec gen_simple ctx dst = function
       else false
   | _ -> false
 
-let rec is_simple = function
-  | Int _ | Var _ -> true
-  | Unary (_, e) -> is_simple e
-  | _ -> false
+let emit_binop ctx op dst src =
+  match op with
+  | Add -> emitf ctx "    add %s, %s, %s" dst dst src
+  | Sub -> emitf ctx "    sub %s, %s, %s" dst dst src
+  | Mul -> emitf ctx "    mul %s, %s, %s" dst dst src
+  | Div -> emitf ctx "    div %s, %s, %s" dst dst src
+  | Mod -> emitf ctx "    rem %s, %s, %s" dst dst src
+  | Lt -> emitf ctx "    slt %s, %s, %s" dst dst src
+  | Gt -> emitf ctx "    slt %s, %s, %s" dst src dst
+  | Le ->
+      emitf ctx "    slt %s, %s, %s" dst src dst;
+      emitf ctx "    xori %s, %s, 1" dst dst
+  | Ge ->
+      emitf ctx "    slt %s, %s, %s" dst dst src;
+      emitf ctx "    xori %s, %s, 1" dst dst
+  | Eq ->
+      emitf ctx "    sub %s, %s, %s" dst dst src;
+      emitf ctx "    sltiu %s, %s, 1" dst dst
+  | Ne ->
+      emitf ctx "    sub %s, %s, %s" dst dst src;
+      emitf ctx "    sltu %s, x0, %s" dst dst
+  | LAnd | LOr -> raise (Error "internal logical operator lowering error")
 
 let rec gen_expr ctx = function
   | Int n ->
@@ -211,27 +229,7 @@ let rec gen_expr ctx = function
       push_reg ctx "t0"
   | Call (name, args) -> gen_call ctx name args
 
-and gen_binop ctx = function
-  | Add -> emit ctx "    add t0, t0, t1"
-  | Sub -> emit ctx "    sub t0, t0, t1"
-  | Mul -> emit ctx "    mul t0, t0, t1"
-  | Div -> emit ctx "    div t0, t0, t1"
-  | Mod -> emit ctx "    rem t0, t0, t1"
-  | Lt -> emit ctx "    slt t0, t0, t1"
-  | Gt -> emit ctx "    slt t0, t1, t0"
-  | Le ->
-      emit ctx "    slt t0, t1, t0";
-      emit ctx "    xori t0, t0, 1"
-  | Ge ->
-      emit ctx "    slt t0, t0, t1";
-      emit ctx "    xori t0, t0, 1"
-  | Eq ->
-      emit ctx "    sub t0, t0, t1";
-      emit ctx "    sltiu t0, t0, 1"
-  | Ne ->
-      emit ctx "    sub t0, t0, t1";
-      emit ctx "    sltu t0, x0, t0"
-  | LAnd | LOr -> raise (Error "internal logical operator lowering error")
+and gen_binop ctx op = emit_binop ctx op "t0" "t1"
 
 and gen_logical_and ctx a b =
   let false_l = fresh_label ctx "and_false" in
@@ -292,14 +290,42 @@ and gen_call ctx name args =
   if call_area > 0 then emitf ctx "    addi sp, sp, %d" call_area;
   push_reg ctx "a0"
 
+let rec reg_need = function
+  | Int _ | Var _ -> Some 1
+  | Unary (_, e) -> reg_need e
+  | Call _ | Binary (LAnd, _, _) | Binary (LOr, _, _) -> None
+  | Binary (_, a, b) -> (
+      match (reg_need a, reg_need b) with
+      | Some left, Some right -> Some (max left (right + 1))
+      | _ -> None)
+
+let rec gen_reg ctx regs = function
+  | Int n ->
+      emitf ctx "    li %s, %Ld" (List.hd regs) n
+  | Var name ->
+      let dst = List.hd regs in
+      load_binding ctx dst (lookup_var ctx name)
+  | Unary (op, e) ->
+      gen_reg ctx regs e;
+      let dst = List.hd regs in
+      (match op with
+      | UPlus -> ()
+      | UMinus -> emitf ctx "    neg %s, %s" dst dst
+      | UNot -> emitf ctx "    sltiu %s, %s, 1" dst dst)
+  | Binary (op, a, b) -> (
+      match regs with
+      | dst :: src :: rest ->
+          gen_reg ctx regs a;
+          gen_reg ctx (src :: rest) b;
+          emit_binop ctx op dst src
+      | _ -> raise (Error "not enough registers for expression"))
+  | Call _ -> raise (Error "function call in register expression")
+
 let gen_value ctx dst e =
   if not (gen_simple ctx dst e) then
-    match e with
-    | Binary (op, a, b)
-      when op <> LAnd && op <> LOr && is_simple a && is_simple b ->
-        ignore (gen_simple ctx "t0" a);
-        ignore (gen_simple ctx "t1" b);
-        gen_binop ctx op;
+    match reg_need e with
+    | Some need when need <= 3 ->
+        gen_reg ctx [ "t0"; "t1"; "t2" ] e;
         if dst <> "t0" then emitf ctx "    addi %s, t0, 0" dst
     | _ ->
         gen_expr ctx e;
