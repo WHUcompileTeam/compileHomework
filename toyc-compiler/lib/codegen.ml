@@ -180,6 +180,11 @@ let rec gen_simple ctx dst = function
       else false
   | _ -> false
 
+let rec is_simple = function
+  | Int _ | Var _ -> true
+  | Unary (_, e) -> is_simple e
+  | _ -> false
+
 let rec gen_expr ctx = function
   | Int n ->
       emitf ctx "    li t0, %Ld" n;
@@ -288,9 +293,17 @@ and gen_call ctx name args =
   push_reg ctx "a0"
 
 let gen_value ctx dst e =
-  if not (gen_simple ctx dst e) then (
-    gen_expr ctx e;
-    pop_reg ctx dst)
+  if not (gen_simple ctx dst e) then
+    match e with
+    | Binary (op, a, b)
+      when op <> LAnd && op <> LOr && is_simple a && is_simple b ->
+        ignore (gen_simple ctx "t0" a);
+        ignore (gen_simple ctx "t1" b);
+        gen_binop ctx op;
+        if dst <> "t0" then emitf ctx "    addi %s, t0, 0" dst
+    | _ ->
+        gen_expr ctx e;
+        pop_reg ctx dst
 
 let rec gen_stmt ctx = function
   | Block stmts -> gen_block ctx stmts
