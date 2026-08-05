@@ -16,11 +16,11 @@ let run () =
     let source = read_stdin () in
     let parsed = Parser.parse source in
     let ast = if has_opt_flag () then Opt.optimize_ast parsed else parsed in
-    let tcg = Tcg.of_ast ast in
-    let cfg = Cfg.of_tcg tcg in
-    let _cfg = if has_opt_flag () then Opt.optimize_cfg cfg else cfg in
     let analysis = Semant.analyze ast in
-    let asm = Codegen.generate analysis in
+    let tcg = Tcg.of_analysis analysis in
+    let cfg = Cfg.of_tcg tcg in
+    let cfg = if has_opt_flag () then Opt.optimize_cfg analysis cfg else cfg in
+    let asm = Codegen.generate analysis cfg in
     print_string (if has_opt_flag () then Asm_opt.peephole asm else asm)
   with
   | Lexer.Error msg
