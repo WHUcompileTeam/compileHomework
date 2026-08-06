@@ -11,9 +11,12 @@ Expected `main` return values:
 
 - `basic.tc`: `5`
 - `control.tc`: `31`
+- `copy_branch_merge.tc`: `2`
 - `functions.tc`: `85`
+- `gvn_temp_redef_loop.tc`: `4`
 - `globals_shortcircuit.tc`: `42`
 - `infinite_return.tc`: `77`
+- `licm_global_invariant.tc`: `24`
 - `recursion_void_global.tc`: `120`
 
 Run the full local regression suite with:

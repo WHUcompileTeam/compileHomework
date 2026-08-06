@@ -276,6 +276,10 @@ type avail_map = Tcg.operand ExprKeyMap.t
 
 let empty_avail = ExprKeyMap.empty
 
+type alias_map = Tcg.operand IntMap.t
+
+let empty_alias = IntMap.empty
+
 let normalize_bin_operands op lhs rhs =
   if is_commutative_binop op && Stdlib.compare lhs rhs > 0 then (rhs, lhs)
   else (lhs, rhs)
@@ -296,29 +300,178 @@ let kill_global_loads globals avail =
       | KeyUn _ | KeyBin _ -> true)
     avail
 
-let transfer_gvn_instr globals avail instr =
-  match simplify_simple_instr instr with
-  | Tcg.Move _ as instr -> (instr, avail)
-  | Tcg.Un (dst, op, src) as instr -> (
-      let key = KeyUn (op, src) in
-      match ExprKeyMap.find_opt key avail with
-      | Some value -> (Tcg.Move (dst, value), avail)
-      | None -> (instr, ExprKeyMap.add key (Tcg.Temp dst) avail))
-  | Tcg.Bin (dst, op, lhs, rhs) -> (
-      let lhs, rhs = normalize_bin_operands op lhs rhs in
-      let key = KeyBin (op, lhs, rhs) in
-      match ExprKeyMap.find_opt key avail with
-      | Some value -> (Tcg.Move (dst, value), avail)
-      | None -> (Tcg.Bin (dst, op, lhs, rhs), ExprKeyMap.add key (Tcg.Temp dst) avail))
-  | Tcg.Load (dst, place) as instr -> (
+let operand_has_temp temp = function
+  | Tcg.Temp other -> other = temp
+  | Tcg.Imm _ -> false
+
+let expr_key_has_temp temp = function
+  | KeyUn (_, src) -> operand_has_temp temp src
+  | KeyBin (_, lhs, rhs) -> operand_has_temp temp lhs || operand_has_temp temp rhs
+  | KeyLoad _ -> false
+
+let avail_value_has_temp temp = function
+  | Tcg.Temp other -> other = temp
+  | Tcg.Imm _ -> false
+
+let alias_value_has_temp temp = function
+  | Tcg.Temp other -> other = temp
+  | Tcg.Imm _ -> false
+
+let kill_temp_avail temp avail =
+  ExprKeyMap.filter
+    (fun key value -> not (expr_key_has_temp temp key || avail_value_has_temp temp value))
+    avail
+
+let equal_avail_map = ExprKeyMap.equal ( = )
+
+let equal_alias_map = IntMap.equal ( = )
+
+let meet_alias_map a b =
+  IntMap.merge
+    (fun _ va vb ->
+      match (va, vb) with
+      | Some a, Some b when a = b -> Some a
+      | _ -> None)
+    a b
+
+let kill_temp_alias temp aliases =
+  IntMap.filter
+    (fun key value -> key <> temp && not (alias_value_has_temp temp value))
+    aliases
+
+let rec resolve_alias_operand aliases seen = function
+  | Tcg.Imm _ as operand -> operand
+  | Tcg.Temp temp ->
+      if IntSet.mem temp seen then Tcg.Temp temp
+      else
+        match IntMap.find_opt temp aliases with
+        | Some src -> resolve_alias_operand aliases (IntSet.add temp seen) src
+        | None -> Tcg.Temp temp
+
+let set_alias_fact aliases dst operand =
+  if operand = Tcg.Temp dst then aliases else IntMap.add dst operand aliases
+
+let retarget_alias_leader temp aliases =
+  let members =
+    IntMap.fold
+      (fun alias value acc ->
+        match value with
+        | Tcg.Temp leader when leader = temp -> alias :: acc
+        | Tcg.Temp _ | Tcg.Imm _ -> acc)
+      aliases []
+  in
+  match members with
+  | [] -> (aliases, None)
+  | first :: rest ->
+      let replacement = List.fold_left min first rest in
+      let aliases =
+        List.fold_left
+          (fun aliases alias ->
+            if alias = replacement then IntMap.remove alias aliases
+            else IntMap.add alias (Tcg.Temp replacement) aliases)
+          aliases members
+      in
+      (aliases, Some (Tcg.Temp replacement))
+
+let kill_temp_gvn temp aliases avail =
+  let aliases, replacement = retarget_alias_leader temp aliases in
+  let avail = ExprKeyMap.filter (fun key _ -> not (expr_key_has_temp temp key)) avail in
+  let avail =
+    match replacement with
+    | Some operand -> ExprKeyMap.map (fun value -> if value = Tcg.Temp temp then operand else value) avail
+    | None -> ExprKeyMap.filter (fun _ value -> not (avail_value_has_temp temp value)) avail
+  in
+  (kill_temp_alias temp aliases, avail)
+
+type gvn_state = {
+  avail : avail_map;
+  aliases : alias_map;
+}
+
+let empty_gvn_state = { avail = empty_avail; aliases = empty_alias }
+
+let equal_gvn_state a b =
+  equal_avail_map a.avail b.avail && equal_alias_map a.aliases b.aliases
+
+let meet_gvn_state a b =
+  { avail = meet_avail a.avail b.avail; aliases = meet_alias_map a.aliases b.aliases }
+
+let transfer_gvn_instr globals state instr =
+  match instr with
+  | Tcg.Move (dst, src) ->
+      let src = resolve_alias_operand state.aliases IntSet.empty src in
+      let instr = simplify_simple_instr (Tcg.Move (dst, src)) in
+      let aliases, avail = kill_temp_gvn dst state.aliases state.avail in
+      let aliases =
+        match instr with
+        | Tcg.Move (_, src) -> set_alias_fact aliases dst src
+        | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> aliases
+      in
+      (instr, { avail; aliases })
+  | Tcg.Un (dst, op, src) ->
+      let src = resolve_alias_operand state.aliases IntSet.empty src in
+      let instr = simplify_simple_instr (Tcg.Un (dst, op, src)) in
+      let aliases, avail = kill_temp_gvn dst state.aliases state.avail in
+      begin
+        match instr with
+        | Tcg.Move (_, src) -> (instr, { avail; aliases = set_alias_fact aliases dst src })
+        | Tcg.Un (_, op, src) ->
+            let key = KeyUn (op, src) in
+            begin
+              match ExprKeyMap.find_opt key avail with
+              | Some value ->
+                  ( Tcg.Move (dst, value),
+                    { avail; aliases = set_alias_fact aliases dst value } )
+              | None ->
+                  (instr, { avail = ExprKeyMap.add key (Tcg.Temp dst) avail; aliases })
+            end
+        | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> (instr, { avail; aliases })
+      end
+  | Tcg.Bin (dst, op, lhs, rhs) ->
+      let lhs = resolve_alias_operand state.aliases IntSet.empty lhs in
+      let rhs = resolve_alias_operand state.aliases IntSet.empty rhs in
+      let instr = simplify_simple_instr (Tcg.Bin (dst, op, lhs, rhs)) in
+      let aliases, avail = kill_temp_gvn dst state.aliases state.avail in
+      begin
+        match instr with
+        | Tcg.Move (_, src) -> (instr, { avail; aliases = set_alias_fact aliases dst src })
+        | Tcg.Bin (_, op, lhs, rhs) ->
+            let lhs, rhs = normalize_bin_operands op lhs rhs in
+            let key = KeyBin (op, lhs, rhs) in
+            begin
+              match ExprKeyMap.find_opt key avail with
+              | Some value ->
+                  ( Tcg.Move (dst, value),
+                    { avail; aliases = set_alias_fact aliases dst value } )
+              | None ->
+                  ( Tcg.Bin (dst, op, lhs, rhs),
+                    { avail = ExprKeyMap.add key (Tcg.Temp dst) avail; aliases } )
+            end
+        | Tcg.Un _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> (instr, { avail; aliases })
+      end
+  | Tcg.Load (dst, place) ->
+      let aliases, avail = kill_temp_gvn dst state.aliases state.avail in
       let key = KeyLoad place in
-      match ExprKeyMap.find_opt key avail with
-      | Some value -> (Tcg.Move (dst, value), avail)
-      | None -> (instr, ExprKeyMap.add key (Tcg.Temp dst) avail))
-  | Tcg.Store (place, value) as instr ->
-      let avail = ExprKeyMap.remove (KeyLoad place) avail in
-      (instr, ExprKeyMap.add (KeyLoad place) value avail)
-  | Tcg.Call _ as instr -> (instr, kill_global_loads globals avail)
+      begin
+        match ExprKeyMap.find_opt key avail with
+        | Some value ->
+            (Tcg.Move (dst, value), { avail; aliases = set_alias_fact aliases dst value })
+        | None ->
+            (Tcg.Load (dst, place), { avail = ExprKeyMap.add key (Tcg.Temp dst) avail; aliases })
+      end
+  | Tcg.Store (place, value) ->
+      let value = resolve_alias_operand state.aliases IntSet.empty value in
+      let avail = ExprKeyMap.remove (KeyLoad place) state.avail in
+      (Tcg.Store (place, value), { state with avail = ExprKeyMap.add (KeyLoad place) value avail })
+  | Tcg.Call (dst, callee, args) ->
+      let args = List.map (resolve_alias_operand state.aliases IntSet.empty) args in
+      let aliases, avail =
+        match dst with
+        | Some temp -> kill_temp_gvn temp state.aliases state.avail
+        | None -> (state.aliases, state.avail)
+      in
+      let avail = kill_global_loads globals avail in
+      (Tcg.Call (dst, callee, args), { avail; aliases })
 
 type cp_fact =
   | CpUndef
@@ -334,8 +487,6 @@ let equal_cp_state a b =
   IntMap.equal ( = ) a.temps b.temps && PlaceMap.equal ( = ) a.places b.places
 
 let equal_operand_map = IntMap.equal ( = )
-
-let equal_avail_map = ExprKeyMap.equal ( = )
 
 let empty_cp_state = { temps = IntMap.empty; places = PlaceMap.empty }
 
@@ -570,147 +721,251 @@ let const_propagate_func global_init globals (f : Cfg.func) =
   in
   Cfg.rebuild_edges { f with blocks }
 
-let run_gvn_transfer globals avail (block : Cfg.block) =
-  let body_rev, avail =
+let run_gvn_transfer globals state (block : Cfg.block) =
+  let body_rev, state =
     List.fold_left
-      (fun (acc, avail) instr ->
-        let instr, avail = transfer_gvn_instr globals avail instr in
-        (instr :: acc, avail))
-      ([], avail) block.body
+      (fun (acc, state) instr ->
+        let instr, state = transfer_gvn_instr globals state instr in
+        (instr :: acc, state))
+      ([], state) block.body
   in
-  ({ block with body = List.rev body_rev }, avail)
+  ({ block with body = List.rev body_rev }, state)
 
-let compute_available_maps globals (f : Cfg.func) =
-  let in_maps = Hashtbl.create (List.length f.blocks) in
-  let out_maps = Hashtbl.create (List.length f.blocks) in
-  let find_map table label =
+let compute_gvn_states globals (f : Cfg.func) =
+  let in_states = Hashtbl.create (List.length f.blocks) in
+  let out_states = Hashtbl.create (List.length f.blocks) in
+  let find_state table label =
     match Hashtbl.find_opt table label with
-    | Some map -> map
-    | None -> empty_avail
+    | Some state -> state
+    | None -> empty_gvn_state
   in
   let meet_preds preds =
     match preds with
-    | [] -> empty_avail
+    | [] -> empty_gvn_state
     | pred :: rest ->
         List.fold_left
-          (fun acc pred -> meet_avail acc (find_map out_maps pred))
-          (find_map out_maps pred) rest
+          (fun acc pred -> meet_gvn_state acc (find_state out_states pred))
+          (find_state out_states pred) rest
   in
   let changed = ref true in
   while !changed do
     changed := false;
     List.iter
       (fun (block : Cfg.block) ->
-        let in_avail = meet_preds block.preds in
-        let _, out_avail = run_gvn_transfer globals in_avail block in
-        let prev_in = find_map in_maps block.label in
-        let prev_out = find_map out_maps block.label in
-        if not (equal_avail_map in_avail prev_in) then (
-          Hashtbl.replace in_maps block.label in_avail;
+        let in_state = meet_preds block.preds in
+        let _, out_state = run_gvn_transfer globals in_state block in
+        let prev_in = find_state in_states block.label in
+        let prev_out = find_state out_states block.label in
+        if not (equal_gvn_state in_state prev_in) then (
+          Hashtbl.replace in_states block.label in_state;
           changed := true);
-        if not (equal_avail_map out_avail prev_out) then (
-          Hashtbl.replace out_maps block.label out_avail;
+        if not (equal_gvn_state out_state prev_out) then (
+          Hashtbl.replace out_states block.label out_state;
           changed := true))
       f.blocks
   done;
-  in_maps
+  in_states
 
 let gvn_func globals (f : Cfg.func) =
-  let in_maps = compute_available_maps globals f in
+  let in_states = compute_gvn_states globals f in
   let blocks =
     List.map
       (fun (block : Cfg.block) ->
-        let avail =
-          match Hashtbl.find_opt in_maps block.label with
-          | Some avail -> avail
-          | None -> empty_avail
+        let state =
+          match Hashtbl.find_opt in_states block.label with
+          | Some state -> state
+          | None -> empty_gvn_state
         in
-        fst (run_gvn_transfer globals avail block))
+        fst (run_gvn_transfer globals state block))
       f.blocks
   in
   Cfg.rebuild_edges { f with blocks }
 
-let copy_propagate_func (f : Cfg.func) =
-  let copies = Hashtbl.create (max 8 f.temp_count) in
-  List.iter
-    (fun (block : Cfg.block) ->
-      List.iter
-        (function
-          | Tcg.Move (dst, src) -> Hashtbl.replace copies dst src
-          | _ -> ())
-        block.body)
-    f.blocks;
-  let memo = Hashtbl.create (max 8 f.temp_count) in
-  let rec resolve_operand seen = function
-    | Tcg.Imm _ as operand -> operand
-    | Tcg.Temp temp -> (
-        if IntSet.mem temp seen then Tcg.Temp temp
-        else
-          match Hashtbl.find_opt memo temp with
-          | Some operand -> operand
-          | None ->
-              let operand =
-                match Hashtbl.find_opt copies temp with
-                | Some src -> resolve_operand (IntSet.add temp seen) src
-                | None -> Tcg.Temp temp
-              in
-              Hashtbl.replace memo temp operand;
-              operand)
-  in
-  let rewrite_instr = function
-    | Tcg.Move (dst, src) -> simplify_simple_instr (Tcg.Move (dst, resolve_operand IntSet.empty src))
-    | Tcg.Un (dst, op, src) ->
-        simplify_simple_instr (Tcg.Un (dst, op, resolve_operand IntSet.empty src))
-    | Tcg.Bin (dst, op, lhs, rhs) ->
-        simplify_simple_instr
-          (Tcg.Bin
-             ( dst,
-               op,
-               resolve_operand IntSet.empty lhs,
-               resolve_operand IntSet.empty rhs ))
-    | Tcg.Load _ as instr -> instr
-    | Tcg.Store (place, value) ->
-        Tcg.Store (place, resolve_operand IntSet.empty value)
-    | Tcg.Call (dst, callee, args) ->
-        Tcg.Call (dst, callee, List.map (resolve_operand IntSet.empty) args)
-  in
-  let rewrite_term (term : Cfg.terminator) =
-    match term with
-    | Cfg.Jump _ as term -> term
-    | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
-        let cond = resolve_operand IntSet.empty cond in
+type copy_state = Tcg.operand IntMap.t
+
+let empty_copy_state = IntMap.empty
+
+let equal_copy_state = IntMap.equal ( = )
+
+let meet_copy_state a b =
+  IntMap.merge
+    (fun _ va vb ->
+      match (va, vb) with
+      | Some a, Some b when a = b -> Some a
+      | _ -> None)
+    a b
+
+let copy_value_has_temp temp = function
+  | Tcg.Temp other -> other = temp
+  | Tcg.Imm _ -> false
+
+let kill_temp_copies temp state =
+  IntMap.filter
+    (fun key value -> key <> temp && not (copy_value_has_temp temp value))
+    state
+
+let rec resolve_copy_operand state seen = function
+  | Tcg.Imm _ as operand -> operand
+  | Tcg.Temp temp ->
+      if IntSet.mem temp seen then Tcg.Temp temp
+      else
+        match IntMap.find_opt temp state with
+        | Some src -> resolve_copy_operand state (IntSet.add temp seen) src
+        | None -> Tcg.Temp temp
+
+let set_copy_fact state dst operand =
+  if operand = Tcg.Temp dst then state else IntMap.add dst operand state
+
+let transfer_copy_instr state instr =
+  match instr with
+  | Tcg.Move (dst, src) ->
+      let src = resolve_copy_operand state IntSet.empty src in
+      let instr = simplify_simple_instr (Tcg.Move (dst, src)) in
+      let state = kill_temp_copies dst state in
+      let state =
+        match instr with
+        | Tcg.Move (_, src) -> set_copy_fact state dst src
+        | _ -> state
+      in
+      (instr, state)
+  | Tcg.Un (dst, op, src) ->
+      let src = resolve_copy_operand state IntSet.empty src in
+      let instr = simplify_simple_instr (Tcg.Un (dst, op, src)) in
+      let state = kill_temp_copies dst state in
+      let state =
+        match instr with
+        | Tcg.Move (_, src) -> set_copy_fact state dst src
+        | _ -> state
+      in
+      (instr, state)
+  | Tcg.Bin (dst, op, lhs, rhs) ->
+      let lhs = resolve_copy_operand state IntSet.empty lhs in
+      let rhs = resolve_copy_operand state IntSet.empty rhs in
+      let instr = simplify_simple_instr (Tcg.Bin (dst, op, lhs, rhs)) in
+      let state = kill_temp_copies dst state in
+      let state =
+        match instr with
+        | Tcg.Move (_, src) -> set_copy_fact state dst src
+        | _ -> state
+      in
+      (instr, state)
+  | Tcg.Load (dst, place) ->
+      (Tcg.Load (dst, place), kill_temp_copies dst state)
+  | Tcg.Store (place, value) ->
+      let value = resolve_copy_operand state IntSet.empty value in
+      (Tcg.Store (place, value), state)
+  | Tcg.Call (dst, callee, args) ->
+      let args = List.map (resolve_copy_operand state IntSet.empty) args in
+      let state =
+        match dst with
+        | Some temp -> kill_temp_copies temp state
+        | None -> state
+      in
+      (Tcg.Call (dst, callee, args), state)
+
+let transfer_copy_term state (term : Cfg.terminator) =
+  match term with
+  | Cfg.Jump _ as term -> (term, state)
+  | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
+      let cond = resolve_copy_operand state IntSet.empty cond in
+      let term =
         if if_zero = if_nonzero then Cfg.Jump if_zero
-        else (
+        else
           match cond with
           | Tcg.Imm value -> Cfg.Jump (if value = 0L then if_zero else if_nonzero)
-          | _ -> Cfg.BranchZero (cond, if_zero, if_nonzero))
-    | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
-        let cond = resolve_operand IntSet.empty cond in
+          | _ -> Cfg.BranchZero (cond, if_zero, if_nonzero)
+      in
+      (term, state)
+  | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
+      let cond = resolve_copy_operand state IntSet.empty cond in
+      let term =
         if if_zero = if_nonzero then Cfg.Jump if_zero
-        else (
+        else
           match cond with
           | Tcg.Imm value -> Cfg.Jump (if value <> 0L then if_nonzero else if_zero)
-          | _ -> Cfg.BranchNonZero (cond, if_nonzero, if_zero))
-    | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
-        let lhs = resolve_operand IntSet.empty lhs in
-        let rhs = resolve_operand IntSet.empty rhs in
+          | _ -> Cfg.BranchNonZero (cond, if_nonzero, if_zero)
+      in
+      (term, state)
+  | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
+      let lhs = resolve_copy_operand state IntSet.empty lhs in
+      let rhs = resolve_copy_operand state IntSet.empty rhs in
+      let term =
         if if_true = if_false then Cfg.Jump if_true
-        else (
+        else
           match (lhs, rhs) with
           | Tcg.Imm a, Tcg.Imm b -> (
               match fold_binop op a b with
               | Some value -> Cfg.Jump (if truth value then if_true else if_false)
               | None -> Cfg.BranchCompare (op, lhs, rhs, if_true, if_false))
-          | _ -> Cfg.BranchCompare (op, lhs, rhs, if_true, if_false))
-    | Cfg.Return None -> Cfg.Return None
-    | Cfg.Return (Some value) -> Cfg.Return (Some (resolve_operand IntSet.empty value))
+          | _ -> Cfg.BranchCompare (op, lhs, rhs, if_true, if_false)
+      in
+      (term, state)
+  | Cfg.Return None -> (Cfg.Return None, state)
+  | Cfg.Return (Some value) ->
+      (Cfg.Return (Some (resolve_copy_operand state IntSet.empty value)), state)
+
+let run_copy_transfer state (block : Cfg.block) =
+  let body_rev, state =
+    List.fold_left
+      (fun (acc, state) instr ->
+        let instr, state = transfer_copy_instr state instr in
+        (instr :: acc, state))
+      ([], state) block.body
   in
+  let term, state = transfer_copy_term state block.term in
+  ({ block with body = List.rev body_rev; term; succs = Cfg.successors term }, state)
+
+let compute_copy_states (f : Cfg.func) =
+  let in_states = Hashtbl.create (List.length f.blocks) in
+  let out_states = Hashtbl.create (List.length f.blocks) in
+  let meet_states = function
+    | [] -> empty_copy_state
+    | state :: rest -> List.fold_left meet_copy_state state rest
+  in
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter
+      (fun (block : Cfg.block) ->
+        let pred_states =
+          List.filter_map (fun pred -> Hashtbl.find_opt out_states pred) block.preds
+        in
+        let in_state =
+          if block.label = f.entry then meet_states (empty_copy_state :: pred_states)
+          else meet_states pred_states
+        in
+        let _, out_state = run_copy_transfer in_state block in
+        let prev_in =
+          match Hashtbl.find_opt in_states block.label with
+          | Some state -> state
+          | None -> empty_copy_state
+        in
+        let prev_out =
+          match Hashtbl.find_opt out_states block.label with
+          | Some state -> state
+          | None -> empty_copy_state
+        in
+        if not (equal_copy_state in_state prev_in) then (
+          Hashtbl.replace in_states block.label in_state;
+          changed := true);
+        if not (equal_copy_state out_state prev_out) then (
+          Hashtbl.replace out_states block.label out_state;
+          changed := true))
+      f.blocks
+  done;
+  in_states
+
+let copy_propagate_func (f : Cfg.func) =
+  let in_states = compute_copy_states f in
   let blocks =
     List.map
       (fun (block : Cfg.block) ->
-        let body = List.map rewrite_instr block.body in
-        let term = rewrite_term block.term in
-        { block with body; term; succs = Cfg.successors term })
+        let state =
+          match Hashtbl.find_opt in_states block.label with
+          | Some state -> state
+          | None -> empty_copy_state
+        in
+        fst (run_copy_transfer state block))
       f.blocks
   in
   Cfg.rebuild_edges { f with blocks }
@@ -1185,15 +1440,20 @@ let mem2reg_func (f : Cfg.func) =
   attempt all_candidates
 
 let compute_dominators (f : Cfg.func) =
-  let all_labels =
-    List.fold_left (fun acc (block : Cfg.block) -> LabelSet.add block.label acc) LabelSet.empty
-      f.blocks
+  let reachable = reachable_labels f.entry f.blocks in
+  let reachable_blocks =
+    List.filter (fun (block : Cfg.block) -> LabelSet.mem block.label reachable) f.blocks
   in
-  let doms = Hashtbl.create (List.length f.blocks) in
+  let all_labels =
+    List.fold_left
+      (fun acc (block : Cfg.block) -> LabelSet.add block.label acc)
+      LabelSet.empty reachable_blocks
+  in
+  let doms = Hashtbl.create (List.length reachable_blocks) in
   List.iter
     (fun (block : Cfg.block) ->
       Hashtbl.add doms block.label (if block.label = f.entry then LabelSet.singleton block.label else all_labels))
-    f.blocks;
+    reachable_blocks;
   let changed = ref true in
   while !changed do
     changed := false;
@@ -1201,7 +1461,8 @@ let compute_dominators (f : Cfg.func) =
       (fun (block : Cfg.block) ->
         if block.label <> f.entry then
           let pred_doms =
-            List.map (fun pred -> table_find_or_empty doms pred all_labels) block.preds
+            List.filter (fun pred -> LabelSet.mem pred reachable) block.preds
+            |> List.map (fun pred -> table_find_or_empty doms pred all_labels)
           in
           let merged =
             match pred_doms with
@@ -1209,31 +1470,43 @@ let compute_dominators (f : Cfg.func) =
             | first :: rest -> List.fold_left LabelSet.inter first rest
           in
           let next_dom = LabelSet.add block.label merged in
-          if not (LabelSet.equal next_dom (table_find_or_empty doms block.label LabelSet.empty)) then (
-            Hashtbl.replace doms block.label next_dom;
-            changed := true))
-      f.blocks
+           if not (LabelSet.equal next_dom (table_find_or_empty doms block.label LabelSet.empty)) then (
+             Hashtbl.replace doms block.label next_dom;
+             changed := true))
+      reachable_blocks
   done;
   doms
 
-let temp_def_blocks (f : Cfg.func) =
-  let defs = Hashtbl.create (max 8 f.temp_count) in
+let temp_def_blocks_of_blocks temp_count blocks =
+  let defs = Hashtbl.create (max 8 temp_count) in
   List.iter
     (fun (block : Cfg.block) ->
       List.iter
         (fun instr ->
           match defs_temp instr with
-          | Some temp -> Hashtbl.replace defs temp block.label
-          | None -> ())
+            | Some temp -> Hashtbl.replace defs temp block.label
+            | None -> ())
         block.body)
-    f.blocks;
+    blocks;
   defs
 
+let temp_def_blocks (f : Cfg.func) = temp_def_blocks_of_blocks f.temp_count f.blocks
+
+type licm_candidate =
+  | LicmPure of Tcg.temp * Tcg.operand list
+  | LicmLoad of Tcg.temp * Tcg.place
+
+type loop_effects = {
+  modified_places : PlaceSet.t;
+  has_call : bool;
+}
+
 let licm_candidate_info = function
-  | Tcg.Move (dst, src) -> Some (dst, [ src ])
-  | Tcg.Un (dst, _, src) -> Some (dst, [ src ])
-  | Tcg.Bin (dst, _, lhs, rhs) -> Some (dst, [ lhs; rhs ])
-  | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> None
+  | Tcg.Move (dst, src) -> Some (LicmPure (dst, [ src ]))
+  | Tcg.Un (dst, _, src) -> Some (LicmPure (dst, [ src ]))
+  | Tcg.Bin (dst, _, lhs, rhs) -> Some (LicmPure (dst, [ lhs; rhs ]))
+  | Tcg.Load (dst, place) -> Some (LicmLoad (dst, place))
+  | Tcg.Store _ | Tcg.Call _ -> None
 
 let operand_invariant loop def_blocks ready_temps = function
   | Tcg.Imm _ -> true
@@ -1241,6 +1514,29 @@ let operand_invariant loop def_blocks ready_temps = function
       match Hashtbl.find_opt def_blocks temp with
       | Some def_label -> (not (LabelSet.mem def_label loop)) || IntSet.mem temp ready_temps
       | None -> true)
+
+let collect_loop_effects loop blocks =
+  List.fold_left
+    (fun effects (block : Cfg.block) ->
+      if not (LabelSet.mem block.label loop) then effects
+      else
+        List.fold_left
+          (fun effects instr ->
+            match instr with
+            | Tcg.Store (place, _) ->
+                { effects with modified_places = PlaceSet.add place effects.modified_places }
+            | Tcg.Call _ -> { effects with has_call = true }
+            | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ -> effects)
+          effects block.body)
+    { modified_places = PlaceSet.empty; has_call = false }
+    blocks
+
+let load_place_invariant effects place =
+  not (PlaceSet.mem place effects.modified_places)
+  &&
+  match place with
+  | Tcg.Local _ -> false
+  | Tcg.Global _ -> not effects.has_call
 
 let natural_loop block_map header pred =
   let rec visit work seen =
@@ -1255,6 +1551,676 @@ let natural_loop block_map header pred =
           | None -> visit rest seen
   in
   visit [ pred ] (LabelSet.singleton header)
+
+type basic_induction_var = {
+  phi_temp : Tcg.temp;
+  outside_inputs : (Tcg.label * Tcg.operand) list;
+  backedge_preds : Tcg.label list;
+  step : int64;
+}
+
+type derived_expr_key =
+  | DerivedScaled of int64
+  | DerivedAdd of Tcg.operand * int64
+  | DerivedSubBase of int64 * Tcg.operand
+  | DerivedBaseMinus of Tcg.operand * int64
+
+let temp_def_instrs_of_blocks temp_count blocks =
+  let defs = Hashtbl.create (max 8 temp_count) in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter
+        (fun instr ->
+          match defs_temp instr with
+          | Some temp when not (Hashtbl.mem defs temp) -> Hashtbl.add defs temp instr
+          | Some _ | None -> ())
+        block.body)
+    blocks;
+  defs
+
+let temp_def_instrs_map (f : Cfg.func) = temp_def_instrs_of_blocks f.temp_count f.blocks
+
+let multi_def_temps_of_blocks temp_count blocks =
+  let counts = Hashtbl.create (max 8 temp_count) in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter
+        (fun instr ->
+          match defs_temp instr with
+          | Some temp ->
+              let count = Option.value ~default:0 (Hashtbl.find_opt counts temp) in
+              Hashtbl.replace counts temp (count + 1)
+          | None -> ())
+        block.body)
+    blocks;
+  Hashtbl.fold
+    (fun temp count acc -> if count > 1 then IntSet.add temp acc else acc)
+    counts IntSet.empty
+
+let multi_def_temps (f : Cfg.func) = multi_def_temps_of_blocks f.temp_count f.blocks
+
+let last_def_of_temp (block : Cfg.block) temp =
+  let rec loop = function
+    | [] -> None
+    | instr :: rest -> (
+        match defs_temp instr with
+        | Some dst when dst = temp -> Some instr
+        | Some _ | None -> loop rest)
+  in
+  loop (List.rev block.body)
+
+let resolve_block_operand (block : Cfg.block) operand =
+  let move_defs = Hashtbl.create (List.length block.body) in
+  List.iter
+    (function
+      | Tcg.Move (dst, src) -> Hashtbl.replace move_defs dst src
+      | _ -> ())
+    block.body;
+  let rec resolve seen = function
+    | Tcg.Imm _ as operand -> operand
+    | Tcg.Temp temp as operand ->
+        if IntSet.mem temp seen then operand
+        else
+          match Hashtbl.find_opt move_defs temp with
+          | Some src -> resolve (IntSet.add temp seen) src
+          | None -> operand
+  in
+  resolve IntSet.empty operand
+
+let resolves_to_induction_temp multi_defs def_instrs phi_temp operand =
+  let rec loop seen = function
+    | Tcg.Imm _ -> false
+    | Tcg.Temp temp ->
+        if temp = phi_temp then true
+        else if IntSet.mem temp seen || IntSet.mem temp multi_defs then false
+        else
+          match Hashtbl.find_opt def_instrs temp with
+          | Some (Tcg.Move (_, src)) -> loop (IntSet.add temp seen) src
+          | Some _ | None -> false
+  in
+  loop IntSet.empty operand
+
+let induction_step_of_instr multi_defs def_instrs phi_temp = function
+  | Tcg.Bin (_, Add, lhs, Tcg.Imm step)
+    when resolves_to_induction_temp multi_defs def_instrs phi_temp lhs ->
+      Some step
+  | Tcg.Bin (_, Add, Tcg.Imm step, rhs)
+    when resolves_to_induction_temp multi_defs def_instrs phi_temp rhs ->
+      Some step
+  | Tcg.Bin (_, Sub, lhs, Tcg.Imm step)
+    when resolves_to_induction_temp multi_defs def_instrs phi_temp lhs ->
+      Some Int64.(neg step)
+  | _ -> None
+
+let mul_factor_of_instr multi_defs def_instrs phi_temp = function
+  | Tcg.Bin (dst, Mul, lhs, Tcg.Imm factor)
+    when resolves_to_induction_temp multi_defs def_instrs phi_temp lhs ->
+      Some (dst, factor)
+  | Tcg.Bin (dst, Mul, Tcg.Imm factor, rhs)
+    when resolves_to_induction_temp multi_defs def_instrs phi_temp rhs ->
+      Some (dst, factor)
+  | _ -> None
+
+let delta_instr dst base delta =
+  if delta >= 0L then simplify_simple_instr (Tcg.Bin (dst, Add, Tcg.Temp base, Tcg.Imm delta))
+  else simplify_simple_instr (Tcg.Bin (dst, Sub, Tcg.Temp base, Tcg.Imm Int64.(neg delta)))
+
+let build_scaled_value dst source factor =
+  match factor with
+  | 0L -> [ Tcg.Move (dst, Tcg.Imm 0L) ]
+  | 1L -> [ Tcg.Move (dst, source) ]
+  | -1L -> [ simplify_simple_instr (Tcg.Bin (dst, Sub, Tcg.Imm 0L, source)) ]
+  | _ -> [ simplify_simple_instr (Tcg.Bin (dst, Mul, source, Tcg.Imm factor)) ]
+
+let build_derived_init key dst source =
+  match key with
+  | DerivedScaled factor -> build_scaled_value dst source factor
+  | DerivedAdd (base, factor) ->
+      build_scaled_value dst source factor
+      @ [ simplify_simple_instr (Tcg.Bin (dst, Add, Tcg.Temp dst, base)) ]
+  | DerivedSubBase (factor, base) ->
+      build_scaled_value dst source factor
+      @ [ simplify_simple_instr (Tcg.Bin (dst, Sub, Tcg.Temp dst, base)) ]
+  | DerivedBaseMinus (base, factor) ->
+      build_scaled_value dst source factor
+      @ [ simplify_simple_instr (Tcg.Bin (dst, Sub, base, Tcg.Temp dst)) ]
+
+let rec scaled_factor_of_operand multi_defs def_instrs phi_temp operand =
+  match operand with
+  | Tcg.Imm _ -> None
+  | Tcg.Temp temp ->
+      if temp = phi_temp then Some 1L
+      else if IntSet.mem temp multi_defs then None
+      else
+        match Hashtbl.find_opt def_instrs temp with
+        | Some (Tcg.Move (_, src)) -> scaled_factor_of_operand multi_defs def_instrs phi_temp src
+        | Some (Tcg.Un (_, UMinus, src))
+          when resolves_to_induction_temp multi_defs def_instrs phi_temp src ->
+            Some (-1L)
+        | Some (Tcg.Bin (_, Sub, Tcg.Imm 0L, src))
+          when resolves_to_induction_temp multi_defs def_instrs phi_temp src ->
+            Some (-1L)
+        | Some instr -> (
+            match mul_factor_of_instr multi_defs def_instrs phi_temp instr with
+            | Some (_, factor) -> Some factor
+            | None -> None)
+        | None -> None
+
+let useful_derived_key = function
+  | DerivedScaled factor -> factor <> 0L && factor <> 1L && factor <> -1L
+  | DerivedAdd (_, factor)
+  | DerivedSubBase (factor, _)
+  | DerivedBaseMinus (_, factor) ->
+      factor <> 0L && factor <> 1L && factor <> -1L
+
+let delta_of_derived_key step = function
+  | DerivedScaled factor
+  | DerivedAdd (_, factor)
+  | DerivedSubBase (factor, _) ->
+      Int64.mul step factor
+  | DerivedBaseMinus (_, factor) -> Int64.neg (Int64.mul step factor)
+
+let collect_loop_stable_phis header loop get_block multi_defs def_instrs =
+  let header_block : Cfg.block = get_block header in
+  let pred_count = List.length header_block.preds in
+  let counts = Hashtbl.create (max 8 pred_count) in
+  List.iter
+    (fun pred ->
+      let seen = ref IntSet.empty in
+      List.iter
+        (function
+          | Tcg.Move (dst, _) when not (IntSet.mem dst !seen) ->
+              seen := IntSet.add dst !seen;
+              let count = Option.value ~default:0 (Hashtbl.find_opt counts dst) in
+              Hashtbl.replace counts dst (count + 1)
+          | _ -> ())
+        ((get_block pred : Cfg.block).body))
+    header_block.preds;
+  let phi_temps =
+    Hashtbl.fold
+      (fun temp count acc -> if count = pred_count then temp :: acc else acc)
+      counts []
+  in
+  let backedge_preds = List.filter (fun pred -> LabelSet.mem pred loop) header_block.preds in
+  List.fold_left
+    (fun acc phi_temp ->
+      let stable =
+        backedge_preds <> []
+        &&
+        List.for_all
+          (fun pred ->
+            match last_def_of_temp (get_block pred) phi_temp with
+            | Some (Tcg.Move (_, src)) ->
+                resolves_to_induction_temp
+                  multi_defs def_instrs phi_temp (resolve_block_operand (get_block pred) src)
+            | Some _ | None -> false)
+          backedge_preds
+      in
+      if stable then IntSet.add phi_temp acc else acc)
+    IntSet.empty phi_temps
+
+let operand_loop_invariant
+    loop
+    def_blocks
+    loop_stable_phis
+    multi_defs
+    def_instrs
+    ready_temps
+    operand
+  =
+  let rec resolve seen = function
+    | Tcg.Imm _ -> true
+    | Tcg.Temp temp as operand ->
+        if IntSet.mem temp ready_temps
+           || IntSet.mem temp loop_stable_phis
+           || operand_invariant loop def_blocks ready_temps operand
+        then true
+        else if IntSet.mem temp seen || IntSet.mem temp multi_defs then false
+        else
+          match Hashtbl.find_opt def_instrs temp with
+          | Some (Tcg.Move (_, src)) -> resolve (IntSet.add temp seen) src
+          | Some _ | None -> false
+  in
+  resolve IntSet.empty operand
+
+let licm_invariant_candidate
+    loop
+    def_blocks
+    ready_temps
+    effects
+    instr
+  =
+  match licm_candidate_info instr with
+  | Some (LicmPure (dst, operands))
+    when List.for_all (operand_invariant loop def_blocks ready_temps) operands ->
+      Some dst
+  | Some (LicmLoad (dst, place)) when load_place_invariant effects place -> Some dst
+  | Some _ | None -> None
+
+let derived_expr_of_instr loop def_blocks loop_stable_phis multi_defs def_instrs phi_temp = function
+  | Tcg.Bin (dst, _, _, _) when dst = phi_temp -> None
+  | Tcg.Bin (dst, Mul, lhs, Tcg.Imm factor)
+    when resolves_to_induction_temp multi_defs def_instrs phi_temp lhs ->
+      Some (dst, DerivedScaled factor)
+  | Tcg.Bin (dst, Mul, Tcg.Imm factor, rhs)
+    when resolves_to_induction_temp multi_defs def_instrs phi_temp rhs ->
+      Some (dst, DerivedScaled factor)
+  | Tcg.Bin (dst, Add, lhs, rhs) -> (
+      match
+        ( scaled_factor_of_operand multi_defs def_instrs phi_temp lhs,
+          operand_loop_invariant
+            loop def_blocks loop_stable_phis multi_defs def_instrs IntSet.empty rhs,
+          scaled_factor_of_operand multi_defs def_instrs phi_temp rhs,
+          operand_loop_invariant
+            loop def_blocks loop_stable_phis multi_defs def_instrs IntSet.empty lhs )
+      with
+      | Some factor, true, _, _ -> Some (dst, DerivedAdd (rhs, factor))
+      | _, _, Some factor, true -> Some (dst, DerivedAdd (lhs, factor))
+      | _ -> None)
+  | Tcg.Bin (dst, Sub, lhs, rhs) -> (
+      match
+        ( scaled_factor_of_operand multi_defs def_instrs phi_temp lhs,
+          operand_loop_invariant
+            loop def_blocks loop_stable_phis multi_defs def_instrs IntSet.empty rhs,
+          scaled_factor_of_operand multi_defs def_instrs phi_temp rhs,
+          operand_loop_invariant
+            loop def_blocks loop_stable_phis multi_defs def_instrs IntSet.empty lhs )
+      with
+      | Some factor, true, _, _ -> Some (dst, DerivedSubBase (factor, rhs))
+      | _, _, Some factor, true -> Some (dst, DerivedBaseMinus (lhs, factor))
+      | _ -> None)
+  | _ -> None
+
+let collect_basic_induction_vars header loop get_block multi_defs def_instrs =
+  let header_block : Cfg.block = get_block header in
+  let pred_count = List.length header_block.preds in
+  let counts = Hashtbl.create (max 8 pred_count) in
+  List.iter
+    (fun pred ->
+      let seen = ref IntSet.empty in
+      List.iter
+        (function
+          | Tcg.Move (dst, _) when not (IntSet.mem dst !seen) ->
+              seen := IntSet.add dst !seen;
+              let count = Option.value ~default:0 (Hashtbl.find_opt counts dst) in
+              Hashtbl.replace counts dst (count + 1)
+          | _ -> ())
+        ((get_block pred : Cfg.block).body))
+    header_block.preds;
+  let phi_temps =
+    Hashtbl.fold
+      (fun temp count acc -> if count = pred_count then temp :: acc else acc)
+      counts []
+  in
+  let outside_preds =
+    List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds
+  in
+  let backedge_preds = List.filter (fun pred -> LabelSet.mem pred loop) header_block.preds in
+  if outside_preds = [] || backedge_preds = [] then []
+  else
+    let phi_vars =
+      List.filter_map
+        (fun phi_temp ->
+          let incoming =
+            List.filter_map
+              (fun pred ->
+                match last_def_of_temp (get_block pred) phi_temp with
+                | Some (Tcg.Move (_, src)) -> Some (pred, src)
+                | Some _ | None -> None)
+              header_block.preds
+          in
+          if List.length incoming <> pred_count then None
+          else
+            let steps =
+              List.filter_map
+                (fun pred ->
+                  match List.assoc_opt pred incoming with
+                  | None -> None
+                  | Some src -> (
+                      match resolve_block_operand (get_block pred) src with
+                      | Tcg.Temp temp -> (
+                          match Hashtbl.find_opt def_instrs temp with
+                          | Some instr ->
+                              induction_step_of_instr multi_defs def_instrs phi_temp instr
+                          | None -> None)
+                      | Tcg.Imm _ -> None))
+                backedge_preds
+            in
+            match steps with
+            | [] -> None
+            | step :: rest when List.length steps = List.length backedge_preds ->
+                if List.for_all (Int64.equal step) rest then
+                  Some
+                    {
+                      phi_temp;
+                      outside_inputs =
+                        List.filter (fun (pred, _) -> List.mem pred outside_preds) incoming;
+                      backedge_preds;
+                      step;
+                    }
+                else None
+            | _ -> None)
+        phi_temps
+    in
+    let seen_phi_temps =
+      List.fold_left (fun acc iv -> IntSet.add iv.phi_temp acc) IntSet.empty phi_vars
+    in
+    let self_update_candidates =
+      List.fold_left
+        (fun acc pred ->
+          let block = get_block pred in
+          List.fold_left
+            (fun acc instr ->
+              match defs_temp instr with
+              | Some dst when not (IntSet.mem dst seen_phi_temps) -> (
+                  match induction_step_of_instr multi_defs def_instrs dst instr with
+                  | Some _ -> IntSet.add dst acc
+                  | None -> acc)
+              | Some _ | None -> acc)
+            acc block.body)
+        IntSet.empty backedge_preds
+    in
+    let self_vars =
+      IntSet.fold
+        (fun phi_temp acc ->
+          let outside_inputs =
+            List.filter_map
+              (fun pred ->
+                match last_def_of_temp (get_block pred) phi_temp with
+                | Some _ -> Some (pred, Tcg.Temp phi_temp)
+                | None -> None)
+              outside_preds
+          in
+          let steps =
+            List.filter_map
+              (fun pred ->
+                match last_def_of_temp (get_block pred) phi_temp with
+                | Some instr -> induction_step_of_instr multi_defs def_instrs phi_temp instr
+                | None -> None)
+              backedge_preds
+          in
+          match steps with
+          | [] -> acc
+          | step :: rest when List.length steps = List.length backedge_preds ->
+              if
+                List.length outside_inputs = List.length outside_preds
+                && List.for_all (Int64.equal step) rest
+              then
+                {
+                  phi_temp;
+                  outside_inputs;
+                  backedge_preds;
+                  step;
+                }
+                :: acc
+              else acc
+          | _ -> acc)
+        self_update_candidates []
+    in
+    phi_vars @ self_vars
+
+let strength_reduce_func (f : Cfg.func) =
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
+  let doms = compute_dominators f in
+  let def_blocks = temp_def_blocks f in
+  let backedges =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        List.fold_left
+          (fun acc succ ->
+            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
+              (block.label, succ) :: acc
+            else acc)
+          acc block.succs)
+      [] f.blocks
+  in
+  if backedges = [] then f
+  else
+    let loops = Hashtbl.create 8 in
+    List.iter
+      (fun (pred, header) ->
+        let loop = natural_loop block_map header pred in
+        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
+        Hashtbl.replace loops header merged)
+      backedges;
+    let headers =
+      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
+      |> List.sort (fun (_, a) (_, b) -> compare a b)
+      |> List.map fst
+    in
+    let def_instrs = temp_def_instrs_map f in
+    let multi_defs = multi_def_temps f in
+    let current_blocks = Hashtbl.create (List.length f.blocks) in
+    List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
+    let get_block label =
+      match Hashtbl.find_opt current_blocks label with
+      | Some block -> block
+      | None -> failwith ("internal missing block: " ^ label)
+    in
+    let update_block (block : Cfg.block) =
+      Hashtbl.replace current_blocks block.label block
+    in
+    let next_temp = ref f.temp_count in
+    let fresh_temp () =
+      let temp = !next_temp in
+      incr next_temp;
+      temp
+    in
+    let changed = ref false in
+    List.iter
+      (fun header ->
+        let loop = table_find_or_empty loops header LabelSet.empty in
+        let loop_stable_phis =
+          collect_loop_stable_phis header loop get_block multi_defs def_instrs
+        in
+        let ivs = collect_basic_induction_vars header loop get_block multi_defs def_instrs in
+        List.iter
+          (fun (iv : basic_induction_var) ->
+            let derived_uses = Hashtbl.create 4 in
+            List.iter
+              (fun (block : Cfg.block) ->
+                if LabelSet.mem block.label loop then
+                  List.iteri
+                    (fun index instr ->
+                      match
+                        derived_expr_of_instr
+                          loop def_blocks loop_stable_phis multi_defs def_instrs iv.phi_temp instr
+                      with
+                      | Some (dst, key) when useful_derived_key key ->
+                          let uses = Option.value ~default:[] (Hashtbl.find_opt derived_uses key) in
+                          Hashtbl.replace derived_uses key ((block.label, index, dst) :: uses)
+                      | Some _ | None -> ())
+                    (get_block block.label).body)
+              f.blocks;
+            Hashtbl.iter
+              (fun key uses ->
+                if uses <> [] then begin
+                  changed := true;
+                  let derived_phi = fresh_temp () in
+                  List.iter
+                    (fun (pred, src) ->
+                      let pred_block = get_block pred in
+                      let body = pred_block.body @ build_derived_init key derived_phi src in
+                      update_block { pred_block with body })
+                    iv.outside_inputs;
+                  let delta = delta_of_derived_key iv.step key in
+                  List.iter
+                    (fun pred ->
+                      let pred_block = get_block pred in
+                      let next_derived = fresh_temp () in
+                      let body =
+                        pred_block.body
+                        @ [ delta_instr next_derived derived_phi delta;
+                            Tcg.Move (derived_phi, Tcg.Temp next_derived) ]
+                      in
+                      update_block { pred_block with body })
+                    iv.backedge_preds;
+                  List.iter
+                    (fun (block : Cfg.block) ->
+                      if LabelSet.mem block.label loop then
+                        let current = get_block block.label in
+                        let replacements = Hashtbl.create (List.length uses) in
+                        List.iter
+                          (fun (label, index, dst) ->
+                            if label = current.label then Hashtbl.replace replacements index dst)
+                          uses;
+                        if Hashtbl.length replacements > 0 then
+                          let body =
+                            List.mapi
+                              (fun index instr ->
+                                match Hashtbl.find_opt replacements index with
+                                | Some dst -> Tcg.Move (dst, Tcg.Temp derived_phi)
+                                | None -> instr)
+                              current.body
+                          in
+                          update_block { current with body })
+                    f.blocks
+                end)
+              derived_uses)
+          ivs)
+      headers;
+    if !changed then
+      let ordered_labels = List.map (fun (block : Cfg.block) -> block.label) f.blocks in
+      let blocks = List.map get_block ordered_labels in
+      Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
+    else f
+
+let temp_use_counts blocks =
+  let counts = Hashtbl.create 32 in
+  let add_operand = function
+    | Tcg.Temp temp ->
+        let count = Option.value ~default:0 (Hashtbl.find_opt counts temp) in
+        Hashtbl.replace counts temp (count + 1)
+    | Tcg.Imm _ -> ()
+  in
+  let add_instr_uses = function
+    | Tcg.Move (_, src)
+    | Tcg.Un (_, _, src) ->
+        add_operand src
+    | Tcg.Bin (_, _, lhs, rhs) ->
+        add_operand lhs;
+        add_operand rhs
+    | Tcg.Load _ -> ()
+    | Tcg.Store (_, value) -> add_operand value
+    | Tcg.Call (_, _, args) -> List.iter add_operand args
+  in
+  let add_term_uses = function
+    | Cfg.Jump _ | Cfg.Return None -> ()
+    | Cfg.BranchZero (cond, _, _)
+    | Cfg.BranchNonZero (cond, _, _)
+    | Cfg.Return (Some cond) ->
+        add_operand cond
+    | Cfg.BranchCompare (_, lhs, rhs, _, _) ->
+        add_operand lhs;
+        add_operand rhs
+  in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter add_instr_uses block.body;
+      add_term_uses block.term)
+    blocks;
+  counts
+
+let reassociate_loop_adds_func (f : Cfg.func) =
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
+  let doms = compute_dominators f in
+  let backedges =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        List.fold_left
+          (fun acc succ ->
+            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
+              (block.label, succ) :: acc
+            else acc)
+          acc block.succs)
+      [] f.blocks
+  in
+  if backedges = [] then f
+  else
+    let loops = Hashtbl.create 8 in
+    List.iter
+      (fun (pred, header) ->
+        let loop = natural_loop block_map header pred in
+        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
+        Hashtbl.replace loops header merged)
+      backedges;
+    let headers =
+      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
+      |> List.sort (fun (_, a) (_, b) -> compare a b)
+      |> List.map fst
+    in
+    let def_blocks = temp_def_blocks f in
+    let def_instrs = temp_def_instrs_map f in
+    let multi_defs = multi_def_temps f in
+    let use_counts = temp_use_counts f.blocks in
+    let current_blocks = Hashtbl.create (List.length f.blocks) in
+    List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
+    let get_block label =
+      match Hashtbl.find_opt current_blocks label with
+      | Some block -> block
+      | None -> failwith ("internal missing block: " ^ label)
+    in
+    let changed = ref false in
+    List.iter
+      (fun header ->
+        let loop = table_find_or_empty loops header LabelSet.empty in
+        let loop_stable_phis =
+          collect_loop_stable_phis header loop get_block multi_defs def_instrs
+        in
+        let invariant operand =
+          operand_loop_invariant
+            loop def_blocks loop_stable_phis multi_defs def_instrs IntSet.empty operand
+        in
+        List.iter
+          (fun (block : Cfg.block) ->
+            if LabelSet.mem block.label loop then
+              let current = get_block block.label in
+              let single_use temp =
+                Option.value ~default:0 (Hashtbl.find_opt use_counts temp) = 1
+              in
+              let try_reassociate first second =
+                match (first, second) with
+                | Tcg.Bin (mid, Add, lhs1, rhs1), Tcg.Bin (dst, Add, lhs2, rhs2)
+                  when single_use mid -> (
+                    let tail_inv, uses_mid =
+                      if lhs2 = Tcg.Temp mid then (Some rhs2, true)
+                      else if rhs2 = Tcg.Temp mid then (Some lhs2, true)
+                      else (None, false)
+                    in
+                    match (tail_inv, uses_mid) with
+                    | Some extra_inv, true when invariant extra_inv -> (
+                        match (invariant lhs1, invariant rhs1) with
+                        | true, false ->
+                            Some
+                              ( simplify_simple_instr (Tcg.Bin (mid, Add, lhs1, extra_inv)),
+                                simplify_simple_instr (Tcg.Bin (dst, Add, rhs1, Tcg.Temp mid)) )
+                        | false, true ->
+                            Some
+                              ( simplify_simple_instr (Tcg.Bin (mid, Add, rhs1, extra_inv)),
+                                simplify_simple_instr (Tcg.Bin (dst, Add, lhs1, Tcg.Temp mid)) )
+                        | _ -> None)
+                    | _ -> None)
+                | _ -> None
+              in
+              let rec rewrite = function
+                | first :: second :: rest -> (
+                    match try_reassociate first second with
+                    | Some (first', second') ->
+                        changed := true;
+                        first' :: second' :: rewrite rest
+                    | None -> first :: rewrite (second :: rest))
+                | body -> body
+              in
+              Hashtbl.replace current_blocks current.label { current with body = rewrite current.body })
+          f.blocks)
+      headers;
+    if !changed then
+      let ordered_labels = List.map (fun (block : Cfg.block) -> block.label) f.blocks in
+      let blocks = List.map get_block ordered_labels in
+      Cfg.rebuild_edges { f with blocks }
+    else f
 
 let licm_func (f : Cfg.func) =
   let block_map = Hashtbl.create (List.length f.blocks) in
@@ -1285,7 +2251,6 @@ let licm_func (f : Cfg.func) =
       |> List.sort (fun (_, a) (_, b) -> compare a b)
       |> List.map fst
     in
-    let def_blocks = temp_def_blocks f in
     let current_blocks = Hashtbl.create (List.length f.blocks + List.length headers) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
     let get_block label =
@@ -1296,6 +2261,7 @@ let licm_func (f : Cfg.func) =
     let update_block (block : Cfg.block) =
       Hashtbl.replace current_blocks block.Cfg.label block
     in
+    let current_block_list () = Hashtbl.fold (fun _ block acc -> block :: acc) current_blocks [] in
     let new_blocks_rev = ref [] in
     let preheader_id = ref 0 in
     let fresh_preheader_label () =
@@ -1306,15 +2272,14 @@ let licm_func (f : Cfg.func) =
     List.iter
       (fun header ->
         let loop = table_find_or_empty loops header LabelSet.empty in
-        let header_block =
-          match Hashtbl.find_opt block_map header with
-          | Some block -> block
-          | None -> get_block header
-        in
+        let header_block = get_block header in
         let outside_preds =
           List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds
         in
         if outside_preds <> [] then begin
+          let blocks_snapshot = current_block_list () in
+          let def_blocks = temp_def_blocks_of_blocks f.temp_count blocks_snapshot in
+          let effects = collect_loop_effects loop blocks_snapshot in
           let invariant_keys = ref InstrKeySet.empty in
           let invariant_temps = ref IntSet.empty in
           let changed = ref true in
@@ -1328,17 +2293,19 @@ let licm_func (f : Cfg.func) =
                     (fun index instr ->
                       let key = (current.label, index) in
                       if not (InstrKeySet.mem key !invariant_keys) then
-                        match licm_candidate_info instr with
-                        | Some (dst, operands)
-                          when
-                            List.for_all
-                              (operand_invariant loop def_blocks !invariant_temps)
-                              operands
-                          ->
+                        match
+                          licm_invariant_candidate
+                            loop
+                            def_blocks
+                            !invariant_temps
+                            effects
+                            instr
+                        with
+                        | Some dst ->
                             invariant_keys := InstrKeySet.add key !invariant_keys;
                             invariant_temps := IntSet.add dst !invariant_temps;
                             changed := true
-                        | _ -> ())
+                        | None -> ())
                     current.body))
               f.blocks
           done;
@@ -1359,18 +2326,20 @@ let licm_func (f : Cfg.func) =
                         if InstrKeySet.mem key !invariant_keys
                            && not (InstrKeySet.mem key !scheduled_keys)
                         then
-                          match licm_candidate_info instr with
-                          | Some (dst, operands)
-                            when
-                              List.for_all
-                                (operand_invariant loop def_blocks !ready_temps)
-                                operands
-                            ->
+                          match
+                            licm_invariant_candidate
+                              loop
+                              def_blocks
+                              !ready_temps
+                              effects
+                              instr
+                          with
+                          | Some dst ->
                               hoisted_rev := instr :: !hoisted_rev;
                               scheduled_keys := InstrKeySet.add key !scheduled_keys;
                               ready_temps := IntSet.add dst !ready_temps;
                               progress := true
-                          | _ -> ())
+                          | None -> ())
                       current.body))
                 f.blocks
             done;
@@ -1535,19 +2504,20 @@ let eliminate_dead_code_func (f : Cfg.func) =
 let optimize_func global_init globals (f : Cfg.func) =
   let promoted = mem2reg_func f in
   let step func =
-    func
-    |> const_propagate_func global_init globals
-    |> copy_propagate_func
-    |> gvn_func globals
-    |> copy_propagate_func
-    |> eliminate_dead_code_func
-    |> licm_func
-    |> const_propagate_func global_init globals
-    |> copy_propagate_func
-    |> gvn_func globals
-    |> eliminate_dead_code_func
-    |> fold_branch_tails_func
-    |> thread_and_prune_func
+    let after_const1 = const_propagate_func global_init globals func in
+    let after_copy1 = copy_propagate_func after_const1 in
+    let after_sr = strength_reduce_func after_copy1 in
+    let after_gvn1 = gvn_func globals after_sr in
+    let after_copy2 = copy_propagate_func after_gvn1 in
+    let after_dce1 = eliminate_dead_code_func after_copy2 in
+    let after_reassoc = reassociate_loop_adds_func after_dce1 in
+    let after_licm = licm_func after_reassoc in
+    let after_const2 = const_propagate_func global_init globals after_licm in
+    let after_copy3 = copy_propagate_func after_const2 in
+    let after_gvn2 = gvn_func globals after_copy3 in
+    let after_dce2 = eliminate_dead_code_func after_gvn2 in
+    let after_fold = fold_branch_tails_func after_dce2 in
+    thread_and_prune_func after_fold
   in
   let rec loop fuel current =
     if fuel = 0 then current

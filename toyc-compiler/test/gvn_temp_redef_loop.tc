@@ -1,0 +1,11 @@
+int main() {
+  int i = 0;
+  int sum = 0;
+  while (i < 4) {
+    int x = i + 1;
+    x = x + 1;
+    sum = sum + (x - (i + 1));
+    i = i + 1;
+  }
+  return sum;
+}
