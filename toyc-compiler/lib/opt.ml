@@ -1665,6 +1665,9 @@ let delta_instr dst base delta =
   if delta >= 0L then simplify_simple_instr (Tcg.Bin (dst, Add, Tcg.Temp base, Tcg.Imm delta))
   else simplify_simple_instr (Tcg.Bin (dst, Sub, Tcg.Temp base, Tcg.Imm Int64.(neg delta)))
 
+let build_derived_backedge_update derived_phi delta =
+  if delta = 0L then [] else [ delta_instr derived_phi derived_phi delta ]
+
 let build_scaled_value dst source factor =
   match factor with
   | 0L -> [ Tcg.Move (dst, Tcg.Imm 0L) ]
@@ -2048,12 +2051,7 @@ let strength_reduce_func (f : Cfg.func) =
                   List.iter
                     (fun pred ->
                       let pred_block = get_block pred in
-                      let next_derived = fresh_temp () in
-                      let body =
-                        pred_block.body
-                        @ [ delta_instr next_derived derived_phi delta;
-                            Tcg.Move (derived_phi, Tcg.Temp next_derived) ]
-                      in
+                      let body = pred_block.body @ build_derived_backedge_update derived_phi delta in
                       update_block { pred_block with body })
                     iv.backedge_preds;
                   List.iter
@@ -2122,6 +2120,73 @@ let temp_use_counts blocks =
     blocks;
   counts
 
+type reassoc_first =
+  | FirstVarPlusInv of Tcg.operand * Tcg.operand
+  | FirstVarMinusInv of Tcg.operand * Tcg.operand
+  | FirstInvMinusVar of Tcg.operand * Tcg.operand
+
+type reassoc_second =
+  | SecondMidPlusInv of Tcg.temp * Tcg.operand
+  | SecondMidMinusInv of Tcg.temp * Tcg.operand
+  | SecondInvMinusMid of Tcg.temp * Tcg.operand
+
+let classify_reassoc_first invariant = function
+  | Tcg.Bin (mid, Add, lhs, rhs) ->
+      if invariant lhs && not (invariant rhs) then Some (mid, FirstVarPlusInv (rhs, lhs))
+      else if not (invariant lhs) && invariant rhs then
+        Some (mid, FirstVarPlusInv (lhs, rhs))
+      else None
+  | Tcg.Bin (mid, Sub, lhs, rhs) ->
+      if not (invariant lhs) && invariant rhs then Some (mid, FirstVarMinusInv (lhs, rhs))
+      else if invariant lhs && not (invariant rhs) then
+        Some (mid, FirstInvMinusVar (lhs, rhs))
+      else None
+  | Tcg.Bin (_, (Mul | Div | Mod | Lt | Gt | Le | Ge | Eq | Ne | LAnd | LOr), _, _) ->
+      None
+  | Tcg.Move _ | Tcg.Un _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> None
+
+let classify_reassoc_second mid invariant = function
+  | Tcg.Bin (dst, Add, lhs, rhs) when lhs = Tcg.Temp mid && invariant rhs ->
+      Some (SecondMidPlusInv (dst, rhs))
+  | Tcg.Bin (dst, Add, lhs, rhs) when rhs = Tcg.Temp mid && invariant lhs ->
+      Some (SecondMidPlusInv (dst, lhs))
+  | Tcg.Bin (dst, Sub, lhs, rhs) when lhs = Tcg.Temp mid && invariant rhs ->
+      Some (SecondMidMinusInv (dst, rhs))
+  | Tcg.Bin (dst, Sub, lhs, rhs) when rhs = Tcg.Temp mid && invariant lhs ->
+      Some (SecondInvMinusMid (dst, lhs))
+  | Tcg.Bin (_, (Mul | Div | Mod | Lt | Gt | Le | Ge | Eq | Ne | LAnd | LOr), _, _) ->
+      None
+  | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> None
+
+let build_reassoc_instrs mid first_shape second_shape =
+  let inv_bin dst op lhs rhs = simplify_simple_instr (Tcg.Bin (dst, op, lhs, rhs)) in
+  let add_mid dst variant = simplify_simple_instr (Tcg.Bin (dst, Add, variant, Tcg.Temp mid)) in
+  let sub_mid_from dst variant =
+    simplify_simple_instr (Tcg.Bin (dst, Sub, Tcg.Temp mid, variant))
+  in
+  let sub_variant_from dst variant =
+    simplify_simple_instr (Tcg.Bin (dst, Sub, variant, Tcg.Temp mid))
+  in
+  match (first_shape, second_shape) with
+  | FirstVarPlusInv (variant, inv1), SecondMidPlusInv (dst, inv2) ->
+      Some (inv_bin mid Add inv1 inv2, add_mid dst variant)
+  | FirstVarPlusInv (variant, inv1), SecondMidMinusInv (dst, inv2) ->
+      Some (inv_bin mid Sub inv1 inv2, add_mid dst variant)
+  | FirstVarPlusInv (variant, inv1), SecondInvMinusMid (dst, inv2) ->
+      Some (inv_bin mid Sub inv2 inv1, sub_mid_from dst variant)
+  | FirstVarMinusInv (variant, inv1), SecondMidPlusInv (dst, inv2) ->
+      Some (inv_bin mid Sub inv2 inv1, add_mid dst variant)
+  | FirstVarMinusInv (variant, inv1), SecondMidMinusInv (dst, inv2) ->
+      Some (inv_bin mid Add inv1 inv2, sub_variant_from dst variant)
+  | FirstVarMinusInv (variant, inv1), SecondInvMinusMid (dst, inv2) ->
+      Some (inv_bin mid Add inv2 inv1, sub_mid_from dst variant)
+  | FirstInvMinusVar (inv1, variant), SecondMidPlusInv (dst, inv2) ->
+      Some (inv_bin mid Add inv1 inv2, sub_mid_from dst variant)
+  | FirstInvMinusVar (inv1, variant), SecondMidMinusInv (dst, inv2) ->
+      Some (inv_bin mid Sub inv1 inv2, sub_mid_from dst variant)
+  | FirstInvMinusVar (inv1, variant), SecondInvMinusMid (dst, inv2) ->
+      Some (inv_bin mid Sub inv2 inv1, add_mid dst variant)
+
 let reassociate_loop_adds_func (f : Cfg.func) =
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
@@ -2181,28 +2246,12 @@ let reassociate_loop_adds_func (f : Cfg.func) =
                 Option.value ~default:0 (Hashtbl.find_opt use_counts temp) = 1
               in
               let try_reassociate first second =
-                match (first, second) with
-                | Tcg.Bin (mid, Add, lhs1, rhs1), Tcg.Bin (dst, Add, lhs2, rhs2)
-                  when single_use mid -> (
-                    let tail_inv, uses_mid =
-                      if lhs2 = Tcg.Temp mid then (Some rhs2, true)
-                      else if rhs2 = Tcg.Temp mid then (Some lhs2, true)
-                      else (None, false)
-                    in
-                    match (tail_inv, uses_mid) with
-                    | Some extra_inv, true when invariant extra_inv -> (
-                        match (invariant lhs1, invariant rhs1) with
-                        | true, false ->
-                            Some
-                              ( simplify_simple_instr (Tcg.Bin (mid, Add, lhs1, extra_inv)),
-                                simplify_simple_instr (Tcg.Bin (dst, Add, rhs1, Tcg.Temp mid)) )
-                        | false, true ->
-                            Some
-                              ( simplify_simple_instr (Tcg.Bin (mid, Add, rhs1, extra_inv)),
-                                simplify_simple_instr (Tcg.Bin (dst, Add, lhs1, Tcg.Temp mid)) )
-                        | _ -> None)
-                    | _ -> None)
-                | _ -> None
+                match classify_reassoc_first invariant first with
+                | Some (mid, first_shape) when single_use mid -> (
+                    match classify_reassoc_second mid invariant second with
+                    | Some second_shape -> build_reassoc_instrs mid first_shape second_shape
+                    | None -> None)
+                | Some _ | None -> None
               in
               let rec rewrite = function
                 | first :: second :: rest -> (

@@ -1,0 +1,17 @@
+int sum10(int a0, int a1, int a2, int a3, int a4, int a5, int a6, int a7, int a8, int a9) {
+  return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9;
+}
+
+int main() {
+  int a = 1;
+  int b = 2;
+  int c = 3;
+  int d = 4;
+  int e = 5;
+  int f = 6;
+  int g = 7;
+  int h = 8;
+  int i = 9;
+  int j = 10;
+  return sum10(a, b + 1, c + 2, d + 3, e + 4, f + 5, g + 6, h + 7, i + 8, j + 9);
+}

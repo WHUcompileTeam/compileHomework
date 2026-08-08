@@ -202,6 +202,18 @@ def run_asm(asm: str, limit: int = 300_000) -> tuple[int, int]:
         elif op == "bnez":
             if read(args[0]) != 0:
                 next_pc = labels[args[1]]
+        elif op == "beq":
+            if read(args[0]) == read(args[1]):
+                next_pc = labels[args[2]]
+        elif op == "bne":
+            if read(args[0]) != read(args[1]):
+                next_pc = labels[args[2]]
+        elif op == "blt":
+            if read(args[0]) < read(args[1]):
+                next_pc = labels[args[2]]
+        elif op == "bge":
+            if read(args[0]) >= read(args[1]):
+                next_pc = labels[args[2]]
         elif op == "j":
             next_pc = labels[args[0]]
         elif op == "call":
@@ -249,4 +261,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

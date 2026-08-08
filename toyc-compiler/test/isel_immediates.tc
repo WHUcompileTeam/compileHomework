@@ -1,0 +1,24 @@
+int id(int v) {
+  return v;
+}
+
+int main() {
+  int x = 5;
+  int y = x + 7;
+  int z = y - 12;
+  int a = id(5);
+  int b = id(5);
+  int c = id(6);
+  int score = 0;
+  if (z == 0) score = score + 10;
+  if (x == 5) score = score + 16;
+  if (x != 6) score = score + 32;
+  if (a == b) score = score + 2;
+  if (a != c) score = score + 64;
+  if (x > 0) score = score + 20;
+  if (0 < x) score = score + 4;
+  if (x >= 0) score = score + 8;
+  if (0 >= z) score = score + 1;
+  if (z != 0) score = score + 100;
+  return score;
+}

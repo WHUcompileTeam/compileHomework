@@ -16,7 +16,12 @@ Expected `main` return values:
 - `gvn_temp_redef_loop.tc`: `4`
 - `globals_shortcircuit.tc`: `42`
 - `infinite_return.tc`: `77`
+- `isel_immediates.tc`: `157`
 - `licm_global_invariant.tc`: `24`
+- `licm_reassociate_add_sub.tc`: `16`
+- `licm_reassociate_sub_add.tc`: `20`
+- `regalloc_call_live.tc`: `89`
+- `regalloc_many_args.tc`: `100`
 - `recursion_void_global.tc`: `120`
 
 Run the full local regression suite with:

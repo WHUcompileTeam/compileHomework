@@ -7,16 +7,26 @@ let starts_with s prefix =
 let split_ws s =
   s |> trim |> String.split_on_char ' ' |> List.filter (fun p -> p <> "")
 
+let strip_trailing_comma s =
+  let len = String.length s in
+  if len > 0 && s.[len - 1] = ',' then String.sub s 0 (len - 1) else s
+
 let parse_push l1 l2 =
   match (split_ws l1, split_ws l2) with
   | [ "addi"; "sp,"; "sp,"; "-4" ], [ "sw"; reg_comma; "0(sp)" ] ->
-      Some (String.sub reg_comma 0 (String.length reg_comma - 1))
+      Some (strip_trailing_comma reg_comma)
   | _ -> None
 
 let parse_pop l1 l2 =
   match (split_ws l1, split_ws l2) with
   | [ "lw"; reg_comma; "0(sp)" ], [ "addi"; "sp,"; "sp,"; "4" ] ->
-      Some (String.sub reg_comma 0 (String.length reg_comma - 1))
+      Some (strip_trailing_comma reg_comma)
+  | _ -> None
+
+let parse_move line =
+  match split_ws line with
+  | [ "addi"; dst_comma; src_comma; "0" ] ->
+      Some (strip_trailing_comma dst_comma, strip_trailing_comma src_comma)
   | _ -> None
 
 let is_label line =
@@ -33,8 +43,18 @@ let is_jump_to line label =
 let move_line dst src =
   if dst = src then None else Some (Printf.sprintf "    addi %s, %s, 0" dst src)
 
-let peephole asm =
-  let lines = asm |> String.split_on_char '\n' |> Array.of_list in
+let rec emit_opt_lines acc = function
+  | [] -> acc
+  | None :: rest -> emit_opt_lines acc rest
+  | Some line :: rest -> emit_opt_lines (line :: acc) rest
+
+let split_lines asm =
+  match List.rev (String.split_on_char '\n' asm) with
+  | "" :: rest -> List.rev rest
+  | rev_lines -> List.rev rev_lines
+
+let peephole_pass asm =
+  let lines = asm |> split_lines |> Array.of_list in
   let n = Array.length lines in
   let rec loop i acc =
     if i >= n then List.rev acc
@@ -51,11 +71,33 @@ let peephole asm =
         | Some line -> line :: acc
       in
       loop (i + 4) acc'
+    else if i + 1 < n then
+      match (parse_move lines.(i), parse_move lines.(i + 1)) with
+      | Some (dst1, src1), Some (dst2, src2) when dst1 = dst2 ->
+          if src2 = dst2 then
+            let acc' = emit_opt_lines acc [ move_line dst1 src1 ] in
+            loop (i + 2) acc'
+          else loop (i + 1) acc
+      | Some (dst1, src1), Some (dst2, src2) when src2 = dst1 ->
+          let acc' = emit_opt_lines acc [ move_line dst1 src1; move_line dst2 src1 ] in
+          loop (i + 2) acc'
+      | _ -> loop_tail i acc
     else if i + 1 < n && starts_with (trim lines.(i)) "j " && is_label lines.(i + 1)
     then
+      let label = label_name lines.(i + 1) in
+      if is_jump_to lines.(i) label then loop (i + 1) acc else loop (i + 1) (lines.(i) :: acc)
+    else loop (i + 1) (lines.(i) :: acc)
+  and loop_tail i acc =
+    if i + 1 < n && starts_with (trim lines.(i)) "j " && is_label lines.(i + 1) then
       let label = label_name lines.(i + 1) in
       if is_jump_to lines.(i) label then loop (i + 1) acc else loop (i + 1) (lines.(i) :: acc)
     else loop (i + 1) (lines.(i) :: acc)
   in
   String.concat "\n" (loop 0 []) ^ "\n"
 
+let peephole asm =
+  let rec fix current =
+    let next = peephole_pass current in
+    if next = current then current else fix next
+  in
+  fix asm
