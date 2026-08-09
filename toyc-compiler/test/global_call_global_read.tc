@@ -1,0 +1,10 @@
+int g = 1;
+
+int read_g() {
+  return g;
+}
+
+int main() {
+  g = 2;
+  return read_g();
+}

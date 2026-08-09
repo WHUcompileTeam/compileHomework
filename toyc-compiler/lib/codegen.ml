@@ -58,6 +58,59 @@ let table_find_or_empty table key empty =
   | Some value -> value
   | None -> empty
 
+let contains_substring text needle =
+  let text_len = String.length text in
+  let needle_len = String.length needle in
+  let rec loop i =
+    if i + needle_len > text_len then false
+    else if String.sub text i needle_len = needle then true
+    else loop (i + 1)
+  in
+  needle_len = 0 || loop 0
+
+let is_mem2reg_edge_label label = contains_substring label "_mem2reg_edge_"
+let is_licm_preheader_label label = contains_substring label "_licm_preheader_"
+let is_synthetic_label label = is_mem2reg_edge_label label || is_licm_preheader_label label
+
+let schedule_func_blocks (f : Cfg.func) =
+  let before_map = Hashtbl.create 8 in
+  let after_map = Hashtbl.create 8 in
+  let append_anchor table key block =
+    let blocks =
+      match Hashtbl.find_opt table key with
+      | Some blocks -> blocks @ [ block ]
+      | None -> [ block ]
+    in
+    Hashtbl.replace table key blocks
+  in
+  List.iter
+    (fun (block : Cfg.block) ->
+      if is_mem2reg_edge_label block.label then
+        match block.preds with
+        | pred :: _ -> append_anchor after_map pred block
+        | [] -> ()
+      else if is_licm_preheader_label block.label then
+        match block.succs with
+        | succ :: _ -> append_anchor before_map succ block
+        | [] -> ())
+    f.blocks;
+  let emitted = Hashtbl.create (List.length f.blocks) in
+  let ordered_rev = ref [] in
+  let rec emit_block (block : Cfg.block) =
+    if not (Hashtbl.mem emitted block.label) then begin
+      Hashtbl.add emitted block.label ();
+      List.iter emit_block (table_find_or_empty before_map block.label []);
+      ordered_rev := block :: !ordered_rev;
+      List.iter emit_block (table_find_or_empty after_map block.label [])
+    end
+  in
+  List.iter
+    (fun (block : Cfg.block) ->
+      if not (is_synthetic_label block.label) then emit_block block)
+    f.blocks;
+  List.iter emit_block f.blocks;
+  { f with blocks = List.rev !ordered_rev }
+
 let max_call_args (f : Cfg.func) =
   List.fold_left
     (fun current (block : Cfg.block) ->
@@ -244,8 +297,10 @@ let spill_weight use_count def_count call_crossings start_pos end_pos =
 let fits_simm12 n = n >= -2048L && n <= 2047L
 
 let compute_temp_intervals (f : Cfg.func) =
+  let live_in, live_out = compute_temp_live_sets f in
   let stats_table = Hashtbl.create (max 8 f.temp_count) in
   let hint_tables = Hashtbl.create (max 8 f.temp_count) in
+  let block_ranges = Hashtbl.create (List.length f.blocks) in
   let call_sites_rev = ref [] in
   let note_operand pos = function
     | Tcg.Temp temp -> note_temp_use stats_table temp pos
@@ -318,13 +373,32 @@ let compute_temp_intervals (f : Cfg.func) =
   let pos = ref 0 in
   List.iter
     (fun (block : Cfg.block) ->
+      let block_start = 2 * !pos in
       List.iter
         (fun instr ->
           note_instr !pos instr;
           incr pos)
         block.body;
       note_term !pos block.term;
-      incr pos)
+      incr pos;
+      Hashtbl.replace block_ranges block.label (block_start, (2 * !pos) - 1))
+    f.blocks;
+  List.iter
+    (fun (block : Cfg.block) ->
+      match Hashtbl.find_opt block_ranges block.label with
+      | None -> ()
+      | Some (block_start, block_end) ->
+          let live =
+            IntSet.union
+              (table_find_or_empty live_in block.label IntSet.empty)
+              (table_find_or_empty live_out block.label IntSet.empty)
+          in
+          IntSet.iter
+            (fun temp ->
+              let stats = get_temp_stats stats_table temp block_start in
+              stats.start_pos <- min stats.start_pos block_start;
+              stats.end_pos <- max stats.end_pos block_end)
+            live)
     f.blocks;
   Hashtbl.fold
     (fun temp (stats : temp_stats) acc ->
@@ -988,6 +1062,7 @@ let gen_block ctx next_label (block : Cfg.block) =
       gen_terminator ctx next_label block.term
 
 let gen_func buf (f : Cfg.func) =
+  let f = schedule_func_blocks f in
   let layout = compute_layout f in
   let epilogue = Printf.sprintf ".L_%s_epilogue" f.label in
   let blocks_by_label = Hashtbl.create (List.length f.blocks) in

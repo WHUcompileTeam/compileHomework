@@ -570,6 +570,7 @@ let kill_global_facts globals state =
   PlaceSet.fold (fun place acc -> set_place_fact acc place CpNac) globals state
 
 let initial_cp_state global_init (f : Cfg.func) =
+  let global_init = if f.name = "main" then global_init else PlaceMap.empty in
   let places =
     List.fold_left
       (fun places (param : Tcg.var) -> PlaceMap.add (Tcg.Local param.id) CpNac places)
