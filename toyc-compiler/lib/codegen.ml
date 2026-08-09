@@ -27,7 +27,9 @@ type ctx = {
 }
 
 let global_addr_reg = "t3"
-let allocatable_caller_regs = [ "a0" ]
+let allocatable_temp_regs = [ "t4"; "t5"; "t6" ]
+let allocatable_arg_regs = [ "a0"; "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7" ]
+let allocatable_caller_regs = allocatable_temp_regs @ allocatable_arg_regs
 let allocatable_saved_regs = [ "s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11" ]
 let allocatable_regs = allocatable_caller_regs @ allocatable_saved_regs
 
@@ -66,6 +68,22 @@ let max_call_args (f : Cfg.func) =
           | _ -> acc)
         current block.body)
     0 f.blocks
+
+let referenced_local_ids (f : Cfg.func) =
+  let add_place locals = function
+    | Tcg.Local id -> IntSet.add id locals
+    | Tcg.Global _ -> locals
+  in
+  List.fold_left
+    (fun locals (block : Cfg.block) ->
+      List.fold_left
+        (fun locals instr ->
+          match instr with
+          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Call _ -> locals
+          | Tcg.Load (_, place) -> add_place locals place
+          | Tcg.Store (place, _) -> add_place locals place)
+        locals block.body)
+    IntSet.empty f.blocks
 
 let add_operand_temp live = function
   | Tcg.Temp temp -> IntSet.add temp live
@@ -152,6 +170,8 @@ type interval = {
   use_count : int;
   def_count : int;
   defined_by_call : bool;
+  max_call_arg_index : int option;
+  used_in_call_args : bool;
   used_as_late_arg : bool;
   call_crossings : int;
   spill_weight : int;
@@ -164,6 +184,8 @@ type temp_stats = {
   mutable use_count : int;
   mutable def_count : int;
   mutable defined_by_call : bool;
+  mutable max_call_arg_index : int option;
+  mutable used_in_call_args : bool;
   mutable used_as_late_arg : bool;
 }
 
@@ -198,6 +220,8 @@ let get_temp_stats stats_table temp pos =
           use_count = 0;
           def_count = 0;
           defined_by_call = false;
+          max_call_arg_index = None;
+          used_in_call_args = false;
           used_as_late_arg = false;
         }
       in
@@ -266,12 +290,17 @@ let compute_temp_intervals (f : Cfg.func) =
           dst;
         List.iteri
           (fun i arg ->
-            if i > 0 then
-              match arg with
-              | Tcg.Temp temp ->
-                  let stats = get_temp_stats stats_table temp use_pos in
-                  stats.used_as_late_arg <- true
-              | Tcg.Imm _ -> ())
+            match arg with
+            | Tcg.Temp temp ->
+                let stats = get_temp_stats stats_table temp use_pos in
+                stats.used_in_call_args <- true;
+                stats.max_call_arg_index <-
+                  Some
+                    (match stats.max_call_arg_index with
+                    | Some prev -> max prev i
+                    | None -> i);
+                if i > 0 then stats.used_as_late_arg <- true
+            | Tcg.Imm _ -> ())
           args;
         List.iter (note_operand use_pos) args
   in
@@ -322,6 +351,8 @@ let compute_temp_intervals (f : Cfg.func) =
         use_count = stats.use_count;
         def_count = stats.def_count;
         defined_by_call = stats.defined_by_call;
+        max_call_arg_index = stats.max_call_arg_index;
+        used_in_call_args = stats.used_in_call_args;
         used_as_late_arg = stats.used_as_late_arg;
         call_crossings;
         spill_weight =
@@ -364,9 +395,31 @@ let allocate_temp_regs (f : Cfg.func) =
         | c -> c < 0)
     | c -> c < 0
   in
+  let arg_reg_index = function
+    | "a0" -> Some 0
+    | "a1" -> Some 1
+    | "a2" -> Some 2
+    | "a3" -> Some 3
+    | "a4" -> Some 4
+    | "a5" -> Some 5
+    | "a6" -> Some 6
+    | "a7" -> Some 7
+    | _ -> None
+  in
+  let allowed_arg_regs (interval : interval) =
+    if interval.call_crossings <> 0 then []
+    else
+      let min_safe_index = Option.value ~default:0 interval.max_call_arg_index in
+      List.filter
+        (fun reg ->
+          match arg_reg_index reg with
+          | Some index -> index >= min_safe_index
+          | None -> false)
+        allocatable_arg_regs
+  in
   let allowed_regs (interval : interval) =
-    if interval.defined_by_call && interval.call_crossings = 0 && not interval.used_as_late_arg then
-      allocatable_regs
+    if interval.call_crossings = 0 then
+      allocatable_temp_regs @ allowed_arg_regs interval @ allocatable_saved_regs
     else allocatable_saved_regs
   in
   let allowed_free_regs interval =
@@ -477,6 +530,7 @@ let allocate_temp_regs (f : Cfg.func) =
 let compute_layout (f : Cfg.func) =
   let local_offsets = Hashtbl.create 64 in
   let temp_homes, saved_regs = allocate_temp_regs f in
+  let referenced_locals = referenced_local_ids f in
   let save_area_size = 4 * (2 + List.length saved_regs) in
   let next = ref (save_area_size + 4) in
   let alloc_slot () =
@@ -485,7 +539,7 @@ let compute_layout (f : Cfg.func) =
     off
   in
   let alloc_local (var : Tcg.var) =
-    if not (Hashtbl.mem local_offsets var.id) then
+    if IntSet.mem var.id referenced_locals && not (Hashtbl.mem local_offsets var.id) then
       Hashtbl.add local_offsets var.id (alloc_slot ())
   in
   List.iter alloc_local f.params;
@@ -962,11 +1016,13 @@ let gen_func buf (f : Cfg.func) =
   emitf ctx "    addi s0, sp, %d" layout.frame_size;
   List.iteri
     (fun i (param : Tcg.var) ->
-      let off = lookup_offset layout.local_offsets param.id "local" in
-      if i < 8 then emitf ctx "    sw a%d, %d(s0)" i off
-      else (
-        emitf ctx "    lw t0, %d(s0)" ((i - 8) * 4);
-        emitf ctx "    sw t0, %d(s0)" off))
+      match Hashtbl.find_opt layout.local_offsets param.id with
+      | None -> ()
+      | Some off ->
+          if i < 8 then emitf ctx "    sw a%d, %d(s0)" i off
+          else (
+            emitf ctx "    lw t0, %d(s0)" ((i - 8) * 4);
+            emitf ctx "    sw t0, %d(s0)" off))
     f.params;
   let rec emit_blocks = function
     | [] -> ()
