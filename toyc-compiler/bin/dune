@@ -2,3 +2,7 @@
  (public_name compiler)
  (name compiler)
  (libraries toyc_compiler))
+
+(executable
+ (name main)
+ (libraries toyc_compiler))
