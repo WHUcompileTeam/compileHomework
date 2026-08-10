@@ -1,0 +1,16 @@
+int g = 1;
+
+int readg() {
+  return g;
+}
+
+int main() {
+  int i = 0;
+  int sum = 0;
+  while (i < 4) {
+    g = g + 2;
+    sum = sum + readg();
+    i = i + 1;
+  }
+  return sum;
+}

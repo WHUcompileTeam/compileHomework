@@ -1,0 +1,12 @@
+int g = 1;
+
+int main() {
+  int x = 0;
+  if (g) {
+    g = 3;
+  } else {
+    g = 4;
+  }
+  x = g + g;
+  return x;
+}

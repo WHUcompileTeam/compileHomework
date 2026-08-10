@@ -2669,6 +2669,10 @@ let summary_expr_is_minus_one = function
   | SummaryOperand (Tcg.Imm (-1L)) -> true
   | SummaryOperand _ | SummaryUn _ | SummaryBin _ -> false
 
+let summary_expr_is_constant = function
+  | SummaryOperand (Tcg.Imm _) -> true
+  | SummaryOperand (Tcg.Temp _) | SummaryUn _ | SummaryBin _ -> false
+
 let summary_expr_neg expr =
   if summary_expr_is_zero expr then expr else SummaryUn (UMinus, expr)
 
@@ -2883,7 +2887,10 @@ let reduction_step_of_operand
       loop_defs def_blocks get_block loop_stable_phis multi_defs def_instrs ivs block operand
   with
   | Some (LinearInvariant expr) -> Some (ReductionInvariant expr)
-  | Some (LinearAffine { iv; coeff; bias }) -> Some (ReductionAffine { iv; coeff; bias })
+  | Some (LinearAffine { iv; coeff; bias })
+    when summary_expr_is_constant coeff && summary_expr_is_constant bias ->
+      Some (ReductionAffine { iv; coeff; bias })
+  | Some (LinearAffine _) -> None
   | None -> None
 
 let reduction_update_of_temp

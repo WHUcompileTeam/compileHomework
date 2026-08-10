@@ -1,0 +1,17 @@
+int g = 1;
+
+void bump() {
+  g = g + 3;
+}
+
+int main() {
+  int i = 0;
+  int sum = 0;
+  while (i < 2) {
+    sum = sum + g;
+    bump();
+    sum = sum + g;
+    i = i + 1;
+  }
+  return sum;
+}
