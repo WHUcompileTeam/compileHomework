@@ -2128,6 +2128,7 @@ let delta_of_derived_key step = function
   | DerivedBaseMinus (_, factor) -> Int64.neg (Int64.mul step factor)
 
 let collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs =
+  let _ = def_blocks in
   let header_block : Cfg.block = get_block header in
   let pred_count = List.length header_block.preds in
   let counts = Hashtbl.create (max 8 pred_count) in
@@ -2149,70 +2150,22 @@ let collect_loop_stable_phis header loop get_block def_blocks multi_defs def_ins
       counts []
   in
   let backedge_preds = List.filter (fun pred -> LabelSet.mem pred loop) header_block.preds in
-  let rec normalize_invariant stable seen = function
-    | Tcg.Imm _ as operand -> operand
-    | Tcg.Temp temp as operand ->
-        if IntSet.mem temp seen || IntSet.mem temp stable then operand
-        else
-          match Hashtbl.find_opt def_blocks temp with
-          | Some def_label when LabelSet.mem def_label loop -> operand
-          | Some def_label -> (
-              match Hashtbl.find_opt def_instrs temp with
-              | Some (Tcg.Move (_, src)) ->
-                  normalize_invariant stable (IntSet.add temp seen) (resolve_block_operand (get_block def_label) src)
-              | Some _ | None -> operand)
-          | None -> operand
-  in
-  let src_is_stable stable = function
-    | Tcg.Imm _ -> true
-    | Tcg.Temp temp ->
-        IntSet.mem temp stable
-        ||
-        match Hashtbl.find_opt def_blocks temp with
-        | Some def_label -> not (LabelSet.mem def_label loop)
-        | None -> true
-  in
-  let rec extend stable =
-    let next =
-      List.fold_left
-        (fun acc phi_temp ->
-          let self_stable =
-            backedge_preds <> []
-            &&
-            List.for_all
-              (fun pred ->
-                match last_def_of_temp (get_block pred) phi_temp with
-                | Some (Tcg.Move (_, src)) ->
-                    resolves_to_induction_temp
-                      multi_defs def_instrs phi_temp (resolve_block_operand (get_block pred) src)
-                | Some _ | None -> false)
-              backedge_preds
-          in
-          let incoming =
-            List.filter_map
-              (fun pred ->
-                match last_def_of_temp (get_block pred) phi_temp with
-                | Some (Tcg.Move (_, src)) ->
-                    Some
-                      (normalize_invariant acc IntSet.empty
-                         (resolve_block_operand (get_block pred) src))
-                | Some _ | None -> None)
-              header_block.preds
-          in
-          let invariant_phi =
-            match incoming with
-            | [] -> false
-            | first :: rest ->
-                List.length incoming = pred_count
-                && List.for_all (( = ) first) rest
-                && src_is_stable acc first
-          in
-          if self_stable || invariant_phi then IntSet.add phi_temp acc else acc)
-        stable phi_temps
-    in
-    if IntSet.equal stable next then stable else extend next
-  in
-  extend IntSet.empty
+  List.fold_left
+    (fun acc phi_temp ->
+      let stable =
+        backedge_preds <> []
+        &&
+        List.for_all
+          (fun pred ->
+            match last_def_of_temp (get_block pred) phi_temp with
+            | Some (Tcg.Move (_, src)) ->
+                resolves_to_induction_temp
+                  multi_defs def_instrs phi_temp (resolve_block_operand (get_block pred) src)
+            | Some _ | None -> false)
+          backedge_preds
+      in
+      if stable then IntSet.add phi_temp acc else acc)
+    IntSet.empty phi_temps
 
 let collect_header_phi_temps header get_block =
   let header_block : Cfg.block = get_block header in
@@ -2669,10 +2622,6 @@ let summary_expr_is_minus_one = function
   | SummaryOperand (Tcg.Imm (-1L)) -> true
   | SummaryOperand _ | SummaryUn _ | SummaryBin _ -> false
 
-let summary_expr_is_constant = function
-  | SummaryOperand (Tcg.Imm _) -> true
-  | SummaryOperand (Tcg.Temp _) | SummaryUn _ | SummaryBin _ -> false
-
 let summary_expr_neg expr =
   if summary_expr_is_zero expr then expr else SummaryUn (UMinus, expr)
 
@@ -2887,9 +2836,6 @@ let reduction_step_of_operand
       loop_defs def_blocks get_block loop_stable_phis multi_defs def_instrs ivs block operand
   with
   | Some (LinearInvariant expr) -> Some (ReductionInvariant expr)
-  | Some (LinearAffine { iv; coeff; bias })
-    when summary_expr_is_constant coeff && summary_expr_is_constant bias ->
-      Some (ReductionAffine { iv; coeff; bias })
   | Some (LinearAffine _) -> None
   | None -> None
 
@@ -2992,44 +2938,9 @@ let collect_counted_reductions
     excluded_temps
     live_temps
   =
-  let header_block : Cfg.block = get_block header in
-  let outside_preds = List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds in
-  let backedge_preds = List.filter (fun pred -> LabelSet.mem pred loop) header_block.preds in
-  if outside_preds = [] || backedge_preds = [] then []
-  else
-    IntSet.fold
-      (fun temp acc ->
-        if IntSet.mem temp excluded_temps then acc
-        else if
-          List.for_all
-            (fun pred -> Option.is_some (last_def_of_temp (get_block pred) temp))
-            outside_preds
-        then
-          let updates =
-            List.filter_map
-              (fun pred ->
-                reduction_update_of_temp
-                  loop_defs
-                  def_blocks
-                  get_block
-                  loop_stable_phis
-                  multi_defs
-                  def_instrs
-                  ivs
-                  temp
-                  (get_block pred)
-                  temp)
-              backedge_preds
-          in
-          match updates with
-          | [] -> acc
-          | first :: rest
-            when List.length updates = List.length backedge_preds
-                 && List.for_all (fun update -> update = first) rest ->
-              first :: acc
-          | _ -> acc
-        else acc)
-      live_temps []
+  let _ = header, loop, loop_defs, get_block, def_blocks, loop_stable_phis in
+  let _ = multi_defs, def_instrs, ivs, excluded_temps, live_temps in
+  []
 
 let build_triangle_number_instrs fresh_temp trip_temp =
   let n_minus_one = fresh_temp () in
