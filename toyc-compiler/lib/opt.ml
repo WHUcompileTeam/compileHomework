@@ -4099,7 +4099,7 @@ let eliminate_dead_code_func (f : Cfg.func) =
   Cfg.rebuild_edges { f with blocks }
 
 let optimize_func global_init globals (f : Cfg.func) =
-  let promoted = f |> mem2reg_func |> promote_globals_func in
+  let promoted = mem2reg_func f in
   let debug_stop_after = Sys.getenv_opt "TOYC_DEBUG_STOP_AFTER" in
   let exception StopPass of Cfg.func in
   let stop_after stage current =
