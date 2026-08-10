@@ -1,0 +1,10 @@
+const int a = 0 == 2 < 3;
+const int b = 1 == 2 < 3;
+const int c = 1 != 2 <= 2;
+
+int main() {
+  if (a) {
+    return 90;
+  }
+  return b + c + 9;
+}

@@ -36,7 +36,8 @@ let mk_func ret name params body = { ret; name; params; body }
 %nonassoc KW_ELSE
 %left OROR
 %left ANDAND
-%left LESS GREATER LESSEQ GREATEREQ EQEQ BANGEQ
+%left EQEQ BANGEQ
+%left LESS GREATER LESSEQ GREATEREQ
 %left PLUS MINUS
 %left STAR SLASH PERCENT
 %right UPLUS UMINUS UNOT
