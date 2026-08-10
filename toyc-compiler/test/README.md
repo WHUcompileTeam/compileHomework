@@ -25,6 +25,7 @@ Expected `main` return values:
 - `regalloc_loop_call_global.tc`: `38`
 - `regalloc_many_args.tc`: `100`
 - `recursion_void_global.tc`: `120`
+- `tail_call.tc`: `210`
 
 Run the full local regression suite with:
 

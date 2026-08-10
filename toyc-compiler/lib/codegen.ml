@@ -24,6 +24,8 @@ type ctx = {
   blocks_by_label : (string, Cfg.block) Hashtbl.t;
   live_out_temps : (string, IntSet.t) Hashtbl.t;
   epilogue : string;
+  frame_size : int;
+  saved_regs : string list;
 }
 
 let global_addr_reg = "t3"
@@ -988,6 +990,14 @@ let forwarded_move_jump_terminator ctx dst src succ_label =
       | Cfg.Jump _ | Cfg.Return None -> None)
   | Some _ | None -> None
 
+let restore_frame ctx =
+  List.iteri
+    (fun i reg -> emitf ctx "    lw %s, %d(sp)" reg (ctx.frame_size - (12 + (4 * i))))
+    ctx.saved_regs;
+  emitf ctx "    lw ra, %d(sp)" (ctx.frame_size - 4);
+  emitf ctx "    lw s0, %d(sp)" (ctx.frame_size - 8);
+  emitf ctx "    addi sp, sp, %d" ctx.frame_size
+
 let gen_tail_return_instr ctx (instr : Tcg.simple_instr) =
   match instr with
   | Tcg.Move (_, src) ->
@@ -1004,6 +1014,10 @@ let gen_tail_return_instr ctx (instr : Tcg.simple_instr) =
       load_place ctx "a0" place;
       emitf ctx "    j %s" ctx.epilogue
   | Tcg.Store _ -> raise (Error "store cannot feed tail return directly")
+  | Tcg.Call (_, callee, args) when List.length args <= 8 ->
+      emit_call_args ctx args;
+      restore_frame ctx;
+      emitf ctx "    j %s" callee
   | Tcg.Call (_, callee, args) ->
       emit_call ctx callee args;
       emitf ctx "    j %s" ctx.epilogue
@@ -1077,6 +1091,8 @@ let gen_func buf (f : Cfg.func) =
       blocks_by_label;
       live_out_temps;
       epilogue;
+      frame_size = layout.frame_size;
+      saved_regs = layout.saved_regs;
     }
   in
   emit ctx "    .text";
@@ -1109,12 +1125,7 @@ let gen_func buf (f : Cfg.func) =
   in
   emit_blocks f.blocks;
   emitf ctx "%s:" epilogue;
-  List.iteri
-    (fun i reg -> emitf ctx "    lw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
-    layout.saved_regs;
-  emitf ctx "    lw ra, %d(sp)" (layout.frame_size - 4);
-  emitf ctx "    lw s0, %d(sp)" (layout.frame_size - 8);
-  emitf ctx "    addi sp, sp, %d" layout.frame_size;
+  restore_frame ctx;
   emit ctx "    ret";
   emit ctx ""
 
