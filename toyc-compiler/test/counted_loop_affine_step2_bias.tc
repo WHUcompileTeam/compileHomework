@@ -1,0 +1,9 @@
+int main() {
+  int i = 1;
+  int sum = 0;
+  while (i < 8) {
+    sum = sum + (i + 3);
+    i = i + 2;
+  }
+  return sum;
+}

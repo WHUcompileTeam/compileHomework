@@ -2140,6 +2140,775 @@ let collect_basic_induction_vars header loop get_block multi_defs def_instrs =
     in
     phi_vars @ self_vars
 
+type counted_loop_kind =
+  | CountUpLt of Tcg.operand
+  | CountUpLe of Tcg.operand
+  | CountDownGt of Tcg.operand
+  | CountDownGe of Tcg.operand
+
+type counted_loop_info = {
+  control_iv : basic_induction_var;
+  inside_label : Tcg.label;
+  exit_label : Tcg.label;
+  kind : counted_loop_kind;
+}
+
+type summary_expr =
+  | SummaryOperand of Tcg.operand
+  | SummaryUn of unop * summary_expr
+  | SummaryBin of binop * summary_expr * summary_expr
+
+type counted_reduction_step =
+  | ReductionInvariant of summary_expr
+  | ReductionAffine of {
+      iv : basic_induction_var;
+      coeff : int64;
+      bias : summary_expr;
+    }
+
+type counted_reduction = {
+  phi_temp : Tcg.temp;
+  subtract : bool;
+  step : counted_reduction_step;
+}
+
+type counted_update =
+  | CountedIv of basic_induction_var
+  | CountedReduction of counted_reduction
+
+let invert_compare = function
+  | Lt -> Ge
+  | Le -> Gt
+  | Gt -> Le
+  | Ge -> Lt
+  | Eq -> Ne
+  | Ne -> Eq
+  | Add | Sub | Mul | Div | Mod | LAnd | LOr -> invalid_arg "invert_compare"
+
+let classify_counted_loop_header
+    loop
+    def_blocks
+    loop_stable_phis
+    multi_defs
+    def_instrs
+    ivs
+    (term : Cfg.terminator)
+  =
+  let invariant operand =
+    operand_loop_invariant
+      loop def_blocks loop_stable_phis multi_defs def_instrs IntSet.empty operand
+  in
+  let match_control_iv op lhs rhs =
+    List.find_map
+      (fun (iv : basic_induction_var) ->
+        let step = iv.step in
+        if step = 0L then None
+        else if resolves_to_induction_temp multi_defs def_instrs iv.phi_temp lhs && invariant rhs
+        then
+          match (step, op) with
+          | step, Lt when step > 0L -> Some (iv, CountUpLt rhs)
+          | step, Le when step > 0L -> Some (iv, CountUpLe rhs)
+          | step, Gt when step < 0L -> Some (iv, CountDownGt rhs)
+          | step, Ge when step < 0L -> Some (iv, CountDownGe rhs)
+          | _ -> None
+        else if resolves_to_induction_temp multi_defs def_instrs iv.phi_temp rhs && invariant lhs
+        then
+          match (step, op) with
+          | step, Gt when step > 0L -> Some (iv, CountUpLt lhs)
+          | step, Ge when step > 0L -> Some (iv, CountUpLe lhs)
+          | step, Lt when step < 0L -> Some (iv, CountDownGt lhs)
+          | step, Le when step < 0L -> Some (iv, CountDownGe lhs)
+          | _ -> None
+        else None)
+      ivs
+  in
+  match term with
+  | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
+      let true_in = LabelSet.mem if_true loop in
+      let false_in = LabelSet.mem if_false loop in
+      if true_in = false_in then None
+      else if true_in then
+        Option.map
+          (fun (control_iv, kind) ->
+            { control_iv; inside_label = if_true; exit_label = if_false; kind })
+          (match_control_iv op lhs rhs)
+      else
+        Option.map
+          (fun (control_iv, kind) ->
+            { control_iv; inside_label = if_false; exit_label = if_true; kind })
+          (match_control_iv (invert_compare op) lhs rhs)
+  | Cfg.Jump _ | Cfg.BranchZero _ | Cfg.BranchNonZero _ | Cfg.Return _ -> None
+
+let linear_loop_path header loop get_block entry_label =
+  let rec walk seen acc label =
+    if label = header then Some (List.rev acc, seen)
+    else if not (LabelSet.mem label loop) || LabelSet.mem label seen then None
+    else
+      let block : Cfg.block = get_block label in
+      match block.succs with
+      | [ next ] -> walk (LabelSet.add label seen) (block :: acc) next
+      | _ -> None
+  in
+  match walk LabelSet.empty [] entry_label with
+  | Some (path, seen) ->
+      if LabelSet.equal seen (LabelSet.remove header loop) then Some path else None
+  | None -> None
+
+let build_positive_ceil_div fresh_temp numer_temp divisor =
+  let trip = fresh_temp () in
+  if divisor = 1L then
+    ([ simplify_simple_instr (Tcg.Move (trip, Tcg.Temp numer_temp)) ], trip)
+  else
+    let quotient = fresh_temp () in
+    let remainder = fresh_temp () in
+    let extra = fresh_temp () in
+    ( [ simplify_simple_instr
+          (Tcg.Bin (quotient, Div, Tcg.Temp numer_temp, Tcg.Imm divisor));
+        simplify_simple_instr
+          (Tcg.Bin (remainder, Mod, Tcg.Temp numer_temp, Tcg.Imm divisor));
+        simplify_simple_instr (Tcg.Bin (extra, Ne, Tcg.Temp remainder, Tcg.Imm 0L));
+        simplify_simple_instr (Tcg.Bin (trip, Add, Tcg.Temp quotient, Tcg.Temp extra)) ],
+      trip )
+
+let build_trip_count_instrs fresh_temp phi_temp step kind =
+  let stride = if step < 0L then Int64.neg step else step in
+  let diff = fresh_temp () in
+  match kind with
+  | CountUpLt bound ->
+      let diff_instr = simplify_simple_instr (Tcg.Bin (diff, Sub, bound, Tcg.Temp phi_temp)) in
+      let trip_instrs, trip = build_positive_ceil_div fresh_temp diff stride in
+      (diff_instr :: trip_instrs, trip)
+  | CountUpLe bound ->
+      let trip = fresh_temp () in
+      ( [ simplify_simple_instr (Tcg.Bin (diff, Sub, bound, Tcg.Temp phi_temp));
+          simplify_simple_instr (Tcg.Bin (trip, Div, Tcg.Temp diff, Tcg.Imm stride));
+          simplify_simple_instr (Tcg.Bin (trip, Add, Tcg.Temp trip, Tcg.Imm 1L)) ],
+        trip )
+  | CountDownGt bound ->
+      let diff_instr = simplify_simple_instr (Tcg.Bin (diff, Sub, Tcg.Temp phi_temp, bound)) in
+      let trip_instrs, trip = build_positive_ceil_div fresh_temp diff stride in
+      (diff_instr :: trip_instrs, trip)
+  | CountDownGe bound ->
+      let trip = fresh_temp () in
+      ( [ simplify_simple_instr (Tcg.Bin (diff, Sub, Tcg.Temp phi_temp, bound));
+          simplify_simple_instr (Tcg.Bin (trip, Div, Tcg.Temp diff, Tcg.Imm stride));
+          simplify_simple_instr (Tcg.Bin (trip, Add, Tcg.Temp trip, Tcg.Imm 1L)) ],
+        trip )
+
+let build_iv_final_update fresh_temp trip_temp (iv : basic_induction_var) =
+  match iv.step with
+  | 0L -> []
+  | 1L -> [ simplify_simple_instr (Tcg.Bin (iv.phi_temp, Add, Tcg.Temp iv.phi_temp, Tcg.Temp trip_temp)) ]
+  | -1L -> [ simplify_simple_instr (Tcg.Bin (iv.phi_temp, Sub, Tcg.Temp iv.phi_temp, Tcg.Temp trip_temp)) ]
+  | step ->
+      let delta = fresh_temp () in
+      [ simplify_simple_instr (Tcg.Bin (delta, Mul, Tcg.Temp trip_temp, Tcg.Imm step));
+        simplify_simple_instr (Tcg.Bin (iv.phi_temp, Add, Tcg.Temp iv.phi_temp, Tcg.Temp delta)) ]
+
+let counted_update_temp = function
+  | CountedIv (iv : basic_induction_var) -> iv.phi_temp
+  | CountedReduction reduction -> reduction.phi_temp
+
+type linear_expr =
+  | LinearInvariant of summary_expr
+  | LinearAffine of {
+      iv : basic_induction_var;
+      coeff : int64;
+      bias : summary_expr;
+    }
+
+let zero_summary_expr = SummaryOperand (Tcg.Imm 0L)
+
+let summary_expr_is_zero = function
+  | SummaryOperand (Tcg.Imm 0L) -> true
+  | SummaryOperand _ | SummaryUn _ | SummaryBin _ -> false
+
+let summary_expr_neg expr =
+  if summary_expr_is_zero expr then expr else SummaryUn (UMinus, expr)
+
+let summary_expr_add lhs rhs =
+  if summary_expr_is_zero lhs then rhs
+  else if summary_expr_is_zero rhs then lhs
+  else SummaryBin (Add, lhs, rhs)
+
+let summary_expr_sub lhs rhs =
+  if summary_expr_is_zero rhs then lhs
+  else if summary_expr_is_zero lhs then summary_expr_neg rhs
+  else SummaryBin (Sub, lhs, rhs)
+
+let summary_expr_scale factor expr =
+  match factor with
+  | 0L -> zero_summary_expr
+  | 1L -> expr
+  | -1L -> summary_expr_neg expr
+  | _ -> SummaryBin (Mul, SummaryOperand (Tcg.Imm factor), expr)
+
+let linear_affine iv coeff bias =
+  if coeff = 0L then LinearInvariant bias else LinearAffine { iv; coeff; bias }
+
+let linear_expr_neg = function
+  | LinearInvariant expr -> LinearInvariant (summary_expr_neg expr)
+  | LinearAffine { iv; coeff; bias } ->
+      linear_affine iv Int64.(neg coeff) (summary_expr_neg bias)
+
+let linear_expr_add lhs rhs =
+  match (lhs, rhs) with
+  | LinearInvariant lhs, LinearInvariant rhs -> Some (LinearInvariant (summary_expr_add lhs rhs))
+  | LinearAffine { iv; coeff; bias }, LinearInvariant rhs
+  | LinearInvariant rhs, LinearAffine { iv; coeff; bias } ->
+      Some (linear_affine iv coeff (summary_expr_add bias rhs))
+  | LinearAffine lhs, LinearAffine rhs when lhs.iv.phi_temp = rhs.iv.phi_temp ->
+      Some
+        (linear_affine lhs.iv Int64.(add lhs.coeff rhs.coeff)
+           (summary_expr_add lhs.bias rhs.bias))
+  | LinearAffine _, LinearAffine _ -> None
+
+let linear_expr_sub lhs rhs =
+  match (lhs, rhs) with
+  | LinearInvariant lhs, LinearInvariant rhs -> Some (LinearInvariant (summary_expr_sub lhs rhs))
+  | LinearAffine { iv; coeff; bias }, LinearInvariant rhs ->
+      Some (linear_affine iv coeff (summary_expr_sub bias rhs))
+  | LinearInvariant lhs, LinearAffine { iv; coeff; bias } ->
+      Some (linear_affine iv Int64.(neg coeff) (summary_expr_sub lhs bias))
+  | LinearAffine lhs, LinearAffine rhs when lhs.iv.phi_temp = rhs.iv.phi_temp ->
+      Some
+        (linear_affine lhs.iv Int64.(sub lhs.coeff rhs.coeff)
+           (summary_expr_sub lhs.bias rhs.bias))
+  | LinearAffine _, LinearAffine _ -> None
+
+let linear_expr_scale factor = function
+  | LinearInvariant expr -> Some (LinearInvariant (summary_expr_scale factor expr))
+  | LinearAffine { iv; coeff; bias } ->
+      Some (linear_affine iv Int64.(mul factor coeff) (summary_expr_scale factor bias))
+
+let summary_expr_of_operand
+    loop
+    def_blocks
+    loop_stable_phis
+    multi_defs
+    def_instrs
+    (block : Cfg.block)
+    operand
+  =
+  let invariant operand =
+    operand_loop_invariant
+      loop def_blocks loop_stable_phis multi_defs def_instrs IntSet.empty operand
+  in
+  let rec of_operand seen = function
+    | Tcg.Imm _ as operand -> Some (SummaryOperand operand)
+    | Tcg.Temp temp as operand ->
+        if invariant operand then Some (SummaryOperand operand)
+        else if IntSet.mem temp seen || IntSet.mem temp multi_defs then None
+        else
+          match last_def_of_temp block temp with
+          | Some instr -> of_instr (IntSet.add temp seen) instr
+          | None -> (
+              match Hashtbl.find_opt def_instrs temp with
+              | Some instr -> of_instr (IntSet.add temp seen) instr
+              | None -> None)
+  and of_instr seen = function
+    | Tcg.Move (_, src) -> of_operand seen src
+    | Tcg.Un (_, op, src) ->
+        let src = resolve_block_operand block src in
+        Option.map (fun src -> SummaryUn (op, src)) (of_operand seen src)
+    | Tcg.Bin (_, Add, lhs, rhs) ->
+        let lhs = resolve_block_operand block lhs in
+        let rhs = resolve_block_operand block rhs in
+        Option.bind (of_operand seen lhs) (fun lhs ->
+            Option.map (fun rhs -> SummaryBin (Add, lhs, rhs)) (of_operand seen rhs))
+    | Tcg.Bin (_, Sub, lhs, rhs) ->
+        let lhs = resolve_block_operand block lhs in
+        let rhs = resolve_block_operand block rhs in
+        Option.bind (of_operand seen lhs) (fun lhs ->
+            Option.map (fun rhs -> SummaryBin (Sub, lhs, rhs)) (of_operand seen rhs))
+    | Tcg.Bin (_, op, lhs, rhs) ->
+        let lhs = resolve_block_operand block lhs in
+        let rhs = resolve_block_operand block rhs in
+        Option.bind (of_operand seen lhs) (fun lhs ->
+            Option.map (fun rhs -> SummaryBin (op, lhs, rhs)) (of_operand seen rhs))
+    | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> None
+  in
+  of_operand IntSet.empty operand
+
+let linear_expr_of_operand
+    loop
+    def_blocks
+    loop_stable_phis
+    multi_defs
+    def_instrs
+    ivs
+    (block : Cfg.block)
+    operand
+  =
+  let direct_scaled operand =
+    List.find_map
+      (fun (iv : basic_induction_var) ->
+        match scaled_factor_of_operand multi_defs def_instrs iv.phi_temp operand with
+        | Some coeff when coeff <> 0L ->
+            Some (LinearAffine { iv; coeff; bias = zero_summary_expr })
+        | Some _ | None -> None)
+      ivs
+  in
+  let rec of_operand seen operand =
+    match direct_scaled operand with
+    | Some expr -> Some expr
+    | None -> (
+        match
+          summary_expr_of_operand
+            loop def_blocks loop_stable_phis multi_defs def_instrs block operand
+        with
+        | Some expr -> Some (LinearInvariant expr)
+        | None -> (
+            match operand with
+            | Tcg.Imm _ -> None
+            | Tcg.Temp temp ->
+                if IntSet.mem temp seen || IntSet.mem temp multi_defs then None
+                else
+                  match last_def_of_temp block temp with
+                  | Some instr -> of_instr (IntSet.add temp seen) instr
+                  | None -> (
+                      match Hashtbl.find_opt def_instrs temp with
+                      | Some instr -> of_instr (IntSet.add temp seen) instr
+                      | None -> None)))
+  and of_instr seen = function
+    | Tcg.Move (_, src) -> of_operand seen (resolve_block_operand block src)
+    | Tcg.Un (_, UMinus, src) ->
+        let src = resolve_block_operand block src in
+        Option.map linear_expr_neg (of_operand seen src)
+    | Tcg.Un _ -> None
+    | Tcg.Bin (_, Add, lhs, rhs) ->
+        let lhs = resolve_block_operand block lhs in
+        let rhs = resolve_block_operand block rhs in
+        Option.bind (of_operand seen lhs) (fun lhs ->
+            Option.bind (of_operand seen rhs) (linear_expr_add lhs))
+    | Tcg.Bin (_, Sub, lhs, rhs) ->
+        let lhs = resolve_block_operand block lhs in
+        let rhs = resolve_block_operand block rhs in
+        Option.bind (of_operand seen lhs) (fun lhs ->
+            Option.bind (of_operand seen rhs) (linear_expr_sub lhs))
+    | Tcg.Bin (_, Mul, lhs, rhs) -> (
+        let lhs = resolve_block_operand block lhs in
+        let rhs = resolve_block_operand block rhs in
+        match (lhs, rhs) with
+        | Tcg.Imm factor, rhs -> Option.bind (of_operand seen rhs) (linear_expr_scale factor)
+        | lhs, Tcg.Imm factor -> Option.bind (of_operand seen lhs) (linear_expr_scale factor)
+        | _ -> None)
+    | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> None
+  in
+  of_operand IntSet.empty operand
+
+let reduction_step_of_operand
+    loop
+    def_blocks
+    loop_stable_phis
+    multi_defs
+    def_instrs
+    ivs
+    (block : Cfg.block)
+    operand
+  =
+  match
+    linear_expr_of_operand
+      loop def_blocks loop_stable_phis multi_defs def_instrs ivs block operand
+  with
+  | Some (LinearInvariant expr) -> Some (ReductionInvariant expr)
+  | Some (LinearAffine { iv; coeff; bias }) when coeff <> 0L ->
+      Some (ReductionAffine { iv; coeff; bias })
+  | Some (LinearAffine _) | None -> None
+
+let reduction_update_of_temp
+    loop
+    def_blocks
+    loop_stable_phis
+    multi_defs
+    def_instrs
+    ivs
+    phi_temp
+    (block : Cfg.block)
+    temp
+  =
+  let invariant operand =
+    operand_loop_invariant
+      loop def_blocks loop_stable_phis multi_defs def_instrs IntSet.empty operand
+  in
+  let rec of_operand seen = function
+    | Tcg.Imm _ -> None
+    | Tcg.Temp temp as operand ->
+        if temp = phi_temp then None
+        else if IntSet.mem temp seen || IntSet.mem temp multi_defs then None
+        else
+          match last_def_of_temp block temp with
+          | Some instr -> of_instr (IntSet.add temp seen) instr
+          | None ->
+              if invariant operand then None
+              else
+                match Hashtbl.find_opt def_instrs temp with
+                | Some instr -> of_instr (IntSet.add temp seen) instr
+                | None -> None
+  and of_instr seen = function
+    | Tcg.Move (_, src) -> of_operand seen src
+    | Tcg.Bin (_, Add, lhs, rhs) ->
+        let lhs = resolve_block_operand block lhs in
+        let rhs = resolve_block_operand block rhs in
+        if resolves_to_induction_temp multi_defs def_instrs phi_temp lhs then
+          Option.map
+            (fun step -> { phi_temp; subtract = false; step })
+            (reduction_step_of_operand
+               loop
+               def_blocks
+               loop_stable_phis
+               multi_defs
+               def_instrs
+               ivs
+               block rhs)
+        else if resolves_to_induction_temp multi_defs def_instrs phi_temp rhs then
+          Option.map
+            (fun step -> { phi_temp; subtract = false; step })
+            (reduction_step_of_operand
+               loop
+               def_blocks
+               loop_stable_phis
+               multi_defs
+               def_instrs
+               ivs
+               block lhs)
+        else None
+    | Tcg.Bin (_, Sub, lhs, rhs) ->
+        let lhs = resolve_block_operand block lhs in
+        let rhs = resolve_block_operand block rhs in
+        if resolves_to_induction_temp multi_defs def_instrs phi_temp lhs then
+          Option.map
+            (fun step -> { phi_temp; subtract = true; step })
+            (reduction_step_of_operand
+               loop
+               def_blocks
+               loop_stable_phis
+               multi_defs
+               def_instrs
+               ivs
+               block rhs)
+        else None
+    | Tcg.Un _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ | Tcg.Bin _ -> None
+  in
+  of_operand IntSet.empty (Tcg.Temp temp)
+
+let collect_counted_reductions
+    header
+    loop
+    get_block
+    def_blocks
+    loop_stable_phis
+    multi_defs
+    def_instrs
+    ivs
+    excluded_temps
+    live_temps
+  =
+  let header_block : Cfg.block = get_block header in
+  let outside_preds = List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds in
+  let backedge_preds = List.filter (fun pred -> LabelSet.mem pred loop) header_block.preds in
+  if outside_preds = [] || backedge_preds = [] then []
+  else
+    IntSet.fold
+      (fun temp acc ->
+        if IntSet.mem temp excluded_temps then acc
+        else if
+          List.for_all
+            (fun pred -> Option.is_some (last_def_of_temp (get_block pred) temp))
+            outside_preds
+        then
+          let updates =
+            List.filter_map
+              (fun pred ->
+                reduction_update_of_temp
+                  loop
+                  def_blocks
+                  loop_stable_phis
+                  multi_defs
+                  def_instrs
+                  ivs
+                  temp
+                  (get_block pred)
+                  temp)
+              backedge_preds
+          in
+          match updates with
+          | [] -> acc
+          | first :: rest
+            when List.length updates = List.length backedge_preds
+                 && List.for_all (fun update -> update = first) rest ->
+              first :: acc
+          | _ -> acc
+        else acc)
+      live_temps []
+
+let build_triangle_number_instrs fresh_temp trip_temp =
+  let n_minus_one = fresh_temp () in
+  let half_n = fresh_temp () in
+  let parity = fresh_temp () in
+  let half_n_minus_one = fresh_temp () in
+  let left = fresh_temp () in
+  let right = fresh_temp () in
+  let triangle = fresh_temp () in
+  ( [ simplify_simple_instr (Tcg.Bin (n_minus_one, Sub, Tcg.Temp trip_temp, Tcg.Imm 1L));
+      simplify_simple_instr (Tcg.Bin (half_n, Div, Tcg.Temp trip_temp, Tcg.Imm 2L));
+      simplify_simple_instr (Tcg.Bin (parity, Mod, Tcg.Temp trip_temp, Tcg.Imm 2L));
+      simplify_simple_instr (Tcg.Bin (half_n_minus_one, Div, Tcg.Temp n_minus_one, Tcg.Imm 2L));
+      simplify_simple_instr (Tcg.Bin (left, Mul, Tcg.Temp half_n, Tcg.Temp n_minus_one));
+      simplify_simple_instr (Tcg.Bin (right, Mul, Tcg.Temp parity, Tcg.Temp half_n_minus_one));
+      simplify_simple_instr (Tcg.Bin (triangle, Add, Tcg.Temp left, Tcg.Temp right)) ],
+    triangle )
+
+let rec emit_summary_expr fresh_temp = function
+  | SummaryOperand operand -> ([], operand)
+  | SummaryUn (op, expr) ->
+      let instrs, operand = emit_summary_expr fresh_temp expr in
+      let dst = fresh_temp () in
+      (instrs @ [ simplify_simple_instr (Tcg.Un (dst, op, operand)) ], Tcg.Temp dst)
+  | SummaryBin (op, lhs, rhs) ->
+      let lhs_instrs, lhs_operand = emit_summary_expr fresh_temp lhs in
+      let rhs_instrs, rhs_operand = emit_summary_expr fresh_temp rhs in
+      let dst = fresh_temp () in
+      ( lhs_instrs @ rhs_instrs
+        @ [ simplify_simple_instr (Tcg.Bin (dst, op, lhs_operand, rhs_operand)) ],
+        Tcg.Temp dst )
+
+let build_invariant_reduction_delta fresh_temp trip_temp step_expr =
+  let step_instrs, step_operand = emit_summary_expr fresh_temp step_expr in
+  match step_operand with
+  | Tcg.Imm 0L -> (step_instrs, None)
+  | Tcg.Imm 1L -> (step_instrs, Some (Tcg.Temp trip_temp))
+  | Tcg.Imm -1L ->
+      let delta = fresh_temp () in
+      ( step_instrs
+        @ [ simplify_simple_instr (Tcg.Bin (delta, Sub, Tcg.Imm 0L, Tcg.Temp trip_temp)) ],
+        Some (Tcg.Temp delta) )
+  | _ ->
+      let delta = fresh_temp () in
+      ( step_instrs
+        @ [ simplify_simple_instr (Tcg.Bin (delta, Mul, Tcg.Temp trip_temp, step_operand)) ],
+        Some (Tcg.Temp delta) )
+
+let build_affine_reduction_delta
+    fresh_temp
+    trip_temp
+    (iv : basic_induction_var)
+    coeff
+    bias
+  =
+  let bias_instrs, bias_operand = emit_summary_expr fresh_temp bias in
+  let base = fresh_temp () in
+  let base_instrs =
+    build_scaled_value base (Tcg.Temp iv.phi_temp) coeff
+    @ bias_instrs
+    @
+    match bias_operand with
+    | Tcg.Imm 0L -> []
+    | _ -> [ simplify_simple_instr (Tcg.Bin (base, Add, Tcg.Temp base, bias_operand)) ]
+  in
+  let delta = fresh_temp () in
+  let delta_instrs =
+    [ simplify_simple_instr (Tcg.Bin (delta, Mul, Tcg.Temp base, Tcg.Temp trip_temp)) ]
+  in
+  let series_coeff = Int64.mul coeff iv.step in
+  if series_coeff = 0L then (base_instrs @ delta_instrs, Some (Tcg.Temp delta))
+  else
+    let triangle_instrs, triangle = build_triangle_number_instrs fresh_temp trip_temp in
+    let series = fresh_temp () in
+    let series_instrs = build_scaled_value series (Tcg.Temp triangle) series_coeff in
+    let combine =
+      simplify_simple_instr (Tcg.Bin (delta, Add, Tcg.Temp delta, Tcg.Temp series))
+    in
+    (base_instrs @ delta_instrs @ triangle_instrs @ series_instrs @ [ combine], Some (Tcg.Temp delta))
+
+let build_reduction_final_update fresh_temp trip_temp (reduction : counted_reduction) =
+  let delta_instrs, delta_operand =
+    match reduction.step with
+    | ReductionInvariant step_expr ->
+        build_invariant_reduction_delta fresh_temp trip_temp step_expr
+    | ReductionAffine { iv; coeff; bias } ->
+        build_affine_reduction_delta fresh_temp trip_temp iv coeff bias
+  in
+  match delta_operand with
+  | None -> []
+  | Some delta_operand ->
+      let update =
+        if reduction.subtract then
+          simplify_simple_instr
+            (Tcg.Bin
+               (reduction.phi_temp, Sub, Tcg.Temp reduction.phi_temp, delta_operand))
+        else
+          simplify_simple_instr
+            (Tcg.Bin
+               (reduction.phi_temp, Add, Tcg.Temp reduction.phi_temp, delta_operand))
+      in
+      delta_instrs @ [ update ]
+
+let eliminate_counted_loops_func (f : Cfg.func) =
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
+  let doms = compute_dominators f in
+  let backedges =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        List.fold_left
+          (fun acc succ ->
+            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
+              (block.label, succ) :: acc
+            else acc)
+          acc block.succs)
+      [] f.blocks
+  in
+  if backedges = [] then f
+  else
+    let loops = Hashtbl.create 8 in
+    List.iter
+      (fun (pred, header) ->
+        let loop = natural_loop block_map header pred in
+        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
+        Hashtbl.replace loops header merged)
+      backedges;
+    let headers =
+      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
+      |> List.sort (fun (_, a) (_, b) -> compare a b)
+      |> List.map fst
+    in
+    let current_blocks = Hashtbl.create (List.length f.blocks + List.length headers) in
+    List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
+    let get_block label =
+      match Hashtbl.find_opt current_blocks label with
+      | Some block -> block
+      | None -> failwith ("internal missing block: " ^ label)
+    in
+    let update_block (block : Cfg.block) =
+      Hashtbl.replace current_blocks block.label block
+    in
+    let current_block_list () = Hashtbl.fold (fun _ block acc -> block :: acc) current_blocks [] in
+    let next_temp = ref f.temp_count in
+    let fresh_temp () =
+      let temp = !next_temp in
+      incr next_temp;
+      temp
+    in
+    let summary_id = ref 0 in
+    let fresh_summary_label () =
+      let id = !summary_id in
+      incr summary_id;
+      Printf.sprintf ".L%s_counted_loop_%d" f.label id
+    in
+    let new_blocks_rev = ref [] in
+    let changed = ref false in
+    List.iter
+      (fun header ->
+        let loop = table_find_or_empty loops header LabelSet.empty in
+        let header_block : Cfg.block = get_block header in
+        let blocks_snapshot = current_block_list () in
+        let def_blocks = temp_def_blocks_of_blocks !next_temp blocks_snapshot in
+        let def_instrs = temp_def_instrs_of_blocks !next_temp blocks_snapshot in
+        let multi_defs = multi_def_temps_of_blocks !next_temp blocks_snapshot in
+        let effects = collect_loop_effects loop blocks_snapshot in
+        let loop_stable_phis =
+          collect_loop_stable_phis header loop get_block multi_defs def_instrs
+        in
+        match
+          classify_counted_loop_header
+            loop
+            def_blocks
+            loop_stable_phis
+            multi_defs
+            def_instrs
+            (collect_basic_induction_vars header loop get_block multi_defs def_instrs)
+            header_block.term
+        with
+        | None -> ()
+        | Some info -> (
+            match linear_loop_path header loop get_block info.inside_label with
+            | None -> ()
+            | Some _path ->
+                if effects.has_call || not (PlaceSet.is_empty effects.modified_places) then ()
+                else
+                  let globals = globals_in_func { f with blocks = blocks_snapshot } in
+                  let live_in_t, _ = compute_liveness globals { f with blocks = blocks_snapshot } in
+                  let live_t_exit = table_find_or_empty live_in_t info.exit_label IntSet.empty in
+                  let ivs =
+                    collect_basic_induction_vars header loop get_block multi_defs def_instrs
+                  in
+                  let live_ivs =
+                    List.filter
+                      (fun (iv : basic_induction_var) ->
+                        iv.phi_temp = info.control_iv.phi_temp || IntSet.mem iv.phi_temp live_t_exit)
+                      ivs
+                  in
+                  let loop_live_defs =
+                    IntSet.inter (loop_defined_temps loop blocks_snapshot) live_t_exit
+                  in
+                  let excluded_temps =
+                    List.fold_left
+                      (fun acc (iv : basic_induction_var) -> IntSet.add iv.phi_temp acc)
+                      IntSet.empty live_ivs
+                  in
+                  let reductions =
+                    collect_counted_reductions
+                      header
+                      loop
+                      get_block
+                      def_blocks
+                      loop_stable_phis
+                      multi_defs
+                      def_instrs
+                      ivs
+                      excluded_temps
+                      loop_live_defs
+                  in
+                  let all_updates =
+                    (List.map (fun iv -> CountedIv iv) live_ivs)
+                    @ List.map (fun reduction -> CountedReduction reduction) reductions
+                  in
+                  let supported_live =
+                    List.fold_left
+                      (fun acc update -> IntSet.add (counted_update_temp update) acc)
+                      IntSet.empty all_updates
+                  in
+                  if not (IntSet.subset loop_live_defs supported_live) then ()
+                  else
+                    let trip_instrs, trip_temp =
+                      build_trip_count_instrs
+                        fresh_temp
+                        info.control_iv.phi_temp
+                        info.control_iv.step
+                        info.kind
+                    in
+                    let updates =
+                      List.concat_map
+                        (build_reduction_final_update fresh_temp trip_temp)
+                        reductions
+                      @ List.concat_map
+                          (build_iv_final_update fresh_temp trip_temp)
+                          live_ivs
+                    in
+                    let summary_label = fresh_summary_label () in
+                    let term =
+                      rewrite_term_successor header_block.term
+                        ~from_label:info.inside_label ~to_label:summary_label
+                    in
+                    update_block { header_block with term; succs = Cfg.successors term };
+                    Hashtbl.add current_blocks summary_label
+                      {
+                        Cfg.label = summary_label;
+                        body = trip_instrs @ updates;
+                        term = Cfg.Jump info.exit_label;
+                        preds = [];
+                        succs = [ info.exit_label ];
+                      };
+                    new_blocks_rev := summary_label :: !new_blocks_rev;
+                    changed := true))
+      headers;
+    if !changed then
+      let ordered_labels = List.map (fun (block : Cfg.block) -> block.label) f.blocks in
+      let blocks = List.map get_block ordered_labels @ List.rev_map get_block !new_blocks_rev in
+      Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
+    else f
+
 let strength_reduce_func (f : Cfg.func) =
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
@@ -2768,7 +3537,13 @@ let optimize_func global_init globals (f : Cfg.func) =
       let after_dce2 = eliminate_dead_code_func after_gvn2 |> stop_after "dce2" in
       let after_dead_loops = eliminate_dead_loops_func after_dce2 |> stop_after "dead_loops" in
       let after_fold = fold_branch_tails_func after_dead_loops |> stop_after "fold" in
-      thread_and_prune_func after_fold |> stop_after "thread"
+      let after_counted = eliminate_counted_loops_func after_fold |> stop_after "counted_loops" in
+      let after_thread = thread_and_prune_func after_counted |> stop_after "thread" in
+      let after_fold2 = fold_branch_tails_func after_thread |> stop_after "fold2" in
+      let after_counted2 =
+        eliminate_counted_loops_func after_fold2 |> stop_after "counted_loops2"
+      in
+      thread_and_prune_func after_counted2 |> stop_after "thread2"
     with
     | StopPass current -> current
   in
