@@ -4086,7 +4086,9 @@ let optimize_func global_init globals (f : Cfg.func) =
         eliminate_counted_loops_func after_fold |> stop_after "counted_loops"
       in
       let after_unroll = unroll_counted_loops_x2_func after_counted |> stop_after "unroll2" in
-      after_unroll |> stop_after "thread"
+      let after_thread = thread_and_prune_func after_unroll |> stop_after "thread" in
+      let after_fold2 = fold_branch_tails_func after_thread |> stop_after "fold2" in
+      after_fold2
     with
     | StopPass current -> current
   in
