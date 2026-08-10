@@ -2833,6 +2833,8 @@ let reduction_step_of_operand
       loop_defs def_blocks get_block loop_stable_phis multi_defs def_instrs ivs block operand
   with
   | Some (LinearInvariant expr) -> Some (ReductionInvariant expr)
+  | Some (LinearAffine { iv; coeff; bias }) when not (summary_expr_is_zero coeff) ->
+      Some (ReductionAffine { iv; coeff; bias })
   | Some (LinearAffine _) -> None
   | None -> None
 
@@ -2935,9 +2937,44 @@ let collect_counted_reductions
     excluded_temps
     live_temps
   =
-  let _ = header, loop, loop_defs, get_block, def_blocks, loop_stable_phis in
-  let _ = multi_defs, def_instrs, ivs, excluded_temps, live_temps in
-  []
+  let header_block : Cfg.block = get_block header in
+  let outside_preds = List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds in
+  let backedge_preds = List.filter (fun pred -> LabelSet.mem pred loop) header_block.preds in
+  if outside_preds = [] || backedge_preds = [] then []
+  else
+    IntSet.fold
+      (fun temp acc ->
+        if IntSet.mem temp excluded_temps then acc
+        else if
+          List.for_all
+            (fun pred -> Option.is_some (last_def_of_temp (get_block pred) temp))
+            outside_preds
+        then
+          let updates =
+            List.filter_map
+              (fun pred ->
+                reduction_update_of_temp
+                  loop_defs
+                  def_blocks
+                  get_block
+                  loop_stable_phis
+                  multi_defs
+                  def_instrs
+                  ivs
+                  temp
+                  (get_block pred)
+                  temp)
+              backedge_preds
+          in
+          match updates with
+          | [] -> acc
+          | first :: rest
+            when List.length updates = List.length backedge_preds
+                 && List.for_all (fun update -> update = first) rest ->
+              first :: acc
+          | _ -> acc
+        else acc)
+      live_temps []
 
 let build_triangle_number_instrs fresh_temp trip_temp =
   let n_minus_one = fresh_temp () in
@@ -3253,6 +3290,7 @@ let eliminate_counted_loops_func (f : Cfg.func) =
 
 let unroll_counted_loops_x2_func (f : Cfg.func) =
   let unroll_max_blocks = 4 in
+  let unroll_min_instrs = 6 in
   let unroll_max_instrs = 16 in
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
@@ -3357,14 +3395,16 @@ let unroll_counted_loops_x2_func (f : Cfg.func) =
                          (fun acc (block : Cfg.block) -> acc + List.length block.body)
                          0 path
                    in
-                   if
-                     effects.has_call
-                     || header_block.body <> []
-                     || path = []
-                     || List.length path > unroll_max_blocks
-                     || total_instrs > unroll_max_instrs
-                     || has_redefined_candidate_temp
-                   then ()
+                    if
+                      effects.has_call
+                      || header_block.body <> []
+                      || path = []
+                      || List.length path > unroll_max_blocks
+                      || (PlaceSet.is_empty effects.modified_places
+                         && total_instrs < unroll_min_instrs)
+                      || total_instrs > unroll_max_instrs
+                      || has_redefined_candidate_temp
+                    then ()
                    else
                      let last_block = List.hd (List.rev path) in
                      if last_block.succs <> [ header ] then ()
@@ -4040,7 +4080,11 @@ let optimize_func global_init globals (f : Cfg.func) =
       let after_dce2 = eliminate_dead_code_func after_gvn2 |> stop_after "dce2" in
       let after_dead_loops = eliminate_dead_loops_func after_dce2 |> stop_after "dead_loops" in
       let after_fold = fold_branch_tails_func after_dead_loops |> stop_after "fold" in
-      after_fold |> stop_after "thread"
+      let after_counted =
+        eliminate_counted_loops_func after_fold |> stop_after "counted_loops"
+      in
+      let after_unroll = unroll_counted_loops_x2_func after_counted |> stop_after "unroll2" in
+      after_unroll |> stop_after "thread"
     with
     | StopPass current -> current
   in
