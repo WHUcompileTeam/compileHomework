@@ -4,10 +4,12 @@ exception Error of string
 
 module StringMap = Map.Make (String)
 module IntSet = Set.Make (Int)
+module LabelSet = Set.Make (String)
 
 type layout = {
   local_offsets : (int, int) Hashtbl.t;
   temp_homes : (int, temp_home) Hashtbl.t;
+  global_base_regs : (string, string) Hashtbl.t;
   frame_size : int;
   outgoing_area : int;
   saved_regs : string list;
@@ -21,6 +23,7 @@ type ctx = {
   buf : Buffer.t;
   local_offsets : (int, int) Hashtbl.t;
   temp_homes : (int, temp_home) Hashtbl.t;
+  global_base_regs : (string, string) Hashtbl.t;
   blocks_by_label : (string, Cfg.block) Hashtbl.t;
   live_out_temps : (string, IntSet.t) Hashtbl.t;
   epilogue : string;
@@ -31,7 +34,7 @@ let allocatable_temp_regs = [ "t4"; "t5"; "t6" ]
 let allocatable_arg_regs = [ "a0"; "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7" ]
 let allocatable_caller_regs = allocatable_temp_regs @ allocatable_arg_regs
 let allocatable_saved_regs = [ "s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11" ]
-let allocatable_regs = allocatable_caller_regs @ allocatable_saved_regs
+let reserved_global_base_regs = [ "s10"; "s11" ]
 
 let align16 n = ((n + 15) / 16) * 16
 
@@ -57,6 +60,76 @@ let table_find_or_empty table key empty =
   match Hashtbl.find_opt table key with
   | Some value -> value
   | None -> empty
+
+let reachable_labels entry blocks =
+  let block_map = Hashtbl.create (List.length blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) blocks;
+  let rec visit work seen =
+    match work with
+    | [] -> seen
+    | label :: rest ->
+        if LabelSet.mem label seen then visit rest seen
+        else
+          let seen = LabelSet.add label seen in
+          match Hashtbl.find_opt block_map label with
+          | Some (block : Cfg.block) -> visit (List.rev_append block.succs rest) seen
+          | None -> visit rest seen
+  in
+  visit [ entry ] LabelSet.empty
+
+let compute_dominators (f : Cfg.func) =
+  let reachable = reachable_labels f.entry f.blocks in
+  let reachable_blocks =
+    List.filter (fun (block : Cfg.block) -> LabelSet.mem block.label reachable) f.blocks
+  in
+  let all_labels =
+    List.fold_left
+      (fun acc (block : Cfg.block) -> LabelSet.add block.label acc)
+      LabelSet.empty reachable_blocks
+  in
+  let doms = Hashtbl.create (List.length reachable_blocks) in
+  List.iter
+    (fun (block : Cfg.block) ->
+      Hashtbl.add doms block.label
+        (if block.label = f.entry then LabelSet.singleton block.label else all_labels))
+    reachable_blocks;
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter
+      (fun (block : Cfg.block) ->
+        if block.label <> f.entry then
+          let pred_doms =
+            List.filter (fun pred -> LabelSet.mem pred reachable) block.preds
+            |> List.map (fun pred -> table_find_or_empty doms pred all_labels)
+          in
+          let merged =
+            match pred_doms with
+            | [] -> all_labels
+            | first :: rest -> List.fold_left LabelSet.inter first rest
+          in
+          let next_dom = LabelSet.add block.label merged in
+          if not (LabelSet.equal next_dom (table_find_or_empty doms block.label LabelSet.empty))
+          then (
+            Hashtbl.replace doms block.label next_dom;
+            changed := true))
+      reachable_blocks
+  done;
+  doms
+
+let natural_loop block_map header pred =
+  let rec visit work seen =
+    match work with
+    | [] -> seen
+    | label :: rest ->
+        if LabelSet.mem label seen then visit rest seen
+        else
+          let seen = LabelSet.add label seen in
+          match Hashtbl.find_opt block_map label with
+          | Some (block : Cfg.block) -> visit (List.rev_append block.preds rest) seen
+          | None -> visit rest seen
+  in
+  visit [ pred ] (LabelSet.singleton header)
 
 let contains_substring text needle =
   let text_len = String.length text in
@@ -223,6 +296,9 @@ type interval = {
   end_pos : int;
   use_count : int;
   def_count : int;
+  loop_use_score : int;
+  loop_def_score : int;
+  loop_carried_score : int;
   defined_by_call : bool;
   max_call_arg_index : int option;
   used_in_call_args : bool;
@@ -237,6 +313,9 @@ type temp_stats = {
   mutable end_pos : int;
   mutable use_count : int;
   mutable def_count : int;
+  mutable loop_use_score : int;
+  mutable loop_def_score : int;
+  mutable loop_carried_score : int;
   mutable defined_by_call : bool;
   mutable max_call_arg_index : int option;
   mutable used_in_call_args : bool;
@@ -273,6 +352,9 @@ let get_temp_stats stats_table temp pos =
           end_pos = pos;
           use_count = 0;
           def_count = 0;
+          loop_use_score = 0;
+          loop_def_score = 0;
+          loop_carried_score = 0;
           defined_by_call = false;
           max_call_arg_index = None;
           used_in_call_args = false;
@@ -282,37 +364,136 @@ let get_temp_stats stats_table temp pos =
       Hashtbl.add stats_table temp stats;
       stats
 
-let note_temp_use stats_table temp pos =
+let note_temp_use stats_table temp pos loop_depth =
   let stats = get_temp_stats stats_table temp pos in
-  stats.use_count <- stats.use_count + 1
+  stats.use_count <- stats.use_count + 1;
+  stats.loop_use_score <- stats.loop_use_score + loop_depth
 
-let note_temp_def stats_table temp pos =
+let note_temp_def stats_table temp pos loop_depth =
   let stats = get_temp_stats stats_table temp pos in
-  stats.def_count <- stats.def_count + 1
+  stats.def_count <- stats.def_count + 1;
+  stats.loop_def_score <- stats.loop_def_score + loop_depth
 
-let spill_weight use_count def_count call_crossings start_pos end_pos =
-  let benefit = max 1 ((4 * use_count) + (2 * def_count) + (12 * call_crossings)) in
+let spill_weight
+    use_count
+    def_count
+    loop_use_score
+    loop_def_score
+    loop_carried_score
+    call_crossings
+    start_pos
+    end_pos
+  =
+  let benefit =
+    max 1
+      ((4 * use_count)
+      + (2 * def_count)
+      + (8 * loop_use_score)
+      + (4 * loop_def_score)
+      + (48 * loop_carried_score)
+      + (12 * call_crossings))
+  in
   let span = max 1 (end_pos - start_pos + 1) in
   (benefit * 1024) / span
 
 let fits_simm12 n = n >= -2048L && n <= 2047L
+
+let compute_loop_depths (f : Cfg.func) =
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
+  let doms = compute_dominators f in
+  let depths = Hashtbl.create (List.length f.blocks) in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter
+        (fun succ ->
+          if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
+            let loop = natural_loop block_map succ block.label in
+            LabelSet.iter
+              (fun label ->
+                let depth = Option.value ~default:0 (Hashtbl.find_opt depths label) in
+                Hashtbl.replace depths label (depth + 1))
+              loop)
+        block.succs)
+    f.blocks;
+  depths
+
+type global_access_stats = {
+  mutable count : int;
+  mutable score : int;
+}
+
+let compute_global_access_stats (f : Cfg.func) =
+  let loop_depths = compute_loop_depths f in
+  let stats = Hashtbl.create 8 in
+  let note_global label loop_depth =
+    let entry =
+      match Hashtbl.find_opt stats label with
+      | Some entry -> entry
+      | None ->
+          let entry = { count = 0; score = 0 } in
+          Hashtbl.add stats label entry;
+          entry
+    in
+    entry.count <- entry.count + 1;
+    entry.score <- entry.score + 1 + (4 * loop_depth)
+  in
+  List.iter
+    (fun (block : Cfg.block) ->
+      let loop_depth = Option.value ~default:0 (Hashtbl.find_opt loop_depths block.label) in
+      List.iter
+        (function
+          | Tcg.Load (_, Tcg.Global label)
+          | Tcg.Store (Tcg.Global label, _) ->
+              note_global label loop_depth
+          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> ())
+        block.body)
+    f.blocks;
+  stats
+
+let select_global_base_regs (f : Cfg.func) =
+  let stats = compute_global_access_stats f in
+  let candidates =
+    Hashtbl.fold
+      (fun label ({ count; score } : global_access_stats) acc ->
+        if count >= 2 && score >= 6 then (label, score, count) :: acc else acc)
+      stats []
+    |> List.sort (fun (a_label, a_score, a_count) (b_label, b_score, b_count) ->
+           match compare b_score a_score with
+           | 0 -> (
+               match compare b_count a_count with
+               | 0 -> compare a_label b_label
+               | c -> c)
+           | c -> c)
+  in
+  let mapping = Hashtbl.create (List.length reserved_global_base_regs) in
+  let rec assign regs remaining =
+    match (regs, remaining) with
+    | reg :: regs_rest, (label, _, _) :: rest ->
+        Hashtbl.add mapping label reg;
+        assign regs_rest rest
+    | _ -> ()
+  in
+  assign reserved_global_base_regs candidates;
+  mapping
 
 let compute_temp_intervals (f : Cfg.func) =
   let live_in, live_out = compute_temp_live_sets f in
   let stats_table = Hashtbl.create (max 8 f.temp_count) in
   let hint_tables = Hashtbl.create (max 8 f.temp_count) in
   let block_ranges = Hashtbl.create (List.length f.blocks) in
+  let loop_depths = compute_loop_depths f in
   let call_sites_rev = ref [] in
-  let note_operand pos = function
-    | Tcg.Temp temp -> note_temp_use stats_table temp pos
+  let note_operand pos loop_depth = function
+    | Tcg.Temp temp -> note_temp_use stats_table temp pos loop_depth
     | Tcg.Imm _ -> ()
   in
-  let note_instr pos = function
+  let note_instr pos loop_depth = function
     | Tcg.Move (dst, src) ->
         let use_pos = 2 * pos in
         let def_pos = use_pos + 1 in
-        note_temp_def stats_table dst def_pos;
-        note_operand use_pos src;
+        note_temp_def stats_table dst def_pos loop_depth;
+        note_operand use_pos loop_depth src;
         (match src with
         | Tcg.Temp src_temp ->
             note_move_hint hint_tables dst src_temp;
@@ -321,26 +502,26 @@ let compute_temp_intervals (f : Cfg.func) =
     | Tcg.Un (dst, _, src) ->
         let use_pos = 2 * pos in
         let def_pos = use_pos + 1 in
-        note_temp_def stats_table dst def_pos;
-        note_operand use_pos src
+        note_temp_def stats_table dst def_pos loop_depth;
+        note_operand use_pos loop_depth src
     | Tcg.Bin (dst, _, lhs, rhs) ->
         let use_pos = 2 * pos in
         let def_pos = use_pos + 1 in
-        note_temp_def stats_table dst def_pos;
-        note_operand use_pos lhs;
-        note_operand use_pos rhs
+        note_temp_def stats_table dst def_pos loop_depth;
+        note_operand use_pos loop_depth lhs;
+        note_operand use_pos loop_depth rhs
     | Tcg.Load (dst, _) ->
         let def_pos = (2 * pos) + 1 in
-        note_temp_def stats_table dst def_pos
+        note_temp_def stats_table dst def_pos loop_depth
     | Tcg.Store (_, value) ->
-        note_operand (2 * pos) value
+        note_operand (2 * pos) loop_depth value
     | Tcg.Call (dst, _, args) ->
         let use_pos = 2 * pos in
         let def_pos = use_pos + 1 in
         call_sites_rev := def_pos :: !call_sites_rev;
         Option.iter
           (fun temp ->
-            note_temp_def stats_table temp def_pos;
+            note_temp_def stats_table temp def_pos loop_depth;
             let stats = get_temp_stats stats_table temp def_pos in
             stats.defined_by_call <- true)
           dst;
@@ -348,6 +529,7 @@ let compute_temp_intervals (f : Cfg.func) =
           (fun i arg ->
             match arg with
             | Tcg.Temp temp ->
+                note_temp_use stats_table temp use_pos loop_depth;
                 let stats = get_temp_stats stats_table temp use_pos in
                 stats.used_in_call_args <- true;
                 stats.max_call_arg_index <-
@@ -357,32 +539,52 @@ let compute_temp_intervals (f : Cfg.func) =
                     | None -> i);
                 if i > 0 then stats.used_as_late_arg <- true
             | Tcg.Imm _ -> ())
-          args;
-        List.iter (note_operand use_pos) args
+          args
   in
-  let note_term pos = function
+  let note_term pos loop_depth = function
     | Cfg.Jump _ | Cfg.Return None -> ()
     | Cfg.BranchZero (cond, _, _)
     | Cfg.BranchNonZero (cond, _, _)
     | Cfg.Return (Some cond) ->
-        note_operand (2 * pos) cond
+        note_operand (2 * pos) loop_depth cond
     | Cfg.BranchCompare (_, lhs, rhs, _, _) ->
         let use_pos = 2 * pos in
-        note_operand use_pos lhs;
-        note_operand use_pos rhs
+        note_operand use_pos loop_depth lhs;
+        note_operand use_pos loop_depth rhs
   in
   let pos = ref 0 in
   List.iter
     (fun (block : Cfg.block) ->
+      let loop_depth = Option.value ~default:0 (Hashtbl.find_opt loop_depths block.label) in
       let block_start = 2 * !pos in
       List.iter
         (fun instr ->
-          note_instr !pos instr;
+          note_instr !pos loop_depth instr;
           incr pos)
         block.body;
-      note_term !pos block.term;
+      note_term !pos loop_depth block.term;
       incr pos;
       Hashtbl.replace block_ranges block.label (block_start, (2 * !pos) - 1))
+    f.blocks;
+  let doms = compute_dominators f in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter
+        (fun succ ->
+          if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
+            let carried =
+              IntSet.inter
+                (table_find_or_empty live_out block.label IntSet.empty)
+                (table_find_or_empty live_in succ IntSet.empty)
+            in
+            let loop_depth = Option.value ~default:1 (Hashtbl.find_opt loop_depths succ) in
+            IntSet.iter
+              (fun temp ->
+                match Hashtbl.find_opt stats_table temp with
+                | Some stats -> stats.loop_carried_score <- stats.loop_carried_score + loop_depth
+                | None -> ())
+              carried)
+        block.succs)
     f.blocks;
   List.iter
     (fun (block : Cfg.block) ->
@@ -425,6 +627,9 @@ let compute_temp_intervals (f : Cfg.func) =
         end_pos = stats.end_pos;
         use_count = stats.use_count;
         def_count = stats.def_count;
+        loop_use_score = stats.loop_use_score;
+        loop_def_score = stats.loop_def_score;
+        loop_carried_score = stats.loop_carried_score;
         defined_by_call = stats.defined_by_call;
         max_call_arg_index = stats.max_call_arg_index;
         used_in_call_args = stats.used_in_call_args;
@@ -434,6 +639,9 @@ let compute_temp_intervals (f : Cfg.func) =
           spill_weight
             stats.use_count
             stats.def_count
+            stats.loop_use_score
+            stats.loop_def_score
+            stats.loop_carried_score
             call_crossings
             stats.start_pos
             stats.end_pos;
@@ -446,11 +654,14 @@ let compute_temp_intervals (f : Cfg.func) =
          | 0 -> compare a.temp b.temp
          | c -> c)
 
-let allocate_temp_regs (f : Cfg.func) =
+let allocate_temp_regs ?(reserved_saved_regs = []) (f : Cfg.func) =
   let intervals = compute_temp_intervals f in
   let homes = Hashtbl.create (max 8 f.temp_count) in
   let active = ref [] in
-  let free_regs = ref allocatable_regs in
+  let temp_saved_regs =
+    List.filter (fun reg -> not (List.mem reg reserved_saved_regs)) allocatable_saved_regs
+  in
+  let free_regs = ref (allocatable_caller_regs @ temp_saved_regs) in
   let remove_reg reg regs =
     let rec loop acc = function
       | [] -> List.rev acc
@@ -460,12 +671,18 @@ let allocate_temp_regs (f : Cfg.func) =
     loop [] regs
   in
   let interval_prefer_spill (a : interval) (b : interval) =
-    match compare a.spill_weight b.spill_weight with
+    match compare a.loop_carried_score b.loop_carried_score with
     | 0 -> (
-        match compare a.use_count b.use_count with
+        match compare (a.loop_use_score + a.loop_def_score) (b.loop_use_score + b.loop_def_score) with
         | 0 -> (
-            match compare b.end_pos a.end_pos with
-            | 0 -> b.temp < a.temp
+            match compare a.spill_weight b.spill_weight with
+            | 0 -> (
+                match compare a.use_count b.use_count with
+                | 0 -> (
+                    match compare b.end_pos a.end_pos with
+                    | 0 -> b.temp < a.temp
+                    | c -> c < 0)
+                | c -> c < 0)
             | c -> c < 0)
         | c -> c < 0)
     | c -> c < 0
@@ -481,6 +698,10 @@ let allocate_temp_regs (f : Cfg.func) =
     | "a7" -> Some 7
     | _ -> None
   in
+  let prefer_saved_regs (interval : interval) =
+    interval.loop_carried_score >= 2
+    && interval.loop_use_score + interval.loop_def_score >= 8
+  in
   let allowed_arg_regs (interval : interval) =
     if interval.call_crossings <> 0 then []
     else
@@ -494,12 +715,14 @@ let allocate_temp_regs (f : Cfg.func) =
   in
   let allowed_regs (interval : interval) =
     if interval.call_crossings = 0 then
-      allocatable_temp_regs @ allowed_arg_regs interval @ allocatable_saved_regs
-    else allocatable_saved_regs
+      if prefer_saved_regs interval then
+        temp_saved_regs @ allocatable_temp_regs @ allowed_arg_regs interval
+      else allocatable_temp_regs @ allowed_arg_regs interval @ temp_saved_regs
+    else temp_saved_regs
   in
   let allowed_free_regs interval =
     let allowed = allowed_regs interval in
-    List.filter (fun reg -> List.mem reg allowed) !free_regs
+    List.filter (fun reg -> List.mem reg !free_regs) allowed
   in
   let choose_free_reg (interval : interval) =
     let free_allowed_regs = allowed_free_regs interval in
@@ -604,7 +827,20 @@ let allocate_temp_regs (f : Cfg.func) =
 
 let compute_layout (f : Cfg.func) =
   let local_offsets = Hashtbl.create 64 in
-  let temp_homes, saved_regs = allocate_temp_regs f in
+  let global_base_regs = select_global_base_regs f in
+  let reserved_saved_regs =
+    Hashtbl.fold
+      (fun _ reg acc -> if List.mem reg acc then acc else reg :: acc)
+      global_base_regs []
+    |> List.sort compare
+  in
+  let temp_homes, temp_saved_regs = allocate_temp_regs ~reserved_saved_regs f in
+  let saved_regs =
+    List.fold_left
+      (fun acc reg -> if List.mem reg acc then acc else reg :: acc)
+      temp_saved_regs reserved_saved_regs
+    |> List.sort compare
+  in
   let referenced_locals = referenced_local_ids f in
   let save_area_size = 4 * (2 + List.length saved_regs) in
   let next = ref (save_area_size + 4) in
@@ -628,6 +864,7 @@ let compute_layout (f : Cfg.func) =
   {
     local_offsets;
     temp_homes;
+    global_base_regs;
     frame_size = align16 frame_bytes;
     outgoing_area;
     saved_regs;
@@ -660,19 +897,27 @@ let store_temp ctx temp src =
   | TempStack off -> emitf ctx "    sw %s, %d(s0)" src off
   | TempReg reg -> emit_reg_copy ctx reg src
 
+let cached_global_base_reg ctx label = Hashtbl.find_opt ctx.global_base_regs label
+
 let load_place ctx dst = function
   | Tcg.Local id ->
       emitf ctx "    lw %s, %d(s0)" dst (lookup_offset ctx.local_offsets id "local")
-  | Tcg.Global label ->
-      emitf ctx "    la %s, %s" global_addr_reg label;
-      emitf ctx "    lw %s, 0(%s)" dst global_addr_reg
+  | Tcg.Global label -> (
+      match cached_global_base_reg ctx label with
+      | Some base_reg -> emitf ctx "    lw %s, 0(%s)" dst base_reg
+      | None ->
+          emitf ctx "    la %s, %s" global_addr_reg label;
+          emitf ctx "    lw %s, 0(%s)" dst global_addr_reg)
 
 let store_place ctx src = function
   | Tcg.Local id ->
       emitf ctx "    sw %s, %d(s0)" src (lookup_offset ctx.local_offsets id "local")
-  | Tcg.Global label ->
-      emitf ctx "    la %s, %s" global_addr_reg label;
-      emitf ctx "    sw %s, 0(%s)" src global_addr_reg
+  | Tcg.Global label -> (
+      match cached_global_base_reg ctx label with
+      | Some base_reg -> emitf ctx "    sw %s, 0(%s)" src base_reg
+      | None ->
+          emitf ctx "    la %s, %s" global_addr_reg label;
+          emitf ctx "    sw %s, 0(%s)" src global_addr_reg)
 
 let emit_unop ctx op dst src =
   match op with
@@ -1074,6 +1319,7 @@ let gen_func buf (f : Cfg.func) =
       buf;
       local_offsets = layout.local_offsets;
       temp_homes = layout.temp_homes;
+      global_base_regs = layout.global_base_regs;
       blocks_by_label;
       live_out_temps;
       epilogue;
@@ -1090,6 +1336,12 @@ let gen_func buf (f : Cfg.func) =
     (fun i reg -> emitf ctx "    sw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
     layout.saved_regs;
   emitf ctx "    addi s0, sp, %d" layout.frame_size;
+  Hashtbl.fold (fun label reg acc -> (reg, label) :: acc) layout.global_base_regs []
+  |> List.sort (fun (a_reg, a_label) (b_reg, b_label) ->
+         match compare a_reg b_reg with
+         | 0 -> compare a_label b_label
+         | c -> c)
+  |> List.iter (fun (reg, label) -> emitf ctx "    la %s, %s" reg label);
   List.iteri
     (fun i (param : Tcg.var) ->
       match Hashtbl.find_opt layout.local_offsets param.id with

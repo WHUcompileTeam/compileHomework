@@ -1,0 +1,20 @@
+int pick(int x) {
+  return x;
+}
+
+int main() {
+  int cols = pick(6);
+  int base = pick(2);
+  int i = 0;
+  int j = 0;
+  int sum = 0;
+  while (i < 4) {
+    j = 0;
+    while (j < 5) {
+      sum = sum + (((i * cols) + j) + base);
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return sum;
+}

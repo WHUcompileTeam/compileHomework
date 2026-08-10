@@ -1,0 +1,21 @@
+int id(int x) {
+  return x;
+}
+
+int main() {
+  int a = id(3);
+  int b = id(5);
+  int c = id(7);
+  int i = 0;
+  int j = 0;
+  int sum = 0;
+  while (i < 4) {
+    j = 0;
+    while (j < 5) {
+      sum = sum + (((a * i) + (b * j)) + c);
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return sum;
+}

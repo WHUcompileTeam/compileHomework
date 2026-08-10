@@ -14,6 +14,8 @@ counted_unroll_global_store_odd.tc 5
 counted_nested_inner.tc 24
 counted_nested_affine_inner.tc 48
 counted_nested_rowcol_linear.tc 168
+counted_nested_affine_coeff_vars.tc 174
+counted_nested_matrix_index.tc 4
 copy_branch_merge.tc 2
 functions.tc 85
 global_call_global_read.tc 2
