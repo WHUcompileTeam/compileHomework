@@ -10,7 +10,6 @@ type layout = {
   local_offsets : (int, int) Hashtbl.t;
   temp_homes : (int, temp_home) Hashtbl.t;
   global_base_regs : (string, string) Hashtbl.t;
-  save_ra : bool;
   frame_size : int;
   outgoing_area : int;
   saved_regs : string list;
@@ -196,16 +195,6 @@ let max_call_args (f : Cfg.func) =
           | _ -> acc)
         current block.body)
     0 f.blocks
-
-let func_has_calls (f : Cfg.func) =
-  List.exists
-    (fun (block : Cfg.block) ->
-      List.exists
-        (function
-          | Tcg.Call _ -> true
-          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> false)
-        block.body)
-    f.blocks
 
 let referenced_local_ids (f : Cfg.func) =
   let add_place locals = function
@@ -839,7 +828,6 @@ let allocate_temp_regs ?(reserved_saved_regs = []) (f : Cfg.func) =
 let compute_layout (f : Cfg.func) =
   let local_offsets = Hashtbl.create 64 in
   let global_base_regs = select_global_base_regs f in
-  let save_ra = func_has_calls f in
   let reserved_saved_regs =
     Hashtbl.fold
       (fun _ reg acc -> if List.mem reg acc then acc else reg :: acc)
@@ -854,8 +842,7 @@ let compute_layout (f : Cfg.func) =
     |> List.sort compare
   in
   let referenced_locals = referenced_local_ids f in
-  let fixed_saved_regs = if save_ra then 2 else 1 in
-  let save_area_size = 4 * (fixed_saved_regs + List.length saved_regs) in
+  let save_area_size = 4 * (2 + List.length saved_regs) in
   let next = ref (save_area_size + 4) in
   let alloc_slot () =
     let off = - !next in
@@ -878,19 +865,10 @@ let compute_layout (f : Cfg.func) =
     local_offsets;
     temp_homes;
     global_base_regs;
-    save_ra;
     frame_size = align16 frame_bytes;
     outgoing_area;
     saved_regs;
   }
-
-let ra_slot layout = layout.frame_size - 4
-
-let s0_slot layout =
-  layout.frame_size - (if layout.save_ra then 8 else 4)
-
-let saved_reg_slot layout index =
-  layout.frame_size - ((if layout.save_ra then 12 else 8) + (4 * index))
 
 let emit_reg_copy ctx dst src =
   if dst <> src then emitf ctx "    addi %s, %s, 0" dst src
@@ -1352,10 +1330,10 @@ let gen_func buf (f : Cfg.func) =
   if f.name = "main" then emit ctx "    .globl main";
   emitf ctx "%s:" f.label;
   emitf ctx "    addi sp, sp, -%d" layout.frame_size;
-  if layout.save_ra then emitf ctx "    sw ra, %d(sp)" (ra_slot layout);
-  emitf ctx "    sw s0, %d(sp)" (s0_slot layout);
+  emitf ctx "    sw ra, %d(sp)" (layout.frame_size - 4);
+  emitf ctx "    sw s0, %d(sp)" (layout.frame_size - 8);
   List.iteri
-    (fun i reg -> emitf ctx "    sw %s, %d(sp)" reg (saved_reg_slot layout i))
+    (fun i reg -> emitf ctx "    sw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
     layout.saved_regs;
   emitf ctx "    addi s0, sp, %d" layout.frame_size;
   Hashtbl.fold (fun label reg acc -> (reg, label) :: acc) layout.global_base_regs []
@@ -1384,10 +1362,10 @@ let gen_func buf (f : Cfg.func) =
   emit_blocks f.blocks;
   emitf ctx "%s:" epilogue;
   List.iteri
-    (fun i reg -> emitf ctx "    lw %s, %d(sp)" reg (saved_reg_slot layout i))
+    (fun i reg -> emitf ctx "    lw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
     layout.saved_regs;
-  if layout.save_ra then emitf ctx "    lw ra, %d(sp)" (ra_slot layout);
-  emitf ctx "    lw s0, %d(sp)" (s0_slot layout);
+  emitf ctx "    lw ra, %d(sp)" (layout.frame_size - 4);
+  emitf ctx "    lw s0, %d(sp)" (layout.frame_size - 8);
   emitf ctx "    addi sp, sp, %d" layout.frame_size;
   emit ctx "    ret";
   emit ctx ""

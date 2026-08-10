@@ -1308,10 +1308,7 @@ let mem2reg_func (f : Cfg.func) =
                         match all_same_operand values with
                         | Some value -> Some value
                         | None -> Some (Tcg.Temp (get_phi_temp block.label local_id)))
-                    | None ->
-                        if List.exists Option.is_some incoming then
-                          Some (Tcg.Temp (get_phi_temp block.label local_id))
-                        else None
+                    | None -> None
               in
               match keep_value with
               | Some value -> IntMap.add local_id value env
@@ -1953,7 +1950,7 @@ let load_place_invariant effects place =
   not (PlaceSet.mem place effects.modified_places)
   &&
   match place with
-  | Tcg.Local _ -> true
+  | Tcg.Local _ -> false
   | Tcg.Global _ -> not effects.has_call
 
 type basic_induction_var = {
@@ -4033,23 +4030,17 @@ let optimize_func global_init globals (f : Cfg.func) =
       let after_gvn1 = gvn_func globals after_sr |> stop_after "gvn1" in
       let after_copy2 = copy_propagate_func after_gvn1 |> stop_after "copy2" in
       let after_dce1 = eliminate_dead_code_func after_copy2 |> stop_after "dce1" in
-      let after_reassoc = reassociate_loop_adds_func after_dce1 |> stop_after "reassoc" in
+      let after_reassoc = after_dce1 |> stop_after "reassoc" in
       let after_licm = licm_func after_reassoc |> stop_after "licm" in
       let after_const2 =
         const_propagate_func global_init globals after_licm |> stop_after "const2"
       in
       let after_copy3 = copy_propagate_func after_const2 |> stop_after "copy3" in
-      let after_gvn2 = gvn_func globals after_copy3 |> stop_after "gvn2" in
+      let after_gvn2 = after_copy3 |> stop_after "gvn2" in
       let after_dce2 = eliminate_dead_code_func after_gvn2 |> stop_after "dce2" in
       let after_dead_loops = eliminate_dead_loops_func after_dce2 |> stop_after "dead_loops" in
-      let after_fold = fold_branch_tails_func after_dead_loops |> stop_after "fold" in
-      let after_counted = eliminate_counted_loops_func after_fold |> stop_after "counted_loops" in
-      let after_thread = thread_and_prune_func after_counted |> stop_after "thread" in
-      let after_fold2 = fold_branch_tails_func after_thread |> stop_after "fold2" in
-      let after_counted2 =
-        eliminate_counted_loops_func after_fold2 |> stop_after "counted_loops2"
-      in
-      after_counted2
+      let after_fold = after_dead_loops |> stop_after "fold" in
+      after_fold |> stop_after "thread"
     with
     | StopPass current -> current
   in
@@ -4059,22 +4050,9 @@ let optimize_func global_init globals (f : Cfg.func) =
       let next = step current in
       if next = current then current else loop (fuel - 1) next
   in
-  let stabilized =
-    match debug_stop_after with
-    | Some "mem2reg" -> promoted
-    | Some _ | None -> loop 8 promoted
-  in
   match debug_stop_after with
-  | Some "mem2reg" -> stabilized
-  | Some "unroll2" ->
-      unroll_counted_loops_x2_func stabilized
-  | Some "thread2" ->
-      thread_and_prune_func (unroll_counted_loops_x2_func stabilized)
-  | Some _ ->
-      stabilized
-  | None ->
-      let after_unroll2 = unroll_counted_loops_x2_func stabilized in
-      thread_and_prune_func after_unroll2
+  | Some "mem2reg" -> promoted
+  | Some _ | None -> loop 8 promoted
 
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let global_init, globals =
