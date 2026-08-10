@@ -242,6 +242,17 @@ let globals_in_func (f : Cfg.func) =
         acc block.body)
     PlaceSet.empty f.blocks
 
+let stored_globals_in_func (f : Cfg.func) =
+  List.fold_left
+    (fun acc (block : Cfg.block) ->
+      List.fold_left
+        (fun acc instr ->
+          match instr with
+          | Tcg.Store (Tcg.Global label, _) -> PlaceSet.add (Tcg.Global label) acc
+          | _ -> acc)
+        acc block.body)
+    PlaceSet.empty f.blocks
+
 let simplify_simple_instr = function
   | Tcg.Un (dst, op, src) -> (
       match src with
@@ -498,6 +509,7 @@ let equal_cp_state a b =
   IntMap.equal ( = ) a.temps b.temps && PlaceMap.equal ( = ) a.places b.places
 
 let equal_operand_map = IntMap.equal ( = )
+let equal_place_operand_map = PlaceMap.equal ( = )
 
 let empty_cp_state = { temps = IntMap.empty; places = PlaceMap.empty }
 
@@ -1431,6 +1443,229 @@ let mem2reg_func (f : Cfg.func) =
                     List.fold_left
                       (fun acc (local_id, phi_temp) ->
                         match IntMap.find_opt local_id pred_out with
+                        | Some source when source <> Tcg.Temp phi_temp -> (phi_temp, source) :: acc
+                        | Some _ | None -> acc)
+                      [] phi_copies
+                  in
+                  match build_parallel_copies (List.rev copies) with
+                  | [] -> ()
+                  | body ->
+                      let edge_label = fresh_edge_label () in
+                      Hashtbl.add redirects (pred, succ_block.label) edge_label;
+                      edge_blocks_rev :=
+                        {
+                          Cfg.label = edge_label;
+                          body;
+                          term = Cfg.Jump succ_block.label;
+                          preds = [];
+                          succs = [ succ_block.label ];
+                        }
+                        :: !edge_blocks_rev)
+                succ_block.preds)
+          promoted_blocks;
+        let blocks =
+          List.map
+            (fun (block : Cfg.block) ->
+              let term = redirect_successors block.label redirects block.term in
+              { block with term; succs = Cfg.successors term })
+            promoted_blocks
+          @ List.rev !edge_blocks_rev
+        in
+        Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
+    end
+  in
+  attempt all_candidates
+
+let promote_globals_func (f : Cfg.func) =
+  let all_candidates = stored_globals_in_func f in
+  let rec attempt candidates =
+    if PlaceSet.is_empty candidates then f
+    else begin
+      let next_temp = ref f.temp_count in
+      let fresh_temp () =
+        let temp = !next_temp in
+        incr next_temp;
+        temp
+      in
+      let in_envs = Hashtbl.create (List.length f.blocks) in
+      let out_envs = Hashtbl.create (List.length f.blocks) in
+      let phi_temps = Hashtbl.create (max 8 (List.length f.blocks)) in
+      let get_env table label = table_find_or_empty table label PlaceMap.empty in
+      let get_phi_temp label place =
+        match Hashtbl.find_opt phi_temps (label, place) with
+        | Some temp -> temp
+        | None ->
+            let temp = fresh_temp () in
+            Hashtbl.add phi_temps (label, place) temp;
+            temp
+      in
+      let compute_in_env (block : Cfg.block) =
+        if block.label = f.entry then PlaceMap.empty
+        else
+          PlaceSet.fold
+            (fun place env ->
+              let incoming =
+                List.map (fun pred -> PlaceMap.find_opt place (get_env out_envs pred)) block.preds
+              in
+              let keep_value =
+                match block.preds with
+                | [] -> None
+                | _ -> (
+                    match all_present incoming with
+                    | Some values -> (
+                        match all_same_operand values with
+                        | Some value -> Some value
+                        | None -> Some (Tcg.Temp (get_phi_temp block.label place)))
+                    | None ->
+                        if List.exists Option.is_some incoming then
+                          Some (Tcg.Temp (get_phi_temp block.label place))
+                        else None)
+              in
+              match keep_value with
+              | Some value -> PlaceMap.add place value env
+              | None -> PlaceMap.remove place env)
+            candidates PlaceMap.empty
+      in
+      let transfer_env env (block : Cfg.block) =
+        List.fold_left
+          (fun env instr ->
+            match instr with
+            | Tcg.Store (place, value) when PlaceSet.mem place candidates -> PlaceMap.add place value env
+            | Tcg.Call _ -> PlaceMap.empty
+            | _ -> env)
+          env block.body
+      in
+      let changed = ref true in
+      while !changed do
+        changed := false;
+        List.iter
+          (fun (block : Cfg.block) ->
+            let in_env = compute_in_env block in
+            let out_env = transfer_env in_env block in
+            if not (equal_place_operand_map in_env (get_env in_envs block.label)) then (
+              Hashtbl.replace in_envs block.label in_env;
+              changed := true);
+            if not (equal_place_operand_map out_env (get_env out_envs block.label)) then (
+              Hashtbl.replace out_envs block.label out_env;
+              changed := true))
+          f.blocks
+      done;
+      let failed = ref PlaceSet.empty in
+      List.iter
+        (fun (block : Cfg.block) ->
+          let env = ref (get_env in_envs block.label) in
+          List.iter
+            (fun instr ->
+              match instr with
+              | Tcg.Load (_, place) when PlaceSet.mem place candidates ->
+                  if not (PlaceMap.mem place !env) then failed := PlaceSet.add place !failed
+              | Tcg.Store (place, value) when PlaceSet.mem place candidates ->
+                  env := PlaceMap.add place value !env
+              | Tcg.Call _ -> env := PlaceMap.empty
+              | _ -> ())
+            block.body;
+          Hashtbl.iter
+            (fun (phi_label, place) _ ->
+              if phi_label = block.label then
+                match PlaceMap.find_opt place (get_env in_envs block.label) with
+                | Some (Tcg.Temp _) ->
+                    List.iter
+                      (fun pred ->
+                        if not (PlaceMap.mem place (get_env out_envs pred)) then
+                          failed := PlaceSet.add place !failed)
+                      block.preds
+                | _ -> ())
+            phi_temps)
+        f.blocks;
+      if not (PlaceSet.is_empty !failed) then attempt (PlaceSet.diff candidates !failed)
+      else
+        let flush_env env =
+          PlaceSet.elements candidates
+          |> List.filter_map (fun place ->
+                 match PlaceMap.find_opt place env with
+                 | Some value -> Some (Tcg.Store (place, value))
+                 | None -> None)
+        in
+        let rewrite_block (block : Cfg.block) =
+          let rec rewrite env acc = function
+            | [] -> (env, List.rev acc)
+            | instr :: rest -> (
+                match instr with
+                | Tcg.Load (dst, place) when PlaceSet.mem place candidates -> (
+                    match PlaceMap.find_opt place env with
+                    | Some value ->
+                        rewrite env (simplify_simple_instr (Tcg.Move (dst, value)) :: acc) rest
+                    | None -> rewrite env (instr :: acc) rest)
+                | Tcg.Store (place, value) when PlaceSet.mem place candidates ->
+                    rewrite (PlaceMap.add place value env) acc rest
+                | Tcg.Call _ ->
+                    let flushed = flush_env env in
+                    let acc = List.rev_append (flushed @ [ instr ]) acc in
+                    rewrite PlaceMap.empty acc rest
+                | _ -> rewrite env (instr :: acc) rest)
+          in
+          let env_out, body = rewrite (get_env in_envs block.label) [] block.body in
+          let body =
+            match block.term with
+            | Cfg.Return _ -> body @ flush_env env_out
+            | _ -> body
+          in
+          { block with body }
+        in
+        let promoted_blocks = List.map rewrite_block f.blocks in
+        let redirects = Hashtbl.create 16 in
+        let edge_blocks_rev = ref [] in
+        let edge_id = ref 0 in
+        let fresh_edge_label () =
+          let id = !edge_id in
+          incr edge_id;
+          Printf.sprintf ".L%s_gprom_edge_%d" f.label id
+        in
+        let build_parallel_copies copies =
+          let snapshots = Hashtbl.create (List.length copies) in
+          let snapshots_rev, assigns_rev =
+            List.fold_left
+              (fun (snapshots_rev, assigns_rev) (dst, src) ->
+                if src = Tcg.Temp dst then (snapshots_rev, assigns_rev)
+                else
+                  match src with
+                  | Tcg.Imm _ ->
+                      (snapshots_rev, simplify_simple_instr (Tcg.Move (dst, src)) :: assigns_rev)
+                  | Tcg.Temp src_temp ->
+                      let snap_temp, snapshots_rev =
+                        match Hashtbl.find_opt snapshots src_temp with
+                        | Some temp -> (temp, snapshots_rev)
+                        | None ->
+                            let temp = fresh_temp () in
+                            Hashtbl.add snapshots src_temp temp;
+                            ( temp,
+                              simplify_simple_instr (Tcg.Move (temp, Tcg.Temp src_temp))
+                              :: snapshots_rev )
+                      in
+                      ( snapshots_rev,
+                        simplify_simple_instr (Tcg.Move (dst, Tcg.Temp snap_temp)) :: assigns_rev ))
+              ([], []) copies
+          in
+          List.rev snapshots_rev @ List.rev assigns_rev
+        in
+        List.iter
+          (fun (succ_block : Cfg.block) ->
+            let phi_copies =
+              PlaceSet.fold
+                (fun place acc ->
+                  match Hashtbl.find_opt phi_temps (succ_block.label, place) with
+                  | Some phi_temp -> (place, phi_temp) :: acc
+                  | None -> acc)
+                candidates []
+            in
+            if phi_copies <> [] then
+              List.iter
+                (fun pred ->
+                  let pred_out = get_env out_envs pred in
+                  let copies =
+                    List.fold_left
+                      (fun acc (place, phi_temp) ->
+                        match PlaceMap.find_opt place pred_out with
                         | Some source when source <> Tcg.Temp phi_temp -> (phi_temp, source) :: acc
                         | Some _ | None -> acc)
                       [] phi_copies
@@ -3864,7 +4099,7 @@ let eliminate_dead_code_func (f : Cfg.func) =
   Cfg.rebuild_edges { f with blocks }
 
 let optimize_func global_init globals (f : Cfg.func) =
-  let promoted = mem2reg_func f in
+  let promoted = f |> mem2reg_func |> promote_globals_func in
   let debug_stop_after = Sys.getenv_opt "TOYC_DEBUG_STOP_AFTER" in
   let exception StopPass of Cfg.func in
   let stop_after stage current =

@@ -19,6 +19,9 @@ counted_nested_matrix_index.tc 4
 copy_branch_merge.tc 2
 functions.tc 85
 global_call_global_read.tc 2
+global_promote_branch_merge.tc 6
+global_promote_call_invalidate.tc 16
+global_promote_loop_call_flush.tc 24
 gvn_temp_redef_loop.tc 4
 globals_shortcircuit.tc 42
 infinite_return.tc 77
