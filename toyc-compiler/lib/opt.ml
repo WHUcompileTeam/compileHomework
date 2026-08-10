@@ -32,6 +32,14 @@ let truth n = n <> 0L
 
 let bool_int b = if b then 1L else 0L
 
+let int32_modulus = 0x1_0000_0000L
+let int32_sign_bit = 0x8000_0000L
+let int32_mask = 0xFFFF_FFFFL
+
+let i32 value =
+  let masked = Int64.logand value int32_mask in
+  if masked >= int32_sign_bit then Int64.sub masked int32_modulus else masked
+
 let empty_env = [ StringMap.empty ]
 
 let push_scope env = StringMap.empty :: env
@@ -61,12 +69,14 @@ let find_const env name =
   loop env
 
 let fold_binop op a b =
+  let a = i32 a in
+  let b = i32 b in
   match op with
-  | Add -> Some Int64.(add a b)
-  | Sub -> Some Int64.(sub a b)
-  | Mul -> Some Int64.(mul a b)
-  | Div -> if b = 0L then None else Some Int64.(div a b)
-  | Mod -> if b = 0L then None else Some Int64.(rem a b)
+  | Add -> Some (i32 Int64.(add a b))
+  | Sub -> Some (i32 Int64.(sub a b))
+  | Mul -> Some (i32 Int64.(mul a b))
+  | Div -> if b = 0L then None else Some (i32 Int64.(div a b))
+  | Mod -> if b = 0L then None else Some (i32 Int64.(rem a b))
   | Lt -> Some (bool_int (a < b))
   | Gt -> Some (bool_int (a > b))
   | Le -> Some (bool_int (a <= b))
@@ -86,9 +96,9 @@ let rec fold_expr env = function
   | Unary (op, e) -> (
       let e' = fold_expr env e in
       match (op, e') with
-      | UPlus, Int v -> Int v
-      | UMinus, Int v -> Int (Int64.neg v)
-      | UNot, Int v -> Int (bool_int (not (truth v)))
+      | UPlus, Int v -> Int (i32 v)
+      | UMinus, Int v -> Int (i32 (Int64.neg (i32 v)))
+      | UNot, Int v -> Int (bool_int (not (truth (i32 v))))
       | _ -> Unary (op, e'))
   | Binary (LAnd, a, b) -> (
       let a' = fold_expr env a in
@@ -202,9 +212,10 @@ let optimize_ast program =
   loop empty_env [] program
 
 let fold_unop op v =
+  let v = i32 v in
   match op with
   | UPlus -> Some v
-  | UMinus -> Some (Int64.neg v)
+  | UMinus -> Some (i32 (Int64.neg v))
   | UNot -> Some (bool_int (not (truth v)))
 
 let add_operand_temps acc = function

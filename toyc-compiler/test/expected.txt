@@ -1,5 +1,7 @@
 basic.tc 5
 compare_precedence_const.tc 10
+const_i32_wrap_global.tc 1
+const_i32_wrap_local.tc 1
 control.tc 31
 copy_branch_merge.tc 2
 functions.tc 85

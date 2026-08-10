@@ -1,0 +1,8 @@
+const int LIMIT = 2147483647 + 1;
+
+int main() {
+  if (LIMIT < 0) {
+    return 1;
+  }
+  return 2;
+}

@@ -48,17 +48,27 @@ let truth n = n <> 0L
 
 let bool_int b = if b then 1L else 0L
 
+let int32_modulus = 0x1_0000_0000L
+let int32_sign_bit = 0x8000_0000L
+let int32_mask = 0xFFFF_FFFFL
+
+let i32 value =
+  let masked = Int64.logand value int32_mask in
+  if masked >= int32_sign_bit then Int64.sub masked int32_modulus else masked
+
 let err msg = raise (Error msg)
 
 let loc_msg loc msg = Printf.sprintf "%d:%d: %s" loc.line loc.col msg
 
 let eval_binop op a b =
+  let a = i32 a in
+  let b = i32 b in
   match op with
-  | Add -> Some Int64.(add a b)
-  | Sub -> Some Int64.(sub a b)
-  | Mul -> Some Int64.(mul a b)
-  | Div -> if b = 0L then None else Some Int64.(div a b)
-  | Mod -> if b = 0L then None else Some Int64.(rem a b)
+  | Add -> Some (i32 Int64.(add a b))
+  | Sub -> Some (i32 Int64.(sub a b))
+  | Mul -> Some (i32 Int64.(mul a b))
+  | Div -> if b = 0L then None else Some (i32 Int64.(div a b))
+  | Mod -> if b = 0L then None else Some (i32 Int64.(rem a b))
   | Lt -> Some (bool_int (a < b))
   | Gt -> Some (bool_int (a > b))
   | Le -> Some (bool_int (a <= b))
@@ -69,7 +79,7 @@ let eval_binop op a b =
   | LOr -> Some (bool_int (truth a || truth b))
 
 let rec eval_const_expr consts = function
-  | Int n -> Some n
+  | Int n -> Some (i32 n)
   | Var name -> StringMap.find_opt name consts
   | Call _ -> None
   | Unary (op, e) -> (
@@ -77,9 +87,9 @@ let rec eval_const_expr consts = function
       | None -> None
       | Some v -> (
           match op with
-          | UPlus -> Some v
-          | UMinus -> Some (Int64.neg v)
-          | UNot -> Some (bool_int (not (truth v)))))
+          | UPlus -> Some (i32 v)
+          | UMinus -> Some (i32 (Int64.neg (i32 v)))
+          | UNot -> Some (bool_int (not (truth (i32 v))))))
   | Binary (LAnd, a, b) -> (
       match eval_const_expr consts a with
       | Some 0L -> Some 0L
@@ -121,7 +131,7 @@ let find_name env name =
   loop env.scopes
 
 let rec eval_const_expr_env env = function
-  | Int n -> Some n
+  | Int n -> Some (i32 n)
   | Var name -> (
       match find_name env name with
       | Some { const_value = Some v; _ } -> Some v
@@ -132,9 +142,9 @@ let rec eval_const_expr_env env = function
       | None -> None
       | Some v -> (
           match op with
-          | UPlus -> Some v
-          | UMinus -> Some (Int64.neg v)
-          | UNot -> Some (bool_int (not (truth v)))))
+          | UPlus -> Some (i32 v)
+          | UMinus -> Some (i32 (Int64.neg (i32 v)))
+          | UNot -> Some (bool_int (not (truth (i32 v))))))
   | Binary (LAnd, a, b) -> (
       match eval_const_expr_env env a with
       | Some 0L -> Some 0L
