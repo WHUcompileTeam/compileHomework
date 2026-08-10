@@ -104,11 +104,12 @@ let schedule_func_blocks (f : Cfg.func) =
       List.iter emit_block (table_find_or_empty after_map block.label [])
     end
   in
+  Option.iter emit_block (List.find_opt (fun (block : Cfg.block) -> block.label = f.entry) f.blocks);
   List.iter
     (fun (block : Cfg.block) ->
-      if not (is_synthetic_label block.label) then emit_block block)
+      if block.label <> f.entry && not (is_synthetic_label block.label) then emit_block block)
     f.blocks;
-  List.iter emit_block f.blocks;
+  List.iter (fun (block : Cfg.block) -> if block.label <> f.entry then emit_block block) f.blocks;
   { f with blocks = List.rev !ordered_rev }
 
 let max_call_args (f : Cfg.func) =

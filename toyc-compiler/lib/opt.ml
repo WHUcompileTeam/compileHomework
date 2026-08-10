@@ -1532,12 +1532,34 @@ let collect_loop_effects loop blocks =
     { modified_places = PlaceSet.empty; has_call = false }
     blocks
 
-let load_place_invariant effects place =
-  not (PlaceSet.mem place effects.modified_places)
-  &&
-  match place with
+let place_is_global = function
+  | Tcg.Global _ -> true
   | Tcg.Local _ -> false
-  | Tcg.Global _ -> not effects.has_call
+
+let rewrite_term_successor term ~from_label ~to_label =
+  let rewrite label = if label = from_label then to_label else label in
+  match term with
+  | Cfg.Jump label -> Cfg.Jump (rewrite label)
+  | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
+      Cfg.BranchZero (cond, rewrite if_zero, rewrite if_nonzero)
+  | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
+      Cfg.BranchNonZero (cond, rewrite if_nonzero, rewrite if_zero)
+  | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
+      Cfg.BranchCompare (op, lhs, rhs, rewrite if_true, rewrite if_false)
+  | Cfg.Return _ as term -> term
+
+let loop_defined_temps loop blocks =
+  List.fold_left
+    (fun acc (block : Cfg.block) ->
+      if not (LabelSet.mem block.label loop) then acc
+      else
+        List.fold_left
+          (fun acc instr ->
+            match defs_temp instr with
+            | Some temp -> IntSet.add temp acc
+            | None -> acc)
+          acc block.body)
+    IntSet.empty blocks
 
 let natural_loop block_map header pred =
   let rec visit work seen =
@@ -1552,6 +1574,128 @@ let natural_loop block_map header pred =
           | None -> visit rest seen
   in
   visit [ pred ] (LabelSet.singleton header)
+
+let eliminate_dead_loops_func (f : Cfg.func) =
+  let debug_dead_loops = Sys.getenv_opt "TOYC_DEBUG_DEAD_LOOPS" <> None in
+  let debugf fmt = Printf.ksprintf (fun s -> if debug_dead_loops then prerr_endline s) fmt in
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
+  let doms = compute_dominators f in
+  let backedges =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        List.fold_left
+          (fun acc succ ->
+            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
+              (block.label, succ) :: acc
+            else acc)
+          acc block.succs)
+      [] f.blocks
+  in
+  if backedges = [] then f
+  else
+    let loops = Hashtbl.create 8 in
+    List.iter
+      (fun (pred, header) ->
+        let loop = natural_loop block_map header pred in
+        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
+        Hashtbl.replace loops header merged)
+      backedges;
+    let headers =
+      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
+      |> List.sort (fun (_, a) (_, b) -> compare a b)
+      |> List.map fst
+    in
+    let globals = globals_in_func f in
+    let live_in_t, live_in_p = compute_liveness globals f in
+    let current_blocks = Hashtbl.create (List.length f.blocks) in
+    List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
+    let current_entry = ref f.entry in
+    let removed = ref LabelSet.empty in
+    let changed = ref false in
+    let current_block_list () = Hashtbl.fold (fun _ block acc -> block :: acc) current_blocks [] in
+    let block_exists label = Hashtbl.mem current_blocks label && not (LabelSet.mem label !removed) in
+    List.iter
+      (fun header ->
+        if block_exists header then
+          let loop = table_find_or_empty loops header LabelSet.empty in
+          if not (LabelSet.exists (fun label -> LabelSet.mem label !removed) loop) then
+            let header_block : Cfg.block = Hashtbl.find current_blocks header in
+            let outside_preds =
+              List.filter (fun pred -> not (LabelSet.mem pred loop) && block_exists pred) header_block.preds
+            in
+            let exit_labels =
+              LabelSet.fold
+                (fun label exits ->
+                  match Hashtbl.find_opt current_blocks label with
+                  | None -> exits
+                  | Some (block : Cfg.block) ->
+                      List.fold_left
+                        (fun exits succ ->
+                          if LabelSet.mem succ loop then exits else LabelSet.add succ exits)
+                        exits block.succs)
+                loop LabelSet.empty
+            in
+            match LabelSet.elements exit_labels with
+            | [ exit_label ] when outside_preds <> [] || header = !current_entry ->
+                let blocks_snapshot = current_block_list () in
+                let effects = collect_loop_effects loop blocks_snapshot in
+                let modified_locals =
+                  PlaceSet.filter (fun place -> not (place_is_global place)) effects.modified_places
+                in
+                let live_t_exit = table_find_or_empty live_in_t exit_label IntSet.empty in
+                let live_p_exit = table_find_or_empty live_in_p exit_label PlaceSet.empty in
+                let defined_temps = loop_defined_temps loop blocks_snapshot in
+                let has_global_store = PlaceSet.exists place_is_global effects.modified_places in
+                if
+                  not effects.has_call
+                  && not has_global_store
+                  && IntSet.is_empty (IntSet.inter defined_temps live_t_exit)
+                  && PlaceSet.is_empty (PlaceSet.inter modified_locals live_p_exit)
+                then begin
+                  debugf "dead-loop-remove func=%s header=%s exit=%s entry=%s preds=%d loop_size=%d"
+                    f.name header exit_label !current_entry (List.length outside_preds)
+                    (LabelSet.cardinal loop);
+                  changed := true;
+                  List.iter
+                    (fun pred ->
+                      match Hashtbl.find_opt current_blocks pred with
+                      | None -> ()
+                      | Some (block : Cfg.block) ->
+                          let term =
+                            rewrite_term_successor block.term ~from_label:header ~to_label:exit_label
+                          in
+                          Hashtbl.replace current_blocks pred
+                            { block with term; succs = Cfg.successors term })
+                    outside_preds;
+                  if header = !current_entry then current_entry := exit_label;
+                  removed := LabelSet.union !removed loop
+                end
+            | _ -> ())
+      headers;
+    if !changed then
+      let blocks =
+        f.blocks
+        |> List.filter (fun (block : Cfg.block) -> not (LabelSet.mem block.label !removed))
+        |> List.map (fun (block : Cfg.block) ->
+               match Hashtbl.find_opt current_blocks block.label with
+               | Some block -> block
+               | None -> block)
+      in
+      let threaded = Cfg.rebuild_edges { f with entry = !current_entry; blocks } in
+      let reachable = reachable_labels threaded.entry threaded.blocks in
+      let blocks =
+        List.filter (fun (block : Cfg.block) -> LabelSet.mem block.label reachable) threaded.blocks
+      in
+      Cfg.rebuild_edges { threaded with blocks }
+    else f
+
+let load_place_invariant effects place =
+  not (PlaceSet.mem place effects.modified_places)
+  &&
+  match place with
+  | Tcg.Local _ -> false
+  | Tcg.Global _ -> not effects.has_call
 
 type basic_induction_var = {
   phi_temp : Tcg.temp;
@@ -1775,11 +1919,9 @@ let operand_loop_invariant
   let rec resolve seen = function
     | Tcg.Imm _ -> true
     | Tcg.Temp temp as operand ->
-        if IntSet.mem temp ready_temps
-           || IntSet.mem temp loop_stable_phis
-           || operand_invariant loop def_blocks ready_temps operand
-        then true
+        if IntSet.mem temp ready_temps || IntSet.mem temp loop_stable_phis then true
         else if IntSet.mem temp seen || IntSet.mem temp multi_defs then false
+        else if operand_invariant loop def_blocks ready_temps operand then true
         else
           match Hashtbl.find_opt def_instrs temp with
           | Some (Tcg.Move (_, src)) -> resolve (IntSet.add temp seen) src
@@ -1790,14 +1932,28 @@ let operand_loop_invariant
 let licm_invariant_candidate
     loop
     def_blocks
+    loop_stable_phis
+    multi_defs
+    def_instrs
     ready_temps
     effects
     instr
   =
   match licm_candidate_info instr with
+  | Some (LicmPure (dst, _)) when IntSet.mem dst multi_defs -> None
   | Some (LicmPure (dst, operands))
-    when List.for_all (operand_invariant loop def_blocks ready_temps) operands ->
+    when
+      List.for_all
+        (operand_loop_invariant
+           loop
+           def_blocks
+           loop_stable_phis
+           multi_defs
+           def_instrs
+           ready_temps)
+        operands ->
       Some dst
+  | Some (LicmLoad (dst, _)) when IntSet.mem dst multi_defs -> None
   | Some (LicmLoad (dst, place)) when load_place_invariant effects place -> Some dst
   | Some _ | None -> None
 
@@ -2329,7 +2485,12 @@ let licm_func (f : Cfg.func) =
         if outside_preds <> [] then begin
           let blocks_snapshot = current_block_list () in
           let def_blocks = temp_def_blocks_of_blocks f.temp_count blocks_snapshot in
+          let def_instrs = temp_def_instrs_of_blocks f.temp_count blocks_snapshot in
+          let multi_defs = multi_def_temps_of_blocks f.temp_count blocks_snapshot in
           let effects = collect_loop_effects loop blocks_snapshot in
+          let loop_stable_phis =
+            collect_loop_stable_phis header loop get_block multi_defs def_instrs
+          in
           let invariant_keys = ref InstrKeySet.empty in
           let invariant_temps = ref IntSet.empty in
           let changed = ref true in
@@ -2347,6 +2508,9 @@ let licm_func (f : Cfg.func) =
                           licm_invariant_candidate
                             loop
                             def_blocks
+                            loop_stable_phis
+                            multi_defs
+                            def_instrs
                             !invariant_temps
                             effects
                             instr
@@ -2380,6 +2544,9 @@ let licm_func (f : Cfg.func) =
                             licm_invariant_candidate
                               loop
                               def_blocks
+                              loop_stable_phis
+                              multi_defs
+                              def_instrs
                               !ready_temps
                               effects
                               instr
@@ -2553,21 +2720,34 @@ let eliminate_dead_code_func (f : Cfg.func) =
 
 let optimize_func global_init globals (f : Cfg.func) =
   let promoted = mem2reg_func f in
+  let debug_stop_after = Sys.getenv_opt "TOYC_DEBUG_STOP_AFTER" in
+  let exception StopPass of Cfg.func in
+  let stop_after stage current =
+    match debug_stop_after with
+    | Some target when target = stage -> raise (StopPass current)
+    | Some _ | None -> current
+  in
   let step func =
-    let after_const1 = const_propagate_func global_init globals func in
-    let after_copy1 = copy_propagate_func after_const1 in
-    let after_sr = strength_reduce_func after_copy1 in
-    let after_gvn1 = gvn_func globals after_sr in
-    let after_copy2 = copy_propagate_func after_gvn1 in
-    let after_dce1 = eliminate_dead_code_func after_copy2 in
-    let after_reassoc = reassociate_loop_adds_func after_dce1 in
-    let after_licm = licm_func after_reassoc in
-    let after_const2 = const_propagate_func global_init globals after_licm in
-    let after_copy3 = copy_propagate_func after_const2 in
-    let after_gvn2 = gvn_func globals after_copy3 in
-    let after_dce2 = eliminate_dead_code_func after_gvn2 in
-    let after_fold = fold_branch_tails_func after_dce2 in
-    thread_and_prune_func after_fold
+    try
+      let after_const1 = const_propagate_func global_init globals func |> stop_after "const1" in
+      let after_copy1 = copy_propagate_func after_const1 |> stop_after "copy1" in
+      let after_sr = strength_reduce_func after_copy1 |> stop_after "sr" in
+      let after_gvn1 = gvn_func globals after_sr |> stop_after "gvn1" in
+      let after_copy2 = copy_propagate_func after_gvn1 |> stop_after "copy2" in
+      let after_dce1 = eliminate_dead_code_func after_copy2 |> stop_after "dce1" in
+      let after_reassoc = reassociate_loop_adds_func after_dce1 |> stop_after "reassoc" in
+      let after_licm = licm_func after_reassoc |> stop_after "licm" in
+      let after_const2 =
+        const_propagate_func global_init globals after_licm |> stop_after "const2"
+      in
+      let after_copy3 = copy_propagate_func after_const2 |> stop_after "copy3" in
+      let after_gvn2 = gvn_func globals after_copy3 |> stop_after "gvn2" in
+      let after_dce2 = eliminate_dead_code_func after_gvn2 |> stop_after "dce2" in
+      let after_dead_loops = eliminate_dead_loops_func after_dce2 |> stop_after "dead_loops" in
+      let after_fold = fold_branch_tails_func after_dead_loops |> stop_after "fold" in
+      thread_and_prune_func after_fold |> stop_after "thread"
+    with
+    | StopPass current -> current
   in
   let rec loop fuel current =
     if fuel = 0 then current
@@ -2575,7 +2755,9 @@ let optimize_func global_init globals (f : Cfg.func) =
       let next = step current in
       if next = current then current else loop (fuel - 1) next
   in
-  loop 8 promoted
+  match debug_stop_after with
+  | Some "mem2reg" -> promoted
+  | Some _ | None -> loop 8 promoted
 
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let global_init, globals =

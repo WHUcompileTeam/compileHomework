@@ -1,0 +1,13 @@
+int main() {
+  int i = 0;
+  while (i < 40) {
+    int j = 0;
+    int acc = 0;
+    while (j < 40) {
+      acc = acc + i + j;
+      j = j + 1;
+    }
+    i = i + 1;
+  }
+  return 1;
+}
