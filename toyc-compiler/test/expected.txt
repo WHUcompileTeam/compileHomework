@@ -9,6 +9,8 @@ counted_loop_down_step3.tc 8
 counted_loop_affine_sum.tc 10
 counted_loop_affine_step2_bias.tc 28
 counted_loop_affine_chain.tc 40
+counted_unroll_global_store_even.tc 6
+counted_unroll_global_store_odd.tc 5
 counted_nested_inner.tc 24
 counted_nested_affine_inner.tc 48
 counted_nested_rowcol_linear.tc 168

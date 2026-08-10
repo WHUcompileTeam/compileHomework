@@ -1928,6 +1928,26 @@ let collect_loop_stable_phis header loop get_block multi_defs def_instrs =
       if stable then IntSet.add phi_temp acc else acc)
     IntSet.empty phi_temps
 
+let collect_header_phi_temps header get_block =
+  let header_block : Cfg.block = get_block header in
+  let pred_count = List.length header_block.preds in
+  let counts = Hashtbl.create (max 8 pred_count) in
+  List.iter
+    (fun pred ->
+      let seen = ref IntSet.empty in
+      List.iter
+        (function
+          | Tcg.Move (dst, _) when not (IntSet.mem dst !seen) ->
+              seen := IntSet.add dst !seen;
+              let count = Option.value ~default:0 (Hashtbl.find_opt counts dst) in
+              Hashtbl.replace counts dst (count + 1)
+          | _ -> ())
+        ((get_block pred : Cfg.block).body))
+    header_block.preds;
+  Hashtbl.fold
+    (fun temp count acc -> if count = pred_count then IntSet.add temp acc else acc)
+    counts IntSet.empty
+
 let operand_loop_invariant
     loop
     def_blocks
@@ -2184,6 +2204,40 @@ let invert_compare = function
   | Eq -> Ne
   | Ne -> Eq
   | Add | Sub | Mul | Div | Mod | LAnd | LOr -> invalid_arg "invert_compare"
+
+let contains_substring text needle =
+  let text_len = String.length text in
+  let needle_len = String.length needle in
+  let rec loop i =
+    if i + needle_len > text_len then false
+    else if String.sub text i needle_len = needle then true
+    else loop (i + 1)
+  in
+  needle_len = 0 || loop 0
+
+let is_unroll2_label label = contains_substring label "_unroll2_"
+
+let rewrite_term_labels rename = function
+  | Cfg.Jump label -> Cfg.Jump (rename label)
+  | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
+      Cfg.BranchZero (cond, rename if_zero, rename if_nonzero)
+  | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
+      Cfg.BranchNonZero (cond, rename if_nonzero, rename if_zero)
+  | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
+      Cfg.BranchCompare (op, lhs, rhs, rename if_true, rename if_false)
+  | Cfg.Return _ as term -> term
+
+let rewrite_term rename_label rename_operand = function
+  | Cfg.Jump label -> Cfg.Jump (rename_label label)
+  | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
+      Cfg.BranchZero (rename_operand cond, rename_label if_zero, rename_label if_nonzero)
+  | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
+      Cfg.BranchNonZero (rename_operand cond, rename_label if_nonzero, rename_label if_zero)
+  | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
+      Cfg.BranchCompare
+        (op, rename_operand lhs, rename_operand rhs, rename_label if_true, rename_label if_false)
+  | Cfg.Return None -> Cfg.Return None
+  | Cfg.Return (Some value) -> Cfg.Return (Some (rename_operand value))
 
 let classify_counted_loop_header
     loop
@@ -2909,6 +2963,165 @@ let eliminate_counted_loops_func (f : Cfg.func) =
       Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
     else f
 
+let unroll_counted_loops_x2_func (f : Cfg.func) =
+  let unroll_max_blocks = 4 in
+  let unroll_max_instrs = 16 in
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
+  let doms = compute_dominators f in
+  let backedges =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        List.fold_left
+          (fun acc succ ->
+            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
+              (block.label, succ) :: acc
+            else acc)
+          acc block.succs)
+      [] f.blocks
+  in
+  if backedges = [] then f
+  else
+    let loops = Hashtbl.create 8 in
+    List.iter
+      (fun (pred, header) ->
+        let loop = natural_loop block_map header pred in
+        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
+        Hashtbl.replace loops header merged)
+      backedges;
+    let headers =
+      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
+      |> List.sort (fun (_, a) (_, b) -> compare a b)
+      |> List.map fst
+    in
+    let current_blocks = Hashtbl.create (List.length f.blocks + (2 * List.length headers)) in
+    List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
+    let block_order = ref (List.map (fun (block : Cfg.block) -> block.label) f.blocks) in
+    let get_block label =
+      match Hashtbl.find_opt current_blocks label with
+      | Some block -> block
+      | None -> failwith ("internal missing block: " ^ label)
+    in
+    let update_block (block : Cfg.block) =
+      Hashtbl.replace current_blocks block.label block
+    in
+    let current_block_list () = List.map get_block !block_order in
+    let insert_after label new_labels =
+      block_order :=
+        List.concat_map
+          (fun current -> if current = label then current :: new_labels else [ current ])
+          !block_order
+    in
+    let unroll_id = ref 0 in
+    let fresh_unroll_label index =
+      let id = !unroll_id in
+      Printf.sprintf ".L%s_unroll2_%d_%d" f.label id index
+    in
+    let changed = ref false in
+    List.iter
+      (fun header ->
+        let loop = table_find_or_empty loops header LabelSet.empty in
+        if is_unroll2_label header || LabelSet.exists is_unroll2_label loop then ()
+        else
+          let header_block : Cfg.block = get_block header in
+          let blocks_snapshot = current_block_list () in
+          let def_blocks = temp_def_blocks_of_blocks f.temp_count blocks_snapshot in
+          let def_instrs = temp_def_instrs_of_blocks f.temp_count blocks_snapshot in
+          let multi_defs = multi_def_temps_of_blocks f.temp_count blocks_snapshot in
+          let effects = collect_loop_effects loop blocks_snapshot in
+          let loop_stable_phis =
+            collect_loop_stable_phis header loop get_block multi_defs def_instrs
+          in
+          match
+            classify_counted_loop_header
+              loop
+              def_blocks
+              loop_stable_phis
+              multi_defs
+              def_instrs
+              (collect_basic_induction_vars header loop get_block multi_defs def_instrs)
+              header_block.term
+          with
+          | None -> ()
+          | Some info -> (
+              match linear_loop_path header loop get_block info.inside_label with
+              | None -> ()
+              | Some path ->
+                  let has_redefined_candidate_temp =
+                    let counts = Hashtbl.create 16 in
+                    let note_instr instr =
+                      match defs_temp instr with
+                      | Some temp ->
+                          let count = Option.value ~default:0 (Hashtbl.find_opt counts temp) in
+                          Hashtbl.replace counts temp (count + 1)
+                      | None -> ()
+                    in
+                    List.iter note_instr header_block.body;
+                    List.iter
+                      (fun (block : Cfg.block) -> List.iter note_instr block.body)
+                      path;
+                    Hashtbl.fold (fun _ count seen -> seen || count > 1) counts false
+                  in
+                   let total_instrs =
+                     List.length header_block.body
+                     + List.fold_left
+                         (fun acc (block : Cfg.block) -> acc + List.length block.body)
+                         0 path
+                   in
+                   if
+                     effects.has_call
+                     || header_block.body <> []
+                     || path = []
+                     || List.length path > unroll_max_blocks
+                     || total_instrs > unroll_max_instrs
+                     || has_redefined_candidate_temp
+                   then ()
+                   else
+                     let last_block = List.hd (List.rev path) in
+                     if last_block.succs <> [ header ] then ()
+                     else
+                       let copied_labels =
+                         List.mapi (fun index (block : Cfg.block) -> (block.label, fresh_unroll_label index)) path
+                       in
+                      incr unroll_id;
+                       let rename label =
+                         match List.assoc_opt label copied_labels with
+                         | Some renamed -> renamed
+                         | None -> label
+                       in
+                      let copied_blocks =
+                        List.map
+                          (fun (block : Cfg.block) ->
+                            let label = rename block.label in
+                            let term = rewrite_term_labels rename block.term in
+                            { block with label; term; succs = Cfg.successors term })
+                          path
+                      in
+                      let copied_entry =
+                        match copied_blocks with
+                        | first :: _ -> first.label
+                        | [] -> failwith "internal empty unroll path"
+                      in
+                      let term =
+                        rewrite_term_successor header_block.term
+                          ~from_label:info.inside_label ~to_label:copied_entry
+                      in
+                      update_block
+                        {
+                          last_block with
+                          body = last_block.body @ header_block.body;
+                          term;
+                          succs = Cfg.successors term;
+                        };
+                      List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) copied_blocks;
+                      insert_after last_block.label (List.map (fun (block : Cfg.block) -> block.label) copied_blocks);
+                       changed := true))
+      headers;
+    if !changed then
+      let blocks = List.map get_block !block_order in
+      Cfg.rebuild_edges { f with blocks }
+    else f
+
 let strength_reduce_func (f : Cfg.func) =
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
@@ -3533,7 +3746,7 @@ let optimize_func global_init globals (f : Cfg.func) =
         const_propagate_func global_init globals after_licm |> stop_after "const2"
       in
       let after_copy3 = copy_propagate_func after_const2 |> stop_after "copy3" in
-      let after_gvn2 = after_copy3 |> stop_after "gvn2" in
+      let after_gvn2 = gvn_func globals after_copy3 |> stop_after "gvn2" in
       let after_dce2 = eliminate_dead_code_func after_gvn2 |> stop_after "dce2" in
       let after_dead_loops = eliminate_dead_loops_func after_dce2 |> stop_after "dead_loops" in
       let after_fold = fold_branch_tails_func after_dead_loops |> stop_after "fold" in
@@ -3543,7 +3756,7 @@ let optimize_func global_init globals (f : Cfg.func) =
       let after_counted2 =
         eliminate_counted_loops_func after_fold2 |> stop_after "counted_loops2"
       in
-      thread_and_prune_func after_counted2 |> stop_after "thread2"
+      after_counted2
     with
     | StopPass current -> current
   in
@@ -3553,9 +3766,22 @@ let optimize_func global_init globals (f : Cfg.func) =
       let next = step current in
       if next = current then current else loop (fuel - 1) next
   in
+  let stabilized =
+    match debug_stop_after with
+    | Some "mem2reg" -> promoted
+    | Some _ | None -> loop 8 promoted
+  in
   match debug_stop_after with
-  | Some "mem2reg" -> promoted
-  | Some _ | None -> loop 8 promoted
+  | Some "mem2reg" -> stabilized
+  | Some "unroll2" ->
+      unroll_counted_loops_x2_func stabilized
+  | Some "thread2" ->
+      thread_and_prune_func (unroll_counted_loops_x2_func stabilized)
+  | Some _ ->
+      stabilized
+  | None ->
+      let after_unroll2 = unroll_counted_loops_x2_func stabilized in
+      thread_and_prune_func after_unroll2
 
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let global_init, globals =
