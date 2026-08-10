@@ -28,6 +28,12 @@ type const_cell =
 
 type const_env = const_cell StringMap.t list
 
+type inline_func = {
+  params : string list;
+  body : expr;
+  cost : int;
+}
+
 let truth n = n <> 0L
 
 let bool_int b = if b then 1L else 0L
@@ -86,6 +92,64 @@ let fold_binop op a b =
   | LAnd -> Some (bool_int (truth a && truth b))
   | LOr -> Some (bool_int (truth a || truth b))
 
+let rec expr_has_call = function
+  | Int _ | Var _ -> false
+  | Call _ -> true
+  | Unary (_, e) -> expr_has_call e
+  | Binary (_, lhs, rhs) -> expr_has_call lhs || expr_has_call rhs
+
+let rec expr_cost = function
+  | Int _ | Var _ -> 1
+  | Call (_, args) ->
+      1 + List.fold_left (fun acc arg -> acc + expr_cost arg) 0 args
+  | Unary (_, e) -> 1 + expr_cost e
+  | Binary (_, lhs, rhs) -> 1 + expr_cost lhs + expr_cost rhs
+
+let inline_expr_limit = 18
+let inline_expr_depth_limit = 6
+
+let rec subst_inline_expr env = function
+  | Int _ as e -> e
+  | Var name -> (
+      match StringMap.find_opt name env with
+      | Some value -> value
+      | None -> Var name)
+  | Call (name, args) -> Call (name, List.map (subst_inline_expr env) args)
+  | Unary (op, e) -> Unary (op, subst_inline_expr env e)
+  | Binary (op, lhs, rhs) ->
+      Binary (op, subst_inline_expr env lhs, subst_inline_expr env rhs)
+
+let inline_def_of_func (f : Ast.func) =
+  match (f.ret, f.body) with
+  | TInt, [ Return (Some body) ] when not (expr_has_call body) ->
+      let cost = expr_cost body in
+      if cost <= inline_expr_limit then
+        Some { params = List.map (fun (param : Ast.ident) -> param.name) f.params; body; cost }
+      else None
+  | _ -> None
+
+let rec inline_expr func_env depth = function
+  | Int _ as e -> e
+  | Var _ as e -> e
+  | Call (name, args) ->
+      let args = List.map (inline_expr func_env depth) args in
+      if depth = 0 then Call (name, args)
+      else
+        (match StringMap.find_opt name func_env with
+        | Some def
+          when List.length def.params = List.length args
+               && List.for_all (fun arg -> not (expr_has_call arg)) args ->
+            let subst_env =
+              List.fold_left2
+                (fun env param arg -> StringMap.add param arg env)
+                StringMap.empty def.params args
+            in
+            inline_expr func_env (depth - 1) (subst_inline_expr subst_env def.body)
+        | Some _ | None -> Call (name, args))
+  | Unary (op, e) -> Unary (op, inline_expr func_env depth e)
+  | Binary (op, lhs, rhs) ->
+      Binary (op, inline_expr func_env depth lhs, inline_expr func_env depth rhs)
+
 let rec fold_expr env = function
   | Int _ as e -> e
   | Var name -> (
@@ -128,6 +192,9 @@ let rec fold_expr env = function
           | None -> Binary (op, a', b'))
       | _ -> Binary (op, a', b'))
 
+let rewrite_expr_ast func_env env expr =
+  fold_expr env (inline_expr func_env inline_expr_depth_limit expr)
+
 let const_of_expr = function
   | Int v -> Some v
   | _ -> None
@@ -140,6 +207,17 @@ let rec terminates = function
 
 let fold_decl env d =
   let init = fold_expr env d.init in
+  let env' =
+    if d.is_const then
+      match const_of_expr init with
+      | Some v -> add_const env d.ident.name v
+      | None -> add_shadow env d.ident.name
+    else add_shadow env d.ident.name
+  in
+  ({ d with init }, env')
+
+let fold_decl_with_inline func_env env d =
+  let init = rewrite_expr_ast func_env env d.init in
   let env' =
     if d.is_const then
       match const_of_expr init with
@@ -195,21 +273,72 @@ and fold_stmt_list env stmts =
   loop env [] stmts
 
 let optimize_ast program =
-  let rec loop env acc = function
+  let rec fold_stmt_inline func_env env = function
+    | Block stmts ->
+        let stmts', _ = fold_stmt_list_inline func_env (push_scope env) stmts in
+        (Block stmts', env)
+    | Empty -> (Empty, env)
+    | Expr e -> (Expr (rewrite_expr_ast func_env env e), env)
+    | Assign (name, e) -> (Assign (name, rewrite_expr_ast func_env env e), env)
+    | Decl d ->
+        let d', env' = fold_decl_with_inline func_env env d in
+        (Decl d', env')
+    | If (cond, t, e) -> (
+        match rewrite_expr_ast func_env env cond with
+        | Int v when truth v ->
+            let t', _ = fold_stmt_inline func_env env t in
+            (t', env)
+        | Int _ -> (
+            match e with
+            | None -> (Empty, env)
+            | Some else_s ->
+                let else_s', _ = fold_stmt_inline func_env env else_s in
+                (else_s', env))
+        | cond' ->
+            let t', _ = fold_stmt_inline func_env env t in
+            let e' = Option.map (fun s -> fst (fold_stmt_inline func_env env s)) e in
+            (If (cond', t', e'), env))
+    | While (cond, body) -> (
+        match rewrite_expr_ast func_env env cond with
+        | Int 0L -> (Empty, env)
+        | cond' ->
+            let body', _ = fold_stmt_inline func_env env body in
+            (While (cond', body'), env))
+    | Break -> (Break, env)
+    | Continue -> (Continue, env)
+    | Return e -> (Return (Option.map (rewrite_expr_ast func_env env) e), env)
+
+  and fold_stmt_list_inline func_env env stmts =
+    let rec loop env acc = function
+      | [] -> (List.rev acc, env)
+      | s :: rest ->
+          let s', env' = fold_stmt_inline func_env env s in
+          let acc' = s' :: acc in
+          if terminates s' then (List.rev acc', env') else loop env' acc' rest
+    in
+    loop env [] stmts
+  in
+  let rec loop env func_env acc = function
     | [] -> List.rev acc
     | TopDecl d :: rest ->
-        let d', env' = fold_decl env d in
-        loop env' (TopDecl d' :: acc) rest
+        let d', env' = fold_decl_with_inline func_env env d in
+        loop env' func_env (TopDecl d' :: acc) rest
     | FuncDef f :: rest ->
         let params_shadow_consts =
           List.fold_left
             (fun env (p : Ast.ident) -> add_shadow env p.name)
             (push_scope env) f.params
         in
-        let body, _ = fold_stmt_list params_shadow_consts f.body in
-        loop env (FuncDef { f with body } :: acc) rest
+        let body, _ = fold_stmt_list_inline func_env params_shadow_consts f.body in
+        let f = { f with body } in
+        let func_env =
+          match inline_def_of_func f with
+          | Some def -> StringMap.add f.name.name def func_env
+          | None -> func_env
+        in
+        loop env func_env (FuncDef f :: acc) rest
   in
-  loop empty_env [] program
+  loop empty_env StringMap.empty [] program
 
 let fold_unop op v =
   let v = i32 v in
@@ -228,6 +357,12 @@ let local_places places =
       | Tcg.Local _ -> true
       | Tcg.Global _ -> false)
     places
+
+let place_is_global = function
+  | Tcg.Global _ -> true
+  | Tcg.Local _ -> false
+
+let global_places places = PlaceSet.filter place_is_global places
 
 let globals_in_func (f : Cfg.func) =
   List.fold_left
@@ -252,6 +387,47 @@ let stored_globals_in_func (f : Cfg.func) =
           | _ -> acc)
         acc block.body)
     PlaceSet.empty f.blocks
+
+type func_effect_summary = {
+  read_globals : PlaceSet.t;
+  written_globals : PlaceSet.t;
+}
+
+let worst_case_effect_summary globals =
+  { read_globals = globals; written_globals = globals }
+
+let call_effect_summary summaries globals callee =
+  match Hashtbl.find_opt summaries callee with
+  | Some summary -> summary
+  | None -> worst_case_effect_summary globals
+
+let call_read_globals summaries globals callee =
+  (call_effect_summary summaries globals callee).read_globals
+
+let call_written_globals summaries globals callee =
+  (call_effect_summary summaries globals callee).written_globals
+
+let summarize_func summaries globals (f : Cfg.func) =
+  List.fold_left
+    (fun summary (block : Cfg.block) ->
+      List.fold_left
+        (fun summary instr ->
+          match instr with
+          | Tcg.Load (_, (Tcg.Global _ as place)) ->
+              { summary with read_globals = PlaceSet.add place summary.read_globals }
+          | Tcg.Store ((Tcg.Global _ as place), _) ->
+              { summary with written_globals = PlaceSet.add place summary.written_globals }
+          | Tcg.Call (_, callee, _) ->
+              let callee_summary = call_effect_summary summaries globals callee in
+              {
+                read_globals = PlaceSet.union summary.read_globals callee_summary.read_globals;
+                written_globals =
+                  PlaceSet.union summary.written_globals callee_summary.written_globals;
+              }
+          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> summary)
+        summary block.body)
+    { read_globals = PlaceSet.empty; written_globals = PlaceSet.empty }
+    f.blocks
 
 let simplify_simple_instr = function
   | Tcg.Un (dst, op, src) -> (
@@ -314,13 +490,15 @@ let meet_avail a b =
       | _ -> None)
     a b
 
-let kill_global_loads globals avail =
+let kill_place_loads killed avail =
   ExprKeyMap.filter
     (fun key _ ->
       match key with
-      | KeyLoad place -> not (PlaceSet.mem place globals)
+      | KeyLoad place -> not (PlaceSet.mem place killed)
       | KeyUn _ | KeyBin _ -> true)
     avail
+
+let kill_global_loads globals avail = kill_place_loads globals avail
 
 let operand_has_temp temp = function
   | Tcg.Temp other -> other = temp
@@ -418,7 +596,7 @@ let equal_gvn_state a b =
 let meet_gvn_state a b =
   { avail = meet_avail a.avail b.avail; aliases = meet_alias_map a.aliases b.aliases }
 
-let transfer_gvn_instr globals state instr =
+let transfer_gvn_instr summaries globals state instr =
   match instr with
   | Tcg.Move (dst, src) ->
       let src = resolve_alias_operand state.aliases IntSet.empty src in
@@ -492,7 +670,7 @@ let transfer_gvn_instr globals state instr =
         | Some temp -> kill_temp_gvn temp state.aliases state.avail
         | None -> (state.aliases, state.avail)
       in
-      let avail = kill_global_loads globals avail in
+      let avail = kill_place_loads (call_written_globals summaries globals callee) avail in
       (Tcg.Call (dst, callee, args), { avail; aliases })
 
 type cp_fact =
@@ -589,8 +767,10 @@ let fold_fact_bin op a b =
   | CpNac, _ | _, CpNac -> CpNac
   | CpUndef, _ | _, CpUndef -> CpUndef
 
-let kill_global_facts globals state =
-  PlaceSet.fold (fun place acc -> set_place_fact acc place CpNac) globals state
+let kill_place_facts places state =
+  PlaceSet.fold (fun place acc -> set_place_fact acc place CpNac) places state
+
+let kill_global_facts globals state = kill_place_facts globals state
 
 let initial_cp_state global_init (f : Cfg.func) =
   let global_init = if f.name = "main" then global_init else PlaceMap.empty in
@@ -601,7 +781,7 @@ let initial_cp_state global_init (f : Cfg.func) =
   in
   { temps = IntMap.empty; places }
 
-let transfer_simple_instr globals state instr =
+let transfer_simple_instr summaries globals state instr =
   match instr with
   | Tcg.Move (dst, src) ->
       let src = rewrite_operand_const state src in
@@ -632,7 +812,7 @@ let transfer_simple_instr globals state instr =
       (Tcg.Store (place, value), set_place_fact state place fact)
   | Tcg.Call (dst, callee, args) ->
       let args = List.map (rewrite_operand_const state) args in
-      let state = kill_global_facts globals state in
+      let state = kill_place_facts (call_written_globals summaries globals callee) state in
       let state =
         match dst with
         | Some temp -> set_temp_fact state temp CpNac
@@ -678,18 +858,18 @@ let transfer_terminator state (term : Cfg.terminator) =
   | Cfg.Return (Some value) ->
       (Cfg.Return (Some (rewrite_operand_const state value)), state)
 
-let run_transfer globals state (block : Cfg.block) =
+let run_transfer summaries globals state (block : Cfg.block) =
   let body_rev, state =
     List.fold_left
       (fun (acc, state) instr ->
-        let instr, state = transfer_simple_instr globals state instr in
+        let instr, state = transfer_simple_instr summaries globals state instr in
         (instr :: acc, state))
       ([], state) block.body
   in
   let term, state = transfer_terminator state block.term in
   ({ block with body = List.rev body_rev; term; succs = Cfg.successors term }, state)
 
-let compute_const_states global_init globals (f : Cfg.func) =
+let compute_const_states global_init summaries globals (f : Cfg.func) =
   let in_states = Hashtbl.create (List.length f.blocks) in
   let out_states = Hashtbl.create (List.length f.blocks) in
   let entry_state = initial_cp_state global_init f in
@@ -709,7 +889,7 @@ let compute_const_states global_init globals (f : Cfg.func) =
           if block.label = f.entry then meet_states (entry_state :: pred_states)
           else meet_states pred_states
         in
-        let _, out_state = run_transfer globals in_state block in
+        let _, out_state = run_transfer summaries globals in_state block in
         let prev_in =
           match Hashtbl.find_opt in_states block.label with
           | Some state -> state
@@ -730,8 +910,8 @@ let compute_const_states global_init globals (f : Cfg.func) =
   done;
   in_states
 
-let const_propagate_func global_init globals (f : Cfg.func) =
-  let in_states = compute_const_states global_init globals f in
+let const_propagate_func global_init summaries globals (f : Cfg.func) =
+  let in_states = compute_const_states global_init summaries globals f in
   let blocks =
     List.map
       (fun (block : Cfg.block) ->
@@ -740,22 +920,22 @@ let const_propagate_func global_init globals (f : Cfg.func) =
           | Some state -> state
           | None -> empty_cp_state
         in
-        fst (run_transfer globals state block))
+        fst (run_transfer summaries globals state block))
       f.blocks
   in
   Cfg.rebuild_edges { f with blocks }
 
-let run_gvn_transfer globals state (block : Cfg.block) =
+let run_gvn_transfer summaries globals state (block : Cfg.block) =
   let body_rev, state =
     List.fold_left
       (fun (acc, state) instr ->
-        let instr, state = transfer_gvn_instr globals state instr in
+        let instr, state = transfer_gvn_instr summaries globals state instr in
         (instr :: acc, state))
       ([], state) block.body
   in
   ({ block with body = List.rev body_rev }, state)
 
-let compute_gvn_states globals (f : Cfg.func) =
+let compute_gvn_states summaries globals (f : Cfg.func) =
   let in_states = Hashtbl.create (List.length f.blocks) in
   let out_states = Hashtbl.create (List.length f.blocks) in
   let find_state table label =
@@ -777,7 +957,7 @@ let compute_gvn_states globals (f : Cfg.func) =
     List.iter
       (fun (block : Cfg.block) ->
         let in_state = meet_preds block.preds in
-        let _, out_state = run_gvn_transfer globals in_state block in
+        let _, out_state = run_gvn_transfer summaries globals in_state block in
         let prev_in = find_state in_states block.label in
         let prev_out = find_state out_states block.label in
         if not (equal_gvn_state in_state prev_in) then (
@@ -790,8 +970,8 @@ let compute_gvn_states globals (f : Cfg.func) =
   done;
   in_states
 
-let gvn_func globals (f : Cfg.func) =
-  let in_states = compute_gvn_states globals f in
+let gvn_func summaries globals (f : Cfg.func) =
+  let in_states = compute_gvn_states summaries globals f in
   let blocks =
     List.map
       (fun (block : Cfg.block) ->
@@ -800,16 +980,16 @@ let gvn_func globals (f : Cfg.func) =
           | Some state -> state
           | None -> empty_gvn_state
         in
-        fst (run_gvn_transfer globals state block))
+        fst (run_gvn_transfer summaries globals state block))
       f.blocks
   in
   Cfg.rebuild_edges { f with blocks }
 
-let gvn_rewrite_instrs globals instrs =
+let gvn_rewrite_instrs summaries globals instrs =
   let rewritten_rev, _ =
     List.fold_left
       (fun (acc, state) instr ->
-        let instr, state = transfer_gvn_instr globals state instr in
+        let instr, state = transfer_gvn_instr summaries globals state instr in
         (instr :: acc, state))
       ([], empty_gvn_state) instrs
   in
@@ -1078,7 +1258,7 @@ let live_out_t live_in_t (block : Cfg.block) =
       IntSet.union acc succ_live)
     IntSet.empty block.succs
 
-let scan_simple_instr globals instr live_t live_p =
+let scan_simple_instr summaries globals instr live_t live_p =
   match instr with
   | Tcg.Move (dst, src) ->
       if IntSet.mem dst live_t then
@@ -1117,11 +1297,17 @@ let scan_simple_instr globals instr live_t live_p =
       let live_t =
         List.fold_left add_operand_temps
           (match dst with
-          | Some temp -> IntSet.remove temp live_t
-          | None -> live_t)
+           | Some temp -> IntSet.remove temp live_t
+           | None -> live_t)
           args
       in
-      let live_p = PlaceSet.union (local_places live_p) globals in
+      let written_globals = call_written_globals summaries globals callee in
+      let read_globals = call_read_globals summaries globals callee in
+      let live_p =
+        PlaceSet.union
+          (local_places live_p)
+          (PlaceSet.union (PlaceSet.diff (global_places live_p) written_globals) read_globals)
+      in
       (Some (Tcg.Call (kept_dst, callee, args)), live_t, live_p)
 
 let scan_terminator globals (term : Cfg.terminator) live_t live_p =
@@ -1139,12 +1325,12 @@ let scan_terminator globals (term : Cfg.terminator) live_t live_p =
         add_operand_temps live_t value,
         PlaceSet.union live_p globals )
 
-let scan_block globals (block : Cfg.block) live_t_out live_p_out =
+let scan_block summaries globals (block : Cfg.block) live_t_out live_p_out =
   let term, live_t, live_p = scan_terminator globals block.term live_t_out live_p_out in
   let body_rev, live_t, live_p =
     List.fold_left
       (fun (acc, live_t, live_p) instr ->
-        let kept, live_t, live_p = scan_simple_instr globals instr live_t live_p in
+        let kept, live_t, live_p = scan_simple_instr summaries globals instr live_t live_p in
         let acc =
           match kept with
           | Some instr -> instr :: acc
@@ -1160,7 +1346,7 @@ let table_find_or_empty table key empty =
   | Some value -> value
   | None -> empty
 
-let compute_liveness globals (f : Cfg.func) =
+let compute_liveness summaries globals (f : Cfg.func) =
   let live_in_t = Hashtbl.create (List.length f.blocks) in
   let live_in_p = Hashtbl.create (List.length f.blocks) in
   let blocks = List.rev f.blocks in
@@ -1181,7 +1367,7 @@ let compute_liveness globals (f : Cfg.func) =
               PlaceSet.union acc (table_find_or_empty live_in_p succ PlaceSet.empty))
             PlaceSet.empty block.succs
         in
-        let _, live_t_in, live_p_in = scan_block globals block live_t_out live_p_out in
+        let _, live_t_in, live_p_in = scan_block summaries globals block live_t_out live_p_out in
         if not (IntSet.equal live_t_in (table_find_or_empty live_in_t block.label IntSet.empty)) then (
           Hashtbl.replace live_in_t block.label live_t_in;
           changed := true);
@@ -1473,7 +1659,7 @@ let mem2reg_func (f : Cfg.func) =
   in
   attempt all_candidates
 
-let promote_globals_func (f : Cfg.func) =
+let promote_globals_func summaries globals (f : Cfg.func) =
   let all_candidates = stored_globals_in_func f in
   let rec attempt candidates =
     if PlaceSet.is_empty candidates then f
@@ -1488,6 +1674,16 @@ let promote_globals_func (f : Cfg.func) =
       let out_envs = Hashtbl.create (List.length f.blocks) in
       let phi_temps = Hashtbl.create (max 8 (List.length f.blocks)) in
       let get_env table label = table_find_or_empty table label PlaceMap.empty in
+      let kill_env_places places env =
+        PlaceSet.fold (fun place env -> PlaceMap.remove place env) places env
+      in
+      let flush_env_places places env =
+        PlaceSet.elements places
+        |> List.filter_map (fun place ->
+               match PlaceMap.find_opt place env with
+               | Some value -> Some (Tcg.Store (place, value))
+               | None -> None)
+      in
       let get_phi_temp label place =
         match Hashtbl.find_opt phi_temps (label, place) with
         | Some temp -> temp
@@ -1528,7 +1724,10 @@ let promote_globals_func (f : Cfg.func) =
           (fun env instr ->
             match instr with
             | Tcg.Store (place, value) when PlaceSet.mem place candidates -> PlaceMap.add place value env
-            | Tcg.Call _ -> PlaceMap.empty
+            | Tcg.Call (_, callee, _) ->
+                kill_env_places
+                  (PlaceSet.inter candidates (call_written_globals summaries globals callee))
+                  env
             | _ -> env)
           env block.body
       in
@@ -1554,12 +1753,16 @@ let promote_globals_func (f : Cfg.func) =
           List.iter
             (fun instr ->
               match instr with
-              | Tcg.Load (_, place) when PlaceSet.mem place candidates ->
-                  if not (PlaceMap.mem place !env) then failed := PlaceSet.add place !failed
-              | Tcg.Store (place, value) when PlaceSet.mem place candidates ->
-                  env := PlaceMap.add place value !env
-              | Tcg.Call _ -> env := PlaceMap.empty
-              | _ -> ())
+                | Tcg.Load (_, place) when PlaceSet.mem place candidates ->
+                    if not (PlaceMap.mem place !env) then failed := PlaceSet.add place !failed
+                | Tcg.Store (place, value) when PlaceSet.mem place candidates ->
+                    env := PlaceMap.add place value !env
+                | Tcg.Call (_, callee, _) ->
+                    env :=
+                      kill_env_places
+                        (PlaceSet.inter candidates (call_written_globals summaries globals callee))
+                        !env
+                | _ -> ())
             block.body;
           Hashtbl.iter
             (fun (phi_label, place) _ ->
@@ -1595,10 +1798,13 @@ let promote_globals_func (f : Cfg.func) =
                     | None -> rewrite env (instr :: acc) rest)
                 | Tcg.Store (place, value) when PlaceSet.mem place candidates ->
                     rewrite (PlaceMap.add place value env) acc rest
-                | Tcg.Call _ ->
-                    let flushed = flush_env env in
+                | Tcg.Call (_, callee, _) as instr ->
+                    let call_kills =
+                      PlaceSet.inter candidates (call_written_globals summaries globals callee)
+                    in
+                    let flushed = flush_env_places call_kills env in
                     let acc = List.rev_append (flushed @ [ instr ]) acc in
-                    rewrite PlaceMap.empty acc rest
+                    rewrite (kill_env_places call_kills env) acc rest
                 | _ -> rewrite env (instr :: acc) rest)
           in
           let env_out, body = rewrite (get_env in_envs block.label) [] block.body in
@@ -1772,7 +1978,7 @@ let operand_invariant loop def_blocks ready_temps = function
       | Some def_label -> (not (LabelSet.mem def_label loop)) || IntSet.mem temp ready_temps
       | None -> true)
 
-let collect_loop_effects loop blocks =
+let collect_loop_effects summaries globals loop blocks =
   List.fold_left
     (fun effects (block : Cfg.block) ->
       if not (LabelSet.mem block.label loop) then effects
@@ -1782,15 +1988,17 @@ let collect_loop_effects loop blocks =
             match instr with
             | Tcg.Store (place, _) ->
                 { effects with modified_places = PlaceSet.add place effects.modified_places }
-            | Tcg.Call _ -> { effects with has_call = true }
+            | Tcg.Call (_, callee, _) ->
+                {
+                  modified_places =
+                    PlaceSet.union effects.modified_places
+                      (call_written_globals summaries globals callee);
+                  has_call = true;
+                }
             | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ -> effects)
           effects block.body)
     { modified_places = PlaceSet.empty; has_call = false }
     blocks
-
-let place_is_global = function
-  | Tcg.Global _ -> true
-  | Tcg.Local _ -> false
 
 let rewrite_term_successor term ~from_label ~to_label =
   let rewrite label = if label = from_label then to_label else label in
@@ -1831,7 +2039,7 @@ let natural_loop block_map header pred =
   in
   visit [ pred ] (LabelSet.singleton header)
 
-let eliminate_dead_loops_func (f : Cfg.func) =
+let eliminate_dead_loops_func summaries globals (f : Cfg.func) =
   let debug_dead_loops = Sys.getenv_opt "TOYC_DEBUG_DEAD_LOOPS" <> None in
   let debugf fmt = Printf.ksprintf (fun s -> if debug_dead_loops then prerr_endline s) fmt in
   let block_map = Hashtbl.create (List.length f.blocks) in
@@ -1862,8 +2070,7 @@ let eliminate_dead_loops_func (f : Cfg.func) =
       |> List.sort (fun (_, a) (_, b) -> compare a b)
       |> List.map fst
     in
-    let globals = globals_in_func f in
-    let live_in_t, live_in_p = compute_liveness globals f in
+    let live_in_t, live_in_p = compute_liveness summaries globals f in
     let current_blocks = Hashtbl.create (List.length f.blocks) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
     let current_entry = ref f.entry in
@@ -1895,7 +2102,7 @@ let eliminate_dead_loops_func (f : Cfg.func) =
             match LabelSet.elements exit_labels with
             | [ exit_label ] when outside_preds <> [] || header = !current_entry ->
                 let blocks_snapshot = current_block_list () in
-                let effects = collect_loop_effects loop blocks_snapshot in
+                let effects = collect_loop_effects summaries globals loop blocks_snapshot in
                 let modified_locals =
                   PlaceSet.filter (fun place -> not (place_is_global place)) effects.modified_places
                 in
@@ -2451,6 +2658,7 @@ let contains_substring text needle =
   needle_len = 0 || loop 0
 
 let is_unroll2_label label = contains_substring label "_unroll2_"
+let is_unswitch_label label = contains_substring label "_unswitch_"
 
 let rewrite_term_labels rename = function
   | Cfg.Jump label -> Cfg.Jump (rename label)
@@ -2473,6 +2681,65 @@ let rewrite_term rename_label rename_operand = function
         (op, rename_operand lhs, rename_operand rhs, rename_label if_true, rename_label if_false)
   | Cfg.Return None -> Cfg.Return None
   | Cfg.Return (Some value) -> Cfg.Return (Some (rename_operand value))
+
+let branch_term_outcomes = function
+  | Cfg.BranchZero (_, if_zero, if_nonzero) -> Some (if_zero, if_nonzero)
+  | Cfg.BranchNonZero (_, if_nonzero, if_zero) -> Some (if_nonzero, if_zero)
+  | Cfg.BranchCompare (_, _, _, if_true, if_false) -> Some (if_true, if_false)
+  | Cfg.Jump _ | Cfg.Return _ -> None
+
+let branch_term_with_targets term if_true if_false =
+  match term with
+  | Cfg.BranchZero (cond, _, _) -> Cfg.BranchZero (cond, if_true, if_false)
+  | Cfg.BranchNonZero (cond, _, _) -> Cfg.BranchNonZero (cond, if_true, if_false)
+  | Cfg.BranchCompare (op, lhs, rhs, _, _) ->
+      Cfg.BranchCompare (op, lhs, rhs, if_true, if_false)
+  | Cfg.Jump _ | Cfg.Return _ -> term
+
+let resolve_operand_before_loop loop_defs multi_defs def_instrs operand =
+  let rec resolve seen = function
+    | Tcg.Imm _ as operand -> Some operand
+    | Tcg.Temp temp as operand ->
+        if not (IntSet.mem temp loop_defs) then Some operand
+        else if IntSet.mem temp seen || IntSet.mem temp multi_defs then None
+        else
+          match Hashtbl.find_opt def_instrs temp with
+          | Some (Tcg.Move (_, src)) -> resolve (IntSet.add temp seen) src
+          | Some _ | None -> None
+  in
+  resolve IntSet.empty operand
+
+let operand_available_before_loop loop_defs multi_defs def_instrs operand =
+  Option.is_some (resolve_operand_before_loop loop_defs multi_defs def_instrs operand)
+
+let branch_term_available_before_loop loop_defs multi_defs def_instrs = function
+  | Cfg.BranchZero (cond, if_zero, if_nonzero)
+  | Cfg.BranchNonZero (cond, if_zero, if_nonzero) ->
+      if_zero <> if_nonzero
+      && operand_available_before_loop loop_defs multi_defs def_instrs cond
+  | Cfg.BranchCompare (_, lhs, rhs, if_true, if_false) ->
+      if_true <> if_false
+      && operand_available_before_loop loop_defs multi_defs def_instrs lhs
+      && operand_available_before_loop loop_defs multi_defs def_instrs rhs
+  | Cfg.Jump _ | Cfg.Return _ -> false
+
+let rewrite_branch_term_before_loop loop_defs multi_defs def_instrs = function
+  | Cfg.BranchZero (cond, if_zero, if_nonzero) -> (
+      match resolve_operand_before_loop loop_defs multi_defs def_instrs cond with
+      | Some cond -> Some (Cfg.BranchZero (cond, if_zero, if_nonzero))
+      | None -> None)
+  | Cfg.BranchNonZero (cond, if_nonzero, if_zero) -> (
+      match resolve_operand_before_loop loop_defs multi_defs def_instrs cond with
+      | Some cond -> Some (Cfg.BranchNonZero (cond, if_nonzero, if_zero))
+      | None -> None)
+  | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) -> (
+      match
+        ( resolve_operand_before_loop loop_defs multi_defs def_instrs lhs,
+          resolve_operand_before_loop loop_defs multi_defs def_instrs rhs )
+      with
+      | Some lhs, Some rhs -> Some (Cfg.BranchCompare (op, lhs, rhs, if_true, if_false))
+      | _ -> None)
+  | Cfg.Jump _ | Cfg.Return _ -> None
 
 let classify_counted_loop_header
     loop
@@ -3100,7 +3367,7 @@ let build_reduction_final_update fresh_temp trip_temp (reduction : counted_reduc
       in
       delta_instrs @ [ update ]
 
-let eliminate_counted_loops_func (f : Cfg.func) =
+let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
   let debug_counted = Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None in
   let debugf fmt = Printf.ksprintf (fun s -> if debug_counted then prerr_endline s) fmt in
   let string_of_intset set =
@@ -3173,7 +3440,7 @@ let eliminate_counted_loops_func (f : Cfg.func) =
         let def_blocks = temp_def_blocks_of_blocks !next_temp blocks_snapshot in
         let def_instrs = temp_def_instrs_of_blocks !next_temp blocks_snapshot in
         let multi_defs = multi_def_temps_of_blocks !next_temp blocks_snapshot in
-        let effects = collect_loop_effects loop blocks_snapshot in
+        let effects = collect_loop_effects summaries globals loop blocks_snapshot in
         let loop_stable_phis =
           collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
         in
@@ -3197,8 +3464,9 @@ let eliminate_counted_loops_func (f : Cfg.func) =
                 if effects.has_call || not (PlaceSet.is_empty effects.modified_places) then
                   debugf "counted-skip func=%s header=%s reason=effects" f.name header
                 else
-                  let globals = globals_in_func { f with blocks = blocks_snapshot } in
-                  let live_in_t, _ = compute_liveness globals { f with blocks = blocks_snapshot } in
+                  let live_in_t, _ =
+                    compute_liveness summaries globals { f with blocks = blocks_snapshot }
+                  in
                   let live_t_exit = table_find_or_empty live_in_t info.exit_label IntSet.empty in
                   let ivs =
                     collect_basic_induction_vars header loop get_block multi_defs def_instrs
@@ -3290,7 +3558,7 @@ let eliminate_counted_loops_func (f : Cfg.func) =
       Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
     else f
 
-let unroll_counted_loops_x2_func (f : Cfg.func) =
+let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
   let unroll_max_blocks = 4 in
   let unroll_min_instrs = 6 in
   let unroll_max_instrs = 16 in
@@ -3357,7 +3625,7 @@ let unroll_counted_loops_x2_func (f : Cfg.func) =
           let def_blocks = temp_def_blocks_of_blocks f.temp_count blocks_snapshot in
           let def_instrs = temp_def_instrs_of_blocks f.temp_count blocks_snapshot in
           let multi_defs = multi_def_temps_of_blocks f.temp_count blocks_snapshot in
-          let effects = collect_loop_effects loop blocks_snapshot in
+          let effects = collect_loop_effects summaries globals loop blocks_snapshot in
           let loop_stable_phis =
             collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
           in
@@ -3764,7 +4032,10 @@ let reassociate_loop_adds_func (f : Cfg.func) =
       Cfg.rebuild_edges { f with blocks }
     else f
 
-let licm_func (f : Cfg.func) =
+let unswitch_max_blocks = 8
+let unswitch_max_instrs = 40
+
+let unswitch_loops_func _summaries _globals (f : Cfg.func) =
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
   let doms = compute_dominators f in
@@ -3793,7 +4064,165 @@ let licm_func (f : Cfg.func) =
       |> List.sort (fun (_, a) (_, b) -> compare a b)
       |> List.map fst
     in
-    let globals = globals_in_func f in
+    let exception Applied of Cfg.func in
+    try
+      List.iter
+        (fun header ->
+          let loop = table_find_or_empty loops header LabelSet.empty in
+          if is_unswitch_label header || LabelSet.exists is_unswitch_label loop then ()
+          else
+            let header_block : Cfg.block = Hashtbl.find block_map header in
+            let outside_preds = List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds in
+            if outside_preds = [] then ()
+            else
+              let loop_blocks =
+                f.blocks
+                |> List.filter (fun (block : Cfg.block) -> LabelSet.mem block.label loop)
+              in
+              let total_instrs =
+                List.fold_left (fun acc (block : Cfg.block) -> acc + List.length block.body) 0 loop_blocks
+              in
+              if List.length loop_blocks > unswitch_max_blocks || total_instrs > unswitch_max_instrs then ()
+              else
+                let loop_defs = loop_defined_temps loop f.blocks in
+                let def_instrs = temp_def_instrs_map f in
+                let multi_defs = multi_def_temps f in
+                match
+                  List.find_map
+                    (fun (block : Cfg.block) ->
+                      match (branch_term_outcomes block.term, rewrite_branch_term_before_loop loop_defs multi_defs def_instrs block.term) with
+                      | Some (if_true, if_false), Some dispatch_term
+                        when LabelSet.mem if_true loop && LabelSet.mem if_false loop ->
+                          Some (block, if_true, if_false, dispatch_term)
+                      | _ -> None)
+                    loop_blocks
+                with
+                | None -> ()
+                | Some (branch_block, if_true, if_false, dispatch_term) ->
+                    let original_labels = List.map (fun (block : Cfg.block) -> block.label) f.blocks in
+                    let current_blocks = Hashtbl.create (List.length f.blocks + (2 * List.length loop_blocks) + 1) in
+                    List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
+                    let get_block label =
+                      match Hashtbl.find_opt current_blocks label with
+                      | Some block -> block
+                      | None -> failwith ("internal missing block: " ^ label)
+                    in
+                    let update_block (block : Cfg.block) =
+                      Hashtbl.replace current_blocks block.label block
+                    in
+                    let clone_id = List.length loop_blocks + List.length outside_preds + List.length header_block.succs in
+                    let dispatch_label =
+                      Printf.sprintf ".L%s_unswitch_dispatch_%s_%d" f.label header clone_id
+                    in
+                    let true_map =
+                      List.mapi
+                        (fun index (block : Cfg.block) ->
+                          ( block.label,
+                            Printf.sprintf ".L%s_unswitch_t_%s_%d_%d" f.label header clone_id index ))
+                        loop_blocks
+                    in
+                    let false_map =
+                      List.mapi
+                        (fun index (block : Cfg.block) ->
+                          ( block.label,
+                            Printf.sprintf ".L%s_unswitch_f_%s_%d_%d" f.label header clone_id index ))
+                        loop_blocks
+                    in
+                    let rename label map =
+                      match List.assoc_opt label map with
+                      | Some renamed -> renamed
+                      | None -> label
+                    in
+                    let true_header = rename header true_map in
+                    let false_header = rename header false_map in
+                    let dispatch_term = branch_term_with_targets dispatch_term true_header false_header in
+                    let dispatch_block =
+                      {
+                        Cfg.label = dispatch_label;
+                        body = [];
+                        term = dispatch_term;
+                        preds = [];
+                        succs = Cfg.successors dispatch_term;
+                      }
+                    in
+                    let clone_block map chosen_target (block : Cfg.block) =
+                      let label = rename block.label map in
+                      let term =
+                        if block.label = branch_block.label then Cfg.Jump (rename chosen_target map)
+                        else rewrite_term_labels (fun lbl -> rename lbl map) block.term
+                      in
+                      { block with label; term; preds = []; succs = Cfg.successors term }
+                    in
+                    let true_blocks = List.map (clone_block true_map if_true) loop_blocks in
+                    let false_blocks = List.map (clone_block false_map if_false) loop_blocks in
+                    let redirects = Hashtbl.create (List.length outside_preds) in
+                    List.iter
+                      (fun pred -> Hashtbl.add redirects (pred, header) dispatch_label)
+                      outside_preds;
+                    List.iter
+                      (fun pred ->
+                        let pred_block = get_block pred in
+                        let term = redirect_successors pred redirects pred_block.term in
+                        update_block { pred_block with term; succs = Cfg.successors term })
+                      outside_preds;
+                    Hashtbl.add current_blocks dispatch_label dispatch_block;
+                    List.iter
+                      (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block)
+                      true_blocks;
+                    List.iter
+                      (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block)
+                      false_blocks;
+                    let new_blocks =
+                      dispatch_label
+                      :: List.map (fun (block : Cfg.block) -> block.label) true_blocks
+                      @ List.map (fun (block : Cfg.block) -> block.label) false_blocks
+                    in
+                    let entry = if header = f.entry then dispatch_label else f.entry in
+                    let blocks =
+                      List.map get_block original_labels @ List.map get_block new_blocks
+                    in
+                    let unswitched = Cfg.rebuild_edges { f with entry; blocks } in
+                    let reachable = reachable_labels unswitched.entry unswitched.blocks in
+                    let blocks =
+                      List.filter
+                        (fun (block : Cfg.block) -> LabelSet.mem block.label reachable)
+                        unswitched.blocks
+                    in
+                    raise (Applied (Cfg.rebuild_edges { unswitched with blocks })))
+        headers;
+      f
+    with
+    | Applied next -> next
+
+let licm_func summaries globals (f : Cfg.func) =
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
+  let doms = compute_dominators f in
+  let backedges =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        List.fold_left
+          (fun acc succ ->
+            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
+              (block.label, succ) :: acc
+            else acc)
+          acc block.succs)
+      [] f.blocks
+  in
+  if backedges = [] then f
+  else
+    let loops = Hashtbl.create 8 in
+    List.iter
+      (fun (pred, header) ->
+        let loop = natural_loop block_map header pred in
+        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
+        Hashtbl.replace loops header merged)
+      backedges;
+    let headers =
+      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
+      |> List.sort (fun (_, a) (_, b) -> compare a b)
+      |> List.map fst
+    in
     let current_blocks = Hashtbl.create (List.length f.blocks + List.length headers) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
     let get_block label =
@@ -3825,7 +4254,7 @@ let licm_func (f : Cfg.func) =
           let def_blocks = temp_def_blocks_of_blocks f.temp_count blocks_snapshot in
           let def_instrs = temp_def_instrs_of_blocks f.temp_count blocks_snapshot in
           let multi_defs = multi_def_temps_of_blocks f.temp_count blocks_snapshot in
-          let effects = collect_loop_effects loop blocks_snapshot in
+          let effects = collect_loop_effects summaries globals loop blocks_snapshot in
           let loop_stable_phis =
             collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
           in
@@ -3930,7 +4359,7 @@ let licm_func (f : Cfg.func) =
               end;
               let preheader = get_block preheader_label in
               let hoisted = List.rev !hoisted_rev in
-              let body = gvn_rewrite_instrs globals (preheader.body @ hoisted) in
+              let body = gvn_rewrite_instrs summaries globals (preheader.body @ hoisted) in
               update_block { preheader with body };
               List.iter
                 (fun (block : Cfg.block) ->
@@ -3982,9 +4411,8 @@ let fold_compare_branch_term term op lhs rhs =
       else Cfg.BranchCompare (op, lhs, rhs, if_nonzero, if_zero)
   | _ -> term
 
-let fold_branch_tails_func (f : Cfg.func) =
-  let globals = globals_in_func f in
-  let live_in_t, _ = compute_liveness globals f in
+let fold_branch_tails_func summaries globals (f : Cfg.func) =
+  let live_in_t, _ = compute_liveness summaries globals f in
   let blocks =
     List.map
       (fun (block : Cfg.block) ->
@@ -4031,9 +4459,8 @@ let fold_branch_tails_func (f : Cfg.func) =
   in
   Cfg.rebuild_edges { f with blocks }
 
-let eliminate_dead_code_func (f : Cfg.func) =
-  let globals = globals_in_func f in
-  let live_in_t, live_in_p = compute_liveness globals f in
+let eliminate_dead_code_func summaries globals (f : Cfg.func) =
+  let live_in_t, live_in_p = compute_liveness summaries globals f in
   let blocks =
     List.map
       (fun (block : Cfg.block) ->
@@ -4049,14 +4476,14 @@ let eliminate_dead_code_func (f : Cfg.func) =
               PlaceSet.union acc (table_find_or_empty live_in_p succ PlaceSet.empty))
             PlaceSet.empty block.succs
         in
-        let block, _, _ = scan_block globals block live_t_out live_p_out in
+        let block, _, _ = scan_block summaries globals block live_t_out live_p_out in
         { block with succs = Cfg.successors block.term })
       f.blocks
   in
   Cfg.rebuild_edges { f with blocks }
 
-let optimize_func global_init globals (f : Cfg.func) =
-  let promoted = f |> mem2reg_func |> promote_globals_func in
+let optimize_func global_init summaries globals (f : Cfg.func) =
+  let promoted = f |> mem2reg_func |> promote_globals_func summaries globals in
   let debug_stop_after = Sys.getenv_opt "TOYC_DEBUG_STOP_AFTER" in
   let exception StopPass of Cfg.func in
   let stop_after stage current =
@@ -4066,28 +4493,35 @@ let optimize_func global_init globals (f : Cfg.func) =
   in
   let step func =
     try
-      let after_const1 = const_propagate_func global_init globals func |> stop_after "const1" in
+      let after_const1 =
+        const_propagate_func global_init summaries globals func |> stop_after "const1"
+      in
       let after_copy1 = copy_propagate_func after_const1 |> stop_after "copy1" in
       let after_sr = strength_reduce_func after_copy1 |> stop_after "sr" in
-      let after_gvn1 = gvn_func globals after_sr |> stop_after "gvn1" in
+      let after_gvn1 = gvn_func summaries globals after_sr |> stop_after "gvn1" in
       let after_copy2 = copy_propagate_func after_gvn1 |> stop_after "copy2" in
-      let after_dce1 = eliminate_dead_code_func after_copy2 |> stop_after "dce1" in
+      let after_dce1 = eliminate_dead_code_func summaries globals after_copy2 |> stop_after "dce1" in
       let after_reassoc = reassociate_loop_adds_func after_dce1 |> stop_after "reassoc" in
-      let after_licm = licm_func after_reassoc |> stop_after "licm" in
+      let after_licm = licm_func summaries globals after_reassoc |> stop_after "licm" in
+      let after_unswitch = unswitch_loops_func summaries globals after_licm |> stop_after "unswitch" in
       let after_const2 =
-        const_propagate_func global_init globals after_licm |> stop_after "const2"
+        const_propagate_func global_init summaries globals after_unswitch |> stop_after "const2"
       in
       let after_copy3 = copy_propagate_func after_const2 |> stop_after "copy3" in
-      let after_gvn2 = gvn_func globals after_copy3 |> stop_after "gvn2" in
-      let after_dce2 = eliminate_dead_code_func after_gvn2 |> stop_after "dce2" in
-      let after_dead_loops = eliminate_dead_loops_func after_dce2 |> stop_after "dead_loops" in
-      let after_fold = fold_branch_tails_func after_dead_loops |> stop_after "fold" in
-      let after_counted =
-        eliminate_counted_loops_func after_fold |> stop_after "counted_loops"
+      let after_gvn2 = gvn_func summaries globals after_copy3 |> stop_after "gvn2" in
+      let after_dce2 = eliminate_dead_code_func summaries globals after_gvn2 |> stop_after "dce2" in
+      let after_dead_loops =
+        eliminate_dead_loops_func summaries globals after_dce2 |> stop_after "dead_loops"
       in
-      let after_unroll = unroll_counted_loops_x2_func after_counted |> stop_after "unroll2" in
+      let after_fold = fold_branch_tails_func summaries globals after_dead_loops |> stop_after "fold" in
+      let after_counted =
+        eliminate_counted_loops_func summaries globals after_fold |> stop_after "counted_loops"
+      in
+      let after_unroll =
+        unroll_counted_loops_x2_func summaries globals after_counted |> stop_after "unroll2"
+      in
       let after_thread = thread_and_prune_func after_unroll |> stop_after "thread" in
-      let after_fold2 = fold_branch_tails_func after_thread |> stop_after "fold2" in
+      let after_fold2 = fold_branch_tails_func summaries globals after_thread |> stop_after "fold2" in
       after_fold2
     with
     | StopPass current -> current
@@ -4110,4 +4544,13 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
         (PlaceMap.add place (CpConst g.init) init, PlaceSet.add place set))
       (PlaceMap.empty, PlaceSet.empty) analysis.globals
   in
-  { Cfg.funcs = List.map (optimize_func global_init globals) cfg.funcs }
+  let summaries = Hashtbl.create (max 8 (List.length cfg.funcs)) in
+  let funcs_rev =
+    List.fold_left
+      (fun acc (f : Cfg.func) ->
+        let optimized = optimize_func global_init summaries globals f in
+        Hashtbl.replace summaries optimized.label (summarize_func summaries globals optimized);
+        optimized :: acc)
+      [] cfg.funcs
+  in
+  { Cfg.funcs = List.rev funcs_rev }
