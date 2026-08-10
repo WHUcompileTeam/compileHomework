@@ -10,6 +10,7 @@ gvn_temp_redef_loop.tc 4
 globals_shortcircuit.tc 42
 infinite_return.tc 77
 isel_immediates.tc 157
+licm_gvn_duplicate_invariant.tc 48
 licm_global_invariant.tc 24
 licm_loop_reset.tc 1
 licm_reassociate_add_sub.tc 16

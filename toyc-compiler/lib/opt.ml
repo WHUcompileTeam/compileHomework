@@ -793,6 +793,16 @@ let gvn_func globals (f : Cfg.func) =
   in
   Cfg.rebuild_edges { f with blocks }
 
+let gvn_rewrite_instrs globals instrs =
+  let rewritten_rev, _ =
+    List.fold_left
+      (fun (acc, state) instr ->
+        let instr, state = transfer_gvn_instr globals state instr in
+        (instr :: acc, state))
+      ([], empty_gvn_state) instrs
+  in
+  List.rev rewritten_rev
+
 type copy_state = Tcg.operand IntMap.t
 
 let empty_copy_state = IntMap.empty
@@ -1705,7 +1715,7 @@ let load_place_invariant effects place =
   not (PlaceSet.mem place effects.modified_places)
   &&
   match place with
-  | Tcg.Local _ -> false
+  | Tcg.Local _ -> true
   | Tcg.Global _ -> not effects.has_call
 
 type basic_induction_var = {
@@ -2468,6 +2478,7 @@ let licm_func (f : Cfg.func) =
       |> List.sort (fun (_, a) (_, b) -> compare a b)
       |> List.map fst
     in
+    let globals = globals_in_func f in
     let current_blocks = Hashtbl.create (List.length f.blocks + List.length headers) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
     let get_block label =
@@ -2605,7 +2616,8 @@ let licm_func (f : Cfg.func) =
               end;
               let preheader = get_block preheader_label in
               let hoisted = List.rev !hoisted_rev in
-              update_block { preheader with body = preheader.body @ hoisted };
+              let body = gvn_rewrite_instrs globals (preheader.body @ hoisted) in
+              update_block { preheader with body };
               List.iter
                 (fun (block : Cfg.block) ->
                   if LabelSet.mem block.label loop then
@@ -2746,7 +2758,7 @@ let optimize_func global_init globals (f : Cfg.func) =
       let after_gvn1 = gvn_func globals after_sr |> stop_after "gvn1" in
       let after_copy2 = copy_propagate_func after_gvn1 |> stop_after "copy2" in
       let after_dce1 = eliminate_dead_code_func after_copy2 |> stop_after "dce1" in
-      let after_reassoc = after_dce1 |> stop_after "reassoc" in
+      let after_reassoc = reassociate_loop_adds_func after_dce1 |> stop_after "reassoc" in
       let after_licm = licm_func after_reassoc |> stop_after "licm" in
       let after_const2 =
         const_propagate_func global_init globals after_licm |> stop_after "const2"
@@ -2755,8 +2767,8 @@ let optimize_func global_init globals (f : Cfg.func) =
       let after_gvn2 = after_copy3 |> stop_after "gvn2" in
       let after_dce2 = eliminate_dead_code_func after_gvn2 |> stop_after "dce2" in
       let after_dead_loops = eliminate_dead_loops_func after_dce2 |> stop_after "dead_loops" in
-      let after_fold = after_dead_loops |> stop_after "fold" in
-      after_fold |> stop_after "thread"
+      let after_fold = fold_branch_tails_func after_dead_loops |> stop_after "fold" in
+      thread_and_prune_func after_fold |> stop_after "thread"
     with
     | StopPass current -> current
   in
