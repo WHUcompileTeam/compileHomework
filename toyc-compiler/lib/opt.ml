@@ -2735,17 +2735,17 @@ let optimize_func global_init globals (f : Cfg.func) =
       let after_gvn1 = gvn_func globals after_sr |> stop_after "gvn1" in
       let after_copy2 = copy_propagate_func after_gvn1 |> stop_after "copy2" in
       let after_dce1 = eliminate_dead_code_func after_copy2 |> stop_after "dce1" in
-      let after_reassoc = reassociate_loop_adds_func after_dce1 |> stop_after "reassoc" in
+      let after_reassoc = after_dce1 |> stop_after "reassoc" in
       let after_licm = licm_func after_reassoc |> stop_after "licm" in
       let after_const2 =
         const_propagate_func global_init globals after_licm |> stop_after "const2"
       in
       let after_copy3 = copy_propagate_func after_const2 |> stop_after "copy3" in
-      let after_gvn2 = gvn_func globals after_copy3 |> stop_after "gvn2" in
+      let after_gvn2 = after_copy3 |> stop_after "gvn2" in
       let after_dce2 = eliminate_dead_code_func after_gvn2 |> stop_after "dce2" in
       let after_dead_loops = eliminate_dead_loops_func after_dce2 |> stop_after "dead_loops" in
-      let after_fold = fold_branch_tails_func after_dead_loops |> stop_after "fold" in
-      thread_and_prune_func after_fold |> stop_after "thread"
+      let after_fold = after_dead_loops |> stop_after "fold" in
+      after_fold |> stop_after "thread"
     with
     | StopPass current -> current
   in
