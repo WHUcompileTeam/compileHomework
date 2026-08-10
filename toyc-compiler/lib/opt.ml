@@ -2117,6 +2117,8 @@ let useful_derived_key = function
   | DerivedBaseMinus (_, factor) ->
       factor <> 0L && factor <> 1L && factor <> -1L
 
+let worthwhile_derived_key key _uses = useful_derived_key key
+
 let delta_of_derived_key step = function
   | DerivedScaled factor
   | DerivedAdd (_, factor)
@@ -3520,15 +3522,15 @@ let strength_reduce_func (f : Cfg.func) =
                         derived_expr_of_instr
                           loop_defs loop_stable_phis multi_defs def_instrs iv.phi_temp instr
                       with
-                      | Some (dst, key) when useful_derived_key key ->
+                      | Some (dst, key) ->
                           let uses = Option.value ~default:[] (Hashtbl.find_opt derived_uses key) in
                           Hashtbl.replace derived_uses key ((block.label, index, dst) :: uses)
-                      | Some _ | None -> ())
+                      | None -> ())
                     (get_block block.label).body)
               f.blocks;
             Hashtbl.iter
-              (fun key uses ->
-                if uses <> [] then begin
+               (fun key uses ->
+                if worthwhile_derived_key key uses then begin
                   changed := true;
                   let derived_phi = fresh_temp () in
                   List.iter
@@ -4054,7 +4056,7 @@ let eliminate_dead_code_func (f : Cfg.func) =
   Cfg.rebuild_edges { f with blocks }
 
 let optimize_func global_init globals (f : Cfg.func) =
-  let promoted = mem2reg_func f in
+  let promoted = f |> mem2reg_func |> promote_globals_func in
   let debug_stop_after = Sys.getenv_opt "TOYC_DEBUG_STOP_AFTER" in
   let exception StopPass of Cfg.func in
   let stop_after stage current =
