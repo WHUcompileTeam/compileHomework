@@ -3346,6 +3346,16 @@ let last_def_of_temp_on_chain chain temp =
   in
   block_loop chain
 
+let last_def_of_temp_on_chain_with_block chain temp =
+  let rec block_loop = function
+    | [] -> None
+    | (block : Cfg.block) :: rest -> (
+        match last_def_of_temp block temp with
+        | Some instr -> Some (block, instr, rest)
+        | None -> block_loop rest)
+  in
+  block_loop chain
+
 let def_instr_on_chain_or_global chain multi_defs def_instrs temp =
   if IntSet.mem temp multi_defs then last_def_of_temp_on_chain chain temp
   else Hashtbl.find_opt def_instrs temp
@@ -3947,6 +3957,17 @@ let branch_term_outcomes = function
   | Cfg.BranchCompare (_, _, _, if_true, if_false) -> Some (if_true, if_false)
   | Cfg.Jump _ | Cfg.Return _ -> None
 
+let transparent_loop_connector (block : Cfg.block) =
+  match block.term with
+  | Cfg.Jump _ ->
+      List.for_all
+        (function
+          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ -> true
+          | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> false)
+        block.body
+      && List.length block.body <= 4
+  | Cfg.BranchZero _ | Cfg.BranchNonZero _ | Cfg.BranchCompare _ | Cfg.Return _ -> false
+
 let branch_term_with_targets term if_true if_false =
   match term with
   | Cfg.BranchZero (cond, _, _) -> Cfg.BranchZero (cond, if_true, if_false)
@@ -4146,6 +4167,36 @@ let find_counted_loop_control
           | Some _ | None -> None)
 
 let linear_loop_path header loop get_block entry_label =
+  let rec collapse_transparent_branch seen visiting label =
+    if label = header || LabelSet.mem label seen then Some header
+    else if LabelSet.mem label visiting || not (LabelSet.mem label loop) then None
+    else
+      let block : Cfg.block = get_block label in
+      match block.term with
+      | Cfg.Jump next when block.body = [] ->
+          collapse_transparent_branch seen (LabelSet.add label visiting) next
+      | _ -> None
+  in
+  let rec equivalent_linear_branch_path seen_pairs a b =
+    if a = b then Some ([], LabelSet.empty, a)
+    else if List.mem (a, b) seen_pairs || List.mem (b, a) seen_pairs then None
+    else if not (LabelSet.mem a loop) || not (LabelSet.mem b loop) then None
+    else
+      let a_block : Cfg.block = get_block a in
+      let b_block : Cfg.block = get_block b in
+      if a_block.body <> b_block.body then None
+      else
+        match (a_block.term, b_block.term) with
+        | Cfg.Jump next_a, Cfg.Jump next_b ->
+            if next_a = next_b then
+              Some ([ a_block ], LabelSet.of_list [ a; b ], next_a)
+            else
+              Option.map
+                (fun (rep_path, seen_labels, next) ->
+                  (a_block :: rep_path, LabelSet.add a (LabelSet.add b seen_labels), next))
+                (equivalent_linear_branch_path ((a, b) :: seen_pairs) next_a next_b)
+        | _ -> None
+  in
   let rec walk seen acc label =
     if label = header then Some (List.rev acc, seen)
     else if not (LabelSet.mem label loop) || LabelSet.mem label seen then None
@@ -4153,7 +4204,27 @@ let linear_loop_path header loop get_block entry_label =
       let block : Cfg.block = get_block label in
       match block.succs with
       | [ next ] -> walk (LabelSet.add label seen) (block :: acc) next
-      | _ -> None
+      | _ -> (
+          match branch_term_outcomes block.term with
+          | Some (a, b) -> (
+              match equivalent_linear_branch_path [] a b with
+              | Some (rep_path, branch_seen, next) ->
+                  walk
+                    (LabelSet.union (LabelSet.add label seen) branch_seen)
+                    (List.rev_append rep_path acc)
+                    next
+              | None -> (
+                  match block.body with
+                  | [] -> (
+                      match
+                        ( collapse_transparent_branch seen (LabelSet.add label LabelSet.empty) a,
+                          collapse_transparent_branch seen (LabelSet.add label LabelSet.empty) b )
+                      with
+                      | Some next_a, Some next_b when next_a = next_b ->
+                          walk (LabelSet.add label seen) acc next_a
+                      | _ -> None)
+                  | _ -> None))
+          | None -> None)
   in
   let rec transparent_connector_reaches seen visiting label =
     if label = header || LabelSet.mem label seen then true
@@ -4181,7 +4252,8 @@ let counted_loop_shape_supported header loop get_block entry_label =
     else
       let block : Cfg.block = get_block label in
       match (block.body, block.term) with
-      | [], Cfg.Jump next -> collapse_empty_successor (LabelSet.add label seen) next
+      | _, Cfg.Jump next when transparent_loop_connector block ->
+          collapse_empty_successor (LabelSet.add label seen) next
       | [], _ -> (
           match branch_term_outcomes block.term with
           | Some (a, b) -> (
@@ -4194,14 +4266,25 @@ let counted_loop_shape_supported header loop get_block entry_label =
           | None -> Some label)
       | _ -> Some label
   in
-  let equivalent_branch_pair a b =
-    let a_block : Cfg.block = get_block a in
-    let b_block : Cfg.block = get_block b in
-    a_block.body = b_block.body
-    && a_block.term = b_block.term
-    && a_block.succs = b_block.succs
-    && a_block.preds <> []
-    && b_block.preds <> []
+  let rec equivalent_linear_branches seen_pairs a b =
+    if a = b then Some (LabelSet.empty, a)
+    else if List.mem (a, b) seen_pairs || List.mem (b, a) seen_pairs then None
+    else if not (LabelSet.mem a loop) || not (LabelSet.mem b loop) then None
+    else
+      let a_block : Cfg.block = get_block a in
+      let b_block : Cfg.block = get_block b in
+      if a_block.body <> b_block.body then None
+      else
+        match (a_block.term, b_block.term) with
+        | Cfg.Jump next_a, Cfg.Jump next_b ->
+            if next_a = next_b then
+              Some (LabelSet.of_list [ a; b ], next_a)
+            else
+              Option.map
+                (fun (seen_labels, next) ->
+                  (LabelSet.add a (LabelSet.add b seen_labels), next))
+                (equivalent_linear_branches ((a, b) :: seen_pairs) next_a next_b)
+        | _ -> None
   in
   let rec walk seen label =
     if label = header then true
@@ -4214,15 +4297,18 @@ let counted_loop_shape_supported header loop get_block entry_label =
       | _ -> (
           match branch_term_outcomes block.term with
           | Some (a, b)
-            when LabelSet.mem a loop
-                 && LabelSet.mem b loop
-                 && equivalent_branch_pair a b -> (
-              let succs = (get_block a).succs in
-              match succs with
-              | [ next ] ->
-                  let seen = LabelSet.add a (LabelSet.add b seen) in
+            when LabelSet.mem a loop && LabelSet.mem b loop -> (
+              match equivalent_linear_branches [] a b with
+              | Some (branch_seen, next) ->
+                  let seen = LabelSet.union seen branch_seen in
                   walk seen next
-              | _ -> false)
+              | None -> (
+                  match
+                    ( collapse_empty_successor seen a,
+                      collapse_empty_successor seen b )
+                  with
+                  | Some next_a, Some next_b when next_a = next_b -> walk seen next_a
+                  | _ -> false))
           | Some (a, b) when block.body = [] -> (
               match
                 ( collapse_empty_successor seen a,
@@ -4323,6 +4409,47 @@ let build_trip_count_instrs fresh_temp phi_temp step kind =
       let diff_instr = simplify_simple_instr (Tcg.Bin (diff, Sub, Tcg.Temp phi_temp, bound)) in
       let trip_instrs, trip = build_nonnegative_inclusive_div fresh_temp diff stride in
       (bound_instrs @ (diff_instr :: trip_instrs), trip)
+
+let int64_floor_div numer denom =
+  let quotient = Int64.div numer denom in
+  let remainder = Int64.rem numer denom in
+  if numer < 0L && remainder <> 0L then Int64.pred quotient else quotient
+
+let int64_nonnegative_ceil_div numer denom =
+  if denom <= 0L then None
+  else if numer <= 0L then Some 0L
+  else
+    let quotient = Int64.div numer denom in
+    let remainder = Int64.rem numer denom in
+    Some (if remainder = 0L then quotient else Int64.succ quotient)
+
+let int64_nonnegative_inclusive_div numer denom =
+  if denom <= 0L then None
+  else
+    let floor = int64_floor_div numer denom in
+    Some (if floor < 0L then 0L else Int64.succ floor)
+
+let constant_trip_count_of_kind resolve_operand init_value step = function
+  | CountUpLt (bound, bias) -> (
+      match resolve_operand bound with
+      | Some bound ->
+          int64_nonnegative_ceil_div Int64.(sub (sub bound bias) init_value) step
+      | None -> None)
+  | CountUpLe (bound, bias) -> (
+      match resolve_operand bound with
+      | Some bound ->
+          int64_nonnegative_inclusive_div Int64.(sub (sub bound bias) init_value) step
+      | None -> None)
+  | CountDownGt (bound, bias) -> (
+      match resolve_operand bound with
+      | Some bound ->
+          int64_nonnegative_ceil_div Int64.(sub init_value (sub bound bias)) (Int64.neg step)
+      | None -> None)
+  | CountDownGe (bound, bias) -> (
+      match resolve_operand bound with
+      | Some bound ->
+          int64_nonnegative_inclusive_div Int64.(sub init_value (sub bound bias)) (Int64.neg step)
+      | None -> None)
 
 let build_iv_final_update fresh_temp trip_temp (iv : basic_induction_var) =
   match iv.step with
@@ -4895,22 +5022,132 @@ let collect_counted_reductions
     else phi_chain_for_pred pred
   in
   let reduction_update_of_temp_on_chain temp chain =
-    match chain with
-    | [] -> None
-    | _ ->
-        let block = flatten_chain_block chain in
-        reduction_update_of_temp
-          invariant_loaded_places
-          loop_defs
-          def_blocks
-          get_block
-          loop_stable_phis
-          multi_defs
-          def_instrs
-          ivs
-          temp
-          block
-          temp
+    let rec resolves_to_self block older_chain seen operand =
+      let operand = resolve_block_operand block operand in
+      match operand with
+      | Tcg.Imm _ -> false
+      | Tcg.Temp current ->
+          if current = temp then true
+          else if IntSet.mem current seen then false
+          else
+            match last_def_of_temp block current with
+            | Some (Tcg.Move (_, src))
+            | Some (Tcg.Un (_, UPlus, src)) ->
+                resolves_to_self block older_chain (IntSet.add current seen) src
+            | Some _ -> false
+            | None -> (
+                match last_def_of_temp_on_chain_with_block older_chain current with
+                | Some (older_block, Tcg.Move (_, src), older_rest)
+                | Some (older_block, Tcg.Un (_, UPlus, src), older_rest) ->
+                    resolves_to_self older_block older_rest (IntSet.add current seen) src
+                | Some _ | None -> false)
+    in
+    let invariant operand =
+      operand_loop_invariant
+        loop_defs loop_stable_phis multi_defs def_instrs IntSet.empty operand
+    in
+    let rec of_operand block older_chain seen = function
+      | Tcg.Imm _ -> None
+      | Tcg.Temp _ as operand ->
+          let operand = resolve_block_operand block operand in
+          match operand with
+          | Tcg.Imm _ -> None
+          | Tcg.Temp current ->
+              if current = temp then None
+              else if IntSet.mem current seen || IntSet.mem current multi_defs then None
+              else
+                match last_def_of_temp block current with
+                | Some instr -> of_instr block older_chain (IntSet.add current seen) instr
+                | None -> (
+                    match last_def_of_temp_on_chain_with_block older_chain current with
+                    | Some (older_block, instr, older_rest) ->
+                        of_instr older_block older_rest (IntSet.add current seen) instr
+                    | None ->
+                        if invariant operand then None
+                        else
+                          match Hashtbl.find_opt def_instrs current with
+                          | Some instr -> (
+                              match Hashtbl.find_opt def_blocks current with
+                              | Some label -> of_instr (get_block label) [] (IntSet.add current seen) instr
+                              | None -> None)
+                          | None -> None)
+    and of_instr block older_chain seen = function
+      | Tcg.Move (_, src) -> of_operand block older_chain seen (resolve_block_operand block src)
+      | Tcg.Bin (_, Add, lhs, rhs) ->
+          let lhs = resolve_block_operand block lhs in
+          let rhs = resolve_block_operand block rhs in
+          if resolves_to_self block older_chain IntSet.empty lhs then
+            Option.map
+              (fun step ->
+                {
+                  target = ReductionTempTarget temp;
+                  subtract = false;
+                  step;
+                  carrier_temp = None;
+                  alias_temps = [];
+                })
+              (reduction_step_of_operand
+                 invariant_loaded_places
+                 loop_defs
+                 def_blocks
+                 get_block
+                 loop_stable_phis
+                 multi_defs
+                 def_instrs
+                 ivs
+                 block rhs)
+          else if resolves_to_self block older_chain IntSet.empty rhs then
+            Option.map
+              (fun step ->
+                {
+                  target = ReductionTempTarget temp;
+                  subtract = false;
+                  step;
+                  carrier_temp = None;
+                  alias_temps = [];
+                })
+              (reduction_step_of_operand
+                 invariant_loaded_places
+                 loop_defs
+                 def_blocks
+                 get_block
+                 loop_stable_phis
+                 multi_defs
+                 def_instrs
+                 ivs
+                 block lhs)
+          else None
+      | Tcg.Bin (_, Sub, lhs, rhs) ->
+          let lhs = resolve_block_operand block lhs in
+          let rhs = resolve_block_operand block rhs in
+          if resolves_to_self block older_chain IntSet.empty lhs then
+            Option.map
+              (fun step ->
+                {
+                  target = ReductionTempTarget temp;
+                  subtract = true;
+                  step;
+                  carrier_temp = None;
+                  alias_temps = [];
+                })
+              (reduction_step_of_operand
+                 invariant_loaded_places
+                 loop_defs
+                 def_blocks
+                 get_block
+                 loop_stable_phis
+                 multi_defs
+                 def_instrs
+                 ivs
+                 block rhs)
+          else None
+      | Tcg.Un _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ | Tcg.Bin _ -> None
+    in
+    match last_def_of_temp_on_chain_with_block chain temp with
+    | Some (block, Tcg.Move (_, src), older_chain) ->
+        of_operand block older_chain IntSet.empty (resolve_block_operand block src)
+    | Some (block, instr, older_chain) -> of_instr block older_chain IntSet.empty instr
+    | None -> None
   in
   let reduction_update_of_place_on_chain place chain =
     match chain with
@@ -6024,6 +6261,205 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
       let ordered_labels = List.map (fun (block : Cfg.block) -> block.label) f.blocks in
       let blocks = List.map get_block ordered_labels @ List.rev_map get_block !new_blocks_rev in
       Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
+    else f
+
+let full_unroll_counted_loops_func summaries globals (f : Cfg.func) =
+  let full_unroll_max_trip = 8L in
+  let full_unroll_max_blocks = 4 in
+  let full_unroll_max_instrs = 28 in
+  let full_unroll_max_control_body_instrs = 4 in
+  let control_body_supported body =
+    List.length body <= full_unroll_max_control_body_instrs
+    && List.for_all pure_cfg_prep_instr body
+  in
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
+  let doms = compute_dominators f in
+  let backedges =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        List.fold_left
+          (fun acc succ ->
+            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
+              (block.label, succ) :: acc
+            else acc)
+          acc block.succs)
+      [] f.blocks
+  in
+  if backedges = [] then f
+  else
+    let loops = Hashtbl.create 8 in
+    List.iter
+      (fun (pred, header) ->
+        let loop = natural_loop block_map header pred in
+        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
+        Hashtbl.replace loops header merged)
+      backedges;
+    let headers =
+      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
+      |> List.sort (fun (_, a) (_, b) -> compare a b)
+      |> List.map fst
+    in
+    let current_blocks = Hashtbl.create (List.length f.blocks + (8 * List.length headers)) in
+    List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
+    let block_order = ref (List.map (fun (block : Cfg.block) -> block.label) f.blocks) in
+    let get_block label =
+      match Hashtbl.find_opt current_blocks label with
+      | Some block -> block
+      | None -> failwith ("internal missing block: " ^ label)
+    in
+    let current_block_list () = List.map get_block !block_order in
+    let insert_after label new_labels =
+      block_order :=
+        List.concat_map
+          (fun current -> if current = label then current :: new_labels else [ current ])
+          !block_order
+    in
+    let next_id = ref 0 in
+    let fresh_unroll_label iter index =
+      let id = !next_id in
+      Printf.sprintf ".L%s_full_unroll_%d_%d_%d" f.label id iter index
+    in
+    let changed = ref false in
+    let current_entry = ref f.entry in
+    List.iter
+      (fun header ->
+        let loop = table_find_or_empty loops header LabelSet.empty in
+        let blocks_snapshot = current_block_list () in
+        let loop_defs = loop_defined_temps loop blocks_snapshot in
+        let def_blocks = temp_def_blocks_of_blocks f.temp_count blocks_snapshot in
+        let def_instrs = temp_def_instrs_of_blocks f.temp_count blocks_snapshot in
+        let multi_defs = multi_def_temps_of_blocks f.temp_count blocks_snapshot in
+        let effects = collect_loop_effects summaries globals loop blocks_snapshot in
+        let loop_stable_phis =
+          collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
+        in
+        let ivs =
+          collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs
+        in
+        match
+          find_counted_loop_control
+            loop
+            loop_defs
+            loop_stable_phis
+            multi_defs
+            def_instrs
+            ivs
+            get_block
+        with
+        | None -> ()
+        | Some info -> (
+            let control_block : Cfg.block = get_block info.control_label in
+            match linear_loop_path info.control_label loop get_block info.inside_label with
+            | None -> ()
+            | Some path ->
+                let outside_preds =
+                  let header_block : Cfg.block = get_block header in
+                  List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds
+                in
+                let total_instrs =
+                  List.length control_block.body
+                  + List.fold_left
+                      (fun acc (block : Cfg.block) -> acc + List.length block.body)
+                      0 path
+                in
+                let modified_globals = global_places effects.modified_places in
+                let resolve_const operand =
+                  match resolve_operand_before_loop loop_defs multi_defs def_instrs operand with
+                  | Some (Tcg.Imm value) -> Some value
+                  | Some (Tcg.Temp _) | None -> None
+                in
+                let init_values =
+                  info.control_iv.outside_inputs
+                  |> List.filter_map (fun (_, operand) -> resolve_const operand)
+                  |> List.sort_uniq compare
+                in
+                let trip_count =
+                  match init_values with
+                  | [ init_value ] ->
+                      constant_trip_count_of_kind resolve_const init_value info.control_iv.step info.kind
+                  | _ -> None
+                in
+                if
+                  effects.has_call
+                  || not (PlaceSet.is_empty modified_globals)
+                  || not (control_body_supported control_block.body)
+                  || path = []
+                  || List.length path > full_unroll_max_blocks
+                  || total_instrs > full_unroll_max_instrs
+                  || (outside_preds = [] && header <> !current_entry)
+                then ()
+                else
+                  match trip_count with
+                  | Some trip when 0L <= trip && trip <= full_unroll_max_trip ->
+                      let target_label =
+                        if trip = 0L then info.exit_label
+                        else
+                          let trip_int = Int64.to_int trip in
+                          let copies =
+                            Array.init trip_int (fun iter ->
+                                Array.of_list
+                                  (List.mapi
+                                     (fun index (block : Cfg.block) ->
+                                       (block.label, fresh_unroll_label iter index))
+                                     path))
+                          in
+                          incr next_id;
+                          let rename copied_labels label =
+                            Array.fold_left
+                              (fun acc (original, renamed) ->
+                                match acc with Some _ -> acc | None -> if original = label then Some renamed else None)
+                              None copied_labels
+                            |> Option.value ~default:label
+                          in
+                          let next_entry iter =
+                            if iter + 1 < trip_int then snd copies.(iter + 1).(0) else info.exit_label
+                          in
+                          let new_labels = ref [] in
+                          Array.iteri
+                            (fun iter copied_labels ->
+                              let copied_blocks =
+                                List.mapi
+                                  (fun index (block : Cfg.block) ->
+                                    let label = snd copied_labels.(index) in
+                                    let term =
+                                      if index + 1 = List.length path then
+                                        Cfg.Jump (next_entry iter)
+                                      else rewrite_term_labels (rename copied_labels) block.term
+                                    in
+                                    let body =
+                                      if index + 1 = List.length path then block.body @ control_block.body
+                                      else block.body
+                                    in
+                                    { block with label; body; term; succs = Cfg.successors term })
+                                  path
+                              in
+                              List.iter
+                                (fun (block : Cfg.block) ->
+                                  Hashtbl.add current_blocks block.label block;
+                                  new_labels := block.label :: !new_labels)
+                                copied_blocks)
+                            copies;
+                          let entry_label = snd copies.(0).(0) in
+                          insert_after info.control_label (List.rev !new_labels);
+                          changed := true;
+                          entry_label
+                      in
+                      List.iter
+                        (fun pred ->
+                          let pred_block = get_block pred in
+                          let term =
+                            rewrite_term_successor pred_block.term ~from_label:header ~to_label:target_label
+                          in
+                          Hashtbl.replace current_blocks pred
+                            { pred_block with term; succs = Cfg.successors term })
+                        outside_preds;
+                      if header = !current_entry then current_entry := target_label
+                  | Some _ | None -> ()))
+      headers;
+    if !changed then
+      let blocks = List.map get_block !block_order in
+      Cfg.rebuild_edges { f with entry = !current_entry; blocks }
     else f
 
 let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
@@ -7222,17 +7658,17 @@ let stage_round_enabled profile round stage =
   | "huge" -> (
       match stage with
       | "split_reductions" | "unswitch" -> round <= 2
-      | "unroll2" | "rotate" | "gvn2" -> round <= 1
+      | "full_unroll" | "unroll2" | "rotate" | "gvn2" -> round <= 1
       | _ -> true)
   | "large" -> (
       match stage with
       | "split_reductions" | "unswitch" -> round <= 3
-      | "unroll2" | "rotate" | "gvn2" -> round <= 4
+      | "full_unroll" | "unroll2" | "rotate" | "gvn2" -> round <= 4
       | _ -> true)
   | "medium" -> (
       match stage with
       | "split_reductions" | "unswitch" -> round <= 2
-      | "unroll2" | "rotate" -> round <= 3
+      | "full_unroll" | "unroll2" | "rotate" -> round <= 3
       | _ -> true)
   | _ -> true
 
@@ -7292,10 +7728,15 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
       profile.enable_gvn2 (format_metrics base_metrics) (format_metrics promoted_metrics);
   let step round func =
     try
+      let after_canon =
+        run_stage round "canonicalize"
+          (loop_canonicalize_func summaries globals)
+          func
+      in
       let after_const1 =
         run_stage round "const1"
           (const_propagate_func global_init summaries globals)
-          func
+          after_canon
       in
       let after_copy1 = run_stage round "copy1" copy_propagate_func after_const1 in
       let after_sr = run_stage round "sr" strength_reduce_func after_copy1 in
@@ -7349,12 +7790,19 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
           (eliminate_counted_loops_func summaries globals)
           after_split
       in
+      let after_full_unroll =
+        run_stage round
+          ~enabled:(profile.enable_unroll && stage_round_enabled profile round "full_unroll")
+          "full_unroll"
+          (full_unroll_counted_loops_func summaries globals)
+          after_counted
+      in
       let after_unroll =
         run_stage round
           ~enabled:(profile.enable_unroll && stage_round_enabled profile round "unroll2")
           "unroll2"
           (unroll_counted_loops_x2_func summaries globals)
-          after_counted
+          after_full_unroll
       in
       let after_thread2 = run_stage round "thread2" thread_and_prune_func after_unroll in
       let after_fold2 =
