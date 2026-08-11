@@ -5032,10 +5032,10 @@ let choose_opt_profile metrics =
     {
       name = "medium";
       max_rounds = 5;
-      enable_unswitch = false;
+      enable_unswitch = true;
       enable_split_reductions = true;
-      enable_unroll = false;
-      enable_rotate = false;
+      enable_unroll = true;
+      enable_rotate = true;
       enable_gvn2 = true;
     }
   else
@@ -5048,6 +5048,14 @@ let choose_opt_profile metrics =
       enable_rotate = true;
       enable_gvn2 = true;
     }
+
+let stage_budget_enabled profile round stage_enabled =
+  if not stage_enabled then false
+  else
+    match profile.name with
+    | "medium" -> round = 1
+    | "large" -> false
+    | _ -> true
 
 let optimize_func global_init summaries globals (f : Cfg.func) =
   let promoted = f |> mem2reg_func |> promote_globals_func summaries globals in
@@ -5109,7 +5117,9 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
       let after_reassoc = run_stage round "reassoc" reassociate_loop_adds_func after_dce1 in
       let after_licm = run_stage round "licm" (licm_func summaries globals) after_reassoc in
       let after_unswitch =
-        run_stage round ~enabled:profile.enable_unswitch "unswitch"
+        run_stage round
+          ~enabled:(stage_budget_enabled profile round profile.enable_unswitch)
+          "unswitch"
           (unswitch_loops_func summaries globals)
           after_licm
       in
@@ -5145,7 +5155,9 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
           after_split
       in
       let after_unroll =
-        run_stage round ~enabled:profile.enable_unroll "unroll2"
+        run_stage round
+          ~enabled:(stage_budget_enabled profile round profile.enable_unroll)
+          "unroll2"
           (unroll_counted_loops_x2_func summaries globals)
           after_counted
       in
@@ -5154,7 +5166,10 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
         run_stage round "fold2" (fold_branch_tails_func summaries globals) after_thread2
       in
       let after_rotate =
-        run_stage round ~enabled:profile.enable_rotate "rotate" loop_rotate_func after_fold2
+        run_stage round
+          ~enabled:(stage_budget_enabled profile round profile.enable_rotate)
+          "rotate"
+          loop_rotate_func after_fold2
       in
       let after_thread3 = run_stage round "thread3" thread_and_prune_func after_rotate in
       let after_fold3 =
