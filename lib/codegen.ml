@@ -125,6 +125,16 @@ let max_call_args (f : Cfg.func) =
         current block.body)
     0 f.blocks
 
+let calls_function (f : Cfg.func) =
+  List.exists
+    (fun (block : Cfg.block) ->
+      List.exists
+        (function
+          | Tcg.Call _ -> true
+          | _ -> false)
+        block.body)
+    f.blocks
+
 let referenced_local_ids (f : Cfg.func) =
   let add_place locals = function
     | Tcg.Local id -> IntSet.add id locals
@@ -627,10 +637,26 @@ let compute_layout (f : Cfg.func) =
   let extra_args = max 0 (max_call_args f - 8) in
   let outgoing_area = align16 (extra_args * 4) in
   let frame_bytes = outgoing_area + (!next - 4) in
+  let has_stack_temp =
+    Hashtbl.fold
+      (fun _ home found ->
+        found
+        ||
+        match home with
+        | TempStack _ -> true
+        | TempReg _ -> false)
+      temp_homes false
+  in
+  let needs_frame =
+    calls_function f
+    || saved_regs <> []
+    || Hashtbl.length local_offsets > 0
+    || has_stack_temp
+  in
   {
     local_offsets;
     temp_homes;
-    frame_size = align16 frame_bytes;
+    frame_size = if needs_frame then align16 frame_bytes else 0;
     outgoing_area;
     saved_regs;
   }
@@ -991,12 +1017,14 @@ let forwarded_move_jump_terminator ctx dst src succ_label =
   | Some _ | None -> None
 
 let restore_frame ctx =
-  List.iteri
-    (fun i reg -> emitf ctx "    lw %s, %d(sp)" reg (ctx.frame_size - (12 + (4 * i))))
-    ctx.saved_regs;
-  emitf ctx "    lw ra, %d(sp)" (ctx.frame_size - 4);
-  emitf ctx "    lw s0, %d(sp)" (ctx.frame_size - 8);
-  emitf ctx "    addi sp, sp, %d" ctx.frame_size
+  if ctx.frame_size > 0 then begin
+    List.iteri
+      (fun i reg -> emitf ctx "    lw %s, %d(sp)" reg (ctx.frame_size - (12 + (4 * i))))
+      ctx.saved_regs;
+    emitf ctx "    lw ra, %d(sp)" (ctx.frame_size - 4);
+    emitf ctx "    lw s0, %d(sp)" (ctx.frame_size - 8);
+    emitf ctx "    addi sp, sp, %d" ctx.frame_size
+  end
 
 let gen_tail_return_instr ctx (instr : Tcg.simple_instr) =
   match instr with
@@ -1099,13 +1127,15 @@ let gen_func buf (f : Cfg.func) =
   emit ctx "    .align 2";
   if f.name = "main" then emit ctx "    .globl main";
   emitf ctx "%s:" f.label;
-  emitf ctx "    addi sp, sp, -%d" layout.frame_size;
-  emitf ctx "    sw ra, %d(sp)" (layout.frame_size - 4);
-  emitf ctx "    sw s0, %d(sp)" (layout.frame_size - 8);
-  List.iteri
-    (fun i reg -> emitf ctx "    sw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
-    layout.saved_regs;
-  emitf ctx "    addi s0, sp, %d" layout.frame_size;
+  if layout.frame_size > 0 then begin
+    emitf ctx "    addi sp, sp, -%d" layout.frame_size;
+    emitf ctx "    sw ra, %d(sp)" (layout.frame_size - 4);
+    emitf ctx "    sw s0, %d(sp)" (layout.frame_size - 8);
+    List.iteri
+      (fun i reg -> emitf ctx "    sw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
+      layout.saved_regs;
+    emitf ctx "    addi s0, sp, %d" layout.frame_size
+  end;
   List.iteri
     (fun i (param : Tcg.var) ->
       match Hashtbl.find_opt layout.local_offsets param.id with
