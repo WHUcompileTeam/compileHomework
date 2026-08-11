@@ -2847,14 +2847,16 @@ let incoming_phi_chain get_block succ_label pred_label =
   walk LabelSet.empty pred_label []
 
 let incoming_update_chain get_block succ_label pred_label =
-  let chain = incoming_phi_chain get_block succ_label pred_label in
-  match List.rev chain with
-  | [] -> chain
-  | (upstream : Cfg.block) :: _ -> (
-      match upstream.preds with
-      | [ prev ] when not (List.exists (fun (block : Cfg.block) -> block.label = prev) chain) ->
-          chain @ [ get_block prev ]
-      | _ -> chain)
+  let rec walk seen label acc =
+    if LabelSet.mem label seen || label = succ_label then List.rev acc
+    else
+      let block : Cfg.block = get_block label in
+      let acc = block :: acc in
+      match block.preds with
+      | [ prev ] -> walk (LabelSet.add label seen) prev acc
+      | _ -> List.rev acc
+  in
+  walk LabelSet.empty pred_label []
 
 let resolve_chain_operand chain operand =
   let move_defs = Hashtbl.create 8 in
@@ -4411,23 +4413,24 @@ let build_reduction_final_update fresh_temp trip_temp (reduction : counted_reduc
           delta_instrs @ [ update ] @ alias_updates
       | ReductionPlaceTarget place ->
           let acc_temp = fresh_temp () in
+          let updated_temp = fresh_temp () in
           let load = simplify_simple_instr (Tcg.Load (acc_temp, place)) in
           let update =
             if reduction.subtract then
               simplify_simple_instr
                 (Tcg.Bin
-                   (acc_temp, Sub, Tcg.Temp acc_temp, delta_operand))
+                   (updated_temp, Sub, Tcg.Temp acc_temp, delta_operand))
             else
               simplify_simple_instr
                 (Tcg.Bin
-                   (acc_temp, Add, Tcg.Temp acc_temp, delta_operand))
+                   (updated_temp, Add, Tcg.Temp acc_temp, delta_operand))
            in
           let alias_updates =
             List.map
-              (fun temp -> simplify_simple_instr (Tcg.Move (temp, Tcg.Temp acc_temp)))
+              (fun temp -> simplify_simple_instr (Tcg.Move (temp, Tcg.Temp updated_temp)))
               reduction.alias_temps
           in
-          delta_instrs @ [ load; update; Tcg.Store (place, Tcg.Temp acc_temp) ] @ alias_updates)
+          delta_instrs @ [ load; update; Tcg.Store (place, Tcg.Temp updated_temp) ] @ alias_updates)
 
 let loop_instr_count loop blocks =
   List.fold_left
@@ -6148,18 +6151,32 @@ let format_metrics { block_count; instr_count; temp_count } =
 
 let choose_opt_profile metrics =
   if
-    metrics.block_count >= 48
-    || metrics.instr_count >= 240
-    || metrics.temp_count >= 128
+    metrics.block_count >= 96
+    || metrics.instr_count >= 480
+    || metrics.temp_count >= 256
   then
     {
-      name = "large";
+      name = "huge";
       max_rounds = 3;
       enable_unswitch = true;
       enable_split_reductions = true;
       enable_unroll = false;
       enable_rotate = false;
       enable_gvn2 = false;
+    }
+  else if
+    metrics.block_count >= 48
+    || metrics.instr_count >= 240
+    || metrics.temp_count >= 128
+  then
+    {
+      name = "large";
+      max_rounds = 5;
+      enable_unswitch = true;
+      enable_split_reductions = true;
+      enable_unroll = true;
+      enable_rotate = true;
+      enable_gvn2 = true;
     }
   else if
     metrics.block_count >= 24
@@ -6198,15 +6215,20 @@ let stage_budget_enabled profile round stage_enabled =
 
 let stage_round_enabled profile round stage =
   match profile.name with
+  | "huge" -> (
+      match stage with
+      | "split_reductions" | "unswitch" -> round <= 1
+      | _ -> false)
+  | "large" -> (
+      match stage with
+      | "split_reductions" | "unswitch" -> round <= 2
+      | "unroll2" | "rotate" | "gvn2" -> round <= 3
+      | _ -> true)
   | "medium" -> (
       match stage with
       | "split_reductions" | "unswitch" -> round <= 1
       | "unroll2" | "rotate" -> round <= 2
       | _ -> true)
-  | "large" -> (
-      match stage with
-      | "split_reductions" | "unswitch" -> round <= 1
-      | _ -> false)
   | _ -> true
 
 let optimize_func global_init summaries globals (f : Cfg.func) =

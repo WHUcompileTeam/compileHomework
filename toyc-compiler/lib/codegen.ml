@@ -593,6 +593,20 @@ let compute_global_access_stats (f : Cfg.func) =
 
 let select_global_base_regs (f : Cfg.func) =
   let stats = compute_global_access_stats f in
+  let reserved_budget =
+    if f.temp_count >= 192 || block_instr_count f.blocks >= 384 then 0
+    else if f.temp_count >= 96 || block_instr_count f.blocks >= 192 then 1
+    else List.length reserved_global_base_regs
+  in
+  let available_reserved_regs =
+    reserved_global_base_regs
+    |> List.fold_left
+         (fun (acc, slots_left) reg ->
+           if slots_left <= 0 then (acc, 0) else (reg :: acc, slots_left - 1))
+         ([], reserved_budget)
+    |> fst
+    |> List.rev
+  in
   let candidates =
     Hashtbl.fold
       (fun label ({ count; score } : global_access_stats) acc ->
@@ -606,7 +620,7 @@ let select_global_base_regs (f : Cfg.func) =
                | c -> c)
            | c -> c)
   in
-  let mapping = Hashtbl.create (List.length reserved_global_base_regs) in
+  let mapping = Hashtbl.create (List.length available_reserved_regs) in
   let rec assign regs remaining =
     match (regs, remaining) with
     | reg :: regs_rest, (label, _, _) :: rest ->
@@ -614,7 +628,7 @@ let select_global_base_regs (f : Cfg.func) =
         assign regs_rest rest
     | _ -> ()
   in
-  assign reserved_global_base_regs candidates;
+  assign available_reserved_regs candidates;
   mapping
 
 let compute_temp_intervals (f : Cfg.func) =
@@ -841,7 +855,8 @@ let allocate_temp_regs ?(reserved_saved_regs = []) (f : Cfg.func) =
   in
   let prefer_saved_regs (interval : interval) =
     interval.loop_carried_score >= 1
-    && interval.loop_use_score + interval.loop_def_score >= 4
+    || interval.loop_use_score + interval.loop_def_score >= 8
+    || interval.spill_weight >= 4096
   in
   let allowed_arg_regs (interval : interval) =
     if interval.call_crossings <> 0 then []
