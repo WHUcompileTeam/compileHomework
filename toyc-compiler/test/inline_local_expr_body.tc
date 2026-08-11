@@ -1,0 +1,9 @@
+int mix(int x, int y) {
+  int t = x + y;
+  int u = t - 1;
+  return u + u;
+}
+
+int main() {
+  return mix(4, 3);
+}

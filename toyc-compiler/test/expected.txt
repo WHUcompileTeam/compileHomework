@@ -41,3 +41,5 @@ inline_expr_chain.tc 12
 inline_call_by_value_guard.tc 2
 effect_summary_selective_global.tc 27
 unswitch_invariant_branch.tc 18
+inline_local_expr_body.tc 12
+counted_split_reduction.tc 73
