@@ -37,3 +37,7 @@ regalloc_loop_carried_call.tc 199
 regalloc_many_args.tc 100
 recursion_void_global.tc 120
 global_hot_loop.tc 63
+inline_expr_chain.tc 12
+inline_call_by_value_guard.tc 2
+effect_summary_selective_global.tc 27
+unswitch_invariant_branch.tc 18

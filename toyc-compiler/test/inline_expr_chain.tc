@@ -1,0 +1,12 @@
+int add1(int x) {
+  return x + 1;
+}
+
+int twice(int x) {
+  return x + x;
+}
+
+int main() {
+  int a = 5;
+  return twice(add1(a));
+}

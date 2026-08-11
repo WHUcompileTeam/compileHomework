@@ -32,6 +32,7 @@ type inline_func = {
   params : string list;
   body : expr;
   cost : int;
+  param_uses : int StringMap.t;
 }
 
 let truth n = n <> 0L
@@ -105,7 +106,16 @@ let rec expr_cost = function
   | Unary (_, e) -> 1 + expr_cost e
   | Binary (_, lhs, rhs) -> 1 + expr_cost lhs + expr_cost rhs
 
-let inline_expr_limit = 18
+let rec expr_var_uses counts = function
+  | Int _ -> counts
+  | Var name ->
+      let count = Option.value ~default:0 (StringMap.find_opt name counts) in
+      StringMap.add name (count + 1) counts
+  | Call (_, args) -> List.fold_left expr_var_uses counts args
+  | Unary (_, e) -> expr_var_uses counts e
+  | Binary (_, lhs, rhs) -> expr_var_uses (expr_var_uses counts lhs) rhs
+
+let inline_expr_limit = 28
 let inline_expr_depth_limit = 6
 
 let rec subst_inline_expr env = function
@@ -124,7 +134,13 @@ let inline_def_of_func (f : Ast.func) =
   | TInt, [ Return (Some body) ] when not (expr_has_call body) ->
       let cost = expr_cost body in
       if cost <= inline_expr_limit then
-        Some { params = List.map (fun (param : Ast.ident) -> param.name) f.params; body; cost }
+        Some
+          {
+            params = List.map (fun (param : Ast.ident) -> param.name) f.params;
+            body;
+            cost;
+            param_uses = expr_var_uses StringMap.empty body;
+          }
       else None
   | _ -> None
 
@@ -138,7 +154,11 @@ let rec inline_expr func_env depth = function
         (match StringMap.find_opt name func_env with
         | Some def
           when List.length def.params = List.length args
-               && List.for_all (fun arg -> not (expr_has_call arg)) args ->
+               && List.for_all2
+                    (fun param arg ->
+                      let uses = Option.value ~default:0 (StringMap.find_opt param def.param_uses) in
+                      not (expr_has_call arg) || uses <= 1)
+                    def.params args ->
             let subst_env =
               List.fold_left2
                 (fun env param arg -> StringMap.add param arg env)
@@ -406,6 +426,11 @@ let call_read_globals summaries globals callee =
 
 let call_written_globals summaries globals callee =
   (call_effect_summary summaries globals callee).written_globals
+
+let call_touched_globals summaries globals callee =
+  PlaceSet.union
+    (call_read_globals summaries globals callee)
+    (call_written_globals summaries globals callee)
 
 let summarize_func summaries globals (f : Cfg.func) =
   List.fold_left
@@ -1660,10 +1685,14 @@ let mem2reg_func (f : Cfg.func) =
   attempt all_candidates
 
 let promote_globals_func summaries globals (f : Cfg.func) =
-  let all_candidates = stored_globals_in_func f in
+  let stored_candidates = stored_globals_in_func f in
+  let readonly_candidates = PlaceSet.diff (globals_in_func f) stored_candidates in
+  let all_candidates = PlaceSet.union stored_candidates readonly_candidates in
   let rec attempt candidates =
     if PlaceSet.is_empty candidates then f
     else begin
+      let writeback_candidates = PlaceSet.inter stored_candidates candidates in
+      let preload_candidates = candidates in
       let next_temp = ref f.temp_count in
       let fresh_temp () =
         let temp = !next_temp in
@@ -1674,6 +1703,17 @@ let promote_globals_func summaries globals (f : Cfg.func) =
       let out_envs = Hashtbl.create (List.length f.blocks) in
       let phi_temps = Hashtbl.create (max 8 (List.length f.blocks)) in
       let get_env table label = table_find_or_empty table label PlaceMap.empty in
+      let entry_preloads_rev = ref [] in
+      let entry_env =
+        PlaceSet.fold
+          (fun place env ->
+            let temp = fresh_temp () in
+            entry_preloads_rev :=
+              simplify_simple_instr (Tcg.Load (temp, place)) :: !entry_preloads_rev;
+            PlaceMap.add place (Tcg.Temp temp) env)
+          preload_candidates PlaceMap.empty
+      in
+      let entry_preloads = List.rev !entry_preloads_rev in
       let kill_env_places places env =
         PlaceSet.fold (fun place env -> PlaceMap.remove place env) places env
       in
@@ -1693,7 +1733,7 @@ let promote_globals_func summaries globals (f : Cfg.func) =
             temp
       in
       let compute_in_env (block : Cfg.block) =
-        if block.label = f.entry then PlaceMap.empty
+        if block.label = f.entry then entry_env
         else
           PlaceSet.fold
             (fun place env ->
@@ -1709,10 +1749,7 @@ let promote_globals_func summaries globals (f : Cfg.func) =
                         match all_same_operand values with
                         | Some value -> Some value
                         | None -> Some (Tcg.Temp (get_phi_temp block.label place)))
-                    | None ->
-                        if List.exists Option.is_some incoming then
-                          Some (Tcg.Temp (get_phi_temp block.label place))
-                        else None)
+                    | None -> None)
               in
               match keep_value with
               | Some value -> PlaceMap.add place value env
@@ -1723,6 +1760,8 @@ let promote_globals_func summaries globals (f : Cfg.func) =
         List.fold_left
           (fun env instr ->
             match instr with
+            | Tcg.Load (dst, place) when PlaceSet.mem place candidates ->
+                PlaceMap.add place (Tcg.Temp dst) env
             | Tcg.Store (place, value) when PlaceSet.mem place candidates -> PlaceMap.add place value env
             | Tcg.Call (_, callee, _) ->
                 kill_env_places
@@ -1749,12 +1788,27 @@ let promote_globals_func summaries globals (f : Cfg.func) =
       let failed = ref PlaceSet.empty in
       List.iter
         (fun (block : Cfg.block) ->
+          if block.label <> f.entry then
+            PlaceSet.iter
+              (fun place ->
+                if PlaceSet.mem place writeback_candidates then
+                  let incoming =
+                    List.map
+                      (fun pred -> PlaceMap.find_opt place (get_env out_envs pred))
+                      block.preds
+                  in
+                  match all_present incoming with
+                  | Some _ -> ()
+                  | None ->
+                      if List.exists Option.is_some incoming then
+                        failed := PlaceSet.add place !failed)
+              candidates;
           let env = ref (get_env in_envs block.label) in
           List.iter
             (fun instr ->
               match instr with
-                | Tcg.Load (_, place) when PlaceSet.mem place candidates ->
-                    if not (PlaceMap.mem place !env) then failed := PlaceSet.add place !failed
+                | Tcg.Load (dst, place) when PlaceSet.mem place candidates ->
+                    env := PlaceMap.add place (Tcg.Temp dst) !env
                 | Tcg.Store (place, value) when PlaceSet.mem place candidates ->
                     env := PlaceMap.add place value !env
                 | Tcg.Call (_, callee, _) ->
@@ -1780,7 +1834,7 @@ let promote_globals_func summaries globals (f : Cfg.func) =
       if not (PlaceSet.is_empty !failed) then attempt (PlaceSet.diff candidates !failed)
       else
         let flush_env env =
-          PlaceSet.elements candidates
+          PlaceSet.elements writeback_candidates
           |> List.filter_map (fun place ->
                  match PlaceMap.find_opt place env with
                  | Some value -> Some (Tcg.Store (place, value))
@@ -1795,20 +1849,29 @@ let promote_globals_func summaries globals (f : Cfg.func) =
                     match PlaceMap.find_opt place env with
                     | Some value ->
                         rewrite env (simplify_simple_instr (Tcg.Move (dst, value)) :: acc) rest
-                    | None -> rewrite env (instr :: acc) rest)
+                    | None ->
+                        rewrite (PlaceMap.add place (Tcg.Temp dst) env) (instr :: acc) rest)
                 | Tcg.Store (place, value) when PlaceSet.mem place candidates ->
                     rewrite (PlaceMap.add place value env) acc rest
                 | Tcg.Call (_, callee, _) as instr ->
+                    let call_flushes =
+                      PlaceSet.inter
+                        writeback_candidates
+                        (call_touched_globals summaries globals callee)
+                    in
                     let call_kills =
                       PlaceSet.inter candidates (call_written_globals summaries globals callee)
                     in
-                    let flushed = flush_env_places call_kills env in
+                    let flushed = flush_env_places call_flushes env in
                     let acc = List.rev_append (flushed @ [ instr ]) acc in
                     rewrite (kill_env_places call_kills env) acc rest
                 | _ -> rewrite env (instr :: acc) rest)
           in
           let env_out, body = rewrite (get_env in_envs block.label) [] block.body in
           let body =
+            let body =
+              if block.label = f.entry && entry_preloads <> [] then entry_preloads @ body else body
+            in
             match block.term with
             | Cfg.Return _ -> body @ flush_env env_out
             | _ -> body
@@ -2155,10 +2218,6 @@ let eliminate_dead_loops_func summaries globals (f : Cfg.func) =
 
 let load_place_invariant effects place =
   not (PlaceSet.mem place effects.modified_places)
-  &&
-  match place with
-  | Tcg.Local _ -> false
-  | Tcg.Global _ -> not effects.has_call
 
 type basic_induction_var = {
   phi_temp : Tcg.temp;
@@ -4514,14 +4573,16 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
         eliminate_dead_loops_func summaries globals after_dce2 |> stop_after "dead_loops"
       in
       let after_fold = fold_branch_tails_func summaries globals after_dead_loops |> stop_after "fold" in
+      let after_thread1 = thread_and_prune_func after_fold |> stop_after "thread1" in
       let after_counted =
-        eliminate_counted_loops_func summaries globals after_fold |> stop_after "counted_loops"
+        eliminate_counted_loops_func summaries globals after_thread1
+        |> stop_after "counted_loops"
       in
       let after_unroll =
         unroll_counted_loops_x2_func summaries globals after_counted |> stop_after "unroll2"
       in
-      let after_thread = thread_and_prune_func after_unroll |> stop_after "thread" in
-      let after_fold2 = fold_branch_tails_func summaries globals after_thread |> stop_after "fold2" in
+      let after_thread2 = thread_and_prune_func after_unroll |> stop_after "thread2" in
+      let after_fold2 = fold_branch_tails_func summaries globals after_thread2 |> stop_after "fold2" in
       after_fold2
     with
     | StopPass current -> current

@@ -1,0 +1,18 @@
+int keep = 7;
+int noise = 0;
+
+int bump() {
+  noise = noise + 1;
+  return noise;
+}
+
+int main() {
+  int i = 0;
+  int sum = 0;
+  while (i < 3) {
+    sum = sum + keep;
+    sum = sum + bump();
+    i = i + 1;
+  }
+  return sum;
+}

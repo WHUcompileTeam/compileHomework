@@ -1,0 +1,23 @@
+int noise = 0;
+
+int tick() {
+  noise = noise + 1;
+  return noise;
+}
+
+int main() {
+  int i = 0;
+  int sum = 0;
+  int flag = 1;
+  int base = 2;
+  while (i < 4) {
+    if (flag) {
+      sum = sum + base;
+    } else {
+      sum = sum + 1;
+    }
+    sum = sum + tick();
+    i = i + 1;
+  }
+  return sum;
+}
