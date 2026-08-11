@@ -2038,19 +2038,19 @@ let promote_locals_func (f : Cfg.func) =
   let stored_candidates = stored_locals_in_func f in
   let readonly_candidates = PlaceSet.diff (locals_in_func f) stored_candidates in
   let all_candidates = PlaceSet.union stored_candidates readonly_candidates in
-  let rec attempt candidates =
-    if PlaceSet.is_empty candidates then f
+  let rec attempt (current : Cfg.func) candidates =
+    if PlaceSet.is_empty candidates then current
     else begin
       let writeback_candidates = PlaceSet.inter stored_candidates candidates in
-      let next_temp = ref f.temp_count in
+      let next_temp = ref current.temp_count in
       let fresh_temp () =
         let temp = !next_temp in
         incr next_temp;
         temp
       in
-      let in_envs = Hashtbl.create (List.length f.blocks) in
-      let out_envs = Hashtbl.create (List.length f.blocks) in
-      let phi_temps = Hashtbl.create (max 8 (List.length f.blocks)) in
+      let in_envs = Hashtbl.create (List.length current.blocks) in
+      let out_envs = Hashtbl.create (List.length current.blocks) in
+      let phi_temps = Hashtbl.create (max 8 (List.length current.blocks)) in
       let get_env table label = table_find_or_empty table label PlaceMap.empty in
       let entry_preloads_rev = ref [] in
       let entry_env =
@@ -2060,14 +2060,18 @@ let promote_locals_func (f : Cfg.func) =
               let place = Tcg.Local param.id in
               if PlaceSet.mem place candidates then
                 let temp = fresh_temp () in
-                entry_preloads_rev :=
-                  simplify_simple_instr (Tcg.Load (temp, place)) :: !entry_preloads_rev;
+                entry_preloads_rev
+                := (place, simplify_simple_instr (Tcg.Load (temp, place))) :: !entry_preloads_rev;
                 PlaceMap.add place (Tcg.Temp temp) env
               else env)
-            PlaceMap.empty f.params
+            PlaceMap.empty current.params
         else PlaceMap.empty
       in
-      let entry_preloads = List.rev !entry_preloads_rev in
+      let entry_preloads_for promoted_places =
+        List.rev !entry_preloads_rev
+        |> List.filter_map (fun (place, instr) ->
+               if PlaceSet.mem place promoted_places then Some instr else None)
+      in
       let get_phi_temp label place =
         match Hashtbl.find_opt phi_temps (label, place) with
         | Some temp -> temp
@@ -2077,7 +2081,7 @@ let promote_locals_func (f : Cfg.func) =
             temp
       in
       let compute_in_env (block : Cfg.block) =
-        if block.label = f.entry then entry_env
+        if block.label = current.entry then entry_env
         else
           PlaceSet.fold
             (fun place env ->
@@ -2123,12 +2127,12 @@ let promote_locals_func (f : Cfg.func) =
             if not (equal_place_operand_map out_env (get_env out_envs block.label)) then (
               Hashtbl.replace out_envs block.label out_env;
               changed := true))
-          f.blocks
+          current.blocks
       done;
       let failed = ref PlaceSet.empty in
       List.iter
         (fun (block : Cfg.block) ->
-          if block.label <> f.entry then
+          if block.label <> current.entry then
             PlaceSet.iter
               (fun place ->
                 if PlaceSet.mem place writeback_candidates then
@@ -2163,11 +2167,17 @@ let promote_locals_func (f : Cfg.func) =
                         if not (PlaceMap.mem place (get_env out_envs pred)) then
                           failed := PlaceSet.add place !failed)
                       block.preds
-                | _ -> ())
+                  | _ -> ())
             phi_temps)
-        f.blocks;
-      if not (PlaceSet.is_empty !failed) then attempt (PlaceSet.diff candidates !failed)
+        current.blocks;
+      if not (PlaceSet.is_empty !failed) then
+        let succeeded = PlaceSet.diff candidates !failed in
+        if PlaceSet.is_empty succeeded then current
+        else
+          let promoted = attempt current succeeded in
+          attempt promoted !failed
       else
+        let entry_preloads = entry_preloads_for candidates in
         let flush_env env =
           PlaceSet.elements writeback_candidates
           |> List.filter_map (fun place ->
@@ -2193,7 +2203,9 @@ let promote_locals_func (f : Cfg.func) =
           let env_out, body = rewrite (get_env in_envs block.label) [] block.body in
           let body =
             let body =
-              if block.label = f.entry && entry_preloads <> [] then entry_preloads @ body else body
+              if block.label = current.entry && entry_preloads <> [] then
+                entry_preloads @ body
+              else body
             in
             match block.term with
             | Cfg.Return _ -> body @ flush_env env_out
@@ -2201,14 +2213,14 @@ let promote_locals_func (f : Cfg.func) =
           in
           { block with body }
         in
-        let promoted_blocks = List.map rewrite_block f.blocks in
+        let promoted_blocks = List.map rewrite_block current.blocks in
         let redirects = Hashtbl.create 16 in
         let edge_blocks_rev = ref [] in
         let edge_id = ref 0 in
         let fresh_edge_label () =
           let id = !edge_id in
           incr edge_id;
-          Printf.sprintf ".L%s_lprom_edge_%d" f.label id
+          Printf.sprintf ".L%s_lprom_edge_%d" current.label id
         in
         let build_parallel_copies copies =
           let snapshots = Hashtbl.create (List.length copies) in
@@ -2283,10 +2295,10 @@ let promote_locals_func (f : Cfg.func) =
             promoted_blocks
           @ List.rev !edge_blocks_rev
         in
-        Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
+        Cfg.rebuild_edges { current with temp_count = !next_temp; blocks }
     end
   in
-  attempt all_candidates
+  attempt f all_candidates
 
 let promote_globals_func summaries globals (f : Cfg.func) =
   let stored_candidates = stored_globals_in_func f in
@@ -3491,6 +3503,7 @@ type counted_reduction = {
   target : counted_reduction_target;
   subtract : bool;
   step : counted_reduction_step;
+  carrier_temp : Tcg.temp option;
   alias_temps : Tcg.temp list;
 }
 
@@ -3942,7 +3955,44 @@ let counted_update_place = function
   | CountedIv _ | CountedReduction { target = ReductionTempTarget _; _ } -> None
 
 let add_reduction_alias_temps acc (reduction : counted_reduction) =
+  let acc =
+    match reduction.carrier_temp with
+    | Some temp -> IntSet.add temp acc
+    | None -> acc
+  in
   List.fold_left (fun acc temp -> IntSet.add temp acc) acc reduction.alias_temps
+
+let place_carriers_of_reductions reductions =
+  List.fold_left
+    (fun acc (reduction : counted_reduction) ->
+      match (reduction.target, reduction.carrier_temp) with
+      | ReductionPlaceTarget place, Some temp -> PlaceMap.add place temp acc
+      | ReductionTempTarget _, _ | ReductionPlaceTarget _, None -> acc)
+    PlaceMap.empty reductions
+
+let materialize_place_reduction_carriers fresh_temp reductions =
+  let carriers = ref PlaceMap.empty in
+  let preloads_rev = ref [] in
+  let ensure_carrier place =
+    match PlaceMap.find_opt place !carriers with
+    | Some temp -> temp
+    | None ->
+        let temp = fresh_temp () in
+        carriers := PlaceMap.add place temp !carriers;
+        preloads_rev := simplify_simple_instr (Tcg.Load (temp, place)) :: !preloads_rev;
+        temp
+  in
+  let reductions =
+    List.map
+      (fun (reduction : counted_reduction) ->
+        match (reduction.target, reduction.carrier_temp) with
+        | ReductionPlaceTarget place, None ->
+            { reduction with carrier_temp = Some (ensure_carrier place) }
+        | ReductionTempTarget _, _
+        | ReductionPlaceTarget _, Some _ -> reduction)
+      reductions
+  in
+  (reductions, List.rev !preloads_rev)
 
 type linear_expr =
   | LinearInvariant of summary_expr
@@ -4236,7 +4286,14 @@ let reduction_update_of_temp
         let rhs = resolve_block_operand block rhs in
         if resolves_to_induction_temp multi_defs def_instrs phi_temp lhs then
           Option.map
-            (fun step -> { target = ReductionTempTarget phi_temp; subtract = false; step; alias_temps = [] })
+            (fun step ->
+              {
+                target = ReductionTempTarget phi_temp;
+                subtract = false;
+                step;
+                carrier_temp = None;
+                alias_temps = [];
+              })
             (reduction_step_of_operand
                invariant_loaded_places
                loop_defs
@@ -4249,7 +4306,14 @@ let reduction_update_of_temp
                block rhs)
         else if resolves_to_induction_temp multi_defs def_instrs phi_temp rhs then
           Option.map
-            (fun step -> { target = ReductionTempTarget phi_temp; subtract = false; step; alias_temps = [] })
+            (fun step ->
+              {
+                target = ReductionTempTarget phi_temp;
+                subtract = false;
+                step;
+                carrier_temp = None;
+                alias_temps = [];
+              })
             (reduction_step_of_operand
                invariant_loaded_places
                loop_defs
@@ -4266,7 +4330,14 @@ let reduction_update_of_temp
         let rhs = resolve_block_operand block rhs in
         if resolves_to_induction_temp multi_defs def_instrs phi_temp lhs then
           Option.map
-            (fun step -> { target = ReductionTempTarget phi_temp; subtract = true; step; alias_temps = [] })
+            (fun step ->
+              {
+                target = ReductionTempTarget phi_temp;
+                subtract = true;
+                step;
+                carrier_temp = None;
+                alias_temps = [];
+              })
             (reduction_step_of_operand
                invariant_loaded_places
                loop_defs
@@ -4342,7 +4413,14 @@ let reduction_update_of_place
         let rhs = resolve_block_operand block rhs in
         if operand_resolves_to_place_value multi_defs place block IntSet.empty lhs then
           Option.map
-            (fun step -> { target = ReductionPlaceTarget place; subtract = false; step; alias_temps = [] })
+            (fun step ->
+              {
+                target = ReductionPlaceTarget place;
+                subtract = false;
+                step;
+                carrier_temp = None;
+                alias_temps = [];
+              })
             (reduction_step_of_operand
                invariant_loaded_places
                loop_defs
@@ -4355,7 +4433,14 @@ let reduction_update_of_place
                block rhs)
         else if operand_resolves_to_place_value multi_defs place block IntSet.empty rhs then
           Option.map
-            (fun step -> { target = ReductionPlaceTarget place; subtract = false; step; alias_temps = [] })
+            (fun step ->
+              {
+                target = ReductionPlaceTarget place;
+                subtract = false;
+                step;
+                carrier_temp = None;
+                alias_temps = [];
+              })
             (reduction_step_of_operand
                invariant_loaded_places
                loop_defs
@@ -4372,7 +4457,14 @@ let reduction_update_of_place
         let rhs = resolve_block_operand block rhs in
         if operand_resolves_to_place_value multi_defs place block IntSet.empty lhs then
           Option.map
-            (fun step -> { target = ReductionPlaceTarget place; subtract = true; step; alias_temps = [] })
+            (fun step ->
+              {
+                target = ReductionPlaceTarget place;
+                subtract = true;
+                step;
+                carrier_temp = None;
+                alias_temps = [];
+              })
             (reduction_step_of_operand
                invariant_loaded_places
                loop_defs
@@ -4617,25 +4709,37 @@ let build_triangle_number_instrs fresh_temp trip_temp =
       simplify_simple_instr (Tcg.Bin (triangle, Add, Tcg.Temp left, Tcg.Temp right)) ],
     triangle )
 
-let rec emit_summary_expr fresh_temp = function
+let rec emit_summary_expr_with_carriers place_carriers fresh_temp = function
   | SummaryOperand operand -> ([], operand)
-  | SummaryPlace place ->
-      let dst = fresh_temp () in
-      ([ simplify_simple_instr (Tcg.Load (dst, place)) ], Tcg.Temp dst)
+  | SummaryPlace place -> (
+      match PlaceMap.find_opt place place_carriers with
+      | Some temp -> ([], Tcg.Temp temp)
+      | None ->
+          let dst = fresh_temp () in
+          ([ simplify_simple_instr (Tcg.Load (dst, place)) ], Tcg.Temp dst))
   | SummaryUn (op, expr) ->
-      let instrs, operand = emit_summary_expr fresh_temp expr in
+      let instrs, operand = emit_summary_expr_with_carriers place_carriers fresh_temp expr in
       let dst = fresh_temp () in
       (instrs @ [ simplify_simple_instr (Tcg.Un (dst, op, operand)) ], Tcg.Temp dst)
   | SummaryBin (op, lhs, rhs) ->
-      let lhs_instrs, lhs_operand = emit_summary_expr fresh_temp lhs in
-      let rhs_instrs, rhs_operand = emit_summary_expr fresh_temp rhs in
+      let lhs_instrs, lhs_operand =
+        emit_summary_expr_with_carriers place_carriers fresh_temp lhs
+      in
+      let rhs_instrs, rhs_operand =
+        emit_summary_expr_with_carriers place_carriers fresh_temp rhs
+      in
       let dst = fresh_temp () in
       ( lhs_instrs @ rhs_instrs
         @ [ simplify_simple_instr (Tcg.Bin (dst, op, lhs_operand, rhs_operand)) ],
         Tcg.Temp dst )
 
-let build_invariant_reduction_delta fresh_temp trip_temp step_expr =
-  let step_instrs, step_operand = emit_summary_expr fresh_temp step_expr in
+let emit_summary_expr fresh_temp expr =
+  emit_summary_expr_with_carriers PlaceMap.empty fresh_temp expr
+
+let build_invariant_reduction_delta place_carriers fresh_temp trip_temp step_expr =
+  let step_instrs, step_operand =
+    emit_summary_expr_with_carriers place_carriers fresh_temp step_expr
+  in
   match step_operand with
   | Tcg.Imm 0L -> (step_instrs, None)
   | Tcg.Imm 1L -> (step_instrs, Some (Tcg.Temp trip_temp))
@@ -4651,14 +4755,19 @@ let build_invariant_reduction_delta fresh_temp trip_temp step_expr =
         Some (Tcg.Temp delta) )
 
 let build_affine_reduction_delta
+    place_carriers
     fresh_temp
     trip_temp
     (iv : basic_induction_var)
     coeff
     bias
   =
-  let coeff_instrs, coeff_operand = emit_summary_expr fresh_temp coeff in
-  let bias_instrs, bias_operand = emit_summary_expr fresh_temp bias in
+  let coeff_instrs, coeff_operand =
+    emit_summary_expr_with_carriers place_carriers fresh_temp coeff
+  in
+  let bias_instrs, bias_operand =
+    emit_summary_expr_with_carriers place_carriers fresh_temp bias
+  in
   let scaled_base = fresh_temp () in
   let base_instrs =
     coeff_instrs
@@ -4702,13 +4811,14 @@ let build_affine_reduction_delta
     ( base_instrs @ base_adjust_instrs @ delta_instrs @ triangle_instrs @ series_instrs @ [ combine ],
       Some (Tcg.Temp delta) )
 
-let build_reduction_final_update fresh_temp trip_temp (reduction : counted_reduction) =
+let build_reduction_final_update fresh_temp trip_temp place_carriers (reduction : counted_reduction)
+  =
   let delta_instrs, delta_operand =
     match reduction.step with
     | ReductionInvariant step_expr ->
-        build_invariant_reduction_delta fresh_temp trip_temp step_expr
+        build_invariant_reduction_delta place_carriers fresh_temp trip_temp step_expr
     | ReductionAffine { iv; coeff; bias } ->
-        build_affine_reduction_delta fresh_temp trip_temp iv coeff bias
+        build_affine_reduction_delta place_carriers fresh_temp trip_temp iv coeff bias
   in
   match delta_operand with
   | None -> []
@@ -4732,25 +4842,32 @@ let build_reduction_final_update fresh_temp trip_temp (reduction : counted_reduc
           in
           delta_instrs @ [ update ] @ alias_updates
       | ReductionPlaceTarget place ->
-          let acc_temp = fresh_temp () in
-          let updated_temp = fresh_temp () in
-          let load = simplify_simple_instr (Tcg.Load (acc_temp, place)) in
+          let acc_temp, acc_instrs =
+            match reduction.carrier_temp with
+            | Some temp -> (temp, [])
+            | None ->
+                let temp = fresh_temp () in
+                (temp, [ simplify_simple_instr (Tcg.Load (temp, place)) ])
+          in
           let update =
             if reduction.subtract then
               simplify_simple_instr
                 (Tcg.Bin
-                   (updated_temp, Sub, Tcg.Temp acc_temp, delta_operand))
+                   (acc_temp, Sub, Tcg.Temp acc_temp, delta_operand))
             else
               simplify_simple_instr
                 (Tcg.Bin
-                   (updated_temp, Add, Tcg.Temp acc_temp, delta_operand))
+                   (acc_temp, Add, Tcg.Temp acc_temp, delta_operand))
            in
           let alias_updates =
             List.map
-              (fun temp -> simplify_simple_instr (Tcg.Move (temp, Tcg.Temp updated_temp)))
-              reduction.alias_temps
+              (fun temp -> simplify_simple_instr (Tcg.Move (temp, Tcg.Temp acc_temp)))
+              (List.filter (fun temp -> temp <> acc_temp) reduction.alias_temps)
           in
-          delta_instrs @ [ load; update; Tcg.Store (place, Tcg.Temp updated_temp) ] @ alias_updates)
+          acc_instrs
+          @ delta_instrs
+          @ [ update; Tcg.Store (place, Tcg.Temp acc_temp) ]
+          @ alias_updates)
 
 let loop_instr_count loop blocks =
   List.fold_left
@@ -5112,8 +5229,18 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
                           info.control_iv.step
                           info.kind
                       in
+                      let extracted_reductions =
+                        extractable |> List.map fst
+                        |> materialize_place_reduction_carriers fresh_temp
+                      in
+                      let extracted_reductions, carrier_preloads = extracted_reductions in
+                      let place_carriers = place_carriers_of_reductions extracted_reductions in
                       let preheader = get_block preheader_label in
-                      update_block { preheader with body = preheader.body @ trip_instrs };
+                      update_block
+                        {
+                          preheader with
+                          body = preheader.body @ trip_instrs @ carrier_preloads;
+                        };
                       Hashtbl.iter
                         (fun label indexes ->
                           let block : Cfg.block = get_block label in
@@ -5127,9 +5254,9 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
                         removals;
                       let summary_label = fresh_summary_label () in
                       let summary_body =
-                        extractable
-                        |> List.map fst
-                        |> List.concat_map (build_reduction_final_update fresh_temp trip_temp)
+                        extracted_reductions
+                        |> List.concat_map
+                             (build_reduction_final_update fresh_temp trip_temp place_carriers)
                       in
                       let control_block = get_block info.control_label in
                       let term =
@@ -5461,6 +5588,10 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
                     (string_of_places (PlaceSet.diff loop_live_places supported_live_places))
                     (string_of_places supported_live_places)
                 else
+                  let reductions, carrier_preloads =
+                    materialize_place_reduction_carriers fresh_temp reductions
+                  in
+                  let place_carriers = place_carriers_of_reductions reductions in
                   let trip_instrs, trip_temp =
                     build_trip_count_instrs
                       fresh_temp
@@ -5469,9 +5600,10 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
                       info.kind
                   in
                   let updates =
-                    List.concat_map
-                      (build_reduction_final_update fresh_temp trip_temp)
-                      reductions
+                    carrier_preloads
+                    @ List.concat_map
+                        (build_reduction_final_update fresh_temp trip_temp place_carriers)
+                        reductions
                     @ List.concat_map
                         (build_iv_final_update fresh_temp trip_temp)
                         live_ivs
@@ -5506,9 +5638,18 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
     else f
 
 let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
-  let unroll_max_blocks = 4 in
-  let unroll_min_instrs = 6 in
-  let unroll_max_instrs = 16 in
+  let unroll_single_path_max_blocks = 6 in
+  let unroll_linear_path_max_blocks = 4 in
+  let unroll_single_block_min_instrs = 4 in
+  let unroll_multi_block_min_instrs = 6 in
+  let unroll_single_block_max_instrs = 32 in
+  let unroll_small_path_max_instrs = 24 in
+  let unroll_large_path_max_instrs = 20 in
+  let unroll_single_block_max_memory_ops = 8 in
+  let unroll_small_path_max_memory_ops = 5 in
+  let unroll_large_path_max_memory_ops = 4 in
+  let unroll_single_block_max_defs = 12 in
+  let unroll_multi_block_max_defs = 8 in
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
   let doms = compute_dominators f in
@@ -5594,6 +5735,24 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
               match linear_loop_path info.control_label loop get_block info.inside_label with
               | None -> ()
               | Some path ->
+                  let path_blocks = List.length path in
+                  let one_block_path = path_blocks <= 1 in
+                  let path_max_blocks =
+                    if one_block_path then unroll_single_path_max_blocks else unroll_linear_path_max_blocks
+                  in
+                  let min_instrs =
+                    if one_block_path then unroll_single_block_min_instrs else unroll_multi_block_min_instrs
+                  in
+                  let max_instrs =
+                    if one_block_path then unroll_single_block_max_instrs
+                    else if path_blocks <= 2 then unroll_small_path_max_instrs
+                    else unroll_large_path_max_instrs
+                  in
+                  let max_memory_ops =
+                    if one_block_path then unroll_single_block_max_memory_ops
+                    else if path_blocks <= 2 then unroll_small_path_max_memory_ops
+                    else unroll_large_path_max_memory_ops
+                  in
                   let has_redefined_candidate_temp =
                     let counts = Hashtbl.create 16 in
                     let note_instr instr =
@@ -5604,40 +5763,70 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
                       | None -> ()
                     in
                     List.iter note_instr control_block.body;
-                    List.iter
-                      (fun (block : Cfg.block) -> List.iter note_instr block.body)
-                      path;
-                    Hashtbl.fold (fun _ count seen -> seen || count > 1) counts false
-                  in
-                   let total_instrs =
-                     List.length control_block.body
-                     + List.fold_left
-                         (fun acc (block : Cfg.block) -> acc + List.length block.body)
-                         0 path
+                     List.iter
+                       (fun (block : Cfg.block) -> List.iter note_instr block.body)
+                       path;
+                     Hashtbl.fold (fun _ count seen -> seen || count > 1) counts false
                    in
-                    if
-                      effects.has_call
-                      || control_block.body <> []
-                      || path = []
-                      || List.length path > unroll_max_blocks
-                      || (PlaceSet.is_empty effects.modified_places
-                         && total_instrs < unroll_min_instrs)
-                      || total_instrs > unroll_max_instrs
-                      || has_redefined_candidate_temp
-                    then ()
-                   else
-                     let last_block = List.hd (List.rev path) in
-                     if last_block.succs <> [ info.control_label ] then ()
-                     else
-                       let copied_labels =
-                         List.mapi (fun index (block : Cfg.block) -> (block.label, fresh_unroll_label index)) path
-                       in
+                  let total_instrs =
+                    List.length control_block.body
+                    + List.fold_left
+                        (fun acc (block : Cfg.block) -> acc + List.length block.body)
+                        0 path
+                  in
+                  let memory_ops =
+                    List.fold_left
+                      (fun acc (block : Cfg.block) ->
+                        acc
+                        + List.fold_left
+                            (fun sum instr ->
+                              sum
+                              +
+                              match instr with
+                              | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> 1
+                              | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ -> 0)
+                            0 block.body)
+                      0 path
+                  in
+                  let unique_defs =
+                    let defs = Hashtbl.create 16 in
+                    let note_instr instr =
+                      match defs_temp instr with
+                      | Some temp -> Hashtbl.replace defs temp ()
+                      | None -> ()
+                    in
+                    List.iter note_instr control_block.body;
+                    List.iter (fun (block : Cfg.block) -> List.iter note_instr block.body) path;
+                    Hashtbl.length defs
+                  in
+                  let enough_benefit =
+                    total_instrs >= min_instrs
+                    && (memory_ops >= 2 || total_instrs >= (if one_block_path then 8 else 10))
+                  in
+                  if
+                    effects.has_call
+                    || control_block.body <> []
+                    || path = []
+                    || path_blocks > path_max_blocks
+                    || total_instrs > max_instrs
+                    || memory_ops > max_memory_ops
+                    || unique_defs > (if one_block_path then unroll_single_block_max_defs else unroll_multi_block_max_defs)
+                    || (PlaceSet.is_empty effects.modified_places && not enough_benefit)
+                    || has_redefined_candidate_temp
+                  then ()
+                  else
+                    let last_block = List.hd (List.rev path) in
+                    if last_block.succs <> [ info.control_label ] then ()
+                    else
+                      let copied_labels =
+                        List.mapi (fun index (block : Cfg.block) -> (block.label, fresh_unroll_label index)) path
+                      in
                       incr unroll_id;
-                       let rename label =
-                         match List.assoc_opt label copied_labels with
-                         | Some renamed -> renamed
-                         | None -> label
-                       in
+                      let rename label =
+                        match List.assoc_opt label copied_labels with
+                        | Some renamed -> renamed
+                        | None -> label
+                      in
                       let copied_blocks =
                         List.map
                           (fun (block : Cfg.block) ->
@@ -5664,7 +5853,7 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
                         };
                       List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) copied_blocks;
                       insert_after last_block.label (List.map (fun (block : Cfg.block) -> block.label) copied_blocks);
-                       changed := true))
+                      changed := true))
       headers;
     if !changed then
       let blocks = List.map get_block !block_order in
@@ -6578,12 +6767,12 @@ let choose_opt_profile metrics =
   then
     {
       name = "huge";
-      max_rounds = 3;
+      max_rounds = 5;
       enable_unswitch = true;
       enable_split_reductions = true;
-      enable_unroll = false;
-      enable_rotate = false;
-      enable_gvn2 = false;
+      enable_unroll = true;
+      enable_rotate = true;
+      enable_gvn2 = true;
     }
   else if
     metrics.block_count >= 48
@@ -6638,23 +6827,26 @@ let stage_round_enabled profile round stage =
   match profile.name with
   | "huge" -> (
       match stage with
-      | "split_reductions" | "unswitch" -> round <= 1
-      | _ -> false)
+      | "split_reductions" | "unswitch" -> round <= 2
+      | "unroll2" | "rotate" | "gvn2" -> round <= 1
+      | _ -> true)
   | "large" -> (
       match stage with
-      | "split_reductions" | "unswitch" -> round <= 2
-      | "unroll2" | "rotate" | "gvn2" -> round <= 3
+      | "split_reductions" | "unswitch" -> round <= 3
+      | "unroll2" | "rotate" | "gvn2" -> round <= 4
       | _ -> true)
   | "medium" -> (
       match stage with
-      | "split_reductions" | "unswitch" -> round <= 1
-      | "unroll2" | "rotate" -> round <= 2
+      | "split_reductions" | "unswitch" -> round <= 2
+      | "unroll2" | "rotate" -> round <= 3
       | _ -> true)
   | _ -> true
 
 let optimize_func global_init summaries globals (f : Cfg.func) =
   let promoted = f |> mem2reg_func |> promote_locals_func |> promote_globals_func summaries globals in
-  let profile = choose_opt_profile (metrics_of_func promoted) in
+  let base_metrics = metrics_of_func f in
+  let promoted_metrics = metrics_of_func promoted in
+  let profile = choose_opt_profile base_metrics in
   let debug_stop_after = Sys.getenv_opt "TOYC_DEBUG_STOP_AFTER" in
   let debug_pass_times = Sys.getenv_opt "TOYC_DEBUG_PASS_TIMES" <> None in
   let debug_opt_profile = debug_pass_times || Sys.getenv_opt "TOYC_DEBUG_OPT_PROFILE" <> None in
@@ -6699,10 +6891,10 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
   in
   if debug_opt_profile then
     Printf.eprintf
-      "opt-profile func=%s profile=%s rounds=%d unswitch=%b split=%b unroll=%b rotate=%b gvn2=%b %s\n%!"
+      "opt-profile func=%s profile=%s rounds=%d unswitch=%b split=%b unroll=%b rotate=%b gvn2=%b base=(%s) promoted=(%s)\n%!"
       promoted.name profile.name profile.max_rounds profile.enable_unswitch
       profile.enable_split_reductions profile.enable_unroll profile.enable_rotate
-      profile.enable_gvn2 (format_metrics (metrics_of_func promoted));
+      profile.enable_gvn2 (format_metrics base_metrics) (format_metrics promoted_metrics);
   let step round func =
     try
       let after_const1 =

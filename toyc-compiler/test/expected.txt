@@ -52,6 +52,7 @@ counted_split_call_mix.tc 16
 counted_split_global_mix.tc 15
 rotate_call_global_loop.tc 16
 hot_local_loop_mix.tc 12
+hot_local_partial_join.tc 39
 loop_param_rowcol.tc 66
 loop_split_place_update.tc 30
 loop_empty_side_blocks.tc 52
