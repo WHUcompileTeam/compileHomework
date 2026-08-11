@@ -1246,6 +1246,11 @@ let redirect_successors pred redirects = function
   | Cfg.Return value -> Cfg.Return value
 
 let mem2reg_func (f : Cfg.func) =
+  let reachable = reachable_labels f.entry f.blocks in
+  let blocks =
+    List.filter (fun (block : Cfg.block) -> LabelSet.mem block.label reachable) f.blocks
+  in
+  let f = Cfg.rebuild_edges { f with blocks } in
   let all_candidates = collect_local_ids f in
   let rec attempt candidates =
     if IntSet.is_empty candidates then f
@@ -1296,7 +1301,10 @@ let mem2reg_func (f : Cfg.func) =
                       match all_same_operand values with
                       | Some value -> Some value
                       | None -> Some (Tcg.Temp (get_phi_temp block.label local_id)))
-                  | None -> None
+                  | None -> (
+                      match first_some incoming with
+                      | Some _ -> Some (Tcg.Temp (get_phi_temp block.label local_id))
+                      | None -> None)
               in
               match keep_value with
               | Some value -> IntMap.add local_id value env
