@@ -25,6 +25,9 @@ type ctx = {
   blocks_by_label : (string, Cfg.block) Hashtbl.t;
   live_out_temps : (string, IntSet.t) Hashtbl.t;
   epilogue : string;
+  func : string;
+  entry : string;
+  params : Tcg.var list;
   frame_size : int;
   saved_regs : string list;
   uses_s0 : bool;
@@ -127,14 +130,18 @@ let max_call_args (f : Cfg.func) =
         current block.body)
     0 f.blocks
 
-let calls_function (f : Cfg.func) =
+let is_call = function
+  | Tcg.Call _ -> true
+  | _ -> false
+
+let needs_return_address (f : Cfg.func) =
   List.exists
     (fun (block : Cfg.block) ->
-      List.exists
-        (function
-          | Tcg.Call _ -> true
-          | _ -> false)
-        block.body)
+      match (List.rev block.body, block.term) with
+      | (Tcg.Call (Some dst, _, args) :: rest), Cfg.Return (Some (Tcg.Temp result))
+        when dst = result && List.length args <= 8 ->
+          List.exists is_call rest
+      | _ -> List.exists is_call block.body)
     f.blocks
 
 let referenced_local_ids (f : Cfg.func) =
@@ -650,7 +657,7 @@ let compute_layout (f : Cfg.func) =
       temp_homes false
   in
   let uses_s0 = Hashtbl.length local_offsets > 0 || has_stack_temp in
-  let needs_frame = calls_function f || saved_regs <> [] || uses_s0 in
+  let needs_frame = needs_return_address f || saved_regs <> [] || uses_s0 in
   {
     local_offsets;
     temp_homes;
@@ -801,6 +808,16 @@ let emit_call_args ctx args =
 let emit_call ctx callee args =
   emit_call_args ctx args;
   emitf ctx "    call %s" callee
+
+let restart_function ctx args =
+  emit_call_args ctx args;
+  List.iteri
+    (fun i (param : Tcg.var) ->
+      match Hashtbl.find_opt ctx.local_offsets param.id with
+      | Some off -> emitf ctx "    sw a%d, %d(s0)" i off
+      | None -> ())
+    ctx.params;
+  emitf ctx "    j %s" ctx.entry
 
 let temp_live_out ctx label temp =
   IntSet.mem temp (table_find_or_empty ctx.live_out_temps label IntSet.empty)
@@ -1041,6 +1058,8 @@ let gen_tail_return_instr ctx (instr : Tcg.simple_instr) =
       load_place ctx "a0" place;
       emitf ctx "    j %s" ctx.epilogue
   | Tcg.Store _ -> raise (Error "store cannot feed tail return directly")
+  | Tcg.Call (_, callee, args) when callee = ctx.func && List.length args <= 8 ->
+      restart_function ctx args
   | Tcg.Call (_, callee, args) when List.length args <= 8 ->
       emit_call_args ctx args;
       restore_frame ctx;
@@ -1118,6 +1137,9 @@ let gen_func buf (f : Cfg.func) =
       blocks_by_label;
       live_out_temps;
       epilogue;
+      func = f.label;
+      entry = f.entry;
+      params = f.params;
       frame_size = layout.frame_size;
       saved_regs = layout.saved_regs;
       uses_s0 = layout.uses_s0;
