@@ -3477,7 +3477,9 @@ let resolves_to_temp multi_defs def_instrs target operand =
         else if IntSet.mem temp seen || IntSet.mem temp multi_defs then false
         else
           match Hashtbl.find_opt def_instrs temp with
-          | Some (Tcg.Move (_, src)) -> loop (IntSet.add temp seen) src
+          | Some (Tcg.Move (_, src))
+          | Some (Tcg.Un (_, UPlus, src)) ->
+              loop (IntSet.add temp seen) src
           | Some _ | None -> false
   in
   loop IntSet.empty operand
@@ -3490,7 +3492,9 @@ let resolves_to_induction_temp multi_defs def_instrs phi_temp operand =
         else if IntSet.mem temp seen || IntSet.mem temp multi_defs then false
         else
           match Hashtbl.find_opt def_instrs temp with
-          | Some (Tcg.Move (_, src)) -> loop (IntSet.add temp seen) src
+          | Some (Tcg.Move (_, src))
+          | Some (Tcg.Un (_, UPlus, src)) ->
+              loop (IntSet.add temp seen) src
           | Some _ | None -> false
   in
   loop IntSet.empty operand
@@ -3572,7 +3576,9 @@ let rec scaled_factor_of_operand multi_defs def_instrs phi_temp operand =
       else if IntSet.mem temp multi_defs then None
       else
         match Hashtbl.find_opt def_instrs temp with
-        | Some (Tcg.Move (_, src)) -> scaled_factor_of_operand multi_defs def_instrs phi_temp src
+        | Some (Tcg.Move (_, src))
+        | Some (Tcg.Un (_, UPlus, src)) ->
+            scaled_factor_of_operand multi_defs def_instrs phi_temp src
         | Some (Tcg.Un (_, UMinus, src))
           when resolves_to_induction_temp multi_defs def_instrs phi_temp src ->
             Some (-1L)
@@ -3762,14 +3768,6 @@ let collect_basic_induction_vars header loop get_block loop_defs multi_defs def_
     | Some chain -> chain
     | None -> [ get_block pred ]
   in
-  let step_of_operand phi_temp operand =
-    match operand with
-    | Tcg.Temp temp -> (
-        match Hashtbl.find_opt def_instrs temp with
-        | Some instr -> induction_step_of_instr loop_defs multi_defs def_instrs phi_temp instr
-        | None -> None)
-    | Tcg.Imm _ -> None
-  in
   let step_of_chain_source phi_temp chain src =
     let resolved = resolve_chain_operand chain src in
     match resolved with
@@ -3823,7 +3821,7 @@ let collect_basic_induction_vars header loop get_block loop_defs multi_defs def_
               List.filter_map
                 (fun pred ->
                   match List.assoc_opt pred incoming with
-                  | Some src -> step_of_operand phi_temp src
+                  | Some src -> step_of_chain_source phi_temp (chain_for_pred pred) src
                   | None -> None)
                 backedge_preds
             in
@@ -3855,7 +3853,15 @@ let collect_basic_induction_vars header loop get_block loop_defs multi_defs def_
                 (fun acc instr ->
                   match defs_temp instr with
                   | Some dst when not (IntSet.mem dst seen_phi_temps) -> (
-                      match induction_step_of_instr loop_defs multi_defs def_instrs dst instr with
+                      match
+                        induction_step_of_instr_on_chain
+                          (chain_for_pred pred)
+                          loop_defs
+                          multi_defs
+                          def_instrs
+                          dst
+                          instr
+                      with
                       | Some _ -> IntSet.add dst acc
                       | None -> acc)
                   | Some _ | None -> acc)
@@ -4073,6 +4079,7 @@ let classify_counted_loop_header
     multi_defs
     def_instrs
     ivs
+    get_block
     (block : Cfg.block)
   =
   let term = block.term in
@@ -4090,12 +4097,98 @@ let classify_counted_loop_header
         else None)
       ivs
   in
+  let inloop_preds = List.filter (fun pred -> LabelSet.mem pred loop) block.preds in
+  let snapshot_bias_in_block (iv : basic_induction_var) temp (pred_block : Cfg.block) =
+    let rec scan trailing_step = function
+      | [] -> None
+      | instr :: rest ->
+          let trailing_step =
+            match defs_temp instr with
+            | Some dst when dst = iv.phi_temp -> (
+                match induction_step_of_instr loop_defs multi_defs def_instrs iv.phi_temp instr with
+                | Some step -> Some step
+                | None -> trailing_step)
+            | Some _ | None -> trailing_step
+          in
+          match instr with
+          | Tcg.Move (dst, src)
+          | Tcg.Un (dst, UPlus, src)
+            when dst = temp
+                 && (resolves_to_induction_temp_in_block pred_block multi_defs def_instrs iv.phi_temp src
+                    || resolves_to_induction_temp multi_defs def_instrs iv.phi_temp src) ->
+              Some
+                (match trailing_step with
+                | Some step -> Int64.neg step
+                | None -> 0L)
+          | Tcg.Bin (dst, Add, lhs, Tcg.Imm delta)
+            when dst = temp
+                 && (resolves_to_induction_temp_in_block pred_block multi_defs def_instrs iv.phi_temp lhs
+                    || resolves_to_induction_temp multi_defs def_instrs iv.phi_temp lhs) ->
+              Some
+                Int64.(
+                  add delta
+                    (match trailing_step with
+                    | Some step -> neg step
+                    | None -> 0L))
+          | Tcg.Bin (dst, Add, Tcg.Imm delta, rhs)
+            when dst = temp
+                 && (resolves_to_induction_temp_in_block pred_block multi_defs def_instrs iv.phi_temp rhs
+                    || resolves_to_induction_temp multi_defs def_instrs iv.phi_temp rhs) ->
+              Some
+                Int64.(
+                  add delta
+                    (match trailing_step with
+                    | Some step -> neg step
+                    | None -> 0L))
+          | Tcg.Bin (dst, Sub, lhs, Tcg.Imm delta)
+            when dst = temp
+                 && (resolves_to_induction_temp_in_block pred_block multi_defs def_instrs iv.phi_temp lhs
+                    || resolves_to_induction_temp multi_defs def_instrs iv.phi_temp lhs) ->
+              Some
+                Int64.(
+                  sub
+                    (match trailing_step with
+                    | Some step -> neg step
+                    | None -> 0L)
+                    delta)
+          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ ->
+              scan trailing_step rest
+    in
+    scan None (List.rev pred_block.body)
+  in
+  let match_snapshot_iv operand =
+    match operand with
+    | Tcg.Imm _ -> None
+    | Tcg.Temp temp ->
+        List.find_map
+          (fun (iv : basic_induction_var) ->
+            let biases =
+              List.filter_map
+                (fun pred ->
+                  let chain = incoming_update_chain get_block control_label pred in
+                  match chain with
+                  | pred_block :: _ -> snapshot_bias_in_block iv temp pred_block
+                  | [] -> None)
+                inloop_preds
+            in
+            match biases with
+            | [] -> None
+            | bias :: rest
+              when List.length biases = List.length inloop_preds
+                   && List.for_all (Int64.equal bias) rest ->
+                Some (iv, bias)
+            | _ -> None)
+          ivs
+  in
   let rec control_iv_bias_of_operand seen = function
     | Tcg.Imm _ -> None
     | Tcg.Temp temp as operand -> (
         match match_known_iv operand with
         | Some match_ -> Some match_
-        | None ->
+        | None -> (
+            match match_snapshot_iv operand with
+            | Some match_ -> Some match_
+            | None ->
             if IntSet.mem temp seen then None
             else
               match def_instr_in_block_or_global block multi_defs def_instrs temp with
@@ -4110,11 +4203,11 @@ let classify_counted_loop_header
                   match control_iv_bias_of_operand (IntSet.add temp seen) rhs with
                   | Some (iv, bias) -> Some (iv, Int64.add bias delta)
                   | None -> control_iv_bias_of_operand (IntSet.add temp seen) rhs)
-              | Some (Tcg.Bin (_, Sub, lhs, Tcg.Imm delta)) -> (
-                  match control_iv_bias_of_operand (IntSet.add temp seen) lhs with
-                  | Some (iv, bias) -> Some (iv, Int64.sub bias delta)
-                  | None -> control_iv_bias_of_operand (IntSet.add temp seen) lhs)
-              | Some _ | None -> None)
+               | Some (Tcg.Bin (_, Sub, lhs, Tcg.Imm delta)) -> (
+                   match control_iv_bias_of_operand (IntSet.add temp seen) lhs with
+                   | Some (iv, bias) -> Some (iv, Int64.sub bias delta)
+                   | None -> control_iv_bias_of_operand (IntSet.add temp seen) lhs)
+               | Some _ | None -> None))
   in
   let match_control_iv op lhs rhs =
     match (control_iv_bias_of_operand IntSet.empty lhs, invariant rhs) with
@@ -4207,6 +4300,7 @@ let find_counted_loop_control
                 multi_defs
                 def_instrs
                 ivs
+                get_block
                 block
           | Some _ | None -> None)
 
@@ -5421,6 +5515,61 @@ let collect_counted_reductions
                     resolves_to_self older_block older_rest (IntSet.add current seen) src
                 | Some _ | None -> false)
     in
+    let rec peel_self_delta block older_chain seen = function
+      | Tcg.Imm _ -> None
+      | Tcg.Temp _ as operand -> (
+          let operand = resolve_block_operand block operand in
+          match operand with
+          | Tcg.Imm _ -> None
+          | Tcg.Temp current ->
+              if IntSet.mem current seen then None
+              else
+                match last_def_of_temp block current with
+                | Some (Tcg.Move (_, src))
+                | Some (Tcg.Un (_, UPlus, src)) ->
+                    peel_self_delta block older_chain (IntSet.add current seen) src
+                | Some (Tcg.Bin (_, Add, lhs, rhs)) ->
+                    let lhs = resolve_block_operand block lhs in
+                    let rhs = resolve_block_operand block rhs in
+                    if resolves_to_self block older_chain IntSet.empty lhs then Some rhs
+                    else if resolves_to_self block older_chain IntSet.empty rhs then Some lhs
+                    else None
+                | Some instr -> (
+                    match instr with
+                    | Tcg.Move _ | Tcg.Un _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ | Tcg.Bin _ ->
+                        None)
+                | None -> (
+                    match last_def_of_temp_on_chain_with_block older_chain current with
+                    | Some (older_block, Tcg.Move (_, src), older_rest)
+                    | Some (older_block, Tcg.Un (_, UPlus, src), older_rest) ->
+                        peel_self_delta older_block older_rest (IntSet.add current seen) src
+                    | Some (older_block, Tcg.Bin (_, Add, lhs, rhs), older_rest) ->
+                        let lhs = resolve_block_operand older_block lhs in
+                        let rhs = resolve_block_operand older_block rhs in
+                        if resolves_to_self older_block older_rest IntSet.empty lhs then Some rhs
+                        else if resolves_to_self older_block older_rest IntSet.empty rhs then Some lhs
+                        else None
+                    | Some _ -> None
+                    | None -> (
+                        match Hashtbl.find_opt def_instrs current with
+                        | Some (Tcg.Move (_, src))
+                        | Some (Tcg.Un (_, UPlus, src)) -> (
+                            match Hashtbl.find_opt def_blocks current with
+                            | Some label ->
+                                peel_self_delta (get_block label) [] (IntSet.add current seen) src
+                            | None -> None)
+                        | Some (Tcg.Bin (_, Add, lhs, rhs)) -> (
+                            match Hashtbl.find_opt def_blocks current with
+                            | Some label ->
+                                let def_block = get_block label in
+                                let lhs = resolve_block_operand def_block lhs in
+                                let rhs = resolve_block_operand def_block rhs in
+                                if resolves_to_self def_block [] IntSet.empty lhs then Some rhs
+                                else if resolves_to_self def_block [] IntSet.empty rhs then Some lhs
+                                else None
+                            | None -> None)
+                        | Some _ | None -> None)))
+    in
     let invariant operand =
       operand_loop_invariant
         loop_defs loop_stable_phis multi_defs def_instrs IntSet.empty operand
@@ -5495,6 +5644,15 @@ let collect_counted_reductions
                          alias_temps = [];
                        }
                  | None ->
+                     let rhs =
+                       match peel_self_delta block older_chain IntSet.empty rhs with
+                       | Some peeled -> peeled
+                       | None -> rhs
+                     in
+                     if debug_counted_local then
+                       Printf.eprintf
+                         "counted-carrier-fallback header=%s temp=%d side=lhs peeled=%s\n%!"
+                         header temp (string_of_operand rhs);
                      Option.map
                        (fun (carrier_temp, step_expr, carrier_subtract, include_updated) ->
                          {
@@ -5552,6 +5710,15 @@ let collect_counted_reductions
                          alias_temps = [];
                        }
                  | None ->
+                     let lhs =
+                       match peel_self_delta block older_chain IntSet.empty lhs with
+                       | Some peeled -> peeled
+                       | None -> lhs
+                     in
+                     if debug_counted_local then
+                       Printf.eprintf
+                         "counted-carrier-fallback header=%s temp=%d side=rhs peeled=%s\n%!"
+                         header temp (string_of_operand lhs);
                      Option.map
                        (fun (carrier_temp, step_expr, carrier_subtract, include_updated) ->
                          {
@@ -5613,6 +5780,15 @@ let collect_counted_reductions
                          alias_temps = [];
                        }
                  | None ->
+                     let rhs =
+                       match peel_self_delta block older_chain IntSet.empty rhs with
+                       | Some peeled -> peeled
+                       | None -> rhs
+                     in
+                     if debug_counted_local then
+                       Printf.eprintf
+                         "counted-carrier-fallback header=%s temp=%d side=sub peeled=%s\n%!"
+                         header temp (string_of_operand rhs);
                      Option.map
                        (fun (carrier_temp, step_expr, carrier_subtract, include_updated) ->
                          {
