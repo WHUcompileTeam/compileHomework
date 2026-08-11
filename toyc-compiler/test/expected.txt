@@ -47,6 +47,7 @@ inline_call_by_value_guard.tc 2
 effect_summary_selective_global.tc 27
 unswitch_invariant_branch.tc 18
 inline_local_expr_body.tc 12
+tailrec_acc_sum.tc 21
 counted_split_reduction.tc 73
 counted_split_call_mix.tc 16
 counted_split_global_mix.tc 15

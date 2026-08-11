@@ -2740,6 +2740,309 @@ let natural_loop block_map header pred =
   in
   visit [ pred ] (LabelSet.singleton header)
 
+let tailrec_elim_func (f : Cfg.func) =
+  let tail_loop_label = f.entry in
+  let next_temp = ref f.temp_count in
+  let fresh_temp () =
+    let temp = !next_temp in
+    incr next_temp;
+    temp
+  in
+  let tail_call_args_of_block (block : Cfg.block) =
+    match block.term with
+    | Cfg.Return (Some ret_operand) ->
+        let rec peel current = function
+          | [] -> None
+          | instr :: rest -> (
+              match (instr, current) with
+              | Tcg.Move (dst, src), Tcg.Temp temp when dst = temp -> peel src rest
+              | Tcg.Call (Some dst, callee, args), Tcg.Temp temp
+                when dst = temp && callee = f.label ->
+                  Some (List.rev rest, args)
+              | _ -> None)
+        in
+        peel ret_operand (List.rev block.body)
+    | Cfg.Return None | Cfg.Jump _ | Cfg.BranchZero _ | Cfg.BranchNonZero _ | Cfg.BranchCompare _ ->
+        None
+  in
+  let build_parallel_param_stores args =
+    if List.length args <> List.length f.params then None
+    else
+      let snapshots_rev = ref [] in
+      let stores_rev = ref [] in
+      List.iter2
+        (fun (param : Tcg.var) arg ->
+          let arg =
+            match arg with
+            | Tcg.Imm _ -> arg
+            | Tcg.Temp temp ->
+                let snap = fresh_temp () in
+                snapshots_rev :=
+                  simplify_simple_instr (Tcg.Move (snap, Tcg.Temp temp)) :: !snapshots_rev;
+                Tcg.Temp snap
+          in
+          stores_rev := Tcg.Store (Tcg.Local param.id, arg) :: !stores_rev)
+        f.params args;
+      Some (List.rev !snapshots_rev @ List.rev !stores_rev)
+  in
+  let changed = ref false in
+  let blocks =
+    List.map
+      (fun (block : Cfg.block) ->
+        match tail_call_args_of_block block with
+        | None -> block
+        | Some (prefix, args) -> (
+            match build_parallel_param_stores args with
+            | None -> block
+            | Some stores ->
+                changed := true;
+                let term = Cfg.Jump tail_loop_label in
+                { block with body = prefix @ stores; term; succs = Cfg.successors term }))
+      f.blocks
+  in
+  if !changed then
+    let existing_labels =
+      List.fold_left
+        (fun seen (block : Cfg.block) -> LabelSet.add block.label seen)
+        LabelSet.empty blocks
+    in
+    let rec fresh_entry index =
+      let label = Printf.sprintf ".L%s_tail_entry_%d" f.label index in
+      if LabelSet.mem label existing_labels then fresh_entry (index + 1) else label
+    in
+    let new_entry = fresh_entry 0 in
+    let entry_block =
+      {
+        Cfg.label = new_entry;
+        body = [];
+        term = Cfg.Jump tail_loop_label;
+        preds = [];
+        succs = [ tail_loop_label ];
+      }
+    in
+    let blocks =
+      List.fold_right
+        (fun (block : Cfg.block) acc ->
+          if block.label = tail_loop_label then entry_block :: block :: acc
+          else block :: acc)
+        blocks []
+    in
+    Cfg.rebuild_edges { f with entry = new_entry; temp_count = !next_temp; blocks }
+  else f
+
+let loop_canonicalize_func _summaries _globals (f : Cfg.func) =
+  let next_preheader_id = ref 0 in
+  let fresh_preheader_label () =
+    let id = !next_preheader_id in
+    incr next_preheader_id;
+    Printf.sprintf ".L%s_canon_pre_%d" f.label id
+  in
+  let next_exit_id = ref 0 in
+  let fresh_exit_label () =
+    let id = !next_exit_id in
+    incr next_exit_id;
+    Printf.sprintf ".L%s_canon_exit_%d" f.label id
+  in
+  let next_prep_id = ref 0 in
+  let fresh_prep_label () =
+    let id = !next_prep_id in
+    incr next_prep_id;
+    Printf.sprintf ".L%s_canon_cmp_%d" f.label id
+  in
+  let rec apply (current : Cfg.func) =
+    let block_map = Hashtbl.create (List.length current.blocks) in
+    List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) current.blocks;
+    let doms = compute_dominators current in
+    let backedges =
+      List.fold_left
+        (fun acc (block : Cfg.block) ->
+          List.fold_left
+            (fun acc succ ->
+              if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
+                (block.label, succ) :: acc
+              else acc)
+            acc block.succs)
+        [] current.blocks
+    in
+    if backedges = [] then current
+    else
+      let loops = Hashtbl.create 8 in
+      List.iter
+        (fun (pred, header) ->
+          let loop = natural_loop block_map header pred in
+          let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
+          Hashtbl.replace loops header merged)
+        backedges;
+      let headers =
+        Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
+        |> List.sort (fun (_, a) (_, b) -> compare a b)
+        |> List.map fst
+      in
+      let current_blocks = Hashtbl.create (List.length current.blocks + (3 * List.length headers)) in
+      List.iter
+        (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block)
+        current.blocks;
+      let block_order = ref (List.map (fun (block : Cfg.block) -> block.label) current.blocks) in
+      let current_entry = ref current.entry in
+      let get_block label =
+        match Hashtbl.find_opt current_blocks label with
+        | Some block -> block
+        | None -> failwith ("internal missing block: " ^ label)
+      in
+      let update_block (block : Cfg.block) =
+        Hashtbl.replace current_blocks block.label block
+      in
+      let insert_before label new_labels =
+        block_order :=
+          List.concat_map
+            (fun current_label ->
+              if current_label = label then List.rev_append new_labels [ current_label ]
+              else [ current_label ])
+            !block_order
+      in
+      let pure_prep_instr = function
+        | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ -> true
+        | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> false
+      in
+      let branch_targets = function
+        | Cfg.BranchZero (_, if_zero, if_nonzero) -> Some (if_zero, if_nonzero)
+        | Cfg.BranchNonZero (_, if_nonzero, if_zero) -> Some (if_nonzero, if_zero)
+        | Cfg.BranchCompare (_, _, _, if_true, if_false) -> Some (if_true, if_false)
+        | Cfg.Jump _ | Cfg.Return _ -> None
+      in
+      let is_small_pure_control_body body =
+        List.length body <= 4 && List.for_all pure_prep_instr body
+      in
+      let changed = ref false in
+      List.iter
+        (fun header ->
+          let loop = table_find_or_empty loops header LabelSet.empty in
+          let header_block : Cfg.block = get_block header in
+          let outside_preds = List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds in
+          let need_preheader =
+            outside_preds <> []
+            &&
+            (List.length outside_preds > 1
+            || List.exists
+                 (fun pred ->
+                   let pred_block : Cfg.block = get_block pred in
+                   pred_block.succs <> [ header ])
+                 outside_preds)
+          in
+          if need_preheader then begin
+            changed := true;
+            let preheader_label = fresh_preheader_label () in
+            let redirects = Hashtbl.create (List.length outside_preds) in
+            List.iter
+              (fun pred -> Hashtbl.add redirects (pred, header) preheader_label)
+              outside_preds;
+            List.iter
+              (fun pred ->
+                let pred_block : Cfg.block = get_block pred in
+                let term = redirect_successors pred redirects pred_block.term in
+                update_block { pred_block with term; succs = Cfg.successors term })
+              outside_preds;
+            Hashtbl.add current_blocks preheader_label
+              {
+                Cfg.label = preheader_label;
+                body = [];
+                term = Cfg.Jump header;
+                preds = [];
+                succs = [ header ];
+              };
+            insert_before header [ preheader_label ];
+            if header = !current_entry then current_entry := preheader_label
+          end;
+          let exit_labels =
+            LabelSet.fold
+              (fun label exits ->
+                let block : Cfg.block = get_block label in
+                List.fold_left
+                  (fun exits succ -> if LabelSet.mem succ loop then exits else LabelSet.add succ exits)
+                  exits block.succs)
+              loop LabelSet.empty
+          in
+          LabelSet.iter
+            (fun exit_label ->
+              let exit_block : Cfg.block = get_block exit_label in
+              let loop_preds = List.filter (fun pred -> LabelSet.mem pred loop) exit_block.preds in
+              let outside_exit_preds =
+                List.filter (fun pred -> not (LabelSet.mem pred loop)) exit_block.preds
+              in
+              if loop_preds <> [] && outside_exit_preds <> [] then begin
+                changed := true;
+                let dedicated_label = fresh_exit_label () in
+                let redirects = Hashtbl.create (List.length loop_preds) in
+                List.iter
+                  (fun pred -> Hashtbl.add redirects (pred, exit_label) dedicated_label)
+                  loop_preds;
+                List.iter
+                  (fun pred ->
+                    let pred_block : Cfg.block = get_block pred in
+                    let term = redirect_successors pred redirects pred_block.term in
+                    update_block { pred_block with term; succs = Cfg.successors term })
+                  loop_preds;
+                Hashtbl.add current_blocks dedicated_label
+                  {
+                    Cfg.label = dedicated_label;
+                    body = [];
+                    term = Cfg.Jump exit_label;
+                    preds = [];
+                    succs = [ exit_label ];
+                  };
+                insert_before exit_label [ dedicated_label ]
+              end)
+            exit_labels;
+          LabelSet.iter
+            (fun label ->
+              let block : Cfg.block = get_block label in
+              let exits_loop =
+                match branch_targets block.term with
+                | Some (a, b) -> LabelSet.mem a loop <> LabelSet.mem b loop
+                | None -> false
+              in
+              if
+                label <> header
+                && exits_loop
+                && block.preds <> []
+                && block.body <> []
+                && is_small_pure_control_body block.body
+              then begin
+                changed := true;
+                let prep_label = fresh_prep_label () in
+                let redirects = Hashtbl.create (List.length block.preds) in
+                List.iter
+                  (fun pred -> Hashtbl.add redirects (pred, label) prep_label)
+                  block.preds;
+                List.iter
+                  (fun pred ->
+                    let pred_block : Cfg.block = get_block pred in
+                    let term = redirect_successors pred redirects pred_block.term in
+                    update_block { pred_block with term; succs = Cfg.successors term })
+                  block.preds;
+                Hashtbl.add current_blocks prep_label
+                  {
+                    Cfg.label = prep_label;
+                    body = block.body;
+                    term = Cfg.Jump label;
+                    preds = [];
+                    succs = [ label ];
+                  };
+                insert_before label [ prep_label ];
+                update_block { block with body = [] };
+                if label = !current_entry then current_entry := prep_label
+              end)
+            loop)
+        headers;
+      if !changed then
+        let blocks = List.map get_block !block_order in
+        let rebuilt = Cfg.rebuild_edges { current with entry = !current_entry; blocks } in
+        let cleaned = thread_and_prune_func rebuilt in
+        if cleaned = current then current else apply cleaned
+      else current
+  in
+  apply f
+
 let eliminate_dead_loops_func summaries globals (f : Cfg.func) =
   let debug_dead_loops = Sys.getenv_opt "TOYC_DEBUG_DEAD_LOOPS" <> None in
   let debugf fmt = Printf.ksprintf (fun s -> if debug_dead_loops then prerr_endline s) fmt in
@@ -3043,6 +3346,81 @@ let last_def_of_temp_on_chain chain temp =
   in
   block_loop chain
 
+let def_instr_on_chain_or_global chain multi_defs def_instrs temp =
+  if IntSet.mem temp multi_defs then last_def_of_temp_on_chain chain temp
+  else Hashtbl.find_opt def_instrs temp
+
+let def_instr_in_block_or_global (block : Cfg.block) multi_defs def_instrs temp =
+  if IntSet.mem temp multi_defs then last_def_of_temp block temp
+  else Hashtbl.find_opt def_instrs temp
+
+let resolves_to_induction_temp_on_chain chain multi_defs def_instrs phi_temp operand =
+  let rec loop seen = function
+    | Tcg.Imm _ -> false
+    | Tcg.Temp temp ->
+        if temp = phi_temp then true
+        else if IntSet.mem temp seen then false
+        else
+          match def_instr_on_chain_or_global chain multi_defs def_instrs temp with
+          | Some (Tcg.Move (_, src))
+          | Some (Tcg.Un (_, UPlus, src)) ->
+              loop (IntSet.add temp seen) src
+          | Some _ | None -> false
+  in
+  loop IntSet.empty operand
+
+let resolves_to_induction_temp_in_block block multi_defs def_instrs phi_temp operand =
+  let rec loop seen = function
+    | Tcg.Imm _ -> false
+    | Tcg.Temp temp ->
+        if temp = phi_temp then true
+        else if IntSet.mem temp seen then false
+        else
+          match def_instr_in_block_or_global block multi_defs def_instrs temp with
+          | Some (Tcg.Move (_, src))
+          | Some (Tcg.Un (_, UPlus, src)) ->
+              loop (IntSet.add temp seen) src
+          | Some _ | None -> false
+  in
+  loop IntSet.empty operand
+
+let operand_static_int64_on_chain chain loop_defs multi_defs def_instrs operand =
+  let rec loop seen = function
+    | Tcg.Imm value -> Some value
+    | Tcg.Temp temp ->
+        if IntSet.mem temp seen || IntSet.mem temp loop_defs then None
+        else
+          match def_instr_on_chain_or_global chain multi_defs def_instrs temp with
+          | Some (Tcg.Move (_, src))
+          | Some (Tcg.Un (_, UPlus, src)) ->
+              loop (IntSet.add temp seen) src
+          | Some (Tcg.Un (_, op, src)) ->
+              Option.bind (loop (IntSet.add temp seen) src) (fold_unop op)
+          | Some (Tcg.Bin (_, op, lhs, rhs)) -> (
+              match (loop (IntSet.add temp seen) lhs, loop (IntSet.add temp seen) rhs) with
+              | Some lhs, Some rhs -> fold_binop op lhs rhs
+              | _ -> None)
+          | Some (Tcg.Load _ | Tcg.Store _ | Tcg.Call _) | None -> None
+  in
+  loop IntSet.empty operand
+
+let induction_step_of_instr_on_chain chain loop_defs multi_defs def_instrs phi_temp = function
+  | Tcg.Bin (_, Add, lhs, rhs)
+    when resolves_to_induction_temp_on_chain chain multi_defs def_instrs phi_temp lhs ->
+      operand_static_int64_on_chain chain loop_defs multi_defs def_instrs rhs
+  | Tcg.Bin (_, Add, lhs, rhs)
+    when resolves_to_induction_temp_on_chain chain multi_defs def_instrs phi_temp rhs ->
+      operand_static_int64_on_chain chain loop_defs multi_defs def_instrs lhs
+  | Tcg.Bin (_, Sub, lhs, rhs)
+    when resolves_to_induction_temp_on_chain chain multi_defs def_instrs phi_temp lhs ->
+      Option.map Int64.neg
+        (operand_static_int64_on_chain chain loop_defs multi_defs def_instrs rhs)
+  | _ -> None
+
+let pure_cfg_prep_instr = function
+  | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ -> true
+  | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> false
+
 let resolves_to_temp multi_defs def_instrs target operand =
   let rec loop seen = function
     | Tcg.Imm _ -> false
@@ -3345,12 +3723,19 @@ let collect_basic_induction_vars header loop get_block loop_defs multi_defs def_
     | Tcg.Imm _ -> None
   in
   let step_of_chain_source phi_temp chain src =
-    step_of_operand phi_temp (resolve_chain_operand chain src)
+    let resolved = resolve_chain_operand chain src in
+    match resolved with
+    | Tcg.Imm _ -> None
+    | Tcg.Temp temp -> (
+        match def_instr_on_chain_or_global chain multi_defs def_instrs temp with
+        | Some instr ->
+            induction_step_of_instr_on_chain chain loop_defs multi_defs def_instrs phi_temp instr
+        | None -> None)
   in
   let step_of_chain_def phi_temp chain =
     match last_def_of_temp_on_chain chain phi_temp with
     | Some (Tcg.Move (_, src)) -> step_of_chain_source phi_temp chain src
-    | Some instr -> induction_step_of_instr loop_defs multi_defs def_instrs phi_temp instr
+    | Some instr -> induction_step_of_instr_on_chain chain loop_defs multi_defs def_instrs phi_temp instr
     | None -> None
   in
   let counts = Hashtbl.create (max 8 pred_count) in
@@ -3623,28 +4008,32 @@ let classify_counted_loop_header
     multi_defs
     def_instrs
     ivs
-    (term : Cfg.terminator)
+    (block : Cfg.block)
   =
+  let term = block.term in
   let invariant operand =
     operand_loop_invariant
       loop_defs loop_stable_phis multi_defs def_instrs IntSet.empty operand
   in
+  let match_known_iv operand =
+    List.find_map
+      (fun (iv : basic_induction_var) ->
+        if
+          resolves_to_induction_temp_in_block block multi_defs def_instrs iv.phi_temp operand
+          || resolves_to_induction_temp multi_defs def_instrs iv.phi_temp operand
+        then Some (iv, 0L)
+        else None)
+      ivs
+  in
   let rec control_iv_bias_of_operand seen = function
     | Tcg.Imm _ -> None
     | Tcg.Temp temp as operand -> (
-        match
-          List.find_map
-            (fun (iv : basic_induction_var) ->
-              if resolves_to_induction_temp multi_defs def_instrs iv.phi_temp operand then
-                Some (iv, 0L)
-              else None)
-            ivs
-        with
+        match match_known_iv operand with
         | Some match_ -> Some match_
         | None ->
-            if IntSet.mem temp seen || IntSet.mem temp multi_defs then None
+            if IntSet.mem temp seen then None
             else
-              match Hashtbl.find_opt def_instrs temp with
+              match def_instr_in_block_or_global block multi_defs def_instrs temp with
               | Some (Tcg.Move (_, src))
               | Some (Tcg.Un (_, UPlus, src)) ->
                   control_iv_bias_of_operand (IntSet.add temp seen) src
@@ -3706,9 +4095,9 @@ let classify_counted_loop_header
   let rec resolve_compare_operand seen negate = function
     | Tcg.Imm _ -> None
     | Tcg.Temp temp ->
-        if IntSet.mem temp seen || IntSet.mem temp multi_defs then None
+        if IntSet.mem temp seen then None
         else
-          match Hashtbl.find_opt def_instrs temp with
+          match def_instr_in_block_or_global block multi_defs def_instrs temp with
           | Some (Tcg.Move (_, src))
           | Some (Tcg.Un (_, UPlus, src)) ->
               resolve_compare_operand (IntSet.add temp seen) negate src
@@ -3745,16 +4134,16 @@ let find_counted_loop_control
          let block : Cfg.block = get_block label in
          match branch_term_outcomes block.term with
          | Some (a, b) when LabelSet.mem a loop <> LabelSet.mem b loop ->
-             classify_counted_loop_header
-               label
-               loop
-               loop_defs
-               loop_stable_phis
-               multi_defs
-               def_instrs
-               ivs
-               block.term
-         | Some _ | None -> None)
+              classify_counted_loop_header
+                label
+                loop
+                loop_defs
+                loop_stable_phis
+                multi_defs
+                def_instrs
+                ivs
+                block
+          | Some _ | None -> None)
 
 let linear_loop_path header loop get_block entry_label =
   let rec walk seen acc label =
@@ -5650,6 +6039,11 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
   let unroll_large_path_max_memory_ops = 4 in
   let unroll_single_block_max_defs = 12 in
   let unroll_multi_block_max_defs = 8 in
+  let unroll_max_control_body_instrs = 4 in
+  let control_body_supported body =
+    List.length body <= unroll_max_control_body_instrs
+    && List.for_all pure_cfg_prep_instr body
+  in
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
   let doms = compute_dominators f in
@@ -5805,7 +6199,7 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
                   in
                   if
                     effects.has_call
-                    || control_block.body <> []
+                    || not (control_body_supported control_block.body)
                     || path = []
                     || path_blocks > path_max_blocks
                     || total_instrs > max_instrs
@@ -6844,6 +7238,7 @@ let stage_round_enabled profile round stage =
 
 let optimize_func global_init summaries globals (f : Cfg.func) =
   let promoted = f |> mem2reg_func |> promote_locals_func |> promote_globals_func summaries globals in
+  let canonical = loop_canonicalize_func summaries globals promoted in
   let base_metrics = metrics_of_func f in
   let promoted_metrics = metrics_of_func promoted in
   let profile = choose_opt_profile base_metrics in
@@ -6987,12 +7382,13 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
   in
   match debug_stop_after with
   | Some "mem2reg" -> promoted
-  | Some _ | None -> loop 1 profile.max_rounds promoted
+  | Some _ | None -> loop 1 profile.max_rounds canonical
 
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
   last_liveness_cache := None;
   last_dominator_cache := None;
+  let cfg = { Cfg.funcs = List.map tailrec_elim_func cfg.funcs } in
   let global_init, globals =
     List.fold_left
       (fun (init, set) (g : Semant.global_decl) ->
