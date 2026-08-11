@@ -142,13 +142,15 @@ let contains_substring text needle =
   needle_len = 0 || loop 0
 
 let is_mem2reg_edge_label label = contains_substring label "_mem2reg_edge_"
+let is_lprom_edge_label label = contains_substring label "_lprom_edge_"
 let is_gprom_edge_label label = contains_substring label "_gprom_edge_"
 let is_licm_preheader_label label = contains_substring label "_licm_preheader_"
 let is_split_preheader_label label = contains_substring label "_split_preheader_"
 let is_split_summary_label label = contains_substring label "_split_summary_"
 let is_counted_loop_label label = contains_substring label "_counted_loop_"
 
-let is_edge_anchor_label label = is_mem2reg_edge_label label || is_gprom_edge_label label
+let is_edge_anchor_label label =
+  is_mem2reg_edge_label label || is_lprom_edge_label label || is_gprom_edge_label label
 
 let is_before_successor_anchor_label label =
   is_licm_preheader_label label
@@ -408,10 +410,10 @@ let spill_weight
     max 1
       ((4 * use_count)
       + (2 * def_count)
-      + (8 * loop_use_score)
-      + (4 * loop_def_score)
-      + (48 * loop_carried_score)
-      + (12 * call_crossings))
+      + (12 * loop_use_score)
+      + (6 * loop_def_score)
+      + (96 * loop_carried_score)
+      + (10 * call_crossings))
   in
   let span = max 1 (end_pos - start_pos + 1) in
   (benefit * 1024) / span
@@ -719,7 +721,8 @@ let compute_temp_intervals (f : Cfg.func) =
             IntSet.iter
               (fun temp ->
                 match Hashtbl.find_opt stats_table temp with
-                | Some stats -> stats.loop_carried_score <- stats.loop_carried_score + loop_depth
+                | Some stats ->
+                    stats.loop_carried_score <- stats.loop_carried_score + (2 * loop_depth)
                 | None -> ())
               carried)
         block.succs)
@@ -837,8 +840,8 @@ let allocate_temp_regs ?(reserved_saved_regs = []) (f : Cfg.func) =
     | _ -> None
   in
   let prefer_saved_regs (interval : interval) =
-    interval.loop_carried_score >= 2
-    && interval.loop_use_score + interval.loop_def_score >= 8
+    interval.loop_carried_score >= 1
+    && interval.loop_use_score + interval.loop_def_score >= 4
   in
   let allowed_arg_regs (interval : interval) =
     if interval.call_crossings <> 0 then []
