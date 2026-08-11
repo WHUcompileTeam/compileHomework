@@ -39,6 +39,7 @@ let allocatable_arg_regs = [ "a0"; "a1"; "a2"; "a3"; "a4"; "a5"; "a6"; "a7" ]
 let allocatable_caller_regs = allocatable_temp_regs @ allocatable_arg_regs
 let allocatable_saved_regs = [ "s1"; "s2"; "s3"; "s4"; "s5"; "s6"; "s7"; "s8"; "s9"; "s10"; "s11" ]
 let reserved_global_base_regs = [ "s10"; "s11" ]
+let hot_local_regs_enabled = Sys.getenv_opt "TOYC_DISABLE_HOT_LOCAL_REGS" = None
 
 let align16 n = ((n + 15) / 16) * 16
 
@@ -676,13 +677,14 @@ let select_global_base_regs (f : Cfg.func) =
   mapping
 
 let select_hot_local_regs reserved_saved_regs (f : Cfg.func) =
+  if not hot_local_regs_enabled then Hashtbl.create 0
+  else
   let stats = compute_local_access_stats f in
   let instr_count = block_instr_count f.blocks in
   let budget =
-    if f.temp_count >= 224 || instr_count >= 448 then 1
-    else if f.temp_count >= 128 || instr_count >= 256 then 2
-    else if f.temp_count >= 64 || instr_count >= 128 then 3
-    else 4
+    if f.temp_count >= 256 || instr_count >= 512 then 2
+    else if f.temp_count >= 160 || instr_count >= 320 then 1
+    else 0
   in
   let available_regs =
     allocatable_saved_regs
@@ -691,7 +693,7 @@ let select_hot_local_regs reserved_saved_regs (f : Cfg.func) =
   let candidates =
     Hashtbl.fold
       (fun id ({ count; score; stores } : local_access_stats) acc ->
-        if count >= 3 && score >= 18 && (stores <> 0 || score >= 36) then
+        if count >= 6 && stores >= 2 && score >= 72 then
           (id, score, stores, count) :: acc
         else acc)
       stats []
