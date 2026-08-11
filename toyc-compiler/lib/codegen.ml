@@ -142,10 +142,23 @@ let contains_substring text needle =
   needle_len = 0 || loop 0
 
 let is_mem2reg_edge_label label = contains_substring label "_mem2reg_edge_"
+let is_gprom_edge_label label = contains_substring label "_gprom_edge_"
 let is_licm_preheader_label label = contains_substring label "_licm_preheader_"
-let is_synthetic_label label = is_mem2reg_edge_label label || is_licm_preheader_label label
+let is_split_preheader_label label = contains_substring label "_split_preheader_"
+let is_split_summary_label label = contains_substring label "_split_summary_"
+let is_counted_loop_label label = contains_substring label "_counted_loop_"
 
-let schedule_func_blocks (f : Cfg.func) =
+let is_edge_anchor_label label = is_mem2reg_edge_label label || is_gprom_edge_label label
+
+let is_before_successor_anchor_label label =
+  is_licm_preheader_label label
+  || is_split_preheader_label label
+  || is_split_summary_label label
+  || is_counted_loop_label label
+
+let is_synthetic_label label = is_edge_anchor_label label || is_before_successor_anchor_label label
+
+let build_block_anchor_maps blocks =
   let before_map = Hashtbl.create 8 in
   let after_map = Hashtbl.create 8 in
   let append_anchor table key block =
@@ -158,32 +171,16 @@ let schedule_func_blocks (f : Cfg.func) =
   in
   List.iter
     (fun (block : Cfg.block) ->
-      if is_mem2reg_edge_label block.label then
+      if is_edge_anchor_label block.label then
         match block.preds with
         | pred :: _ -> append_anchor after_map pred block
         | [] -> ()
-      else if is_licm_preheader_label block.label then
+      else if is_before_successor_anchor_label block.label then
         match block.succs with
         | succ :: _ -> append_anchor before_map succ block
         | [] -> ())
-    f.blocks;
-  let emitted = Hashtbl.create (List.length f.blocks) in
-  let ordered_rev = ref [] in
-  let rec emit_block (block : Cfg.block) =
-    if not (Hashtbl.mem emitted block.label) then begin
-      Hashtbl.add emitted block.label ();
-      List.iter emit_block (table_find_or_empty before_map block.label []);
-      ordered_rev := block :: !ordered_rev;
-      List.iter emit_block (table_find_or_empty after_map block.label [])
-    end
-  in
-  Option.iter emit_block (List.find_opt (fun (block : Cfg.block) -> block.label = f.entry) f.blocks);
-  List.iter
-    (fun (block : Cfg.block) ->
-      if block.label <> f.entry && not (is_synthetic_label block.label) then emit_block block)
-    f.blocks;
-  List.iter (fun (block : Cfg.block) -> if block.label <> f.entry then emit_block block) f.blocks;
-  { f with blocks = List.rev !ordered_rev }
+    blocks;
+  (before_map, after_map)
 
 let max_call_args (f : Cfg.func) =
   List.fold_left
@@ -417,6 +414,121 @@ let compute_loop_depths (f : Cfg.func) =
         block.succs)
     f.blocks;
   depths
+
+let schedule_primary_blocks (f : Cfg.func) =
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
+  let reachable = reachable_labels f.entry f.blocks in
+  let loop_depths = compute_loop_depths f in
+  let original_order = Hashtbl.create (List.length f.blocks) in
+  List.iteri (fun index (block : Cfg.block) -> Hashtbl.add original_order block.label index) f.blocks;
+  let primary_blocks =
+    List.filter
+      (fun (block : Cfg.block) ->
+        LabelSet.mem block.label reachable && not (is_synthetic_label block.label))
+      f.blocks
+  in
+  let primary_labels =
+    List.fold_left
+      (fun labels (block : Cfg.block) -> LabelSet.add block.label labels)
+      LabelSet.empty primary_blocks
+  in
+  let loop_depth label = Option.value ~default:0 (Hashtbl.find_opt loop_depths label) in
+  let original_index label =
+    Option.value ~default:max_int (Hashtbl.find_opt original_order label)
+  in
+  let rec resolve_primary_successor seen label =
+    if LabelSet.mem label seen || not (LabelSet.mem label reachable) then None
+    else if LabelSet.mem label primary_labels then Some label
+    else
+      match Hashtbl.find_opt block_map label with
+      | Some (block : Cfg.block) when is_synthetic_label label -> (
+          match block.succs with
+          | [ next_label ] -> resolve_primary_successor (LabelSet.add label seen) next_label
+          | _ -> None)
+      | Some _ | None -> None
+  in
+  let block_heat (block : Cfg.block) =
+    (4096 * loop_depth block.label)
+    + (64 * min 4 (List.length block.preds))
+    + (8 * min 8 (List.length block.body))
+  in
+  let edge_heat (block : Cfg.block) succ_label =
+    let succ_block : Cfg.block = Hashtbl.find block_map succ_label in
+    let current_depth = loop_depth block.label in
+    let succ_depth = loop_depth succ_label in
+    let depth_bonus =
+      if succ_depth < current_depth then -8192 * (current_depth - succ_depth)
+      else 2048 * (succ_depth - current_depth)
+    in
+    let jump_bonus =
+      match block.term with
+      | Cfg.Jump target when target = succ_label -> 16384
+      | _ -> 0
+    in
+    let chain_bonus = if List.length succ_block.preds <= 1 then 1024 else 0 in
+    jump_bonus + depth_bonus + (256 * succ_depth) + chain_bonus - original_index succ_label
+  in
+  let visited = Hashtbl.create (List.length primary_blocks) in
+  let ordered_rev = ref [] in
+  let rec follow_trace label =
+    if not (Hashtbl.mem visited label) then begin
+      Hashtbl.add visited label ();
+      ordered_rev := Hashtbl.find block_map label :: !ordered_rev;
+      let block : Cfg.block = Hashtbl.find block_map label in
+      let successors =
+        List.fold_left
+          (fun acc succ ->
+            match resolve_primary_successor LabelSet.empty succ with
+            | Some resolved
+              when not (Hashtbl.mem visited resolved)
+                   && not (List.exists (fun existing -> existing = resolved) acc) ->
+                resolved :: acc
+            | Some _ | None -> acc)
+          [] block.succs
+        |> List.rev
+        |> List.sort (fun a b ->
+               match compare (edge_heat block b) (edge_heat block a) with
+               | 0 -> compare (original_index a) (original_index b)
+               | c -> c)
+      in
+      match successors with
+      | next_label :: _ -> follow_trace next_label
+      | [] -> ()
+    end
+  in
+  let initial_start = resolve_primary_successor LabelSet.empty f.entry in
+  Option.iter follow_trace initial_start;
+  let remaining_starts =
+    List.sort
+      (fun (a : Cfg.block) (b : Cfg.block) ->
+        match compare (block_heat b) (block_heat a) with
+        | 0 -> compare (original_index a.label) (original_index b.label)
+        | c -> c)
+      primary_blocks
+  in
+  List.iter (fun (block : Cfg.block) -> follow_trace block.label) remaining_starts;
+  List.rev !ordered_rev
+
+let schedule_func_blocks_with_hot_traces (f : Cfg.func) =
+  let before_map, after_map = build_block_anchor_maps f.blocks in
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
+  let primary_order = schedule_primary_blocks f in
+  let emitted = Hashtbl.create (List.length f.blocks) in
+  let ordered_rev = ref [] in
+  let rec emit_block (block : Cfg.block) =
+    if not (Hashtbl.mem emitted block.label) then begin
+      Hashtbl.add emitted block.label ();
+      List.iter emit_block (table_find_or_empty before_map block.label []);
+      ordered_rev := block :: !ordered_rev;
+      List.iter emit_block (table_find_or_empty after_map block.label [])
+    end
+  in
+  Option.iter emit_block (Hashtbl.find_opt block_map f.entry);
+  List.iter emit_block primary_order;
+  List.iter emit_block f.blocks;
+  { f with blocks = List.rev !ordered_rev }
 
 type global_access_stats = {
   mutable count : int;
@@ -1308,7 +1420,7 @@ let gen_block ctx next_label (block : Cfg.block) =
       gen_terminator ctx next_label block.term
 
 let gen_func buf (f : Cfg.func) =
-  let f = schedule_func_blocks f in
+  let f = schedule_func_blocks_with_hot_traces f in
   let layout = compute_layout f in
   let epilogue = Printf.sprintf ".L_%s_epilogue" f.label in
   let blocks_by_label = Hashtbl.create (List.length f.blocks) in

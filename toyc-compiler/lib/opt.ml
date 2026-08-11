@@ -2751,6 +2751,7 @@ let contains_substring text needle =
 
 let is_unroll2_label label = contains_substring label "_unroll2_"
 let is_unswitch_label label = contains_substring label "_unswitch_"
+let is_rotate_guard_label label = contains_substring label "_rotate_guard_"
 
 let rewrite_term_labels rename = function
   | Cfg.Jump label -> Cfg.Jump (rename label)
@@ -4117,6 +4118,111 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
       Cfg.rebuild_edges { f with blocks }
     else f
 
+let classify_loop_rotate_targets loop (term : Cfg.terminator) =
+  match branch_term_outcomes term with
+  | Some (first_label, second_label) ->
+      let first_inside = LabelSet.mem first_label loop in
+      let second_inside = LabelSet.mem second_label loop in
+      if first_inside && not second_inside then Some (first_label, second_label)
+      else if second_inside && not first_inside then Some (second_label, first_label)
+      else None
+  | None -> None
+
+let loop_rotate_func (f : Cfg.func) =
+  let next_guard_id = ref 0 in
+  let fresh_guard_label () =
+    let id = !next_guard_id in
+    incr next_guard_id;
+    Printf.sprintf ".L%s_rotate_guard_%d" f.label id
+  in
+  let rec apply (current : Cfg.func) =
+    let block_map = Hashtbl.create (List.length current.blocks) in
+    List.iter
+      (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block)
+      current.blocks;
+    let doms = compute_dominators current in
+    let backedges =
+      List.fold_left
+        (fun acc (block : Cfg.block) ->
+          List.fold_left
+            (fun acc succ ->
+              if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
+                (block.label, succ) :: acc
+              else acc)
+            acc block.succs)
+        [] current.blocks
+    in
+    if backedges = [] then current
+    else
+      let loops = Hashtbl.create 8 in
+      List.iter
+        (fun (pred, header) ->
+          let loop = natural_loop block_map header pred in
+          let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
+          Hashtbl.replace loops header merged)
+        backedges;
+      let headers =
+        Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
+        |> List.sort (fun (_, a) (_, b) -> compare a b)
+        |> List.map fst
+      in
+      match
+        List.find_map
+          (fun header ->
+            let header_block : Cfg.block = Hashtbl.find block_map header in
+            let loop = table_find_or_empty loops header LabelSet.empty in
+            let outside_preds =
+              List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds
+            in
+            let backedge_preds =
+              List.filter (fun pred -> LabelSet.mem pred loop) header_block.preds
+            in
+            if
+              header_block.body <> []
+              || backedge_preds = []
+              || (outside_preds = [] && header <> current.entry)
+              || is_rotate_guard_label header
+            then None
+            else
+              match classify_loop_rotate_targets loop header_block.term with
+              | None -> None
+              | Some (_inside_label, _exit_label) ->
+                  let guard_label = fresh_guard_label () in
+                  let guard_block =
+                    {
+                      Cfg.label = guard_label;
+                      body = [];
+                      term = header_block.term;
+                      preds = [];
+                      succs = Cfg.successors header_block.term;
+                    }
+                  in
+                  let blocks =
+                    let redirected_blocks =
+                      List.map
+                        (fun (block : Cfg.block) ->
+                          if List.exists (fun pred -> pred = block.label) outside_preds then
+                            let term =
+                              rewrite_term_successor block.term ~from_label:header ~to_label:guard_label
+                            in
+                            { block with term; succs = Cfg.successors term }
+                          else block)
+                        current.blocks
+                    in
+                    List.fold_right
+                      (fun (block : Cfg.block) acc ->
+                        if block.label = header then guard_block :: block :: acc else block :: acc)
+                      redirected_blocks []
+                  in
+                  let entry = if header = current.entry then guard_label else current.entry in
+                  Some (Cfg.rebuild_edges { current with entry; blocks }))
+          headers
+      with
+      | Some rotated -> apply rotated
+      | None -> current
+  in
+  apply f
+
 let strength_reduce_func (f : Cfg.func) =
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
@@ -4924,7 +5030,10 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
       in
       let after_thread2 = thread_and_prune_func after_unroll |> stop_after "thread2" in
       let after_fold2 = fold_branch_tails_func summaries globals after_thread2 |> stop_after "fold2" in
-      after_fold2
+      let after_rotate = loop_rotate_func after_fold2 |> stop_after "rotate" in
+      let after_thread3 = thread_and_prune_func after_rotate |> stop_after "thread3" in
+      let after_fold3 = fold_branch_tails_func summaries globals after_thread3 |> stop_after "fold3" in
+      after_fold3
     with
     | StopPass current -> current
   in

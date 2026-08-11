@@ -45,3 +45,4 @@ inline_local_expr_body.tc 12
 counted_split_reduction.tc 73
 counted_split_call_mix.tc 16
 counted_split_global_mix.tc 15
+rotate_call_global_loop.tc 16
