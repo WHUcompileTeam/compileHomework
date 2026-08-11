@@ -11,6 +11,7 @@ type layout = {
   frame_size : int;
   outgoing_area : int;
   saved_regs : string list;
+  uses_s0 : bool;
 }
 
 and temp_home =
@@ -26,6 +27,7 @@ type ctx = {
   epilogue : string;
   frame_size : int;
   saved_regs : string list;
+  uses_s0 : bool;
 }
 
 let global_addr_reg = "t3"
@@ -647,18 +649,15 @@ let compute_layout (f : Cfg.func) =
         | TempReg _ -> false)
       temp_homes false
   in
-  let needs_frame =
-    calls_function f
-    || saved_regs <> []
-    || Hashtbl.length local_offsets > 0
-    || has_stack_temp
-  in
+  let uses_s0 = Hashtbl.length local_offsets > 0 || has_stack_temp in
+  let needs_frame = calls_function f || saved_regs <> [] || uses_s0 in
   {
     local_offsets;
     temp_homes;
     frame_size = if needs_frame then align16 frame_bytes else 0;
     outgoing_area;
     saved_regs;
+    uses_s0;
   }
 
 let emit_reg_copy ctx dst src =
@@ -1022,7 +1021,7 @@ let restore_frame ctx =
       (fun i reg -> emitf ctx "    lw %s, %d(sp)" reg (ctx.frame_size - (12 + (4 * i))))
       ctx.saved_regs;
     emitf ctx "    lw ra, %d(sp)" (ctx.frame_size - 4);
-    emitf ctx "    lw s0, %d(sp)" (ctx.frame_size - 8);
+    if ctx.uses_s0 then emitf ctx "    lw s0, %d(sp)" (ctx.frame_size - 8);
     emitf ctx "    addi sp, sp, %d" ctx.frame_size
   end
 
@@ -1121,6 +1120,7 @@ let gen_func buf (f : Cfg.func) =
       epilogue;
       frame_size = layout.frame_size;
       saved_regs = layout.saved_regs;
+      uses_s0 = layout.uses_s0;
     }
   in
   emit ctx "    .text";
@@ -1130,11 +1130,11 @@ let gen_func buf (f : Cfg.func) =
   if layout.frame_size > 0 then begin
     emitf ctx "    addi sp, sp, -%d" layout.frame_size;
     emitf ctx "    sw ra, %d(sp)" (layout.frame_size - 4);
-    emitf ctx "    sw s0, %d(sp)" (layout.frame_size - 8);
+    if layout.uses_s0 then emitf ctx "    sw s0, %d(sp)" (layout.frame_size - 8);
     List.iteri
       (fun i reg -> emitf ctx "    sw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
       layout.saved_regs;
-    emitf ctx "    addi s0, sp, %d" layout.frame_size
+    if layout.uses_s0 then emitf ctx "    addi s0, sp, %d" layout.frame_size
   end;
   List.iteri
     (fun i (param : Tcg.var) ->
