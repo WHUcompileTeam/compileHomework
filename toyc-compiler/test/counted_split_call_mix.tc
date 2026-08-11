@@ -1,0 +1,15 @@
+int inc(int x) {
+  return x + 1;
+}
+
+int main() {
+  int i = 0;
+  int sum = 0;
+  int acc = 1;
+  while (i < 5) {
+    sum = sum + i;
+    acc = inc(acc);
+    i = i + 1;
+  }
+  return sum + acc;
+}

@@ -3596,7 +3596,6 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
         let def_blocks = temp_def_blocks_of_blocks !next_temp blocks_snapshot in
         let def_instrs = temp_def_instrs_of_blocks !next_temp blocks_snapshot in
         let multi_defs = multi_def_temps_of_blocks !next_temp blocks_snapshot in
-        let effects = collect_loop_effects summaries globals loop blocks_snapshot in
         let loop_stable_phis =
           collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
         in
@@ -3615,150 +3614,148 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
             match linear_loop_path header loop get_block info.inside_label with
             | None -> ()
             | Some _path ->
-                if effects.has_call || not (PlaceSet.is_empty effects.modified_places) then ()
+                let live_in_t, _ =
+                  compute_liveness summaries globals { f with blocks = blocks_snapshot }
+                in
+                let live_t_exit = table_find_or_empty live_in_t info.exit_label IntSet.empty in
+                let ivs =
+                  collect_basic_induction_vars header loop get_block multi_defs def_instrs
+                in
+                let live_ivs =
+                  List.filter
+                    (fun (iv : basic_induction_var) ->
+                      iv.phi_temp = info.control_iv.phi_temp || IntSet.mem iv.phi_temp live_t_exit)
+                    ivs
+                in
+                let loop_live_defs = IntSet.inter loop_defs live_t_exit in
+                let excluded_temps =
+                  List.fold_left
+                    (fun acc (iv : basic_induction_var) -> IntSet.add iv.phi_temp acc)
+                    IntSet.empty live_ivs
+                in
+                let reductions =
+                  collect_counted_reductions
+                    header
+                    loop
+                    loop_defs
+                    get_block
+                    def_blocks
+                    loop_stable_phis
+                    multi_defs
+                    def_instrs
+                    ivs
+                    excluded_temps
+                    loop_live_defs
+                in
+                let all_updates =
+                  (List.map (fun iv -> CountedIv iv) live_ivs)
+                  @ List.map (fun reduction -> CountedReduction reduction) reductions
+                in
+                let supported_live =
+                  List.fold_left
+                    (fun acc update -> IntSet.add (counted_update_temp update) acc)
+                    IntSet.empty all_updates
+                in
+                if IntSet.subset loop_live_defs supported_live then ()
                 else
-                  let live_in_t, _ =
-                    compute_liveness summaries globals { f with blocks = blocks_snapshot }
-                  in
-                  let live_t_exit = table_find_or_empty live_in_t info.exit_label IntSet.empty in
-                  let ivs =
-                    collect_basic_induction_vars header loop get_block multi_defs def_instrs
-                  in
-                  let live_ivs =
-                    List.filter
-                      (fun (iv : basic_induction_var) ->
-                        iv.phi_temp = info.control_iv.phi_temp || IntSet.mem iv.phi_temp live_t_exit)
-                      ivs
-                  in
-                  let loop_live_defs = IntSet.inter loop_defs live_t_exit in
-                  let excluded_temps =
-                    List.fold_left
-                      (fun acc (iv : basic_induction_var) -> IntSet.add iv.phi_temp acc)
-                      IntSet.empty live_ivs
-                  in
-                  let reductions =
-                    collect_counted_reductions
-                      header
+                  let extractable =
+                    collect_direct_extractable_reductions
                       loop
-                      loop_defs
                       get_block
-                      def_blocks
-                      loop_stable_phis
-                      multi_defs
-                      def_instrs
-                      ivs
-                      excluded_temps
-                      loop_live_defs
+                      info.control_iv.backedge_preds
+                      reductions
                   in
-                  let all_updates =
-                    (List.map (fun iv -> CountedIv iv) live_ivs)
-                    @ List.map (fun reduction -> CountedReduction reduction) reductions
-                  in
-                  let supported_live =
-                    List.fold_left
-                      (fun acc update -> IntSet.add (counted_update_temp update) acc)
-                      IntSet.empty all_updates
-                  in
-                  if IntSet.subset loop_live_defs supported_live then ()
+                  if extractable = [] then ()
                   else
-                    let extractable =
-                      collect_direct_extractable_reductions
-                        loop
-                        get_block
-                        info.control_iv.backedge_preds
-                        reductions
+                    let outside_preds =
+                      List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds
                     in
-                    if extractable = [] then ()
+                    if outside_preds = [] then ()
                     else
-                      let outside_preds =
-                        List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds
+                      let removals = Hashtbl.create 8 in
+                      List.iter
+                        (fun (_, defs) ->
+                          List.iter
+                            (fun (label, index) ->
+                              let current =
+                                match Hashtbl.find_opt removals label with
+                                | Some set -> set
+                                | None -> IntSet.empty
+                              in
+                              Hashtbl.replace removals label (IntSet.add index current))
+                            defs)
+                        extractable;
+                      let preheader_label =
+                        match outside_preds with
+                        | [ pred ] ->
+                            let pred_block = get_block pred in
+                            if pred_block.succs = [ header ] then pred else fresh_preheader_label ()
+                        | _ -> fresh_preheader_label ()
                       in
-                      if outside_preds = [] then ()
-                      else
-                        let removals = Hashtbl.create 8 in
+                      let created_preheader = not (Hashtbl.mem current_blocks preheader_label) in
+                      if created_preheader then begin
+                        let redirects = Hashtbl.create (List.length outside_preds) in
                         List.iter
-                          (fun (_, defs) ->
-                            List.iter
-                              (fun (label, index) ->
-                                let current =
-                                  match Hashtbl.find_opt removals label with
-                                  | Some set -> set
-                                  | None -> IntSet.empty
-                                in
-                                Hashtbl.replace removals label (IntSet.add index current))
-                              defs)
-                          extractable;
-                        let preheader_label =
-                          match outside_preds with
-                          | [ pred ] ->
-                              let pred_block = get_block pred in
-                              if pred_block.succs = [ header ] then pred else fresh_preheader_label ()
-                          | _ -> fresh_preheader_label ()
-                        in
-                        let created_preheader = not (Hashtbl.mem current_blocks preheader_label) in
-                        if created_preheader then begin
-                          let redirects = Hashtbl.create (List.length outside_preds) in
-                          List.iter
-                            (fun pred -> Hashtbl.add redirects (pred, header) preheader_label)
-                            outside_preds;
-                          List.iter
-                            (fun pred ->
-                              let pred_block = get_block pred in
-                              let term = redirect_successors pred redirects pred_block.term in
-                              update_block { pred_block with term; succs = Cfg.successors term })
-                            outside_preds;
-                          Hashtbl.add current_blocks preheader_label
-                            {
-                              Cfg.label = preheader_label;
-                              body = [];
-                              term = Cfg.Jump header;
-                              preds = [];
-                              succs = [ header ];
-                            };
-                          new_blocks_rev := preheader_label :: !new_blocks_rev
-                        end;
-                        let trip_instrs, trip_temp =
-                          build_trip_count_instrs
-                            fresh_temp
-                            info.control_iv.phi_temp
-                            info.control_iv.step
-                            info.kind
-                        in
-                        let preheader = get_block preheader_label in
-                        update_block { preheader with body = preheader.body @ trip_instrs };
-                        Hashtbl.iter
-                          (fun label indexes ->
-                            let block : Cfg.block = get_block label in
-                            let body =
-                              block.body
-                              |> List.mapi (fun index instr -> (index, instr))
-                              |> List.filter (fun (index, _) -> not (IntSet.mem index indexes))
-                              |> List.map snd
-                            in
-                            update_block { block with body })
-                          removals;
-                        let summary_label = fresh_summary_label () in
-                        let summary_body =
-                          extractable
-                          |> List.map fst
-                          |> List.concat_map (build_reduction_final_update fresh_temp trip_temp)
-                        in
-                        let header_block = get_block header in
-                        let term =
-                          rewrite_term_successor header_block.term
-                            ~from_label:info.exit_label ~to_label:summary_label
-                        in
-                        update_block { header_block with term; succs = Cfg.successors term };
-                        Hashtbl.add current_blocks summary_label
+                          (fun pred -> Hashtbl.add redirects (pred, header) preheader_label)
+                          outside_preds;
+                        List.iter
+                          (fun pred ->
+                            let pred_block = get_block pred in
+                            let term = redirect_successors pred redirects pred_block.term in
+                            update_block { pred_block with term; succs = Cfg.successors term })
+                          outside_preds;
+                        Hashtbl.add current_blocks preheader_label
                           {
-                            Cfg.label = summary_label;
-                            body = summary_body;
-                            term = Cfg.Jump info.exit_label;
+                            Cfg.label = preheader_label;
+                            body = [];
+                            term = Cfg.Jump header;
                             preds = [];
-                            succs = [ info.exit_label ];
+                            succs = [ header ];
                           };
-                        new_blocks_rev := summary_label :: !new_blocks_rev;
-                        changed := true))
+                        new_blocks_rev := preheader_label :: !new_blocks_rev
+                      end;
+                      let trip_instrs, trip_temp =
+                        build_trip_count_instrs
+                          fresh_temp
+                          info.control_iv.phi_temp
+                          info.control_iv.step
+                          info.kind
+                      in
+                      let preheader = get_block preheader_label in
+                      update_block { preheader with body = preheader.body @ trip_instrs };
+                      Hashtbl.iter
+                        (fun label indexes ->
+                          let block : Cfg.block = get_block label in
+                          let body =
+                            block.body
+                            |> List.mapi (fun index instr -> (index, instr))
+                            |> List.filter (fun (index, _) -> not (IntSet.mem index indexes))
+                            |> List.map snd
+                          in
+                          update_block { block with body })
+                        removals;
+                      let summary_label = fresh_summary_label () in
+                      let summary_body =
+                        extractable
+                        |> List.map fst
+                        |> List.concat_map (build_reduction_final_update fresh_temp trip_temp)
+                      in
+                      let header_block = get_block header in
+                      let term =
+                        rewrite_term_successor header_block.term
+                          ~from_label:info.exit_label ~to_label:summary_label
+                      in
+                      update_block { header_block with term; succs = Cfg.successors term };
+                      Hashtbl.add current_blocks summary_label
+                        {
+                          Cfg.label = summary_label;
+                          body = summary_body;
+                          term = Cfg.Jump info.exit_label;
+                          preds = [];
+                          succs = [ info.exit_label ];
+                        };
+                      new_blocks_rev := summary_label :: !new_blocks_rev;
+                      changed := true))
       headers;
     if !changed then
       let ordered_labels = List.map (fun (block : Cfg.block) -> block.label) f.blocks in
