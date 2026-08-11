@@ -7,7 +7,7 @@ module IntSet = Set.Make (Int)
 module LabelSet = Set.Make (String)
 
 type layout = {
-  local_offsets : (int, int) Hashtbl.t;
+  local_homes : (int, local_home) Hashtbl.t;
   temp_homes : (int, temp_home) Hashtbl.t;
   global_base_regs : (string, string) Hashtbl.t;
   frame_size : int;
@@ -15,13 +15,17 @@ type layout = {
   saved_regs : string list;
 }
 
+and local_home =
+  | LocalStack of int
+  | LocalReg of string
+
 and temp_home =
   | TempStack of int
   | TempReg of string
 
 type ctx = {
   buf : Buffer.t;
-  local_offsets : (int, int) Hashtbl.t;
+  local_homes : (int, local_home) Hashtbl.t;
   temp_homes : (int, temp_home) Hashtbl.t;
   global_base_regs : (string, string) Hashtbl.t;
   blocks_by_label : (string, Cfg.block) Hashtbl.t;
@@ -53,6 +57,11 @@ let lookup_temp_home table temp =
   match Hashtbl.find_opt table temp with
   | Some home -> home
   | None -> raise (Error "internal missing temp home")
+
+let lookup_local_home table id =
+  match Hashtbl.find_opt table id with
+  | Some home -> home
+  | None -> raise (Error "internal missing local home")
 
 let lookup_block table label = Hashtbl.find_opt table label
 
@@ -563,6 +572,12 @@ type global_access_stats = {
   mutable score : int;
 }
 
+type local_access_stats = {
+  mutable count : int;
+  mutable score : int;
+  mutable stores : int;
+}
+
 let compute_global_access_stats (f : Cfg.func) =
   let loop_depths = compute_loop_depths f in
   let stats = Hashtbl.create 8 in
@@ -586,6 +601,35 @@ let compute_global_access_stats (f : Cfg.func) =
           | Tcg.Load (_, Tcg.Global label)
           | Tcg.Store (Tcg.Global label, _) ->
               note_global label loop_depth
+          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> ())
+        block.body)
+    f.blocks;
+  stats
+
+let compute_local_access_stats (f : Cfg.func) =
+  let loop_depths = compute_loop_depths f in
+  let stats = Hashtbl.create 16 in
+  let note_local id is_store loop_depth =
+    let entry =
+      match Hashtbl.find_opt stats id with
+      | Some entry -> entry
+      | None ->
+          let entry = { count = 0; score = 0; stores = 0 } in
+          Hashtbl.add stats id entry;
+          entry
+    in
+    entry.count <- entry.count + 1;
+    if is_store then entry.stores <- entry.stores + 1;
+    let base = if is_store then 2 else 1 in
+    entry.score <- entry.score + (base * (1 + (6 * loop_depth)))
+  in
+  List.iter
+    (fun (block : Cfg.block) ->
+      let loop_depth = Option.value ~default:0 (Hashtbl.find_opt loop_depths block.label) in
+      List.iter
+        (function
+          | Tcg.Load (_, Tcg.Local id) -> note_local id false loop_depth
+          | Tcg.Store (Tcg.Local id, _) -> note_local id true loop_depth
           | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> ())
         block.body)
     f.blocks;
@@ -629,6 +673,51 @@ let select_global_base_regs (f : Cfg.func) =
     | _ -> ()
   in
   assign available_reserved_regs candidates;
+  mapping
+
+let select_hot_local_regs reserved_saved_regs (f : Cfg.func) =
+  let stats = compute_local_access_stats f in
+  let instr_count = block_instr_count f.blocks in
+  let budget =
+    if f.temp_count >= 224 || instr_count >= 448 then 1
+    else if f.temp_count >= 128 || instr_count >= 256 then 2
+    else if f.temp_count >= 64 || instr_count >= 128 then 3
+    else 4
+  in
+  let available_regs =
+    allocatable_saved_regs
+    |> List.filter (fun reg -> not (List.mem reg reserved_saved_regs))
+  in
+  let candidates =
+    Hashtbl.fold
+      (fun id ({ count; score; stores } : local_access_stats) acc ->
+        if count >= 3 && score >= 18 && (stores <> 0 || score >= 36) then
+          (id, score, stores, count) :: acc
+        else acc)
+      stats []
+    |> List.sort (fun (a_id, a_score, a_stores, a_count) (b_id, b_score, b_stores, b_count) ->
+           match compare b_score a_score with
+           | 0 -> (
+               match compare b_stores a_stores with
+               | 0 -> (
+                   match compare b_count a_count with
+                   | 0 -> compare a_id b_id
+                   | c -> c)
+               | c -> c)
+           | c -> c)
+  in
+  let mapping = Hashtbl.create (min budget (List.length available_regs)) in
+  let rec assign regs slots remaining =
+    match (regs, slots, remaining) with
+    | _, 0, _
+    | [], _, _
+    | _, _, [] ->
+        ()
+    | reg :: rest_regs, _, (id, _, _, _) :: rest ->
+        Hashtbl.add mapping id reg;
+        assign rest_regs (slots - 1) rest
+  in
+  assign available_regs budget candidates;
   mapping
 
 let compute_temp_intervals (f : Cfg.func) =
@@ -982,12 +1071,19 @@ let allocate_temp_regs ?(reserved_saved_regs = []) (f : Cfg.func) =
   (homes, saved_regs)
 
 let compute_layout (f : Cfg.func) =
-  let local_offsets = Hashtbl.create 64 in
+  let local_homes = Hashtbl.create 64 in
   let global_base_regs = select_global_base_regs f in
   let reserved_saved_regs =
     Hashtbl.fold
       (fun _ reg acc -> if List.mem reg acc then acc else reg :: acc)
       global_base_regs []
+    |> List.sort compare
+  in
+  let hot_local_regs = select_hot_local_regs reserved_saved_regs f in
+  let reserved_saved_regs =
+    Hashtbl.fold
+      (fun _ reg acc -> if List.mem reg acc then acc else reg :: acc)
+      hot_local_regs reserved_saved_regs
     |> List.sort compare
   in
   let temp_homes, temp_saved_regs = allocate_temp_regs ~reserved_saved_regs f in
@@ -1006,8 +1102,10 @@ let compute_layout (f : Cfg.func) =
     off
   in
   let alloc_local (var : Tcg.var) =
-    if IntSet.mem var.id referenced_locals && not (Hashtbl.mem local_offsets var.id) then
-      Hashtbl.add local_offsets var.id (alloc_slot ())
+    if IntSet.mem var.id referenced_locals && not (Hashtbl.mem local_homes var.id) then
+      match Hashtbl.find_opt hot_local_regs var.id with
+      | Some reg -> Hashtbl.add local_homes var.id (LocalReg reg)
+      | None -> Hashtbl.add local_homes var.id (LocalStack (alloc_slot ()))
   in
   List.iter alloc_local f.params;
   List.iter alloc_local f.locals;
@@ -1018,7 +1116,7 @@ let compute_layout (f : Cfg.func) =
   let outgoing_area = align16 (extra_args * 4) in
   let frame_bytes = outgoing_area + (!next - 4) in
   {
-    local_offsets;
+    local_homes;
     temp_homes;
     global_base_regs;
     frame_size = align16 frame_bytes;
@@ -1056,8 +1154,10 @@ let store_temp ctx temp src =
 let cached_global_base_reg ctx label = Hashtbl.find_opt ctx.global_base_regs label
 
 let load_place ctx dst = function
-  | Tcg.Local id ->
-      emitf ctx "    lw %s, %d(s0)" dst (lookup_offset ctx.local_offsets id "local")
+  | Tcg.Local id -> (
+      match lookup_local_home ctx.local_homes id with
+      | LocalStack off -> emitf ctx "    lw %s, %d(s0)" dst off
+      | LocalReg reg -> emit_reg_copy ctx dst reg)
   | Tcg.Global label -> (
       match cached_global_base_reg ctx label with
       | Some base_reg -> emitf ctx "    lw %s, 0(%s)" dst base_reg
@@ -1066,8 +1166,10 @@ let load_place ctx dst = function
           emitf ctx "    lw %s, 0(%s)" dst global_addr_reg)
 
 let store_place ctx src = function
-  | Tcg.Local id ->
-      emitf ctx "    sw %s, %d(s0)" src (lookup_offset ctx.local_offsets id "local")
+  | Tcg.Local id -> (
+      match lookup_local_home ctx.local_homes id with
+      | LocalStack off -> emitf ctx "    sw %s, %d(s0)" src off
+      | LocalReg reg -> emit_reg_copy ctx reg src)
   | Tcg.Global label -> (
       match cached_global_base_reg ctx label with
       | Some base_reg -> emitf ctx "    sw %s, 0(%s)" src base_reg
@@ -1473,7 +1575,7 @@ let gen_func buf (f : Cfg.func) =
   let ctx =
     {
       buf;
-      local_offsets = layout.local_offsets;
+      local_homes = layout.local_homes;
       temp_homes = layout.temp_homes;
       global_base_regs = layout.global_base_regs;
       blocks_by_label;
@@ -1500,13 +1602,16 @@ let gen_func buf (f : Cfg.func) =
   |> List.iter (fun (reg, label) -> emitf ctx "    la %s, %s" reg label);
   List.iteri
     (fun i (param : Tcg.var) ->
-      match Hashtbl.find_opt layout.local_offsets param.id with
+      match Hashtbl.find_opt layout.local_homes param.id with
       | None -> ()
-      | Some off ->
+      | Some (LocalStack off) ->
           if i < 8 then emitf ctx "    sw a%d, %d(s0)" i off
           else (
             emitf ctx "    lw t0, %d(s0)" ((i - 8) * 4);
-            emitf ctx "    sw t0, %d(s0)" off))
+            emitf ctx "    sw t0, %d(s0)" off)
+      | Some (LocalReg reg) ->
+          if i < 8 then emit_reg_copy ctx reg (Printf.sprintf "a%d" i)
+          else emitf ctx "    lw %s, %d(s0)" reg ((i - 8) * 4))
     f.params;
   let rec emit_blocks = function
     | [] -> ()

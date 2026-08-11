@@ -1,0 +1,13 @@
+int main() {
+  int i = 0;
+  int sum = 0;
+  int bias = 3;
+  while (i < 8) {
+    if (i < 100) {
+    } else {
+    }
+    sum = sum + i + bias;
+    i = i + 1;
+  }
+  return sum;
+}
