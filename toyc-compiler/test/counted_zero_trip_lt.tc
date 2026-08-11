@@ -1,0 +1,9 @@
+int main() {
+  int i = 10;
+  int sum = 7;
+  while (i < 0) {
+    sum = sum + 3;
+    i = i + 2;
+  }
+  return sum;
+}

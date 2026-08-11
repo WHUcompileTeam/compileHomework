@@ -47,6 +47,10 @@ let i32 value =
   let masked = Int64.logand value int32_mask in
   if masked >= int32_sign_bit then Int64.sub masked int32_modulus else masked
 
+let has_prefix prefix text =
+  let prefix_len = String.length prefix in
+  String.length text >= prefix_len && String.sub text 0 prefix_len = prefix
+
 let empty_env = [ StringMap.empty ]
 
 let push_scope env = StringMap.empty :: env
@@ -161,15 +165,14 @@ let stmt_list_var_uses counts stmts =
 let rec inline_stmt_template_supported = function
   | Block stmts -> List.for_all inline_stmt_template_supported stmts
   | Empty -> true
-  | Expr expr | Assign (_, expr) | Return (Some expr) -> not (expr_has_call expr)
-  | Decl d -> not (expr_has_call d.init)
-  | If (cond, t, e) ->
+  | Expr _ | Assign _ | Decl _ | Return (Some _) -> true
+  | If (_, t, e) ->
       let else_supported =
         match e with
         | Some else_stmt -> inline_stmt_template_supported else_stmt
         | None -> true
       in
-      not (expr_has_call cond) && inline_stmt_template_supported t && else_supported
+      inline_stmt_template_supported t && else_supported
   | While _ | Break | Continue -> false
   | Return None -> false
 
@@ -236,44 +239,76 @@ let rec subst_inline_expr_scoped env = function
   | Binary (op, lhs, rhs) ->
       Binary (op, subst_inline_expr_scoped env lhs, subst_inline_expr_scoped env rhs)
 
-let inline_pure_expr_scoped env expr =
+let rec inline_expr func_env depth = function
+  | Int _ as e -> e
+  | Var _ as e -> e
+  | Call (name, args) ->
+      let args = List.map (inline_expr func_env depth) args in
+      if depth = 0 then Call (name, args)
+      else
+        (match StringMap.find_opt name func_env with
+        | Some def
+          when List.length def.params = List.length args
+               && List.for_all2
+                    (fun param arg ->
+                      let uses = Option.value ~default:0 (StringMap.find_opt param def.param_uses) in
+                      not (expr_has_call arg) || uses <= 1)
+                    def.params args ->
+             let subst_scope =
+               List.fold_left2
+                 (fun env param arg -> add_inline_binding env param arg)
+                 empty_inline_scope def.params args
+             in
+            (match eval_inline_stmt_list func_env (depth - 1) subst_scope def.body_stmts with
+            | Some (InlineReturn body) -> inline_expr func_env (depth - 1) body
+            | Some (InlineContinue _) | None -> Call (name, args))
+        | Some _ | None -> Call (name, args))
+  | Unary (op, e) -> Unary (op, inline_expr func_env depth e)
+  | Binary (op, lhs, rhs) ->
+      Binary (op, inline_expr func_env depth lhs, inline_expr func_env depth rhs)
+
+and inline_pure_expr_scoped func_env depth env expr =
   let expr = subst_inline_expr_scoped env expr in
+  let expr = inline_expr func_env depth expr in
   if expr_has_call expr then None else Some expr
 
-let rec eval_inline_stmt_list env = function
+and eval_inline_stmt_list func_env depth env = function
   | [] -> Some (InlineContinue env)
-  | Empty :: rest -> eval_inline_stmt_list env rest
+  | Empty :: rest -> eval_inline_stmt_list func_env depth env rest
   | Expr expr :: rest -> (
-      match inline_pure_expr_scoped env expr with
-      | Some _ -> eval_inline_stmt_list env rest
+      match inline_pure_expr_scoped func_env depth env expr with
+      | Some _ -> eval_inline_stmt_list func_env depth env rest
       | None -> None)
   | Decl d :: rest -> (
-      match inline_pure_expr_scoped env d.init with
-      | Some init -> eval_inline_stmt_list (add_inline_binding env d.ident.name init) rest
+      match inline_pure_expr_scoped func_env depth env d.init with
+      | Some init ->
+          eval_inline_stmt_list func_env depth (add_inline_binding env d.ident.name init) rest
       | None -> None)
   | Assign (name, expr) :: rest -> (
-      match inline_pure_expr_scoped env expr with
+      match inline_pure_expr_scoped func_env depth env expr with
       | Some value -> (
           match set_inline_binding env name value with
-          | Some env -> eval_inline_stmt_list env rest
+          | Some env -> eval_inline_stmt_list func_env depth env rest
           | None -> None)
       | None -> None)
   | Block stmts :: rest -> (
-      match eval_inline_stmt_list (push_inline_scope env) stmts with
-      | Some (InlineContinue inner_env) -> eval_inline_stmt_list (pop_inline_scope inner_env) rest
+      match eval_inline_stmt_list func_env depth (push_inline_scope env) stmts with
+      | Some (InlineContinue inner_env) ->
+          eval_inline_stmt_list func_env depth (pop_inline_scope inner_env) rest
       | Some (InlineReturn expr) -> Some (InlineReturn expr)
       | None -> None)
   | If (cond, then_stmt, else_stmt) :: rest -> (
-      match inline_pure_expr_scoped env cond with
-      | Some (Int value) when truth value -> eval_inline_stmt_list env (then_stmt :: rest)
+      match inline_pure_expr_scoped func_env depth env cond with
+      | Some (Int value) when truth value -> eval_inline_stmt_list func_env depth env (then_stmt :: rest)
       | Some (Int _) -> (
           match else_stmt with
-          | Some else_stmt -> eval_inline_stmt_list env (else_stmt :: rest)
-          | None -> eval_inline_stmt_list env rest)
+          | Some else_stmt -> eval_inline_stmt_list func_env depth env (else_stmt :: rest)
+          | None -> eval_inline_stmt_list func_env depth env rest)
       | Some _ | None -> None)
   | While _ :: _ -> None
   | Break :: _ | Continue :: _ -> None
-  | Return (Some expr) :: _ -> Option.map (fun expr -> InlineReturn expr) (inline_pure_expr_scoped env expr)
+  | Return (Some expr) :: _ ->
+      Option.map (fun expr -> InlineReturn expr) (inline_pure_expr_scoped func_env depth env expr)
   | Return None :: _ -> None
 
 let inline_def_of_func (f : Ast.func) =
@@ -290,34 +325,6 @@ let inline_def_of_func (f : Ast.func) =
           }
       else None
   | TInt | TVoid -> None
-
-let rec inline_expr func_env depth = function
-  | Int _ as e -> e
-  | Var _ as e -> e
-  | Call (name, args) ->
-      let args = List.map (inline_expr func_env depth) args in
-      if depth = 0 then Call (name, args)
-      else
-        (match StringMap.find_opt name func_env with
-        | Some def
-          when List.length def.params = List.length args
-               && List.for_all2
-                    (fun param arg ->
-                      let uses = Option.value ~default:0 (StringMap.find_opt param def.param_uses) in
-                      not (expr_has_call arg) || uses <= 1)
-                    def.params args ->
-            let subst_scope =
-              List.fold_left2
-                (fun env param arg -> add_inline_binding env param arg)
-                empty_inline_scope def.params args
-            in
-            (match eval_inline_stmt_list subst_scope def.body_stmts with
-            | Some (InlineReturn body) -> inline_expr func_env (depth - 1) body
-            | Some (InlineContinue _) | None -> Call (name, args))
-        | Some _ | None -> Call (name, args))
-  | Unary (op, e) -> Unary (op, inline_expr func_env depth e)
-  | Binary (op, lhs, rhs) ->
-      Binary (op, inline_expr func_env depth lhs, inline_expr func_env depth rhs)
 
 let rec fold_expr env = function
   | Int _ as e -> e
@@ -1656,41 +1663,84 @@ let table_find_or_empty table key empty =
   | Some value -> value
   | None -> empty
 
+type liveness_cache = {
+  generation : int;
+  entry_label : string;
+  temp_count : int;
+  blocks_key : Cfg.block list;
+  live_in_t_cache : (string, IntSet.t) Hashtbl.t;
+  live_in_p_cache : (string, PlaceSet.t) Hashtbl.t;
+}
+
+type dominator_cache = {
+  generation : int;
+  entry_label : string;
+  temp_count : int;
+  blocks_key : Cfg.block list;
+  doms_cache : (string, LabelSet.t) Hashtbl.t;
+}
+
+let analysis_cache_generation = ref 0
+let last_liveness_cache : liveness_cache option ref = ref None
+let last_dominator_cache : dominator_cache option ref = ref None
+
 let compute_liveness summaries globals (f : Cfg.func) =
-  let live_in_t = Hashtbl.create (List.length f.blocks) in
-  let live_in_p = Hashtbl.create (List.length f.blocks) in
-  let blocks = List.rev f.blocks in
-  let changed = ref true in
-  while !changed do
-    changed := false;
-    List.iter
-      (fun (block : Cfg.block) ->
-        let live_t_out =
-          List.fold_left
-            (fun acc succ ->
-              IntSet.union acc (table_find_or_empty live_in_t succ IntSet.empty))
-            IntSet.empty block.succs
-        in
-        let live_p_out =
-          List.fold_left
-            (fun acc succ ->
-              PlaceSet.union acc (table_find_or_empty live_in_p succ PlaceSet.empty))
-            PlaceSet.empty block.succs
-        in
-        let _, live_t_in, live_p_in = scan_block summaries globals block live_t_out live_p_out in
-        if not (IntSet.equal live_t_in (table_find_or_empty live_in_t block.label IntSet.empty)) then (
-          Hashtbl.replace live_in_t block.label live_t_in;
-          changed := true);
-        if
-          not
-            (PlaceSet.equal live_p_in
-               (table_find_or_empty live_in_p block.label PlaceSet.empty))
-        then (
-          Hashtbl.replace live_in_p block.label live_p_in;
-          changed := true))
-      blocks
-  done;
-  (live_in_t, live_in_p)
+  match !last_liveness_cache with
+  | Some cache
+    when !analysis_cache_generation <> 0
+         && cache.generation = !analysis_cache_generation
+         && cache.entry_label = f.entry
+         && cache.temp_count = f.temp_count
+         && cache.blocks_key = f.blocks ->
+      (cache.live_in_t_cache, cache.live_in_p_cache)
+  | Some _ | None ->
+      let live_in_t = Hashtbl.create (List.length f.blocks) in
+      let live_in_p = Hashtbl.create (List.length f.blocks) in
+      let blocks = List.rev f.blocks in
+      let changed = ref true in
+      while !changed do
+        changed := false;
+        List.iter
+          (fun (block : Cfg.block) ->
+            let live_t_out =
+              List.fold_left
+                (fun acc succ ->
+                  IntSet.union acc (table_find_or_empty live_in_t succ IntSet.empty))
+                IntSet.empty block.succs
+            in
+            let live_p_out =
+              List.fold_left
+                (fun acc succ ->
+                  PlaceSet.union acc (table_find_or_empty live_in_p succ PlaceSet.empty))
+                PlaceSet.empty block.succs
+            in
+            let _, live_t_in, live_p_in = scan_block summaries globals block live_t_out live_p_out in
+            if
+              not (IntSet.equal live_t_in (table_find_or_empty live_in_t block.label IntSet.empty))
+            then (
+              Hashtbl.replace live_in_t block.label live_t_in;
+              changed := true);
+            if
+              not
+                (PlaceSet.equal live_p_in
+                   (table_find_or_empty live_in_p block.label PlaceSet.empty))
+            then (
+              Hashtbl.replace live_in_p block.label live_p_in;
+              changed := true))
+          blocks
+      done;
+      if !analysis_cache_generation <> 0 then
+        last_liveness_cache :=
+          Some
+            {
+              generation = !analysis_cache_generation;
+              entry_label = f.entry;
+              temp_count = f.temp_count;
+              blocks_key = f.blocks;
+              live_in_t_cache = live_in_t;
+              live_in_p_cache = live_in_p;
+            };
+      (live_in_t, live_in_p)
 
 let collect_local_ids (f : Cfg.func) =
   List.fold_left
@@ -1704,6 +1754,9 @@ let first_some values =
     | None :: rest -> loop rest
   in
   loop values
+
+let promote_local_param_preloads_enabled =
+  Sys.getenv_opt "TOYC_ENABLE_LOCAL_PARAM_PRELOADS" <> None
 
 let all_present values =
   let rec loop acc = function
@@ -1755,29 +1808,27 @@ let redirect_successors pred redirects = function
 
 let mem2reg_func (f : Cfg.func) =
   let all_candidates = collect_local_ids f in
-  let rec attempt candidates =
-    if IntSet.is_empty candidates then f
+  let rec attempt (current : Cfg.func) candidates =
+    if IntSet.is_empty candidates then current
     else begin
-      let next_temp = ref f.temp_count in
+      let next_temp = ref current.temp_count in
       let fresh_temp () =
         let temp = !next_temp in
         incr next_temp;
         temp
       in
-      let seed_env, seed_instrs_rev =
+      let seed_env =
         List.fold_left
-          (fun (env, instrs_rev) (param : Tcg.var) ->
+          (fun env (param : Tcg.var) ->
             if IntSet.mem param.id candidates then
               let temp = fresh_temp () in
-              ( IntMap.add param.id (Tcg.Temp temp) env,
-                Tcg.Load (temp, Tcg.Local param.id) :: instrs_rev )
-            else (env, instrs_rev))
-          (IntMap.empty, []) f.params
+              IntMap.add param.id (Tcg.Temp temp) env
+            else env)
+          IntMap.empty current.params
       in
-      let seed_instrs = List.rev seed_instrs_rev in
-      let in_envs = Hashtbl.create (List.length f.blocks) in
-      let out_envs = Hashtbl.create (List.length f.blocks) in
-      let phi_temps = Hashtbl.create (max 8 (List.length f.blocks)) in
+      let in_envs = Hashtbl.create (List.length current.blocks) in
+      let out_envs = Hashtbl.create (List.length current.blocks) in
+      let phi_temps = Hashtbl.create (max 8 (List.length current.blocks)) in
       let get_env table label = table_find_or_empty table label IntMap.empty in
       let get_phi_temp label local_id =
         match Hashtbl.find_opt phi_temps (label, local_id) with
@@ -1788,7 +1839,7 @@ let mem2reg_func (f : Cfg.func) =
             temp
       in
       let compute_in_env (block : Cfg.block) =
-        if block.label = f.entry then seed_env
+        if block.label = current.entry then seed_env
         else
           IntSet.fold
             (fun local_id env ->
@@ -1832,7 +1883,7 @@ let mem2reg_func (f : Cfg.func) =
             if not (equal_operand_map out_env (get_env out_envs block.label)) then (
               Hashtbl.replace out_envs block.label out_env;
               changed := true))
-          f.blocks
+          current.blocks
       done;
       let failed = ref IntSet.empty in
       List.iter
@@ -1859,37 +1910,50 @@ let mem2reg_func (f : Cfg.func) =
                       block.preds
                 | _ -> ())
             phi_temps)
-        f.blocks;
-      if not (IntSet.is_empty !failed) then attempt (IntSet.diff candidates !failed)
+        current.blocks;
+      let succeeded = IntSet.diff candidates !failed in
+      if IntSet.is_empty succeeded then current
       else
+        let entry_seed_instrs =
+          List.fold_left
+            (fun acc (param : Tcg.var) ->
+              if IntSet.mem param.id succeeded then
+                match IntMap.find_opt param.id seed_env with
+                | Some (Tcg.Temp temp) ->
+                    simplify_simple_instr (Tcg.Load (temp, Tcg.Local param.id)) :: acc
+                | Some (Tcg.Imm _) | None -> acc
+              else acc)
+            [] current.params
+          |> List.rev
+        in
         let rewrite_block (block : Cfg.block) =
           let rec rewrite env acc = function
             | [] -> List.rev acc
             | instr :: rest -> (
                 match instr with
-                | Tcg.Load (dst, Tcg.Local id) when IntSet.mem id candidates -> (
+                | Tcg.Load (dst, Tcg.Local id) when IntSet.mem id succeeded -> (
                     match IntMap.find_opt id env with
                     | Some value ->
                         rewrite env (simplify_simple_instr (Tcg.Move (dst, value)) :: acc) rest
                     | None -> rewrite env (instr :: acc) rest)
-                | Tcg.Store (Tcg.Local id, value) when IntSet.mem id candidates ->
+                | Tcg.Store (Tcg.Local id, value) when IntSet.mem id succeeded ->
                     rewrite (IntMap.add id value env) acc rest
                 | _ -> rewrite env (instr :: acc) rest)
           in
           let body =
-            (if block.label = f.entry then seed_instrs else [])
+            (if block.label = current.entry then entry_seed_instrs else [])
             @ rewrite (get_env in_envs block.label) [] block.body
           in
           { block with body }
         in
-        let promoted_blocks = List.map rewrite_block f.blocks in
+        let promoted_blocks = List.map rewrite_block current.blocks in
         let redirects = Hashtbl.create 16 in
         let edge_blocks_rev = ref [] in
         let edge_id = ref 0 in
         let fresh_edge_label () =
           let id = !edge_id in
           incr edge_id;
-          Printf.sprintf ".L%s_mem2reg_edge_%d" f.label id
+          Printf.sprintf ".L%s_mem2reg_edge_%d" current.label id
         in
         let build_parallel_copies copies =
           let snapshots = Hashtbl.create (List.length copies) in
@@ -1926,7 +1990,7 @@ let mem2reg_func (f : Cfg.func) =
                   match Hashtbl.find_opt phi_temps (succ_block.label, local_id) with
                   | Some phi_temp -> (local_id, phi_temp) :: acc
                   | None -> acc)
-                candidates []
+                succeeded []
             in
             if phi_copies <> [] then
               List.iter
@@ -1964,10 +2028,11 @@ let mem2reg_func (f : Cfg.func) =
             promoted_blocks
           @ List.rev !edge_blocks_rev
         in
-        Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
+        let promoted = Cfg.rebuild_edges { current with temp_count = !next_temp; blocks } in
+        if IntSet.is_empty !failed then promoted else attempt promoted !failed
     end
   in
-  attempt all_candidates
+  attempt f all_candidates
 
 let promote_locals_func (f : Cfg.func) =
   let stored_candidates = stored_locals_in_func f in
@@ -1989,16 +2054,18 @@ let promote_locals_func (f : Cfg.func) =
       let get_env table label = table_find_or_empty table label PlaceMap.empty in
       let entry_preloads_rev = ref [] in
       let entry_env =
-        List.fold_left
-          (fun env (param : Tcg.var) ->
-            let place = Tcg.Local param.id in
-            if PlaceSet.mem place candidates then
-              let temp = fresh_temp () in
-              entry_preloads_rev :=
-                simplify_simple_instr (Tcg.Load (temp, place)) :: !entry_preloads_rev;
-              PlaceMap.add place (Tcg.Temp temp) env
-            else env)
-          PlaceMap.empty f.params
+        if promote_local_param_preloads_enabled then
+          List.fold_left
+            (fun env (param : Tcg.var) ->
+              let place = Tcg.Local param.id in
+              if PlaceSet.mem place candidates then
+                let temp = fresh_temp () in
+                entry_preloads_rev :=
+                  simplify_simple_instr (Tcg.Load (temp, place)) :: !entry_preloads_rev;
+                PlaceMap.add place (Tcg.Temp temp) env
+              else env)
+            PlaceMap.empty f.params
+        else PlaceMap.empty
       in
       let entry_preloads = List.rev !entry_preloads_rev in
       let get_phi_temp label place =
@@ -2503,42 +2570,64 @@ let promote_globals_func summaries globals (f : Cfg.func) =
   attempt all_candidates
 
 let compute_dominators (f : Cfg.func) =
-  let reachable = reachable_labels f.entry f.blocks in
-  let reachable_blocks =
-    List.filter (fun (block : Cfg.block) -> LabelSet.mem block.label reachable) f.blocks
-  in
-  let all_labels =
-    List.fold_left
-      (fun acc (block : Cfg.block) -> LabelSet.add block.label acc)
-      LabelSet.empty reachable_blocks
-  in
-  let doms = Hashtbl.create (List.length reachable_blocks) in
-  List.iter
-    (fun (block : Cfg.block) ->
-      Hashtbl.add doms block.label (if block.label = f.entry then LabelSet.singleton block.label else all_labels))
-    reachable_blocks;
-  let changed = ref true in
-  while !changed do
-    changed := false;
-    List.iter
-      (fun (block : Cfg.block) ->
-        if block.label <> f.entry then
-          let pred_doms =
-            List.filter (fun pred -> LabelSet.mem pred reachable) block.preds
-            |> List.map (fun pred -> table_find_or_empty doms pred all_labels)
-          in
-          let merged =
-            match pred_doms with
-            | [] -> all_labels
-            | first :: rest -> List.fold_left LabelSet.inter first rest
-          in
-          let next_dom = LabelSet.add block.label merged in
-           if not (LabelSet.equal next_dom (table_find_or_empty doms block.label LabelSet.empty)) then (
-             Hashtbl.replace doms block.label next_dom;
-             changed := true))
-      reachable_blocks
-  done;
-  doms
+  match !last_dominator_cache with
+  | Some cache
+    when !analysis_cache_generation <> 0
+         && cache.generation = !analysis_cache_generation
+         && cache.entry_label = f.entry
+         && cache.temp_count = f.temp_count
+         && cache.blocks_key = f.blocks ->
+      cache.doms_cache
+  | Some _ | None ->
+      let reachable = reachable_labels f.entry f.blocks in
+      let reachable_blocks =
+        List.filter (fun (block : Cfg.block) -> LabelSet.mem block.label reachable) f.blocks
+      in
+      let all_labels =
+        List.fold_left
+          (fun acc (block : Cfg.block) -> LabelSet.add block.label acc)
+          LabelSet.empty reachable_blocks
+      in
+      let doms = Hashtbl.create (List.length reachable_blocks) in
+      List.iter
+        (fun (block : Cfg.block) ->
+          Hashtbl.add doms block.label
+            (if block.label = f.entry then LabelSet.singleton block.label else all_labels))
+        reachable_blocks;
+      let changed = ref true in
+      while !changed do
+        changed := false;
+        List.iter
+          (fun (block : Cfg.block) ->
+            if block.label <> f.entry then
+              let pred_doms =
+                List.filter (fun pred -> LabelSet.mem pred reachable) block.preds
+                |> List.map (fun pred -> table_find_or_empty doms pred all_labels)
+              in
+              let merged =
+                match pred_doms with
+                | [] -> all_labels
+                | first :: rest -> List.fold_left LabelSet.inter first rest
+              in
+              let next_dom = LabelSet.add block.label merged in
+              if
+                not (LabelSet.equal next_dom (table_find_or_empty doms block.label LabelSet.empty))
+              then (
+                Hashtbl.replace doms block.label next_dom;
+                changed := true))
+          reachable_blocks
+      done;
+      if !analysis_cache_generation <> 0 then
+        last_dominator_cache :=
+          Some
+            {
+              generation = !analysis_cache_generation;
+              entry_label = f.entry;
+              temp_count = f.temp_count;
+              blocks_key = f.blocks;
+              doms_cache = doms;
+            };
+      doms
 
 let temp_def_blocks_of_blocks temp_count blocks =
   let defs = Hashtbl.create (max 8 temp_count) in
@@ -2968,16 +3057,30 @@ let resolves_to_induction_temp multi_defs def_instrs phi_temp operand =
   in
   loop IntSet.empty operand
 
-let induction_step_of_instr multi_defs def_instrs phi_temp = function
-  | Tcg.Bin (_, Add, lhs, Tcg.Imm step)
-    when resolves_to_induction_temp multi_defs def_instrs phi_temp lhs ->
-      Some step
-  | Tcg.Bin (_, Add, Tcg.Imm step, rhs)
-    when resolves_to_induction_temp multi_defs def_instrs phi_temp rhs ->
-      Some step
-  | Tcg.Bin (_, Sub, lhs, Tcg.Imm step)
-    when resolves_to_induction_temp multi_defs def_instrs phi_temp lhs ->
-      Some Int64.(neg step)
+let operand_static_int64 loop_defs multi_defs def_instrs operand =
+  let rec loop seen = function
+    | Tcg.Imm value -> Some value
+    | Tcg.Temp temp ->
+        if IntSet.mem temp seen || IntSet.mem temp multi_defs || IntSet.mem temp loop_defs then None
+        else
+          match Hashtbl.find_opt def_instrs temp with
+          | Some (Tcg.Move (_, src)) -> loop (IntSet.add temp seen) src
+          | Some (Tcg.Un (_, op, src)) -> Option.bind (loop (IntSet.add temp seen) src) (fold_unop op)
+          | Some (Tcg.Bin (_, op, lhs, rhs)) -> (
+              match (loop (IntSet.add temp seen) lhs, loop (IntSet.add temp seen) rhs) with
+              | Some lhs, Some rhs -> fold_binop op lhs rhs
+              | _ -> None)
+          | Some (Tcg.Load _ | Tcg.Store _ | Tcg.Call _) | None -> None
+  in
+  loop IntSet.empty operand
+
+let induction_step_of_instr loop_defs multi_defs def_instrs phi_temp = function
+  | Tcg.Bin (_, Add, lhs, rhs) when resolves_to_induction_temp multi_defs def_instrs phi_temp lhs ->
+      operand_static_int64 loop_defs multi_defs def_instrs rhs
+  | Tcg.Bin (_, Add, lhs, rhs) when resolves_to_induction_temp multi_defs def_instrs phi_temp rhs ->
+      operand_static_int64 loop_defs multi_defs def_instrs lhs
+  | Tcg.Bin (_, Sub, lhs, rhs) when resolves_to_induction_temp multi_defs def_instrs phi_temp lhs ->
+      Option.map Int64.neg (operand_static_int64 loop_defs multi_defs def_instrs rhs)
   | _ -> None
 
 let mul_factor_of_instr multi_defs def_instrs phi_temp = function
@@ -3210,7 +3313,7 @@ let derived_expr_of_instr loop_defs loop_stable_phis multi_defs def_instrs phi_t
       | _ -> None)
   | _ -> None
 
-let collect_basic_induction_vars header loop get_block multi_defs def_instrs =
+let collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs =
   let header_block : Cfg.block = get_block header in
   let pred_count = List.length header_block.preds in
   let pred_chains =
@@ -3225,7 +3328,7 @@ let collect_basic_induction_vars header loop get_block multi_defs def_instrs =
     match operand with
     | Tcg.Temp temp -> (
         match Hashtbl.find_opt def_instrs temp with
-        | Some instr -> induction_step_of_instr multi_defs def_instrs phi_temp instr
+        | Some instr -> induction_step_of_instr loop_defs multi_defs def_instrs phi_temp instr
         | None -> None)
     | Tcg.Imm _ -> None
   in
@@ -3235,7 +3338,7 @@ let collect_basic_induction_vars header loop get_block multi_defs def_instrs =
   let step_of_chain_def phi_temp chain =
     match last_def_of_temp_on_chain chain phi_temp with
     | Some (Tcg.Move (_, src)) -> step_of_chain_source phi_temp chain src
-    | Some instr -> induction_step_of_instr multi_defs def_instrs phi_temp instr
+    | Some instr -> induction_step_of_instr loop_defs multi_defs def_instrs phi_temp instr
     | None -> None
   in
   let counts = Hashtbl.create (max 8 pred_count) in
@@ -3307,7 +3410,7 @@ let collect_basic_induction_vars header loop get_block multi_defs def_instrs =
                 (fun acc instr ->
                   match defs_temp instr with
                   | Some dst when not (IntSet.mem dst seen_phi_temps) -> (
-                      match induction_step_of_instr multi_defs def_instrs dst instr with
+                      match induction_step_of_instr loop_defs multi_defs def_instrs dst instr with
                       | Some _ -> IntSet.add dst acc
                       | None -> acc)
                   | Some _ | None -> acc)
@@ -3729,21 +3832,61 @@ let counted_loop_shape_supported header loop get_block entry_label =
   in
   walk LabelSet.empty entry_label
 
-let build_positive_ceil_div fresh_temp numer_temp divisor =
-  let trip = fresh_temp () in
-  if divisor = 1L then
-    ([ simplify_simple_instr (Tcg.Move (trip, Tcg.Temp numer_temp)) ], trip)
+let clamp_nonnegative_temp fresh_temp temp =
+  let keep = fresh_temp () in
+  let clamped = fresh_temp () in
+  ( [ simplify_simple_instr (Tcg.Bin (keep, Ge, Tcg.Temp temp, Tcg.Imm 0L));
+      simplify_simple_instr (Tcg.Bin (clamped, Mul, Tcg.Temp temp, Tcg.Temp keep)) ],
+    clamped )
+
+let build_floor_div fresh_temp numer_temp divisor =
+  if divisor = 1L then ([], numer_temp)
   else
     let quotient = fresh_temp () in
     let remainder = fresh_temp () in
-    let extra = fresh_temp () in
+    let numer_neg = fresh_temp () in
+    let rem_nz = fresh_temp () in
+    let adjust = fresh_temp () in
+    let floor = fresh_temp () in
     ( [ simplify_simple_instr
           (Tcg.Bin (quotient, Div, Tcg.Temp numer_temp, Tcg.Imm divisor));
         simplify_simple_instr
           (Tcg.Bin (remainder, Mod, Tcg.Temp numer_temp, Tcg.Imm divisor));
-        simplify_simple_instr (Tcg.Bin (extra, Ne, Tcg.Temp remainder, Tcg.Imm 0L));
-        simplify_simple_instr (Tcg.Bin (trip, Add, Tcg.Temp quotient, Tcg.Temp extra)) ],
+        simplify_simple_instr (Tcg.Bin (numer_neg, Lt, Tcg.Temp numer_temp, Tcg.Imm 0L));
+        simplify_simple_instr (Tcg.Bin (rem_nz, Ne, Tcg.Temp remainder, Tcg.Imm 0L));
+        simplify_simple_instr (Tcg.Bin (adjust, Mul, Tcg.Temp numer_neg, Tcg.Temp rem_nz));
+        simplify_simple_instr (Tcg.Bin (floor, Sub, Tcg.Temp quotient, Tcg.Temp adjust)) ],
+      floor )
+
+let build_nonnegative_ceil_div fresh_temp numer_temp divisor =
+  if divisor = 1L then clamp_nonnegative_temp fresh_temp numer_temp
+  else
+    let quotient = fresh_temp () in
+    let remainder = fresh_temp () in
+    let numer_pos = fresh_temp () in
+    let rem_nz = fresh_temp () in
+    let extra = fresh_temp () in
+    let raw = fresh_temp () in
+    let clamp_instrs, trip = clamp_nonnegative_temp fresh_temp raw in
+    ( [ simplify_simple_instr
+          (Tcg.Bin (quotient, Div, Tcg.Temp numer_temp, Tcg.Imm divisor));
+        simplify_simple_instr
+          (Tcg.Bin (remainder, Mod, Tcg.Temp numer_temp, Tcg.Imm divisor));
+        simplify_simple_instr (Tcg.Bin (numer_pos, Gt, Tcg.Temp numer_temp, Tcg.Imm 0L));
+        simplify_simple_instr (Tcg.Bin (rem_nz, Ne, Tcg.Temp remainder, Tcg.Imm 0L));
+        simplify_simple_instr (Tcg.Bin (extra, Mul, Tcg.Temp numer_pos, Tcg.Temp rem_nz));
+        simplify_simple_instr (Tcg.Bin (raw, Add, Tcg.Temp quotient, Tcg.Temp extra)) ]
+      @ clamp_instrs,
       trip )
+
+let build_nonnegative_inclusive_div fresh_temp numer_temp divisor =
+  let floor_instrs, floor = build_floor_div fresh_temp numer_temp divisor in
+  let raw = fresh_temp () in
+  let clamp_instrs, trip = clamp_nonnegative_temp fresh_temp raw in
+  ( floor_instrs
+    @ [ simplify_simple_instr (Tcg.Bin (raw, Add, Tcg.Temp floor, Tcg.Imm 1L)) ]
+    @ clamp_instrs,
+    trip )
 
 let build_trip_count_instrs fresh_temp phi_temp step kind =
   let adjust_bound bound bias =
@@ -3761,29 +3904,23 @@ let build_trip_count_instrs fresh_temp phi_temp step kind =
   | CountUpLt (bound, bias) ->
       let bound_instrs, bound = adjust_bound bound bias in
       let diff_instr = simplify_simple_instr (Tcg.Bin (diff, Sub, bound, Tcg.Temp phi_temp)) in
-      let trip_instrs, trip = build_positive_ceil_div fresh_temp diff stride in
+      let trip_instrs, trip = build_nonnegative_ceil_div fresh_temp diff stride in
       (bound_instrs @ (diff_instr :: trip_instrs), trip)
   | CountUpLe (bound, bias) ->
       let bound_instrs, bound = adjust_bound bound bias in
-      let trip = fresh_temp () in
-      ( bound_instrs
-        @ [ simplify_simple_instr (Tcg.Bin (diff, Sub, bound, Tcg.Temp phi_temp));
-           simplify_simple_instr (Tcg.Bin (trip, Div, Tcg.Temp diff, Tcg.Imm stride));
-           simplify_simple_instr (Tcg.Bin (trip, Add, Tcg.Temp trip, Tcg.Imm 1L)) ],
-        trip )
+      let diff_instr = simplify_simple_instr (Tcg.Bin (diff, Sub, bound, Tcg.Temp phi_temp)) in
+      let trip_instrs, trip = build_nonnegative_inclusive_div fresh_temp diff stride in
+      (bound_instrs @ (diff_instr :: trip_instrs), trip)
   | CountDownGt (bound, bias) ->
       let bound_instrs, bound = adjust_bound bound bias in
       let diff_instr = simplify_simple_instr (Tcg.Bin (diff, Sub, Tcg.Temp phi_temp, bound)) in
-      let trip_instrs, trip = build_positive_ceil_div fresh_temp diff stride in
+      let trip_instrs, trip = build_nonnegative_ceil_div fresh_temp diff stride in
       (bound_instrs @ (diff_instr :: trip_instrs), trip)
   | CountDownGe (bound, bias) ->
       let bound_instrs, bound = adjust_bound bound bias in
-      let trip = fresh_temp () in
-      ( bound_instrs
-        @ [ simplify_simple_instr (Tcg.Bin (diff, Sub, Tcg.Temp phi_temp, bound));
-           simplify_simple_instr (Tcg.Bin (trip, Div, Tcg.Temp diff, Tcg.Imm stride));
-           simplify_simple_instr (Tcg.Bin (trip, Add, Tcg.Temp trip, Tcg.Imm 1L)) ],
-        trip )
+      let diff_instr = simplify_simple_instr (Tcg.Bin (diff, Sub, Tcg.Temp phi_temp, bound)) in
+      let trip_instrs, trip = build_nonnegative_inclusive_div fresh_temp diff stride in
+      (bound_instrs @ (diff_instr :: trip_instrs), trip)
 
 let build_iv_final_update fresh_temp trip_temp (iv : basic_induction_var) =
   match iv.step with
@@ -4789,7 +4926,7 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
           collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
         in
         let ivs =
-          collect_basic_induction_vars header loop get_block multi_defs def_instrs
+          collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs
         in
         match
           find_counted_loop_control
@@ -5131,7 +5268,7 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
           collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
         in
         let ivs =
-          collect_basic_induction_vars header loop get_block multi_defs def_instrs
+          collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs
         in
         match
           find_counted_loop_control
@@ -5439,7 +5576,7 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
             collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
           in
           let ivs =
-            collect_basic_induction_vars header loop get_block multi_defs def_instrs
+            collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs
           in
           match
             find_counted_loop_control
@@ -5695,7 +5832,7 @@ let strength_reduce_func (f : Cfg.func) =
         let loop_stable_phis =
           collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
         in
-        let ivs = collect_basic_induction_vars header loop get_block multi_defs def_instrs in
+        let ivs = collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs in
         List.iter
           (fun (iv : basic_induction_var) ->
             let derived_uses = Hashtbl.create 4 in
@@ -6536,7 +6673,15 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
     end else
       let before_metrics = if debug_pass_times then Some (metrics_of_func current) else None in
       let start_time = if debug_pass_times then Sys.time () else 0.0 in
-      let next = pass current in
+      let next =
+        try pass current with
+        | Failure message when has_prefix "internal missing block: " message ->
+            if debug_pass_times then
+              Printf.eprintf
+                "pass-time func=%s round=%d stage=%s recovered_missing_block=%s\n%!"
+                promoted.name round stage message;
+            current
+      in
       if debug_pass_times then begin
         let elapsed_ms = (Sys.time () -. start_time) *. 1000.0 in
         let before_metrics =
@@ -6653,6 +6798,9 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
   | Some _ | None -> loop 1 profile.max_rounds promoted
 
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
+  incr analysis_cache_generation;
+  last_liveness_cache := None;
+  last_dominator_cache := None;
   let global_init, globals =
     List.fold_left
       (fun (init, set) (g : Semant.global_decl) ->

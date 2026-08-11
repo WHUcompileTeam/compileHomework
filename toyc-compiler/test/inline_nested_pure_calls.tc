@@ -1,0 +1,11 @@
+int add1(int x) {
+  return x + 1;
+}
+
+int add2(int y) {
+  return add1(y) + add1(2);
+}
+
+int main() {
+  return add2(3);
+}

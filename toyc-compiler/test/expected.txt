@@ -9,8 +9,12 @@ counted_loop_down_step3.tc 8
 counted_loop_affine_sum.tc 10
 counted_loop_affine_step2_bias.tc 28
 counted_loop_affine_chain.tc 40
+counted_loop_temp_step.tc 19
 counted_unroll_global_store_even.tc 6
 counted_unroll_global_store_odd.tc 5
+counted_zero_trip_lt.tc 7
+counted_zero_trip_le.tc 11
+counted_zero_trip_down_ge.tc 13
 counted_nested_inner.tc 24
 counted_nested_affine_inner.tc 48
 counted_nested_rowcol_linear.tc 168
@@ -38,6 +42,7 @@ regalloc_many_args.tc 100
 recursion_void_global.tc 120
 global_hot_loop.tc 63
 inline_expr_chain.tc 12
+inline_nested_pure_calls.tc 7
 inline_call_by_value_guard.tc 2
 effect_summary_selective_global.tc 27
 unswitch_invariant_branch.tc 18
