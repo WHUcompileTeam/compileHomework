@@ -4984,68 +4984,195 @@ let eliminate_dead_code_func summaries globals (f : Cfg.func) =
   in
   Cfg.rebuild_edges { f with blocks }
 
+type func_metrics = {
+  block_count : int;
+  instr_count : int;
+  temp_count : int;
+}
+
+type opt_profile = {
+  name : string;
+  max_rounds : int;
+  enable_unswitch : bool;
+  enable_split_reductions : bool;
+  enable_unroll : bool;
+  enable_rotate : bool;
+  enable_gvn2 : bool;
+}
+
+let metrics_of_func (f : Cfg.func) =
+  let instr_count =
+    List.fold_left (fun acc (block : Cfg.block) -> acc + List.length block.body) 0 f.blocks
+  in
+  { block_count = List.length f.blocks; instr_count; temp_count = f.temp_count }
+
+let format_metrics { block_count; instr_count; temp_count } =
+  Printf.sprintf "blocks=%d instrs=%d temps=%d" block_count instr_count temp_count
+
+let choose_opt_profile metrics =
+  if
+    metrics.block_count >= 48
+    || metrics.instr_count >= 240
+    || metrics.temp_count >= 128
+  then
+    {
+      name = "large";
+      max_rounds = 3;
+      enable_unswitch = false;
+      enable_split_reductions = false;
+      enable_unroll = false;
+      enable_rotate = false;
+      enable_gvn2 = false;
+    }
+  else if
+    metrics.block_count >= 24
+    || metrics.instr_count >= 120
+    || metrics.temp_count >= 64
+  then
+    {
+      name = "medium";
+      max_rounds = 5;
+      enable_unswitch = false;
+      enable_split_reductions = true;
+      enable_unroll = false;
+      enable_rotate = false;
+      enable_gvn2 = true;
+    }
+  else
+    {
+      name = "full";
+      max_rounds = 8;
+      enable_unswitch = true;
+      enable_split_reductions = true;
+      enable_unroll = true;
+      enable_rotate = true;
+      enable_gvn2 = true;
+    }
+
 let optimize_func global_init summaries globals (f : Cfg.func) =
   let promoted = f |> mem2reg_func |> promote_globals_func summaries globals in
+  let profile = choose_opt_profile (metrics_of_func promoted) in
   let debug_stop_after = Sys.getenv_opt "TOYC_DEBUG_STOP_AFTER" in
+  let debug_pass_times = Sys.getenv_opt "TOYC_DEBUG_PASS_TIMES" <> None in
+  let debug_opt_profile = debug_pass_times || Sys.getenv_opt "TOYC_DEBUG_OPT_PROFILE" <> None in
   let exception StopPass of Cfg.func in
   let stop_after stage current =
     match debug_stop_after with
     | Some target when target = stage -> raise (StopPass current)
     | Some _ | None -> current
   in
-  let step func =
+  let run_stage round ?(enabled = true) stage pass current =
+    if not enabled then begin
+      if debug_pass_times then
+        Printf.eprintf "pass-time func=%s round=%d stage=%s skipped profile=%s\n%!"
+          promoted.name round stage profile.name;
+      stop_after stage current
+    end else
+      let before_metrics = if debug_pass_times then Some (metrics_of_func current) else None in
+      let start_time = if debug_pass_times then Sys.time () else 0.0 in
+      let next = pass current in
+      if debug_pass_times then begin
+        let elapsed_ms = (Sys.time () -. start_time) *. 1000.0 in
+        let before_metrics =
+          match before_metrics with
+          | Some metrics -> metrics
+          | None -> metrics_of_func current
+        in
+        let after_metrics = metrics_of_func next in
+        Printf.eprintf
+          "pass-time func=%s round=%d stage=%s changed=%b ms=%.3f %s -> %s\n%!"
+          promoted.name round stage (next <> current) elapsed_ms
+          (format_metrics before_metrics) (format_metrics after_metrics)
+      end;
+      stop_after stage next
+  in
+  if debug_opt_profile then
+    Printf.eprintf
+      "opt-profile func=%s profile=%s rounds=%d unswitch=%b split=%b unroll=%b rotate=%b gvn2=%b %s\n%!"
+      promoted.name profile.name profile.max_rounds profile.enable_unswitch
+      profile.enable_split_reductions profile.enable_unroll profile.enable_rotate
+      profile.enable_gvn2 (format_metrics (metrics_of_func promoted));
+  let step round func =
     try
       let after_const1 =
-        const_propagate_func global_init summaries globals func |> stop_after "const1"
+        run_stage round "const1"
+          (const_propagate_func global_init summaries globals)
+          func
       in
-      let after_copy1 = copy_propagate_func after_const1 |> stop_after "copy1" in
-      let after_sr = strength_reduce_func after_copy1 |> stop_after "sr" in
-      let after_gvn1 = gvn_func summaries globals after_sr |> stop_after "gvn1" in
-      let after_copy2 = copy_propagate_func after_gvn1 |> stop_after "copy2" in
-      let after_dce1 = eliminate_dead_code_func summaries globals after_copy2 |> stop_after "dce1" in
-      let after_reassoc = reassociate_loop_adds_func after_dce1 |> stop_after "reassoc" in
-      let after_licm = licm_func summaries globals after_reassoc |> stop_after "licm" in
-      let after_unswitch = unswitch_loops_func summaries globals after_licm |> stop_after "unswitch" in
+      let after_copy1 = run_stage round "copy1" copy_propagate_func after_const1 in
+      let after_sr = run_stage round "sr" strength_reduce_func after_copy1 in
+      let after_gvn1 = run_stage round "gvn1" (gvn_func summaries globals) after_sr in
+      let after_copy2 = run_stage round "copy2" copy_propagate_func after_gvn1 in
+      let after_dce1 =
+        run_stage round "dce1" (eliminate_dead_code_func summaries globals) after_copy2
+      in
+      let after_reassoc = run_stage round "reassoc" reassociate_loop_adds_func after_dce1 in
+      let after_licm = run_stage round "licm" (licm_func summaries globals) after_reassoc in
+      let after_unswitch =
+        run_stage round ~enabled:profile.enable_unswitch "unswitch"
+          (unswitch_loops_func summaries globals)
+          after_licm
+      in
       let after_const2 =
-        const_propagate_func global_init summaries globals after_unswitch |> stop_after "const2"
+        run_stage round "const2"
+          (const_propagate_func global_init summaries globals)
+          after_unswitch
       in
-      let after_copy3 = copy_propagate_func after_const2 |> stop_after "copy3" in
-      let after_gvn2 = gvn_func summaries globals after_copy3 |> stop_after "gvn2" in
-      let after_dce2 = eliminate_dead_code_func summaries globals after_gvn2 |> stop_after "dce2" in
+      let after_copy3 = run_stage round "copy3" copy_propagate_func after_const2 in
+      let after_gvn2 =
+        run_stage round ~enabled:profile.enable_gvn2 "gvn2"
+          (gvn_func summaries globals)
+          after_copy3
+      in
+      let after_dce2 =
+        run_stage round "dce2" (eliminate_dead_code_func summaries globals) after_gvn2
+      in
       let after_dead_loops =
-        eliminate_dead_loops_func summaries globals after_dce2 |> stop_after "dead_loops"
+        run_stage round "dead_loops" (eliminate_dead_loops_func summaries globals) after_dce2
       in
-      let after_fold = fold_branch_tails_func summaries globals after_dead_loops |> stop_after "fold" in
-      let after_thread1 = thread_and_prune_func after_fold |> stop_after "thread1" in
+      let after_fold =
+        run_stage round "fold" (fold_branch_tails_func summaries globals) after_dead_loops
+      in
+      let after_thread1 = run_stage round "thread1" thread_and_prune_func after_fold in
       let after_split =
-        extract_counted_reductions_func summaries globals after_thread1
-        |> stop_after "split_reductions"
+        run_stage round ~enabled:profile.enable_split_reductions "split_reductions"
+          (extract_counted_reductions_func summaries globals)
+          after_thread1
       in
       let after_counted =
-        eliminate_counted_loops_func summaries globals after_split
-        |> stop_after "counted_loops"
+        run_stage round "counted_loops"
+          (eliminate_counted_loops_func summaries globals)
+          after_split
       in
       let after_unroll =
-        unroll_counted_loops_x2_func summaries globals after_counted |> stop_after "unroll2"
+        run_stage round ~enabled:profile.enable_unroll "unroll2"
+          (unroll_counted_loops_x2_func summaries globals)
+          after_counted
       in
-      let after_thread2 = thread_and_prune_func after_unroll |> stop_after "thread2" in
-      let after_fold2 = fold_branch_tails_func summaries globals after_thread2 |> stop_after "fold2" in
-      let after_rotate = loop_rotate_func after_fold2 |> stop_after "rotate" in
-      let after_thread3 = thread_and_prune_func after_rotate |> stop_after "thread3" in
-      let after_fold3 = fold_branch_tails_func summaries globals after_thread3 |> stop_after "fold3" in
+      let after_thread2 = run_stage round "thread2" thread_and_prune_func after_unroll in
+      let after_fold2 =
+        run_stage round "fold2" (fold_branch_tails_func summaries globals) after_thread2
+      in
+      let after_rotate =
+        run_stage round ~enabled:profile.enable_rotate "rotate" loop_rotate_func after_fold2
+      in
+      let after_thread3 = run_stage round "thread3" thread_and_prune_func after_rotate in
+      let after_fold3 =
+        run_stage round "fold3" (fold_branch_tails_func summaries globals) after_thread3
+      in
       after_fold3
     with
     | StopPass current -> current
   in
-  let rec loop fuel current =
+  let rec loop round fuel current =
     if fuel = 0 then current
     else
-      let next = step current in
-      if next = current then current else loop (fuel - 1) next
+      let next = step round current in
+      if next = current then current else loop (round + 1) (fuel - 1) next
   in
   match debug_stop_after with
   | Some "mem2reg" -> promoted
-  | Some _ | None -> loop 8 promoted
+  | Some _ | None -> loop 1 profile.max_rounds promoted
 
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let global_init, globals =

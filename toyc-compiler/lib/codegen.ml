@@ -158,6 +158,9 @@ let is_before_successor_anchor_label label =
 
 let is_synthetic_label label = is_edge_anchor_label label || is_before_successor_anchor_label label
 
+let block_instr_count blocks =
+  List.fold_left (fun acc (block : Cfg.block) -> acc + List.length block.body) 0 blocks
+
 let build_block_anchor_maps blocks =
   let before_map = Hashtbl.create 8 in
   let after_map = Hashtbl.create 8 in
@@ -181,6 +184,26 @@ let build_block_anchor_maps blocks =
         | [] -> ())
     blocks;
   (before_map, after_map)
+
+let schedule_func_blocks_simple (f : Cfg.func) =
+  let before_map, after_map = build_block_anchor_maps f.blocks in
+  let emitted = Hashtbl.create (List.length f.blocks) in
+  let ordered_rev = ref [] in
+  let rec emit_block (block : Cfg.block) =
+    if not (Hashtbl.mem emitted block.label) then begin
+      Hashtbl.add emitted block.label ();
+      List.iter emit_block (table_find_or_empty before_map block.label []);
+      ordered_rev := block :: !ordered_rev;
+      List.iter emit_block (table_find_or_empty after_map block.label [])
+    end
+  in
+  Option.iter emit_block (List.find_opt (fun (block : Cfg.block) -> block.label = f.entry) f.blocks);
+  List.iter
+    (fun (block : Cfg.block) ->
+      if block.label <> f.entry && not (is_synthetic_label block.label) then emit_block block)
+    f.blocks;
+  List.iter (fun (block : Cfg.block) -> if block.label <> f.entry then emit_block block) f.blocks;
+  { f with blocks = List.rev !ordered_rev }
 
 let max_call_args (f : Cfg.func) =
   List.fold_left
@@ -511,24 +534,27 @@ let schedule_primary_blocks (f : Cfg.func) =
   List.rev !ordered_rev
 
 let schedule_func_blocks_with_hot_traces (f : Cfg.func) =
-  let before_map, after_map = build_block_anchor_maps f.blocks in
-  let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
-  let primary_order = schedule_primary_blocks f in
-  let emitted = Hashtbl.create (List.length f.blocks) in
-  let ordered_rev = ref [] in
-  let rec emit_block (block : Cfg.block) =
-    if not (Hashtbl.mem emitted block.label) then begin
-      Hashtbl.add emitted block.label ();
-      List.iter emit_block (table_find_or_empty before_map block.label []);
-      ordered_rev := block :: !ordered_rev;
-      List.iter emit_block (table_find_or_empty after_map block.label [])
-    end
-  in
-  Option.iter emit_block (Hashtbl.find_opt block_map f.entry);
-  List.iter emit_block primary_order;
-  List.iter emit_block f.blocks;
-  { f with blocks = List.rev !ordered_rev }
+  if List.length f.blocks >= 96 || block_instr_count f.blocks >= 640 then
+    schedule_func_blocks_simple f
+  else
+    let before_map, after_map = build_block_anchor_maps f.blocks in
+    let block_map = Hashtbl.create (List.length f.blocks) in
+    List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
+    let primary_order = schedule_primary_blocks f in
+    let emitted = Hashtbl.create (List.length f.blocks) in
+    let ordered_rev = ref [] in
+    let rec emit_block (block : Cfg.block) =
+      if not (Hashtbl.mem emitted block.label) then begin
+        Hashtbl.add emitted block.label ();
+        List.iter emit_block (table_find_or_empty before_map block.label []);
+        ordered_rev := block :: !ordered_rev;
+        List.iter emit_block (table_find_or_empty after_map block.label [])
+      end
+    in
+    Option.iter emit_block (Hashtbl.find_opt block_map f.entry);
+    List.iter emit_block primary_order;
+    List.iter emit_block f.blocks;
+    { f with blocks = List.rev !ordered_rev }
 
 type global_access_stats = {
   mutable count : int;
