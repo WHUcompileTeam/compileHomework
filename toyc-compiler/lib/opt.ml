@@ -30,7 +30,7 @@ type const_env = const_cell StringMap.t list
 
 type inline_func = {
   params : string list;
-  body : expr;
+  body_stmts : stmt list;
   cost : int;
   param_uses : int StringMap.t;
 }
@@ -99,6 +99,8 @@ let rec expr_has_call = function
   | Unary (_, e) -> expr_has_call e
   | Binary (_, lhs, rhs) -> expr_has_call lhs || expr_has_call rhs
 
+let expr_is_pure expr = not (expr_has_call expr)
+
 let rec expr_cost = function
   | Int _ | Var _ -> 1
   | Call (_, args) ->
@@ -114,6 +116,62 @@ let rec expr_var_uses counts = function
   | Call (_, args) -> List.fold_left expr_var_uses counts args
   | Unary (_, e) -> expr_var_uses counts e
   | Binary (_, lhs, rhs) -> expr_var_uses (expr_var_uses counts lhs) rhs
+
+let rec stmt_cost = function
+  | Block stmts -> 1 + List.fold_left (fun acc stmt -> acc + stmt_cost stmt) 0 stmts
+  | Empty -> 0
+  | Expr expr -> 1 + expr_cost expr
+  | Assign (_, expr) -> 1 + expr_cost expr
+  | Decl d -> 1 + expr_cost d.init
+  | If (cond, t, e) ->
+      let else_cost =
+        match e with
+        | Some else_stmt -> stmt_cost else_stmt
+        | None -> 0
+      in
+      1 + expr_cost cond + stmt_cost t + else_cost
+  | While (cond, body) -> 1 + expr_cost cond + stmt_cost body
+  | Break | Continue -> 1
+  | Return None -> 1
+  | Return (Some expr) -> 1 + expr_cost expr
+
+let rec stmt_var_uses counts = function
+  | Block stmts -> List.fold_left stmt_var_uses counts stmts
+  | Empty | Break | Continue | Return None -> counts
+  | Expr expr -> expr_var_uses counts expr
+  | Assign (_, expr) -> expr_var_uses counts expr
+  | Decl d -> expr_var_uses counts d.init
+  | If (cond, t, e) ->
+      let counts = expr_var_uses counts cond in
+      let counts = stmt_var_uses counts t in
+      begin
+        match e with
+        | Some else_stmt -> stmt_var_uses counts else_stmt
+        | None -> counts
+      end
+  | While (cond, body) -> stmt_var_uses (expr_var_uses counts cond) body
+  | Return (Some expr) -> expr_var_uses counts expr
+
+let stmt_list_cost stmts =
+  List.fold_left (fun acc stmt -> acc + stmt_cost stmt) 0 stmts
+
+let stmt_list_var_uses counts stmts =
+  List.fold_left stmt_var_uses counts stmts
+
+let rec inline_stmt_template_supported = function
+  | Block stmts -> List.for_all inline_stmt_template_supported stmts
+  | Empty -> true
+  | Expr expr | Assign (_, expr) | Return (Some expr) -> not (expr_has_call expr)
+  | Decl d -> not (expr_has_call d.init)
+  | If (cond, t, e) ->
+      let else_supported =
+        match e with
+        | Some else_stmt -> inline_stmt_template_supported else_stmt
+        | None -> true
+      in
+      not (expr_has_call cond) && inline_stmt_template_supported t && else_supported
+  | While _ | Break | Continue -> false
+  | Return None -> false
 
 let inline_expr_limit = 28
 let inline_expr_depth_limit = 6
@@ -133,49 +191,105 @@ let inline_pure_expr env expr =
   let expr = subst_inline_expr env expr in
   if expr_has_call expr then None else Some expr
 
-let inline_expr_body_of_func (f : Ast.func) =
-  let param_env =
-    List.fold_left
-      (fun env (param : Ast.ident) -> StringMap.add param.name (Var param.name) env)
-      StringMap.empty f.params
-  in
-  let rec eval env = function
-    | [] -> None
-    | Empty :: rest -> eval env rest
-    | Expr expr :: rest -> (
-        match inline_pure_expr env expr with
-        | Some _ -> eval env rest
-        | None -> None)
-    | Decl d :: rest -> (
-        match inline_pure_expr env d.init with
-        | Some init -> eval (StringMap.add d.ident.name init env) rest
-        | None -> None)
-    | Assign (name, expr) :: rest ->
-        if StringMap.mem name env then
-          match inline_pure_expr env expr with
-          | Some value -> eval (StringMap.add name value env) rest
-          | None -> None
-        else None
-    | Return (Some expr) :: _ -> inline_pure_expr env expr
-    | Return None :: _ -> None
-    | Block _ :: _ | If _ :: _ | While _ :: _ | Break :: _ | Continue :: _ -> None
-  in
-  eval param_env f.body
+type inline_scope_env = expr StringMap.t list
+
+type inline_stmt_result =
+  | InlineContinue of inline_scope_env
+  | InlineReturn of expr
+
+let empty_inline_scope = [ StringMap.empty ]
+
+let push_inline_scope env = StringMap.empty :: env
+
+let pop_inline_scope = function
+  | _ :: rest -> rest
+  | [] -> []
+
+let add_inline_binding env name value =
+  match env with
+  | scope :: rest -> StringMap.add name value scope :: rest
+  | [] -> [ StringMap.singleton name value ]
+
+let rec find_inline_binding env name =
+  match env with
+  | [] -> None
+  | scope :: rest -> (
+      match StringMap.find_opt name scope with
+      | Some value -> Some value
+      | None -> find_inline_binding rest name)
+
+let rec set_inline_binding env name value =
+  match env with
+  | [] -> None
+  | scope :: rest ->
+      if StringMap.mem name scope then Some (StringMap.add name value scope :: rest)
+      else Option.map (fun rest -> scope :: rest) (set_inline_binding rest name value)
+
+let rec subst_inline_expr_scoped env = function
+  | Int _ as e -> e
+  | Var name -> (
+      match find_inline_binding env name with
+      | Some value -> value
+      | None -> Var name)
+  | Call (name, args) -> Call (name, List.map (subst_inline_expr_scoped env) args)
+  | Unary (op, e) -> Unary (op, subst_inline_expr_scoped env e)
+  | Binary (op, lhs, rhs) ->
+      Binary (op, subst_inline_expr_scoped env lhs, subst_inline_expr_scoped env rhs)
+
+let inline_pure_expr_scoped env expr =
+  let expr = subst_inline_expr_scoped env expr in
+  if expr_has_call expr then None else Some expr
+
+let rec eval_inline_stmt_list env = function
+  | [] -> Some (InlineContinue env)
+  | Empty :: rest -> eval_inline_stmt_list env rest
+  | Expr expr :: rest -> (
+      match inline_pure_expr_scoped env expr with
+      | Some _ -> eval_inline_stmt_list env rest
+      | None -> None)
+  | Decl d :: rest -> (
+      match inline_pure_expr_scoped env d.init with
+      | Some init -> eval_inline_stmt_list (add_inline_binding env d.ident.name init) rest
+      | None -> None)
+  | Assign (name, expr) :: rest -> (
+      match inline_pure_expr_scoped env expr with
+      | Some value -> (
+          match set_inline_binding env name value with
+          | Some env -> eval_inline_stmt_list env rest
+          | None -> None)
+      | None -> None)
+  | Block stmts :: rest -> (
+      match eval_inline_stmt_list (push_inline_scope env) stmts with
+      | Some (InlineContinue inner_env) -> eval_inline_stmt_list (pop_inline_scope inner_env) rest
+      | Some (InlineReturn expr) -> Some (InlineReturn expr)
+      | None -> None)
+  | If (cond, then_stmt, else_stmt) :: rest -> (
+      match inline_pure_expr_scoped env cond with
+      | Some (Int value) when truth value -> eval_inline_stmt_list env (then_stmt :: rest)
+      | Some (Int _) -> (
+          match else_stmt with
+          | Some else_stmt -> eval_inline_stmt_list env (else_stmt :: rest)
+          | None -> eval_inline_stmt_list env rest)
+      | Some _ | None -> None)
+  | While _ :: _ -> None
+  | Break :: _ | Continue :: _ -> None
+  | Return (Some expr) :: _ -> Option.map (fun expr -> InlineReturn expr) (inline_pure_expr_scoped env expr)
+  | Return None :: _ -> None
 
 let inline_def_of_func (f : Ast.func) =
-  match (f.ret, inline_expr_body_of_func f) with
-  | TInt, Some body ->
-      let cost = expr_cost body in
+  match f.ret with
+  | TInt when List.for_all inline_stmt_template_supported f.body ->
+      let cost = stmt_list_cost f.body in
       if cost <= inline_expr_limit then
         Some
           {
             params = List.map (fun (param : Ast.ident) -> param.name) f.params;
-            body;
+            body_stmts = f.body;
             cost;
-            param_uses = expr_var_uses StringMap.empty body;
+            param_uses = stmt_list_var_uses StringMap.empty f.body;
           }
       else None
-  | _ -> None
+  | TInt | TVoid -> None
 
 let rec inline_expr func_env depth = function
   | Int _ as e -> e
@@ -192,12 +306,14 @@ let rec inline_expr func_env depth = function
                       let uses = Option.value ~default:0 (StringMap.find_opt param def.param_uses) in
                       not (expr_has_call arg) || uses <= 1)
                     def.params args ->
-            let subst_env =
+            let subst_scope =
               List.fold_left2
-                (fun env param arg -> StringMap.add param arg env)
-                StringMap.empty def.params args
+                (fun env param arg -> add_inline_binding env param arg)
+                empty_inline_scope def.params args
             in
-            inline_expr func_env (depth - 1) (subst_inline_expr subst_env def.body)
+            (match eval_inline_stmt_list subst_scope def.body_stmts with
+            | Some (InlineReturn body) -> inline_expr func_env (depth - 1) body
+            | Some (InlineContinue _) | None -> Call (name, args))
         | Some _ | None -> Call (name, args))
   | Unary (op, e) -> Unary (op, inline_expr func_env depth e)
   | Binary (op, lhs, rhs) ->
@@ -243,7 +359,25 @@ let rec fold_expr env = function
           match fold_binop op av bv with
           | Some v -> Int v
           | None -> Binary (op, a', b'))
-      | _ -> Binary (op, a', b'))
+      | _ -> (
+          match op with
+          | Add when a' = Int 0L -> b'
+          | Add when b' = Int 0L -> a'
+          | Sub when b' = Int 0L -> a'
+          | Sub when expr_is_pure a' && a' = b' -> Int 0L
+          | Mul when (a' = Int 0L && expr_is_pure b') || (b' = Int 0L && expr_is_pure a') ->
+              Int 0L
+          | Mul when a' = Int 1L -> b'
+          | Mul when b' = Int 1L -> a'
+          | Div when b' = Int 1L -> a'
+          | Mod when b' = Int 1L && expr_is_pure a' -> Int 0L
+          | Eq when expr_is_pure a' && a' = b' -> Int 1L
+          | Ne when expr_is_pure a' && a' = b' -> Int 0L
+          | Lt when expr_is_pure a' && a' = b' -> Int 0L
+          | Gt when expr_is_pure a' && a' = b' -> Int 0L
+          | Le when expr_is_pure a' && a' = b' -> Int 1L
+          | Ge when expr_is_pure a' && a' = b' -> Int 1L
+          | _ -> Binary (op, a', b')))
 
 let rewrite_expr_ast func_env env expr =
   fold_expr env (inline_expr func_env inline_expr_depth_limit expr)
@@ -325,7 +459,18 @@ and fold_stmt_list env stmts =
   in
   loop env [] stmts
 
-let optimize_ast program =
+let build_inline_func_env program =
+  List.fold_left
+    (fun env -> function
+      | FuncDef f -> (
+          match inline_def_of_func f with
+          | Some def -> StringMap.add f.name.name def env
+          | None -> env)
+      | TopDecl _ -> env)
+    StringMap.empty program
+
+let optimize_ast_once program =
+  let base_func_env = build_inline_func_env program in
   let rec fold_stmt_inline func_env env = function
     | Block stmts ->
         let stmts', _ = fold_stmt_list_inline func_env (push_scope env) stmts in
@@ -391,7 +536,14 @@ let optimize_ast program =
         in
         loop env func_env (FuncDef f :: acc) rest
   in
-  loop empty_env StringMap.empty [] program
+  loop empty_env base_func_env [] program
+
+let optimize_ast program =
+  let rec iterate fuel current =
+    let next = optimize_ast_once current in
+    if fuel = 0 || next = current then next else iterate (fuel - 1) next
+  in
+  iterate 2 program
 
 let fold_unop op v =
   let v = i32 v in
@@ -465,6 +617,10 @@ let call_touched_globals summaries globals callee =
     (call_read_globals summaries globals callee)
     (call_written_globals summaries globals callee)
 
+let equal_func_effect_summary a b =
+  PlaceSet.equal a.read_globals b.read_globals
+  && PlaceSet.equal a.written_globals b.written_globals
+
 let summarize_func summaries globals (f : Cfg.func) =
   List.fold_left
     (fun summary (block : Cfg.block) ->
@@ -487,6 +643,42 @@ let summarize_func summaries globals (f : Cfg.func) =
     { read_globals = PlaceSet.empty; written_globals = PlaceSet.empty }
     f.blocks
 
+let compute_func_summaries globals funcs =
+  let summaries = Hashtbl.create (max 8 (List.length funcs)) in
+  let empty_summary = { read_globals = PlaceSet.empty; written_globals = PlaceSet.empty } in
+  List.iter (fun (f : Cfg.func) -> Hashtbl.replace summaries f.label empty_summary) funcs;
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter
+      (fun (f : Cfg.func) ->
+        let summary = summarize_func summaries globals f in
+        let prev =
+          match Hashtbl.find_opt summaries f.label with
+          | Some prev -> prev
+          | None -> empty_summary
+        in
+        if not (equal_func_effect_summary summary prev) then (
+          Hashtbl.replace summaries f.label summary;
+          changed := true))
+      funcs
+  done;
+  summaries
+
+let operand_is_zero = function
+  | Tcg.Imm 0L -> true
+  | Tcg.Temp _ | Tcg.Imm _ -> false
+
+let operand_is_one = function
+  | Tcg.Imm 1L -> true
+  | Tcg.Temp _ | Tcg.Imm _ -> false
+
+let operand_is_minus_one = function
+  | Tcg.Imm (-1L) -> true
+  | Tcg.Temp _ | Tcg.Imm _ -> false
+
+let operand_equal a b = a = b
+
 let simplify_simple_instr = function
   | Tcg.Un (dst, op, src) -> (
       match src with
@@ -504,7 +696,27 @@ let simplify_simple_instr = function
           match fold_binop op a b with
           | Some folded -> Tcg.Move (dst, Tcg.Imm folded)
           | None -> Tcg.Bin (dst, op, lhs, rhs))
-      | _ -> Tcg.Bin (dst, op, lhs, rhs))
+      | _ -> (
+          match op with
+          | Add when operand_is_zero lhs -> Tcg.Move (dst, rhs)
+          | Add when operand_is_zero rhs -> Tcg.Move (dst, lhs)
+          | Sub when operand_is_zero rhs -> Tcg.Move (dst, lhs)
+          | Sub when operand_equal lhs rhs -> Tcg.Move (dst, Tcg.Imm 0L)
+          | Sub when operand_is_zero lhs -> Tcg.Un (dst, UMinus, rhs)
+          | Mul when operand_is_zero lhs || operand_is_zero rhs -> Tcg.Move (dst, Tcg.Imm 0L)
+          | Mul when operand_is_one lhs -> Tcg.Move (dst, rhs)
+          | Mul when operand_is_one rhs -> Tcg.Move (dst, lhs)
+          | Mul when operand_is_minus_one lhs -> Tcg.Un (dst, UMinus, rhs)
+          | Mul when operand_is_minus_one rhs -> Tcg.Un (dst, UMinus, lhs)
+          | Div when operand_is_one rhs -> Tcg.Move (dst, lhs)
+          | Mod when operand_is_one rhs -> Tcg.Move (dst, Tcg.Imm 0L)
+          | Eq when operand_equal lhs rhs -> Tcg.Move (dst, Tcg.Imm 1L)
+          | Ne when operand_equal lhs rhs -> Tcg.Move (dst, Tcg.Imm 0L)
+          | Lt when operand_equal lhs rhs -> Tcg.Move (dst, Tcg.Imm 0L)
+          | Gt when operand_equal lhs rhs -> Tcg.Move (dst, Tcg.Imm 0L)
+          | Le when operand_equal lhs rhs -> Tcg.Move (dst, Tcg.Imm 1L)
+          | Ge when operand_equal lhs rhs -> Tcg.Move (dst, Tcg.Imm 1L)
+          | _ -> Tcg.Bin (dst, op, lhs, rhs)))
   | instr -> instr
 
 let is_compare_binop = function
@@ -928,8 +1140,11 @@ let run_transfer summaries globals state (block : Cfg.block) =
   ({ block with body = List.rev body_rev; term; succs = Cfg.successors term }, state)
 
 let compute_const_states global_init summaries globals (f : Cfg.func) =
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block) f.blocks;
   let in_states = Hashtbl.create (List.length f.blocks) in
   let out_states = Hashtbl.create (List.length f.blocks) in
+  let executable = ref (LabelSet.singleton f.entry) in
   let entry_state = initial_cp_state global_init f in
   let meet_states = function
     | [] -> empty_cp_state
@@ -940,45 +1155,58 @@ let compute_const_states global_init summaries globals (f : Cfg.func) =
     changed := false;
     List.iter
       (fun (block : Cfg.block) ->
-        let pred_states =
-          List.filter_map (fun pred -> Hashtbl.find_opt out_states pred) block.preds
-        in
-        let in_state =
-          if block.label = f.entry then meet_states (entry_state :: pred_states)
-          else meet_states pred_states
-        in
-        let _, out_state = run_transfer summaries globals in_state block in
-        let prev_in =
-          match Hashtbl.find_opt in_states block.label with
-          | Some state -> state
-          | None -> empty_cp_state
-        in
-        let prev_out =
-          match Hashtbl.find_opt out_states block.label with
-          | Some state -> state
-          | None -> empty_cp_state
-        in
-        if not (equal_cp_state in_state prev_in) then (
-          Hashtbl.replace in_states block.label in_state;
-          changed := true);
-        if not (equal_cp_state out_state prev_out) then (
-          Hashtbl.replace out_states block.label out_state;
-          changed := true))
+        if LabelSet.mem block.label !executable then (
+          let pred_states =
+            List.filter_map
+              (fun pred ->
+                if LabelSet.mem pred !executable then Hashtbl.find_opt out_states pred else None)
+              block.preds
+          in
+          let in_state =
+            if block.label = f.entry then meet_states (entry_state :: pred_states)
+            else meet_states pred_states
+          in
+          let rewritten_block, out_state = run_transfer summaries globals in_state block in
+          let prev_in =
+            match Hashtbl.find_opt in_states block.label with
+            | Some state -> state
+            | None -> empty_cp_state
+          in
+          let prev_out =
+            match Hashtbl.find_opt out_states block.label with
+            | Some state -> state
+            | None -> empty_cp_state
+          in
+          if not (equal_cp_state in_state prev_in) then (
+            Hashtbl.replace in_states block.label in_state;
+            changed := true);
+          if not (equal_cp_state out_state prev_out) then (
+            Hashtbl.replace out_states block.label out_state;
+            changed := true);
+          List.iter
+            (fun succ ->
+              if Hashtbl.mem block_map succ && not (LabelSet.mem succ !executable) then (
+                executable := LabelSet.add succ !executable;
+                changed := true))
+            rewritten_block.succs))
       f.blocks
   done;
-  in_states
+  (!executable, in_states)
 
 let const_propagate_func global_init summaries globals (f : Cfg.func) =
-  let in_states = compute_const_states global_init summaries globals f in
+  let executable, in_states = compute_const_states global_init summaries globals f in
   let blocks =
-    List.map
+    List.filter_map
       (fun (block : Cfg.block) ->
-        let state =
-          match Hashtbl.find_opt in_states block.label with
-          | Some state -> state
-          | None -> empty_cp_state
-        in
-        fst (run_transfer summaries globals state block))
+        if LabelSet.mem block.label executable then
+          let state =
+            match Hashtbl.find_opt in_states block.label with
+            | Some state -> state
+            | None when block.label = f.entry -> initial_cp_state global_init f
+            | None -> empty_cp_state
+          in
+          Some (fst (run_transfer summaries globals state block))
+        else None)
       f.blocks
   in
   Cfg.rebuild_edges { f with blocks }
@@ -5210,12 +5438,11 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
         (PlaceMap.add place (CpConst g.init) init, PlaceSet.add place set))
       (PlaceMap.empty, PlaceSet.empty) analysis.globals
   in
-  let summaries = Hashtbl.create (max 8 (List.length cfg.funcs)) in
+  let summaries = compute_func_summaries globals cfg.funcs in
   let funcs_rev =
     List.fold_left
       (fun acc (f : Cfg.func) ->
         let optimized = optimize_func global_init summaries globals f in
-        Hashtbl.replace summaries optimized.label (summarize_func summaries globals optimized);
         optimized :: acc)
       [] cfg.funcs
   in
