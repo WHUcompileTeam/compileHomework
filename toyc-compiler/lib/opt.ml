@@ -2815,6 +2815,107 @@ let resolve_block_operand (block : Cfg.block) operand =
   in
   resolve IntSet.empty operand
 
+let trivial_phi_bridge_to succ_label (block : Cfg.block) =
+  List.length block.preds = 1
+  && block.succs = [ succ_label ]
+  &&
+  match block.term with
+  | Cfg.Jump target when target = succ_label ->
+      List.for_all
+        (function
+          | Tcg.Move _ -> true
+          | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> false)
+        block.body
+  | Cfg.Jump _ | Cfg.BranchZero _ | Cfg.BranchNonZero _ | Cfg.BranchCompare _ | Cfg.Return _ ->
+      false
+
+let incoming_phi_chain get_block succ_label pred_label =
+  let _ = succ_label in
+  let rec walk seen label acc =
+    if LabelSet.mem label seen then List.rev acc
+    else
+      let block : Cfg.block = get_block label in
+      let acc = block :: acc in
+      match block.preds with
+      | [ prev ] ->
+          let prev_block : Cfg.block = get_block prev in
+          if trivial_phi_bridge_to label prev_block then
+            walk (LabelSet.add label seen) prev acc
+          else List.rev acc
+      | _ -> List.rev acc
+  in
+  walk LabelSet.empty pred_label []
+
+let incoming_update_chain get_block succ_label pred_label =
+  let chain = incoming_phi_chain get_block succ_label pred_label in
+  match List.rev chain with
+  | [] -> chain
+  | (upstream : Cfg.block) :: _ -> (
+      match upstream.preds with
+      | [ prev ] when not (List.exists (fun (block : Cfg.block) -> block.label = prev) chain) ->
+          chain @ [ get_block prev ]
+      | _ -> chain)
+
+let resolve_chain_operand chain operand =
+  let move_defs = Hashtbl.create 8 in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter
+        (function
+          | Tcg.Move (dst, src) when not (Hashtbl.mem move_defs dst) ->
+              Hashtbl.add move_defs dst src
+          | Tcg.Move _ -> ()
+          | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> ())
+        (List.rev block.body))
+    chain;
+  let rec resolve seen = function
+    | Tcg.Imm _ as operand -> operand
+    | Tcg.Temp temp as operand ->
+        if IntSet.mem temp seen then operand
+        else
+          match Hashtbl.find_opt move_defs temp with
+          | Some src -> resolve (IntSet.add temp seen) src
+          | None -> operand
+  in
+  resolve IntSet.empty operand
+
+let move_dests_in_chain chain =
+  List.fold_left
+    (fun seen (block : Cfg.block) ->
+      List.fold_left
+        (fun seen instr ->
+          match instr with
+          | Tcg.Move (dst, _) -> IntSet.add dst seen
+          | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> seen)
+        seen block.body)
+    IntSet.empty chain
+
+let last_move_of_temp_on_chain chain temp =
+  let rec block_loop = function
+    | [] -> None
+    | (block : Cfg.block) :: rest -> (
+        let rec instr_loop = function
+          | [] -> block_loop rest
+          | instr :: instrs -> (
+              match instr with
+              | Tcg.Move (dst, src) when dst = temp -> Some src
+              | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ ->
+                  instr_loop instrs)
+        in
+        instr_loop (List.rev block.body))
+  in
+  block_loop chain
+
+let last_def_of_temp_on_chain chain temp =
+  let rec block_loop = function
+    | [] -> None
+    | (block : Cfg.block) :: rest -> (
+        match last_def_of_temp block temp with
+        | Some _ as found -> found
+        | None -> block_loop rest)
+  in
+  block_loop chain
+
 let resolves_to_induction_temp multi_defs def_instrs phi_temp operand =
   let rec loop seen = function
     | Tcg.Imm _ -> false
@@ -2933,19 +3034,18 @@ let collect_loop_stable_phis header loop get_block def_blocks multi_defs def_ins
   let _ = def_blocks in
   let header_block : Cfg.block = get_block header in
   let pred_count = List.length header_block.preds in
+  let pred_chains =
+    List.map (fun pred -> (pred, incoming_phi_chain get_block header pred)) header_block.preds
+  in
   let counts = Hashtbl.create (max 8 pred_count) in
   List.iter
-    (fun pred ->
-      let seen = ref IntSet.empty in
-      List.iter
-        (function
-          | Tcg.Move (dst, _) when not (IntSet.mem dst !seen) ->
-              seen := IntSet.add dst !seen;
-              let count = Option.value ~default:0 (Hashtbl.find_opt counts dst) in
-              Hashtbl.replace counts dst (count + 1)
-          | _ -> ())
-        ((get_block pred : Cfg.block).body))
-    header_block.preds;
+    (fun (_, chain) ->
+      IntSet.iter
+        (fun dst ->
+          let count = Option.value ~default:0 (Hashtbl.find_opt counts dst) in
+          Hashtbl.replace counts dst (count + 1))
+        (move_dests_in_chain chain))
+    pred_chains;
   let phi_temps =
     Hashtbl.fold
       (fun temp count acc -> if count = pred_count then temp :: acc else acc)
@@ -2959,11 +3059,16 @@ let collect_loop_stable_phis header loop get_block def_blocks multi_defs def_ins
         &&
         List.for_all
           (fun pred ->
-            match last_def_of_temp (get_block pred) phi_temp with
-            | Some (Tcg.Move (_, src)) ->
+            let chain =
+              match List.assoc_opt pred pred_chains with
+              | Some chain -> chain
+              | None -> [ get_block pred ]
+            in
+            match last_move_of_temp_on_chain chain phi_temp with
+            | Some src ->
                 resolves_to_induction_temp
-                  multi_defs def_instrs phi_temp (resolve_block_operand (get_block pred) src)
-            | Some _ | None -> false)
+                  multi_defs def_instrs phi_temp (resolve_chain_operand chain src)
+            | None -> false)
           backedge_preds
       in
       if stable then IntSet.add phi_temp acc else acc)
@@ -2975,15 +3080,11 @@ let collect_header_phi_temps header get_block =
   let counts = Hashtbl.create (max 8 pred_count) in
   List.iter
     (fun pred ->
-      let seen = ref IntSet.empty in
-      List.iter
-        (function
-          | Tcg.Move (dst, _) when not (IntSet.mem dst !seen) ->
-              seen := IntSet.add dst !seen;
-              let count = Option.value ~default:0 (Hashtbl.find_opt counts dst) in
-              Hashtbl.replace counts dst (count + 1)
-          | _ -> ())
-        ((get_block pred : Cfg.block).body))
+      IntSet.iter
+        (fun dst ->
+          let count = Option.value ~default:0 (Hashtbl.find_opt counts dst) in
+          Hashtbl.replace counts dst (count + 1))
+        (move_dests_in_chain (incoming_phi_chain get_block header pred)))
     header_block.preds;
   Hashtbl.fold
     (fun temp count acc -> if count = pred_count then IntSet.add temp acc else acc)
@@ -3073,19 +3174,40 @@ let derived_expr_of_instr loop_defs loop_stable_phis multi_defs def_instrs phi_t
 let collect_basic_induction_vars header loop get_block multi_defs def_instrs =
   let header_block : Cfg.block = get_block header in
   let pred_count = List.length header_block.preds in
+  let pred_chains =
+    List.map (fun pred -> (pred, incoming_phi_chain get_block header pred)) header_block.preds
+  in
+  let chain_for_pred pred =
+    match List.assoc_opt pred pred_chains with
+    | Some chain -> chain
+    | None -> [ get_block pred ]
+  in
+  let step_of_operand phi_temp operand =
+    match operand with
+    | Tcg.Temp temp -> (
+        match Hashtbl.find_opt def_instrs temp with
+        | Some instr -> induction_step_of_instr multi_defs def_instrs phi_temp instr
+        | None -> None)
+    | Tcg.Imm _ -> None
+  in
+  let step_of_chain_source phi_temp chain src =
+    step_of_operand phi_temp (resolve_chain_operand chain src)
+  in
+  let step_of_chain_def phi_temp chain =
+    match last_def_of_temp_on_chain chain phi_temp with
+    | Some (Tcg.Move (_, src)) -> step_of_chain_source phi_temp chain src
+    | Some instr -> induction_step_of_instr multi_defs def_instrs phi_temp instr
+    | None -> None
+  in
   let counts = Hashtbl.create (max 8 pred_count) in
   List.iter
-    (fun pred ->
-      let seen = ref IntSet.empty in
-      List.iter
-        (function
-          | Tcg.Move (dst, _) when not (IntSet.mem dst !seen) ->
-              seen := IntSet.add dst !seen;
-              let count = Option.value ~default:0 (Hashtbl.find_opt counts dst) in
-              Hashtbl.replace counts dst (count + 1)
-          | _ -> ())
-        ((get_block pred : Cfg.block).body))
-    header_block.preds;
+    (fun (_, chain) ->
+      IntSet.iter
+        (fun dst ->
+          let count = Option.value ~default:0 (Hashtbl.find_opt counts dst) in
+          Hashtbl.replace counts dst (count + 1))
+        (move_dests_in_chain chain))
+    pred_chains;
   let phi_temps =
     Hashtbl.fold
       (fun temp count acc -> if count = pred_count then temp :: acc else acc)
@@ -3102,11 +3224,11 @@ let collect_basic_induction_vars header loop get_block multi_defs def_instrs =
         (fun phi_temp ->
           let incoming =
             List.filter_map
-              (fun pred ->
-                match last_def_of_temp (get_block pred) phi_temp with
-                | Some (Tcg.Move (_, src)) -> Some (pred, src)
-                | Some _ | None -> None)
-              header_block.preds
+              (fun (pred, chain) ->
+                match last_move_of_temp_on_chain chain phi_temp with
+                | Some src -> Some (pred, resolve_chain_operand chain src)
+                | None -> None)
+              pred_chains
           in
           if List.length incoming <> pred_count then None
           else
@@ -3114,15 +3236,8 @@ let collect_basic_induction_vars header loop get_block multi_defs def_instrs =
               List.filter_map
                 (fun pred ->
                   match List.assoc_opt pred incoming with
-                  | None -> None
-                  | Some src -> (
-                      match resolve_block_operand (get_block pred) src with
-                      | Tcg.Temp temp -> (
-                          match Hashtbl.find_opt def_instrs temp with
-                          | Some instr ->
-                              induction_step_of_instr multi_defs def_instrs phi_temp instr
-                          | None -> None)
-                      | Tcg.Imm _ -> None))
+                  | Some src -> step_of_operand phi_temp src
+                  | None -> None)
                 backedge_preds
             in
             match steps with
@@ -3147,16 +3262,18 @@ let collect_basic_induction_vars header loop get_block multi_defs def_instrs =
     let self_update_candidates =
       List.fold_left
         (fun acc pred ->
-          let block = get_block pred in
           List.fold_left
-            (fun acc instr ->
-              match defs_temp instr with
-              | Some dst when not (IntSet.mem dst seen_phi_temps) -> (
-                  match induction_step_of_instr multi_defs def_instrs dst instr with
-                  | Some _ -> IntSet.add dst acc
-                  | None -> acc)
-              | Some _ | None -> acc)
-            acc block.body)
+            (fun acc (block : Cfg.block) ->
+              List.fold_left
+                (fun acc instr ->
+                  match defs_temp instr with
+                  | Some dst when not (IntSet.mem dst seen_phi_temps) -> (
+                      match induction_step_of_instr multi_defs def_instrs dst instr with
+                      | Some _ -> IntSet.add dst acc
+                      | None -> acc)
+                  | Some _ | None -> acc)
+                acc block.body)
+            acc (chain_for_pred pred))
         IntSet.empty backedge_preds
     in
     let self_vars =
@@ -3165,7 +3282,7 @@ let collect_basic_induction_vars header loop get_block multi_defs def_instrs =
           let outside_inputs =
             List.filter_map
               (fun pred ->
-                match last_def_of_temp (get_block pred) phi_temp with
+                match last_def_of_temp_on_chain (chain_for_pred pred) phi_temp with
                 | Some _ -> Some (pred, Tcg.Temp phi_temp)
                 | None -> None)
               outside_preds
@@ -3173,9 +3290,7 @@ let collect_basic_induction_vars header loop get_block multi_defs def_instrs =
           let steps =
             List.filter_map
               (fun pred ->
-                match last_def_of_temp (get_block pred) phi_temp with
-                | Some instr -> induction_step_of_instr multi_defs def_instrs phi_temp instr
-                | None -> None)
+                step_of_chain_def phi_temp (chain_for_pred pred))
               backedge_preds
           in
           match steps with
@@ -3234,6 +3349,7 @@ type counted_reduction = {
   target : counted_reduction_target;
   subtract : bool;
   step : counted_reduction_step;
+  alias_temps : Tcg.temp list;
 }
 
 type counted_update =
@@ -3575,6 +3691,9 @@ let counted_update_place = function
   | CountedReduction { target = ReductionPlaceTarget place; _ } -> Some place
   | CountedIv _ | CountedReduction { target = ReductionTempTarget _; _ } -> None
 
+let add_reduction_alias_temps acc (reduction : counted_reduction) =
+  List.fold_left (fun acc temp -> IntSet.add temp acc) acc reduction.alias_temps
+
 type linear_expr =
   | LinearInvariant of summary_expr
   | LinearAffine of {
@@ -3867,7 +3986,7 @@ let reduction_update_of_temp
         let rhs = resolve_block_operand block rhs in
         if resolves_to_induction_temp multi_defs def_instrs phi_temp lhs then
           Option.map
-            (fun step -> { target = ReductionTempTarget phi_temp; subtract = false; step })
+            (fun step -> { target = ReductionTempTarget phi_temp; subtract = false; step; alias_temps = [] })
             (reduction_step_of_operand
                invariant_loaded_places
                loop_defs
@@ -3880,7 +3999,7 @@ let reduction_update_of_temp
                block rhs)
         else if resolves_to_induction_temp multi_defs def_instrs phi_temp rhs then
           Option.map
-            (fun step -> { target = ReductionTempTarget phi_temp; subtract = false; step })
+            (fun step -> { target = ReductionTempTarget phi_temp; subtract = false; step; alias_temps = [] })
             (reduction_step_of_operand
                invariant_loaded_places
                loop_defs
@@ -3897,7 +4016,7 @@ let reduction_update_of_temp
         let rhs = resolve_block_operand block rhs in
         if resolves_to_induction_temp multi_defs def_instrs phi_temp lhs then
           Option.map
-            (fun step -> { target = ReductionTempTarget phi_temp; subtract = true; step })
+            (fun step -> { target = ReductionTempTarget phi_temp; subtract = true; step; alias_temps = [] })
             (reduction_step_of_operand
                invariant_loaded_places
                loop_defs
@@ -3973,7 +4092,7 @@ let reduction_update_of_place
         let rhs = resolve_block_operand block rhs in
         if operand_resolves_to_place_value multi_defs place block IntSet.empty lhs then
           Option.map
-            (fun step -> { target = ReductionPlaceTarget place; subtract = false; step })
+            (fun step -> { target = ReductionPlaceTarget place; subtract = false; step; alias_temps = [] })
             (reduction_step_of_operand
                invariant_loaded_places
                loop_defs
@@ -3986,7 +4105,7 @@ let reduction_update_of_place
                block rhs)
         else if operand_resolves_to_place_value multi_defs place block IntSet.empty rhs then
           Option.map
-            (fun step -> { target = ReductionPlaceTarget place; subtract = false; step })
+            (fun step -> { target = ReductionPlaceTarget place; subtract = false; step; alias_temps = [] })
             (reduction_step_of_operand
                invariant_loaded_places
                loop_defs
@@ -4003,7 +4122,7 @@ let reduction_update_of_place
         let rhs = resolve_block_operand block rhs in
         if operand_resolves_to_place_value multi_defs place block IntSet.empty lhs then
           Option.map
-            (fun step -> { target = ReductionPlaceTarget place; subtract = true; step })
+            (fun step -> { target = ReductionPlaceTarget place; subtract = true; step; alias_temps = [] })
             (reduction_step_of_operand
                invariant_loaded_places
                loop_defs
@@ -4039,6 +4158,64 @@ let collect_counted_reductions
   let header_block : Cfg.block = get_block header in
   let outside_preds = List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds in
   let backedge_preds = List.filter (fun pred -> LabelSet.mem pred loop) header_block.preds in
+  let phi_chain_for_pred pred = incoming_phi_chain get_block header pred in
+  let update_chain_for_pred pred =
+    if LabelSet.mem pred loop then incoming_update_chain get_block header pred
+    else phi_chain_for_pred pred
+  in
+  let rec reduction_update_of_temp_on_chain temp = function
+    | [] -> None
+    | (block : Cfg.block) :: rest -> (
+        match
+          reduction_update_of_temp
+            invariant_loaded_places
+            loop_defs
+            def_blocks
+            get_block
+            loop_stable_phis
+            multi_defs
+            def_instrs
+            ivs
+            temp
+            block
+            temp
+        with
+        | Some _ as update -> update
+        | None -> reduction_update_of_temp_on_chain temp rest)
+  in
+  let rec reduction_update_of_place_on_chain place = function
+    | [] -> None
+    | (block : Cfg.block) :: rest -> (
+        match
+          reduction_update_of_place
+            invariant_loaded_places
+            loop_defs
+            def_blocks
+            get_block
+            loop_stable_phis
+            multi_defs
+            def_instrs
+            ivs
+            place
+            block
+        with
+        | Some _ as update -> update
+        | None -> reduction_update_of_place_on_chain place rest)
+  in
+  let rec last_store_value_of_place_on_chain place chain =
+    match chain with
+    | [] -> None
+    | (block : Cfg.block) :: rest -> (
+        match last_store_of_place place block with
+        | Some (_, value) -> Some (resolve_chain_operand chain value)
+        | None -> last_store_value_of_place_on_chain place rest)
+  in
+  let place_alias_temp_on_chain place chain temp =
+    match last_store_value_of_place_on_chain place chain with
+    | Some stored_value ->
+        resolve_chain_operand chain (Tcg.Temp temp) = stored_value
+    | None -> false
+  in
   if backedge_preds = [] then []
   else
     let temp_reductions =
@@ -4047,24 +4224,12 @@ let collect_counted_reductions
           if IntSet.mem temp excluded_temps then acc
           else if
             List.for_all
-              (fun pred -> Option.is_some (last_def_of_temp (get_block pred) temp))
+              (fun pred -> Option.is_some (last_def_of_temp_on_chain (phi_chain_for_pred pred) temp))
               outside_preds
           then
             let updates =
               List.filter_map
-                (fun pred ->
-                  reduction_update_of_temp
-                    invariant_loaded_places
-                    loop_defs
-                    def_blocks
-                    get_block
-                    loop_stable_phis
-                    multi_defs
-                    def_instrs
-                    ivs
-                    temp
-                    (get_block pred)
-                    temp)
+                (fun pred -> reduction_update_of_temp_on_chain temp (update_chain_for_pred pred))
                 backedge_preds
             in
             match updates with
@@ -4085,18 +4250,7 @@ let collect_counted_reductions
           | Tcg.Local _ ->
               let updates =
                 List.filter_map
-                  (fun pred ->
-                    reduction_update_of_place
-                      invariant_loaded_places
-                      loop_defs
-                      def_blocks
-                      get_block
-                      loop_stable_phis
-                      multi_defs
-                      def_instrs
-                      ivs
-                      place
-                      (get_block pred))
+                  (fun pred -> reduction_update_of_place_on_chain place (update_chain_for_pred pred))
                   backedge_preds
               in
               match updates with
@@ -4107,6 +4261,20 @@ let collect_counted_reductions
                   first :: acc
               | _ -> acc)
         live_places []
+      |> List.map (fun reduction ->
+             match reduction.target with
+             | ReductionTempTarget _ -> reduction
+             | ReductionPlaceTarget place ->
+                 let alias_temps =
+                   IntSet.elements live_temps
+                   |> List.filter (fun temp -> not (IntSet.mem temp excluded_temps))
+                   |> List.filter (fun temp ->
+                          List.for_all
+                            (fun pred -> place_alias_temp_on_chain place (update_chain_for_pred pred) temp)
+                            backedge_preds)
+                   |> List.sort_uniq compare
+                 in
+                 { reduction with alias_temps })
     in
     temp_reductions @ place_reductions
 
@@ -4234,8 +4402,13 @@ let build_reduction_final_update fresh_temp trip_temp (reduction : counted_reduc
               simplify_simple_instr
                 (Tcg.Bin
                    (phi_temp, Add, Tcg.Temp phi_temp, delta_operand))
+           in
+          let alias_updates =
+            List.map
+              (fun temp -> simplify_simple_instr (Tcg.Move (temp, Tcg.Temp phi_temp)))
+              reduction.alias_temps
           in
-          delta_instrs @ [ update ]
+          delta_instrs @ [ update ] @ alias_updates
       | ReductionPlaceTarget place ->
           let acc_temp = fresh_temp () in
           let load = simplify_simple_instr (Tcg.Load (acc_temp, place)) in
@@ -4249,7 +4422,12 @@ let build_reduction_final_update fresh_temp trip_temp (reduction : counted_reduc
                 (Tcg.Bin
                    (acc_temp, Add, Tcg.Temp acc_temp, delta_operand))
            in
-           delta_instrs @ [ load; update; Tcg.Store (place, Tcg.Temp acc_temp) ])
+          let alias_updates =
+            List.map
+              (fun temp -> simplify_simple_instr (Tcg.Move (temp, Tcg.Temp acc_temp)))
+              reduction.alias_temps
+          in
+          delta_instrs @ [ load; update; Tcg.Store (place, Tcg.Temp acc_temp) ] @ alias_updates)
 
 let loop_instr_count loop blocks =
   List.fold_left
@@ -4484,10 +4662,26 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
                   List.fold_left
                     (fun acc update ->
                       match update with
-                      | CountedIv _ | CountedReduction { target = ReductionTempTarget _; _ } ->
+                      | CountedIv _ ->
                           IntSet.add (counted_update_temp update) acc
-                      | CountedReduction { target = ReductionPlaceTarget _; _ } -> acc)
+                      | CountedReduction ({ target = ReductionTempTarget _; _ } as reduction) ->
+                          add_reduction_alias_temps
+                            (IntSet.add (counted_update_temp update) acc)
+                            reduction
+                      | CountedReduction ({ target = ReductionPlaceTarget _; _ } as reduction) ->
+                          add_reduction_alias_temps acc reduction)
                     IntSet.empty all_updates
+                in
+                let supported_live_temps =
+                  IntSet.fold
+                    (fun temp acc ->
+                      if operand_available_before_loop loop_defs multi_defs def_instrs (Tcg.Temp temp) then
+                        IntSet.add temp acc
+                      else acc)
+                    loop_live_defs supported_live_temps
+                in
+                let supported_live_temps =
+                  IntSet.union supported_live_temps (IntSet.inter loop_live_defs loop_stable_phis)
                 in
                 let supported_live_places =
                   List.fold_left
@@ -4629,6 +4823,14 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
     | Cfg.BranchNonZero _ -> "branch_nonzero"
     | Cfg.BranchCompare _ -> "branch_compare"
     | Cfg.Return _ -> "return"
+  in
+  let instr_kind = function
+    | Tcg.Move _ -> "move"
+    | Tcg.Un _ -> "un"
+    | Tcg.Bin _ -> "bin"
+    | Tcg.Load _ -> "load"
+    | Tcg.Store _ -> "store"
+    | Tcg.Call _ -> "call"
   in
   let string_of_intset set =
     IntSet.elements set |> List.map string_of_int |> String.concat ","
@@ -4778,10 +4980,26 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
                   List.fold_left
                     (fun acc update ->
                       match update with
-                      | CountedIv _ | CountedReduction { target = ReductionTempTarget _; _ } ->
+                      | CountedIv _ ->
                           IntSet.add (counted_update_temp update) acc
-                      | CountedReduction { target = ReductionPlaceTarget _; _ } -> acc)
+                      | CountedReduction ({ target = ReductionTempTarget _; _ } as reduction) ->
+                          add_reduction_alias_temps
+                            (IntSet.add (counted_update_temp update) acc)
+                            reduction
+                      | CountedReduction ({ target = ReductionPlaceTarget _; _ } as reduction) ->
+                          add_reduction_alias_temps acc reduction)
                     IntSet.empty all_updates
+                in
+                let supported_live_temps =
+                  IntSet.fold
+                    (fun temp acc ->
+                      if operand_available_before_loop loop_defs multi_defs def_instrs (Tcg.Temp temp) then
+                        IntSet.add temp acc
+                      else acc)
+                    loop_live_defs supported_live_temps
+                in
+                let supported_live_temps =
+                  IntSet.union supported_live_temps (IntSet.inter loop_live_defs loop_stable_phis)
                 in
                 let supported_live_places =
                   List.fold_left
@@ -4799,9 +5017,26 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
                 if effects.has_call || not (PlaceSet.is_empty modified_globals) then
                   debugf "counted-skip func=%s header=%s reason=effects" f.name header
                 else if not (IntSet.subset loop_live_defs supported_live_temps) then
+                  let missing = IntSet.diff loop_live_defs supported_live_temps in
                   debugf "counted-skip func=%s header=%s reason=unsupported_live missing={%s}"
                     f.name header
-                    (string_of_intset (IntSet.diff loop_live_defs supported_live_temps))
+                    (string_of_intset missing);
+                  IntSet.iter
+                    (fun temp ->
+                      let def_label =
+                        match Hashtbl.find_opt def_blocks temp with
+                        | Some label -> label
+                        | None -> "<none>"
+                      in
+                      let def_kind =
+                        match Hashtbl.find_opt def_instrs temp with
+                        | Some instr -> instr_kind instr
+                        | None -> "none"
+                      in
+                      debugf
+                        "counted-missing-temp func=%s header=%s temp=%d def_block=%s def_kind=%s"
+                        f.name header temp def_label def_kind)
+                    missing
                 else if not (PlaceSet.subset loop_live_places supported_live_places) then
                   debugf "counted-skip func=%s header=%s reason=unsupported_live_places" f.name header
                 else
