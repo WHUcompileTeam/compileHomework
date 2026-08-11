@@ -621,11 +621,11 @@ let allocate_temp_regs (f : Cfg.func) =
       homes []
     |> List.sort compare
   in
-  (homes, saved_regs)
+  (homes, saved_regs, intervals)
 
 let compute_layout (f : Cfg.func) =
   let local_offsets = Hashtbl.create 64 in
-  let temp_homes, saved_regs = allocate_temp_regs f in
+  let temp_homes, saved_regs, intervals = allocate_temp_regs f in
   let referenced_locals = referenced_local_ids f in
   let save_area_size = 4 * (2 + List.length saved_regs) in
   let next = ref (save_area_size + 4) in
@@ -640,9 +640,11 @@ let compute_layout (f : Cfg.func) =
   in
   List.iter alloc_local f.params;
   List.iter alloc_local f.locals;
-  for temp = 0 to f.temp_count - 1 do
-    if not (Hashtbl.mem temp_homes temp) then Hashtbl.add temp_homes temp (TempStack (alloc_slot ()))
-  done;
+  List.iter
+    (fun (interval : interval) ->
+      if not (Hashtbl.mem temp_homes interval.temp) then
+        Hashtbl.add temp_homes interval.temp (TempStack (alloc_slot ())))
+    intervals;
   let extra_args = max 0 (max_call_args f - 8) in
   let outgoing_area = align16 (extra_args * 4) in
   let frame_bytes = outgoing_area + (!next - 4) in
