@@ -750,8 +750,13 @@ type alias_map = Tcg.operand IntMap.t
 let empty_alias = IntMap.empty
 
 let normalize_bin_operands op lhs rhs =
-  if is_commutative_binop op && Stdlib.compare lhs rhs > 0 then (rhs, lhs)
-  else (lhs, rhs)
+  if not (is_commutative_binop op) then (lhs, rhs)
+  else
+    match (lhs, rhs) with
+    | Tcg.Imm _, Tcg.Temp _ -> (rhs, lhs)
+    | Tcg.Temp _, Tcg.Imm _ -> (lhs, rhs)
+    | _ when Stdlib.compare lhs rhs > 0 -> (rhs, lhs)
+    | _ -> (lhs, rhs)
 
 let simplify_cfg_func (f : Cfg.func) =
   let simplify_instr instr =
@@ -7645,6 +7650,173 @@ let temp_use_counts blocks =
     blocks;
   counts
 
+let algebra_canonicalize_func (f : Cfg.func) =
+  let _, _, def_instrs, multi_defs =
+    analyze_temp_defs_of_blocks f.temp_count f.blocks
+  in
+  let use_counts = temp_use_counts f.blocks in
+  let use_count temp =
+    Option.value ~default:0 (Hashtbl.find_opt use_counts temp)
+  in
+  let add_i32 a b = i32 Int64.(add (i32 a) (i32 b)) in
+  let sub_i32 a b = i32 Int64.(sub (i32 a) (i32 b)) in
+  let mul_i32 a b = i32 Int64.(mul (i32 a) (i32 b)) in
+  let neg_i32 value = i32 Int64.(neg (i32 value)) in
+  let rec affine_of_operand seen = function
+    | Tcg.Imm _ -> None
+    | Tcg.Temp temp as operand ->
+        if IntSet.mem temp seen || IntSet.mem temp multi_defs || use_count temp <> 1 then
+          Some (operand, 1, 0L, false)
+        else
+          let seen = IntSet.add temp seen in
+          match Hashtbl.find_opt def_instrs temp with
+          | Some (Tcg.Move (_, src))
+          | Some (Tcg.Un (_, UPlus, src)) -> (
+              match affine_of_operand seen src with
+              | Some (base, sign, bias, _) -> Some (base, sign, bias, true)
+              | None -> Some (operand, 1, 0L, false))
+          | Some (Tcg.Un (_, UMinus, src)) -> (
+              match affine_of_operand seen src with
+              | Some (base, sign, bias, _) ->
+                  Some (base, -sign, neg_i32 bias, true)
+              | None -> Some (operand, 1, 0L, false))
+          | Some (Tcg.Bin (_, Add, lhs, Tcg.Imm c))
+          | Some (Tcg.Bin (_, Add, Tcg.Imm c, lhs)) -> (
+              match affine_of_operand seen lhs with
+              | Some (base, sign, bias, _) ->
+                  Some (base, sign, add_i32 bias c, true)
+              | None -> Some (operand, 1, 0L, false))
+          | Some (Tcg.Bin (_, Sub, lhs, Tcg.Imm c)) -> (
+              match affine_of_operand seen lhs with
+              | Some (base, sign, bias, _) ->
+                  Some (base, sign, sub_i32 bias c, true)
+              | None -> Some (operand, 1, 0L, false))
+          | Some (Tcg.Bin (_, Sub, Tcg.Imm c, rhs)) -> (
+              match affine_of_operand seen rhs with
+              | Some (base, sign, bias, _) ->
+                  Some (base, -sign, sub_i32 c bias, true)
+              | None -> Some (operand, 1, 0L, false))
+          | Some (Tcg.Un _)
+          | Some (Tcg.Bin _)
+          | Some (Tcg.Load _)
+          | Some (Tcg.Store _)
+          | Some (Tcg.Call _)
+          | None ->
+              Some (operand, 1, 0L, false)
+  in
+  let rec scale_of_operand seen = function
+    | Tcg.Imm _ -> None
+    | Tcg.Temp temp as operand ->
+        if IntSet.mem temp seen || IntSet.mem temp multi_defs || use_count temp <> 1 then
+          Some (operand, 1L, false)
+        else
+          let seen = IntSet.add temp seen in
+          match Hashtbl.find_opt def_instrs temp with
+          | Some (Tcg.Move (_, src))
+          | Some (Tcg.Un (_, UPlus, src)) -> (
+              match scale_of_operand seen src with
+              | Some (base, factor, _) -> Some (base, factor, true)
+              | None -> Some (operand, 1L, false))
+          | Some (Tcg.Un (_, UMinus, src)) -> (
+              match scale_of_operand seen src with
+              | Some (base, factor, _) ->
+                  Some (base, neg_i32 factor, true)
+              | None -> Some (operand, 1L, false))
+          | Some (Tcg.Bin (_, Mul, lhs, Tcg.Imm c))
+          | Some (Tcg.Bin (_, Mul, Tcg.Imm c, lhs)) -> (
+              match scale_of_operand seen lhs with
+              | Some (base, factor, _) ->
+                  Some (base, mul_i32 factor c, true)
+              | None -> Some (operand, 1L, false))
+          | Some (Tcg.Un _)
+          | Some (Tcg.Bin _)
+          | Some (Tcg.Load _)
+          | Some (Tcg.Store _)
+          | Some (Tcg.Call _)
+          | None ->
+              Some (operand, 1L, false)
+  in
+  let build_affine dst (base, sign, bias) =
+    if sign = 1 then
+      if bias = 0L then Tcg.Move (dst, base)
+      else Tcg.Bin (dst, Add, base, Tcg.Imm bias)
+    else if bias = 0L then
+      Tcg.Un (dst, UMinus, base)
+    else
+      Tcg.Bin (dst, Sub, Tcg.Imm bias, base)
+  in
+  let build_scale dst base factor =
+    if factor = 0L then Tcg.Move (dst, Tcg.Imm 0L)
+    else if factor = 1L then Tcg.Move (dst, base)
+    else if factor = -1L then Tcg.Un (dst, UMinus, base)
+    else Tcg.Bin (dst, Mul, base, Tcg.Imm factor)
+  in
+  let rewrites = ref 0 in
+  let rewrite_instr instr =
+    let initial = simplify_simple_instr instr in
+    let rewritten =
+      match initial with
+      | Tcg.Bin (dst, Add, lhs, rhs) ->
+          let lhs, rhs =
+            match (lhs, rhs) with
+            | Tcg.Imm c, other -> (other, Tcg.Imm c)
+            | _ -> (lhs, rhs)
+          in
+          begin match rhs with
+          | Tcg.Imm c -> (
+              match affine_of_operand IntSet.empty lhs with
+              | Some (base, sign, bias, true) ->
+                  build_affine dst (base, sign, add_i32 bias c)
+              | Some _ | None -> Tcg.Bin (dst, Add, lhs, rhs))
+          | Tcg.Temp _ -> Tcg.Bin (dst, Add, lhs, rhs)
+          end
+      | Tcg.Bin (dst, Sub, lhs, Tcg.Imm c) -> (
+          match affine_of_operand IntSet.empty lhs with
+          | Some (base, sign, bias, true) ->
+              build_affine dst (base, sign, sub_i32 bias c)
+          | Some _ | None -> initial)
+      | Tcg.Bin (dst, Sub, Tcg.Imm c, rhs) -> (
+          match affine_of_operand IntSet.empty rhs with
+          | Some (base, sign, bias, true) ->
+              build_affine dst (base, -sign, sub_i32 c bias)
+          | Some _ | None -> initial)
+      | Tcg.Bin (dst, Mul, lhs, rhs) ->
+          let lhs, rhs =
+            match (lhs, rhs) with
+            | Tcg.Imm c, other -> (other, Tcg.Imm c)
+            | _ -> (lhs, rhs)
+          in
+          begin match rhs with
+          | Tcg.Imm c -> (
+              match scale_of_operand IntSet.empty lhs with
+              | Some (base, factor, true) ->
+                  build_scale dst base (mul_i32 factor c)
+              | Some _ | None -> Tcg.Bin (dst, Mul, lhs, rhs))
+          | Tcg.Temp _ -> Tcg.Bin (dst, Mul, lhs, rhs)
+          end
+      | Tcg.Un (dst, UMinus, src) -> (
+          match affine_of_operand IntSet.empty src with
+          | Some (base, sign, bias, true) ->
+              build_affine dst (base, -sign, neg_i32 bias)
+          | Some _ | None -> initial)
+      | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ ->
+          initial
+    in
+    let rewritten = simplify_simple_instr rewritten in
+    if rewritten <> instr then incr rewrites;
+    rewritten
+  in
+  let blocks =
+    List.map
+      (fun (block : Cfg.block) ->
+        let body = List.map rewrite_instr block.body in
+        { block with body })
+      f.blocks
+  in
+  if Sys.getenv_opt "TOYC_DEBUG_ALGEBRA" <> None then
+    Printf.eprintf "algebra func=%s rewrites=%d\n%!" f.name !rewrites;
+  if !rewrites = 0 then f else Cfg.rebuild_edges { f with blocks }
+
 type reassoc_first =
   | FirstVarPlusInv of Tcg.operand * Tcg.operand
   | FirstVarMinusInv of Tcg.operand * Tcg.operand
@@ -8895,7 +9067,10 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
           (const_propagate_func global_init summaries globals)
           after_simplify0
       in
-      let after_sr = run_stage round "sr" strength_reduce_func after_const1 in
+      let after_algebra1 =
+        run_stage round "algebra1" algebra_canonicalize_func after_const1
+      in
+      let after_sr = run_stage round "sr" strength_reduce_func after_algebra1 in
       let after_gvn1 = run_stage round "gvn1" (gvn_func summaries globals) after_sr in
       let after_dce1 =
         run_stage round "dce1" (eliminate_dead_code_func summaries globals) after_gvn1
@@ -8914,10 +9089,13 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
           (const_propagate_func global_init summaries globals)
           after_unswitch
       in
+      let after_algebra2 =
+        run_stage round "algebra2" algebra_canonicalize_func after_const2
+      in
       let after_gvn2 =
         run_stage round "gvn2"
           (gvn_func summaries globals)
-          after_const2
+          after_algebra2
       in
       let after_dce2 =
         run_stage round "dce2" (eliminate_dead_code_func summaries globals) after_gvn2
