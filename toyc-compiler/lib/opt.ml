@@ -4095,16 +4095,18 @@ let range_of_counted_iv_expr kind expr_bias =
 
 let compare_truth_from_range op range constant =
   match (range.min_value, range.max_value, op) with
-  | Some min_value, _, Lt -> Some (min_value < constant)
-  | Some min_value, _, Le -> Some (min_value <= constant)
-  | Some min_value, _, Gt -> Some (min_value > constant)
-  | Some min_value, _, Ge -> Some (min_value >= constant)
-  | _, Some max_value, Lt -> Some (max_value < constant)
-  | _, Some max_value, Le -> Some (max_value <= constant)
-  | _, Some max_value, Gt -> Some (max_value > constant)
-  | _, Some max_value, Ge -> Some (max_value >= constant)
+  | _, Some max_value, Lt when max_value < constant -> Some true
+  | Some min_value, _, Lt when min_value >= constant -> Some false
+  | _, Some max_value, Le when max_value <= constant -> Some true
+  | Some min_value, _, Le when min_value > constant -> Some false
+  | Some min_value, _, Gt when min_value > constant -> Some true
+  | _, Some max_value, Gt when max_value <= constant -> Some false
+  | Some min_value, _, Ge when min_value >= constant -> Some true
+  | _, Some max_value, Ge when max_value < constant -> Some false
+  | Some min_value, Some max_value, Eq when min_value = constant && max_value = constant -> Some true
   | Some min_value, _, Eq when min_value > constant -> Some false
   | _, Some max_value, Eq when max_value < constant -> Some false
+  | Some min_value, Some max_value, Ne when min_value = constant && max_value = constant -> Some false
   | Some min_value, _, Ne when min_value > constant -> Some true
   | _, Some max_value, Ne when max_value < constant -> Some true
   | _ -> None
@@ -4155,6 +4157,18 @@ let branch_term_with_targets term if_true if_false =
   | Cfg.BranchCompare (op, lhs, rhs, _, _) ->
       Cfg.BranchCompare (op, lhs, rhs, if_true, if_false)
   | Cfg.Jump _ | Cfg.Return _ -> term
+
+let branch_compare_shape_in_block block multi_defs def_instrs = function
+  | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) -> Some (op, lhs, rhs, if_true, if_false)
+  | Cfg.BranchZero (cond, if_zero, if_nonzero) -> (
+      match resolve_compare_operand_in_block block multi_defs def_instrs cond with
+      | Some (op, lhs, rhs) -> Some (op, lhs, rhs, if_nonzero, if_zero)
+      | None -> None)
+  | Cfg.BranchNonZero (cond, if_nonzero, if_zero) -> (
+      match resolve_compare_operand_in_block block multi_defs def_instrs cond with
+      | Some (op, lhs, rhs) -> Some (op, lhs, rhs, if_nonzero, if_zero)
+      | None -> None)
+  | Cfg.Jump _ | Cfg.Return _ -> None
 
 let resolve_operand_before_loop loop_defs multi_defs def_instrs operand =
   let rec resolve seen = function
@@ -8753,8 +8767,288 @@ let simplify_counted_loop_guards_func _summaries _globals (f : Cfg.func) =
     if not !changed then f
     else
       let ordered_labels = List.map (fun (block : Cfg.block) -> block.label) f.blocks in
-      let blocks = List.map get_current ordered_labels in
-      Cfg.rebuild_edges { f with blocks }
+       let blocks = List.map get_current ordered_labels in
+       Cfg.rebuild_edges { f with blocks }
+
+let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
+  let doms = compute_dominators f in
+  let backedges =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        List.fold_left
+          (fun acc succ ->
+            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
+              (block.label, succ) :: acc
+            else acc)
+          acc block.succs)
+      [] f.blocks
+  in
+  if backedges = [] then f
+  else
+    let loops = Hashtbl.create 8 in
+    List.iter
+      (fun (pred, header) ->
+        let loop = natural_loop block_map header pred in
+        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
+        Hashtbl.replace loops header merged)
+      backedges;
+    let headers =
+      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
+      |> List.sort (fun (_, a) (_, b) -> compare a b)
+      |> List.map fst
+    in
+    let exception Applied of Cfg.func in
+    let pure_scalar_block (block : Cfg.block) =
+      List.for_all
+        (function
+          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ -> true
+          | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> false)
+        block.body
+    in
+    let rec collapse_pure_scalar_connector loop seen label =
+      if LabelSet.mem label seen || not (Hashtbl.mem block_map label) then None
+      else
+        let block : Cfg.block = Hashtbl.find block_map label in
+        if not (LabelSet.mem block.label loop) then None
+        else if not (pure_scalar_block block) then None
+        else
+          match block.succs with
+          | [] -> Some block.label
+          | [ next ] ->
+              if transparent_loop_connector block then
+                collapse_pure_scalar_connector loop (LabelSet.add label seen) next
+              else Some block.label
+          | _ -> Some block.label
+    in
+    let countup_outer_bound = function
+      | CountUpLt (Tcg.Imm bound, bias) -> Some (Lt, Int64.sub bound bias)
+      | CountUpLe (Tcg.Imm bound, bias) -> Some (Le, Int64.sub bound bias)
+      | CountUpLt _ | CountUpLe _ | CountDownGt _ | CountDownGe _ -> None
+    in
+    let exclusive_upper_bound = function
+      | Lt, bound -> Some bound
+      | Le, bound -> Some Int64.(add bound 1L)
+      | _ -> None
+    in
+    let relabel_func_prefix prefix (func : Cfg.func) =
+      let mapping = Hashtbl.create (List.length func.blocks) in
+      let blocks =
+        List.mapi
+          (fun index (block : Cfg.block) ->
+            let label = Printf.sprintf ".L%s_%s_%d" f.label prefix index in
+            Hashtbl.add mapping block.label label;
+            { block with label })
+          func.blocks
+      in
+      let rename label = Option.value ~default:label (Hashtbl.find_opt mapping label) in
+      let blocks =
+        List.map
+          (fun (block : Cfg.block) ->
+            let term = rewrite_term_labels rename block.term in
+            { block with term; succs = Cfg.successors term })
+          blocks
+      in
+      { func with entry = rename func.entry; blocks }
+    in
+    try
+      List.iter
+        (fun header ->
+          let loop = table_find_or_empty loops header LabelSet.empty in
+          let header_block : Cfg.block = Hashtbl.find block_map header in
+          let loop_blocks =
+            f.blocks |> List.filter (fun (block : Cfg.block) -> LabelSet.mem block.label loop)
+          in
+          let loop_defs = loop_defined_temps loop f.blocks in
+          let def_instrs = temp_def_instrs_map f in
+          let multi_defs = multi_def_temps f in
+          let loop_stable_phis = collect_header_phi_temps header (Hashtbl.find block_map) in
+          let ivs =
+            collect_basic_induction_vars header loop (Hashtbl.find block_map) loop_defs multi_defs
+              def_instrs
+          in
+          match
+            find_counted_loop_control loop loop_defs loop_stable_phis multi_defs def_instrs ivs
+              (Hashtbl.find block_map)
+          with
+          | None -> ()
+          | Some info ->
+              if info.control_label <> header then ()
+              else
+                let inside_block : Cfg.block = Hashtbl.find block_map info.inside_label in
+                match branch_term_outcomes inside_block.term with
+                | Some (branch_a, branch_b)
+                  when LabelSet.mem branch_a loop && LabelSet.mem branch_b loop -> (
+                    let branch_a_block : Cfg.block = Hashtbl.find block_map branch_a in
+                    let branch_b_block : Cfg.block = Hashtbl.find block_map branch_b in
+                    if
+                      not (pure_scalar_block inside_block && pure_scalar_block branch_a_block && pure_scalar_block branch_b_block)
+                      || branch_a = branch_b
+                    then ()
+                    else
+                      match
+                        ( collapse_pure_scalar_connector loop LabelSet.empty branch_a,
+                          collapse_pure_scalar_connector loop LabelSet.empty branch_b,
+                          branch_compare_shape_in_block inside_block multi_defs def_instrs inside_block.term,
+                          countup_outer_bound info.kind )
+                      with
+                      | Some join_a, Some join_b, Some (split_op0, lhs, rhs, if_true, if_false), Some (outer_op, outer_bound)
+                        when join_a = join_b -> (
+                          let join_label = join_a in
+                          let split_info =
+                            match
+                              ( iv_bias_of_operand_in_block
+                                  inside_block
+                                  multi_defs
+                                  def_instrs
+                                  info.control_iv.phi_temp
+                                  lhs,
+                                operand_static_int64 loop_defs multi_defs def_instrs rhs )
+                            with
+                            | Some bias, Some constant ->
+                                Some (split_op0, Int64.sub constant bias, if_true, if_false)
+                            | _ -> (
+                                match
+                                  ( iv_bias_of_operand_in_block
+                                      inside_block
+                                      multi_defs
+                                      def_instrs
+                                      info.control_iv.phi_temp
+                                      rhs,
+                                    operand_static_int64 loop_defs multi_defs def_instrs lhs )
+                                with
+                                | Some bias, Some constant ->
+                                    Some (swap_compare split_op0, Int64.sub constant bias, if_true, if_false)
+                                | _ -> None)
+                          in
+                          match split_info with
+                          | Some (split_op, split_bound, if_true, if_false) -> (
+                              match (exclusive_upper_bound (outer_op, outer_bound), exclusive_upper_bound (split_op, split_bound)) with
+                              | Some outer_excl, Some split_excl ->
+                                  let first_excl = if outer_excl < split_excl then outer_excl else split_excl in
+                                  let first_branch, second_branch =
+                                    match split_op with
+                                    | Lt | Le -> (if_true, if_false)
+                                    | Gt | Ge -> (if_false, if_true)
+                                    | _ -> (if_true, if_false)
+                                  in
+                                  let before_bridge_label =
+                                    Printf.sprintf ".L%s_split_bridge_%s" f.label header
+                                  in
+                                  let entry_dispatch_label =
+                                    Printf.sprintf ".L%s_split_entry_%s" f.label header
+                                  in
+                                  let split_dispatch_label =
+                                    Printf.sprintf ".L%s_split_dispatch_%s" f.label header
+                                  in
+                                  let clone_loop prefix header_true_target header_false_target forced_branch =
+                                    let blocks =
+                                      List.map
+                                        (fun (block : Cfg.block) ->
+                                          if block.label = header then
+                                            {
+                                              block with
+                                              body = [];
+                                              term =
+                                                Cfg.BranchCompare
+                                                  ( Lt,
+                                                    Tcg.Temp info.control_iv.phi_temp,
+                                                    Tcg.Imm header_true_target,
+                                                    info.inside_label,
+                                                    header_false_target );
+                                              succs = [];
+                                            }
+                                          else if block.label = info.inside_label then
+                                            {
+                                              block with
+                                              body = [];
+                                              term = Cfg.Jump forced_branch;
+                                              succs = [ forced_branch ];
+                                            }
+                                          else block)
+                                        loop_blocks
+                                    in
+                                    relabel_func_prefix prefix
+                                      (Cfg.rebuild_edges { f with entry = header; blocks })
+                                  in
+                                  let before_func =
+                                    clone_loop "split_pre" first_excl before_bridge_label first_branch
+                                  in
+                                  let after_func =
+                                    clone_loop "split_post" outer_excl info.exit_label second_branch
+                                  in
+                                  let entry_dispatch_block =
+                                    {
+                                      Cfg.label = entry_dispatch_label;
+                                      body = [];
+                                      term =
+                                        Cfg.BranchCompare
+                                          ( outer_op,
+                                            Tcg.Temp info.control_iv.phi_temp,
+                                            Tcg.Imm outer_bound,
+                                            split_dispatch_label,
+                                            info.exit_label );
+                                      preds = [];
+                                      succs = [ split_dispatch_label; info.exit_label ];
+                                    }
+                                  in
+                                  let split_dispatch_block =
+                                    {
+                                      Cfg.label = split_dispatch_label;
+                                      body = [];
+                                      term =
+                                        Cfg.BranchCompare
+                                          ( split_op,
+                                            Tcg.Temp info.control_iv.phi_temp,
+                                            Tcg.Imm split_bound,
+                                            before_func.entry,
+                                            after_func.entry );
+                                      preds = [];
+                                      succs = [ before_func.entry; after_func.entry ];
+                                    }
+                                  in
+                                  let bridge_block =
+                                    {
+                                      Cfg.label = before_bridge_label;
+                                      body = [];
+                                      term = Cfg.Jump after_func.entry;
+                                      preds = [];
+                                      succs = [ after_func.entry ];
+                                    }
+                                  in
+                                  let outside_preds =
+                                    List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds
+                                  in
+                                  let redirects = Hashtbl.create (List.length outside_preds) in
+                                  List.iter
+                                    (fun pred -> Hashtbl.add redirects (pred, header) entry_dispatch_label)
+                                    outside_preds;
+                                  let base_blocks =
+                                    f.blocks
+                                    |> List.filter (fun (block : Cfg.block) -> not (LabelSet.mem block.label loop))
+                                    |> List.map (fun (block : Cfg.block) ->
+                                           if List.exists (fun pred -> pred = block.label) outside_preds then
+                                             let term = redirect_successors block.label redirects block.term in
+                                             { block with term; succs = Cfg.successors term }
+                                           else block)
+                                  in
+                                  let entry = if header = f.entry then entry_dispatch_label else f.entry in
+                                  let blocks =
+                                    base_blocks
+                                    @ [ entry_dispatch_block; split_dispatch_block; bridge_block ]
+                                    @ before_func.blocks @ after_func.blocks
+                                  in
+                                  let _ = join_label in
+                                  raise (Applied (Cfg.rebuild_edges { f with entry; blocks }))
+                              | _ -> ())
+                          | None -> ())
+                      | _ -> ())
+                | Some _ | None -> ())
+        headers;
+      f
+    with
+    | Applied next -> next
 
 type func_metrics = {
   block_count : int;
@@ -8996,6 +9290,11 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
           (loop_canonicalize_func summaries globals)
           after_thread4
       in
+      let after_diamond_split =
+        run_stage round "diamond_split"
+          (split_counted_diamond_loops_func summaries globals)
+          after_canon3
+      in
       let after_split =
         run_stage round
           ~enabled:
@@ -9003,7 +9302,7 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
             && stage_round_enabled profile round "split_reductions")
           "split_reductions"
           (extract_counted_reductions_func summaries globals)
-          after_canon3
+          after_diamond_split
       in
       let after_counted =
         run_stage round "counted_loops"
