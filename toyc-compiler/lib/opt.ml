@@ -55,10 +55,6 @@ let empty_env = [ StringMap.empty ]
 
 let push_scope env = StringMap.empty :: env
 
-let pop_scope = function
-  | _ :: rest -> rest
-  | [] -> []
-
 let add_binding env name value =
   match env with
   | scope :: rest -> StringMap.add name value scope :: rest
@@ -178,21 +174,6 @@ let rec inline_stmt_template_supported = function
 
 let inline_expr_limit = 28
 let inline_expr_depth_limit = 6
-
-let rec subst_inline_expr env = function
-  | Int _ as e -> e
-  | Var name -> (
-      match StringMap.find_opt name env with
-      | Some value -> value
-      | None -> Var name)
-  | Call (name, args) -> Call (name, List.map (subst_inline_expr env) args)
-  | Unary (op, e) -> Unary (op, subst_inline_expr env e)
-  | Binary (op, lhs, rhs) ->
-      Binary (op, subst_inline_expr env lhs, subst_inline_expr env rhs)
-
-let inline_pure_expr env expr =
-  let expr = subst_inline_expr env expr in
-  if expr_has_call expr then None else Some expr
 
 type inline_scope_env = expr StringMap.t list
 
@@ -602,17 +583,6 @@ let locals_in_func (f : Cfg.func) =
         acc block.body)
     PlaceSet.empty f.blocks
 
-let stored_locals_in_func (f : Cfg.func) =
-  List.fold_left
-    (fun acc (block : Cfg.block) ->
-      List.fold_left
-        (fun acc instr ->
-          match instr with
-          | Tcg.Store ((Tcg.Local _ as place), _) -> PlaceSet.add place acc
-          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> acc)
-        acc block.body)
-    PlaceSet.empty f.blocks
-
 let stored_globals_in_func (f : Cfg.func) =
   List.fold_left
     (fun acc (block : Cfg.block) ->
@@ -824,8 +794,6 @@ let kill_place_loads killed avail =
       | KeyUn _ | KeyBin _ -> true)
     avail
 
-let kill_global_loads globals avail = kill_place_loads globals avail
-
 let operand_has_temp temp = function
   | Tcg.Temp other -> other = temp
   | Tcg.Imm _ -> false
@@ -842,11 +810,6 @@ let avail_value_has_temp temp = function
 let alias_value_has_temp temp = function
   | Tcg.Temp other -> other = temp
   | Tcg.Imm _ -> false
-
-let kill_temp_avail temp avail =
-  ExprKeyMap.filter
-    (fun key value -> not (expr_key_has_temp temp key || avail_value_has_temp temp value))
-    avail
 
 let equal_avail_map = ExprKeyMap.equal ( = )
 
@@ -1096,8 +1059,6 @@ let fold_fact_bin op a b =
 let kill_place_facts places state =
   PlaceSet.fold (fun place acc -> set_place_fact acc place CpNac) places state
 
-let kill_global_facts globals state = kill_place_facts globals state
-
 let initial_cp_state global_init (f : Cfg.func) =
   let global_init = if f.name = "main" then global_init else PlaceMap.empty in
   let places =
@@ -1275,7 +1236,45 @@ let run_gvn_transfer summaries globals state (block : Cfg.block) =
         (instr :: acc, state))
       ([], state) block.body
   in
-  ({ block with body = List.rev body_rev }, state)
+  let term =
+    match block.term with
+    | Cfg.Jump _ as term -> term
+    | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
+        let cond = resolve_alias_operand state.aliases IntSet.empty cond in
+        begin
+          match cond with
+          | Tcg.Imm value -> Cfg.Jump (if value = 0L then if_zero else if_nonzero)
+          | _ ->
+              if if_zero = if_nonzero then Cfg.Jump if_zero
+              else Cfg.BranchZero (cond, if_zero, if_nonzero)
+        end
+    | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
+        let cond = resolve_alias_operand state.aliases IntSet.empty cond in
+        begin
+          match cond with
+          | Tcg.Imm value -> Cfg.Jump (if value <> 0L then if_nonzero else if_zero)
+          | _ ->
+              if if_zero = if_nonzero then Cfg.Jump if_zero
+              else Cfg.BranchNonZero (cond, if_nonzero, if_zero)
+        end
+    | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
+        let lhs = resolve_alias_operand state.aliases IntSet.empty lhs in
+        let rhs = resolve_alias_operand state.aliases IntSet.empty rhs in
+        begin
+          match (lhs, rhs) with
+          | Tcg.Imm a, Tcg.Imm b -> (
+              match fold_binop op a b with
+              | Some value -> Cfg.Jump (if truth value then if_true else if_false)
+              | None -> Cfg.BranchCompare (op, lhs, rhs, if_true, if_false))
+          | _ ->
+              if if_true = if_false then Cfg.Jump if_true
+              else Cfg.BranchCompare (op, lhs, rhs, if_true, if_false)
+        end
+    | Cfg.Return None -> Cfg.Return None
+    | Cfg.Return (Some value) ->
+        Cfg.Return (Some (resolve_alias_operand state.aliases IntSet.empty value))
+  in
+  ({ block with body = List.rev body_rev; term; succs = Cfg.successors term }, state)
 
 let compute_gvn_states summaries globals (f : Cfg.func) =
   let in_states = Hashtbl.create (List.length f.blocks) in
@@ -1336,195 +1335,6 @@ let gvn_rewrite_instrs summaries globals instrs =
       ([], empty_gvn_state) instrs
   in
   List.rev rewritten_rev
-
-type copy_state = Tcg.operand IntMap.t
-
-let empty_copy_state = IntMap.empty
-
-let equal_copy_state = IntMap.equal ( = )
-
-let meet_copy_state a b =
-  IntMap.merge
-    (fun _ va vb ->
-      match (va, vb) with
-      | Some a, Some b when a = b -> Some a
-      | _ -> None)
-    a b
-
-let copy_value_has_temp temp = function
-  | Tcg.Temp other -> other = temp
-  | Tcg.Imm _ -> false
-
-let kill_temp_copies temp state =
-  IntMap.filter
-    (fun key value -> key <> temp && not (copy_value_has_temp temp value))
-    state
-
-let rec resolve_copy_operand state seen = function
-  | Tcg.Imm _ as operand -> operand
-  | Tcg.Temp temp ->
-      if IntSet.mem temp seen then Tcg.Temp temp
-      else
-        match IntMap.find_opt temp state with
-        | Some src -> resolve_copy_operand state (IntSet.add temp seen) src
-        | None -> Tcg.Temp temp
-
-let set_copy_fact state dst operand =
-  if operand = Tcg.Temp dst then state else IntMap.add dst operand state
-
-let transfer_copy_instr state instr =
-  match instr with
-  | Tcg.Move (dst, src) ->
-      let src = resolve_copy_operand state IntSet.empty src in
-      let instr = simplify_simple_instr (Tcg.Move (dst, src)) in
-      let state = kill_temp_copies dst state in
-      let state =
-        match instr with
-        | Tcg.Move (_, src) -> set_copy_fact state dst src
-        | _ -> state
-      in
-      (instr, state)
-  | Tcg.Un (dst, op, src) ->
-      let src = resolve_copy_operand state IntSet.empty src in
-      let instr = simplify_simple_instr (Tcg.Un (dst, op, src)) in
-      let state = kill_temp_copies dst state in
-      let state =
-        match instr with
-        | Tcg.Move (_, src) -> set_copy_fact state dst src
-        | _ -> state
-      in
-      (instr, state)
-  | Tcg.Bin (dst, op, lhs, rhs) ->
-      let lhs = resolve_copy_operand state IntSet.empty lhs in
-      let rhs = resolve_copy_operand state IntSet.empty rhs in
-      let instr = simplify_simple_instr (Tcg.Bin (dst, op, lhs, rhs)) in
-      let state = kill_temp_copies dst state in
-      let state =
-        match instr with
-        | Tcg.Move (_, src) -> set_copy_fact state dst src
-        | _ -> state
-      in
-      (instr, state)
-  | Tcg.Load (dst, place) ->
-      (Tcg.Load (dst, place), kill_temp_copies dst state)
-  | Tcg.Store (place, value) ->
-      let value = resolve_copy_operand state IntSet.empty value in
-      (Tcg.Store (place, value), state)
-  | Tcg.Call (dst, callee, args) ->
-      let args = List.map (resolve_copy_operand state IntSet.empty) args in
-      let state =
-        match dst with
-        | Some temp -> kill_temp_copies temp state
-        | None -> state
-      in
-      (Tcg.Call (dst, callee, args), state)
-
-let transfer_copy_term state (term : Cfg.terminator) =
-  match term with
-  | Cfg.Jump _ as term -> (term, state)
-  | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
-      let cond = resolve_copy_operand state IntSet.empty cond in
-      let term =
-        if if_zero = if_nonzero then Cfg.Jump if_zero
-        else
-          match cond with
-          | Tcg.Imm value -> Cfg.Jump (if value = 0L then if_zero else if_nonzero)
-          | _ -> Cfg.BranchZero (cond, if_zero, if_nonzero)
-      in
-      (term, state)
-  | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
-      let cond = resolve_copy_operand state IntSet.empty cond in
-      let term =
-        if if_zero = if_nonzero then Cfg.Jump if_zero
-        else
-          match cond with
-          | Tcg.Imm value -> Cfg.Jump (if value <> 0L then if_nonzero else if_zero)
-          | _ -> Cfg.BranchNonZero (cond, if_nonzero, if_zero)
-      in
-      (term, state)
-  | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
-      let lhs = resolve_copy_operand state IntSet.empty lhs in
-      let rhs = resolve_copy_operand state IntSet.empty rhs in
-      let term =
-        if if_true = if_false then Cfg.Jump if_true
-        else
-          match (lhs, rhs) with
-          | Tcg.Imm a, Tcg.Imm b -> (
-              match fold_binop op a b with
-              | Some value -> Cfg.Jump (if truth value then if_true else if_false)
-              | None -> Cfg.BranchCompare (op, lhs, rhs, if_true, if_false))
-          | _ -> Cfg.BranchCompare (op, lhs, rhs, if_true, if_false)
-      in
-      (term, state)
-  | Cfg.Return None -> (Cfg.Return None, state)
-  | Cfg.Return (Some value) ->
-      (Cfg.Return (Some (resolve_copy_operand state IntSet.empty value)), state)
-
-let run_copy_transfer state (block : Cfg.block) =
-  let body_rev, state =
-    List.fold_left
-      (fun (acc, state) instr ->
-        let instr, state = transfer_copy_instr state instr in
-        (instr :: acc, state))
-      ([], state) block.body
-  in
-  let term, state = transfer_copy_term state block.term in
-  ({ block with body = List.rev body_rev; term; succs = Cfg.successors term }, state)
-
-let compute_copy_states (f : Cfg.func) =
-  let in_states = Hashtbl.create (List.length f.blocks) in
-  let out_states = Hashtbl.create (List.length f.blocks) in
-  let meet_states = function
-    | [] -> empty_copy_state
-    | state :: rest -> List.fold_left meet_copy_state state rest
-  in
-  let changed = ref true in
-  while !changed do
-    changed := false;
-    List.iter
-      (fun (block : Cfg.block) ->
-        let pred_states =
-          List.filter_map (fun pred -> Hashtbl.find_opt out_states pred) block.preds
-        in
-        let in_state =
-          if block.label = f.entry then meet_states (empty_copy_state :: pred_states)
-          else meet_states pred_states
-        in
-        let _, out_state = run_copy_transfer in_state block in
-        let prev_in =
-          match Hashtbl.find_opt in_states block.label with
-          | Some state -> state
-          | None -> empty_copy_state
-        in
-        let prev_out =
-          match Hashtbl.find_opt out_states block.label with
-          | Some state -> state
-          | None -> empty_copy_state
-        in
-        if not (equal_copy_state in_state prev_in) then (
-          Hashtbl.replace in_states block.label in_state;
-          changed := true);
-        if not (equal_copy_state out_state prev_out) then (
-          Hashtbl.replace out_states block.label out_state;
-          changed := true))
-      f.blocks
-  done;
-  in_states
-
-let copy_propagate_func (f : Cfg.func) =
-  let in_states = compute_copy_states f in
-  let blocks =
-    List.map
-      (fun (block : Cfg.block) ->
-        let state =
-          match Hashtbl.find_opt in_states block.label with
-          | Some state -> state
-          | None -> empty_copy_state
-        in
-        fst (run_copy_transfer state block))
-      f.blocks
-  in
-  Cfg.rebuild_edges { f with blocks }
 
 let rec resolve_jump block_map seen label =
   if LabelSet.mem label seen then label
@@ -1771,17 +1581,6 @@ let collect_local_ids (f : Cfg.func) =
   List.fold_left
     (fun acc (var : Tcg.var) -> IntSet.add var.id acc)
     IntSet.empty (f.params @ f.locals)
-
-let first_some values =
-  let rec loop = function
-    | [] -> None
-    | Some value :: _ -> Some value
-    | None :: rest -> loop rest
-  in
-  loop values
-
-let promote_local_param_preloads_enabled =
-  Sys.getenv_opt "TOYC_ENABLE_LOCAL_PARAM_PRELOADS" <> None
 
 let all_present values =
   let rec loop acc = function
@@ -2055,272 +1854,6 @@ let mem2reg_func (f : Cfg.func) =
         in
         let promoted = Cfg.rebuild_edges { current with temp_count = !next_temp; blocks } in
         if IntSet.is_empty !failed then promoted else attempt promoted !failed
-    end
-  in
-  attempt f all_candidates
-
-let promote_locals_func (f : Cfg.func) =
-  let stored_candidates = stored_locals_in_func f in
-  let readonly_candidates = PlaceSet.diff (locals_in_func f) stored_candidates in
-  let all_candidates = PlaceSet.union stored_candidates readonly_candidates in
-  let rec attempt (current : Cfg.func) candidates =
-    if PlaceSet.is_empty candidates then current
-    else begin
-      let writeback_candidates = PlaceSet.inter stored_candidates candidates in
-      let next_temp = ref current.temp_count in
-      let fresh_temp () =
-        let temp = !next_temp in
-        incr next_temp;
-        temp
-      in
-      let in_envs = Hashtbl.create (List.length current.blocks) in
-      let out_envs = Hashtbl.create (List.length current.blocks) in
-      let phi_temps = Hashtbl.create (max 8 (List.length current.blocks)) in
-      let get_env table label = table_find_or_empty table label PlaceMap.empty in
-      let entry_preloads_rev = ref [] in
-      let entry_env =
-        if promote_local_param_preloads_enabled then
-          List.fold_left
-            (fun env (param : Tcg.var) ->
-              let place = Tcg.Local param.id in
-              if PlaceSet.mem place candidates then
-                let temp = fresh_temp () in
-                entry_preloads_rev
-                := (place, simplify_simple_instr (Tcg.Load (temp, place))) :: !entry_preloads_rev;
-                PlaceMap.add place (Tcg.Temp temp) env
-              else env)
-            PlaceMap.empty current.params
-        else PlaceMap.empty
-      in
-      let entry_preloads_for promoted_places =
-        List.rev !entry_preloads_rev
-        |> List.filter_map (fun (place, instr) ->
-               if PlaceSet.mem place promoted_places then Some instr else None)
-      in
-      let get_phi_temp label place =
-        match Hashtbl.find_opt phi_temps (label, place) with
-        | Some temp -> temp
-        | None ->
-            let temp = fresh_temp () in
-            Hashtbl.add phi_temps (label, place) temp;
-            temp
-      in
-      let compute_in_env (block : Cfg.block) =
-        if block.label = current.entry then entry_env
-        else
-          PlaceSet.fold
-            (fun place env ->
-              let incoming =
-                List.map (fun pred -> PlaceMap.find_opt place (get_env out_envs pred)) block.preds
-              in
-              let keep_value =
-                match block.preds with
-                | [] -> None
-                | _ -> (
-                    match all_present incoming with
-                    | Some values -> (
-                        match all_same_operand values with
-                        | Some value -> Some value
-                        | None -> Some (Tcg.Temp (get_phi_temp block.label place)))
-                    | None -> None)
-              in
-              match keep_value with
-              | Some value -> PlaceMap.add place value env
-              | None -> PlaceMap.remove place env)
-            candidates PlaceMap.empty
-      in
-      let transfer_env env (block : Cfg.block) =
-        List.fold_left
-          (fun env instr ->
-            match instr with
-            | Tcg.Load (dst, place) when PlaceSet.mem place candidates ->
-                PlaceMap.add place (Tcg.Temp dst) env
-            | Tcg.Store (place, value) when PlaceSet.mem place candidates -> PlaceMap.add place value env
-            | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> env)
-          env block.body
-      in
-      let changed = ref true in
-      while !changed do
-        changed := false;
-        List.iter
-          (fun (block : Cfg.block) ->
-            let in_env = compute_in_env block in
-            let out_env = transfer_env in_env block in
-            if not (equal_place_operand_map in_env (get_env in_envs block.label)) then (
-              Hashtbl.replace in_envs block.label in_env;
-              changed := true);
-            if not (equal_place_operand_map out_env (get_env out_envs block.label)) then (
-              Hashtbl.replace out_envs block.label out_env;
-              changed := true))
-          current.blocks
-      done;
-      let failed = ref PlaceSet.empty in
-      List.iter
-        (fun (block : Cfg.block) ->
-          if block.label <> current.entry then
-            PlaceSet.iter
-              (fun place ->
-                if PlaceSet.mem place writeback_candidates then
-                  let incoming =
-                    List.map
-                      (fun pred -> PlaceMap.find_opt place (get_env out_envs pred))
-                      block.preds
-                  in
-                  match all_present incoming with
-                  | Some _ -> ()
-                  | None ->
-                      if List.exists Option.is_some incoming then
-                        failed := PlaceSet.add place !failed)
-              candidates;
-          let env = ref (get_env in_envs block.label) in
-          List.iter
-            (fun instr ->
-              match instr with
-              | Tcg.Load (dst, place) when PlaceSet.mem place candidates ->
-                  env := PlaceMap.add place (Tcg.Temp dst) !env
-              | Tcg.Store (place, value) when PlaceSet.mem place candidates ->
-                  env := PlaceMap.add place value !env
-              | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> ())
-            block.body;
-          Hashtbl.iter
-            (fun (phi_label, place) _ ->
-              if phi_label = block.label then
-                match PlaceMap.find_opt place (get_env in_envs block.label) with
-                | Some (Tcg.Temp _) ->
-                    List.iter
-                      (fun pred ->
-                        if not (PlaceMap.mem place (get_env out_envs pred)) then
-                          failed := PlaceSet.add place !failed)
-                      block.preds
-                  | _ -> ())
-            phi_temps)
-        current.blocks;
-      if not (PlaceSet.is_empty !failed) then
-        let succeeded = PlaceSet.diff candidates !failed in
-        if PlaceSet.is_empty succeeded then current
-        else
-          let promoted = attempt current succeeded in
-          attempt promoted !failed
-      else
-        let entry_preloads = entry_preloads_for candidates in
-        let flush_env env =
-          PlaceSet.elements writeback_candidates
-          |> List.filter_map (fun place ->
-                 match PlaceMap.find_opt place env with
-                 | Some value -> Some (Tcg.Store (place, value))
-                 | None -> None)
-        in
-        let rewrite_block (block : Cfg.block) =
-          let rec rewrite env acc = function
-            | [] -> (env, List.rev acc)
-            | instr :: rest -> (
-                match instr with
-                | Tcg.Load (dst, place) when PlaceSet.mem place candidates -> (
-                    match PlaceMap.find_opt place env with
-                    | Some value ->
-                        rewrite env (simplify_simple_instr (Tcg.Move (dst, value)) :: acc) rest
-                    | None ->
-                        rewrite (PlaceMap.add place (Tcg.Temp dst) env) (instr :: acc) rest)
-                | Tcg.Store (place, value) when PlaceSet.mem place candidates ->
-                    rewrite (PlaceMap.add place value env) acc rest
-                | _ -> rewrite env (instr :: acc) rest)
-          in
-          let env_out, body = rewrite (get_env in_envs block.label) [] block.body in
-          let body =
-            let body =
-              if block.label = current.entry && entry_preloads <> [] then
-                entry_preloads @ body
-              else body
-            in
-            match block.term with
-            | Cfg.Return _ -> body @ flush_env env_out
-            | _ -> body
-          in
-          { block with body }
-        in
-        let promoted_blocks = List.map rewrite_block current.blocks in
-        let redirects = Hashtbl.create 16 in
-        let edge_blocks_rev = ref [] in
-        let edge_id = ref 0 in
-        let fresh_edge_label () =
-          let id = !edge_id in
-          incr edge_id;
-          Printf.sprintf ".L%s_lprom_edge_%d" current.label id
-        in
-        let build_parallel_copies copies =
-          let snapshots = Hashtbl.create (List.length copies) in
-          let snapshots_rev, assigns_rev =
-            List.fold_left
-              (fun (snapshots_rev, assigns_rev) (dst, src) ->
-                if src = Tcg.Temp dst then (snapshots_rev, assigns_rev)
-                else
-                  match src with
-                  | Tcg.Imm _ ->
-                      (snapshots_rev, simplify_simple_instr (Tcg.Move (dst, src)) :: assigns_rev)
-                  | Tcg.Temp src_temp ->
-                      let snap_temp, snapshots_rev =
-                        match Hashtbl.find_opt snapshots src_temp with
-                        | Some temp -> (temp, snapshots_rev)
-                        | None ->
-                            let temp = fresh_temp () in
-                            Hashtbl.add snapshots src_temp temp;
-                            ( temp,
-                              simplify_simple_instr (Tcg.Move (temp, Tcg.Temp src_temp))
-                              :: snapshots_rev )
-                      in
-                      ( snapshots_rev,
-                        simplify_simple_instr (Tcg.Move (dst, Tcg.Temp snap_temp)) :: assigns_rev ))
-              ([], []) copies
-          in
-          List.rev snapshots_rev @ List.rev assigns_rev
-        in
-        List.iter
-          (fun (succ_block : Cfg.block) ->
-            let phi_copies =
-              PlaceSet.fold
-                (fun place acc ->
-                  match Hashtbl.find_opt phi_temps (succ_block.label, place) with
-                  | Some phi_temp -> (place, phi_temp) :: acc
-                  | None -> acc)
-                candidates []
-            in
-            if phi_copies <> [] then
-              List.iter
-                (fun pred ->
-                  let pred_out = get_env out_envs pred in
-                  let copies =
-                    List.fold_left
-                      (fun acc (place, phi_temp) ->
-                        match PlaceMap.find_opt place pred_out with
-                        | Some source when source <> Tcg.Temp phi_temp -> (phi_temp, source) :: acc
-                        | Some _ | None -> acc)
-                      [] phi_copies
-                  in
-                  match build_parallel_copies (List.rev copies) with
-                  | [] -> ()
-                  | body ->
-                      let edge_label = fresh_edge_label () in
-                      Hashtbl.add redirects (pred, succ_block.label) edge_label;
-                      edge_blocks_rev :=
-                        {
-                          Cfg.label = edge_label;
-                          body;
-                          term = Cfg.Jump succ_block.label;
-                          preds = [];
-                          succs = [ succ_block.label ];
-                        }
-                        :: !edge_blocks_rev)
-                succ_block.preds)
-          promoted_blocks;
-        let blocks =
-          List.map
-            (fun (block : Cfg.block) ->
-              let term = redirect_successors block.label redirects block.term in
-              { block with term; succs = Cfg.successors term })
-            promoted_blocks
-          @ List.rev !edge_blocks_rev
-        in
-        Cfg.rebuild_edges { current with temp_count = !next_temp; blocks }
     end
   in
   attempt f all_candidates
@@ -2696,13 +2229,6 @@ let licm_candidate_info = function
   | Tcg.Bin (dst, _, lhs, rhs) -> Some (LicmPure (dst, [ lhs; rhs ]))
   | Tcg.Load (dst, place) -> Some (LicmLoad (dst, place))
   | Tcg.Store _ | Tcg.Call _ -> None
-
-let operand_invariant loop def_blocks ready_temps = function
-  | Tcg.Imm _ -> true
-  | Tcg.Temp temp -> (
-      match Hashtbl.find_opt def_blocks temp with
-      | Some def_label -> (not (LabelSet.mem def_label loop)) || IntSet.mem temp ready_temps
-      | None -> true)
 
 let collect_loop_effects summaries globals loop blocks =
   List.fold_left
@@ -4215,17 +3741,6 @@ let resolve_operand_before_loop loop_defs multi_defs def_instrs operand =
 let operand_available_before_loop loop_defs multi_defs def_instrs operand =
   Option.is_some (resolve_operand_before_loop loop_defs multi_defs def_instrs operand)
 
-let branch_term_available_before_loop loop_defs multi_defs def_instrs = function
-  | Cfg.BranchZero (cond, if_zero, if_nonzero)
-  | Cfg.BranchNonZero (cond, if_zero, if_nonzero) ->
-      if_zero <> if_nonzero
-      && operand_available_before_loop loop_defs multi_defs def_instrs cond
-  | Cfg.BranchCompare (_, lhs, rhs, if_true, if_false) ->
-      if_true <> if_false
-      && operand_available_before_loop loop_defs multi_defs def_instrs lhs
-      && operand_available_before_loop loop_defs multi_defs def_instrs rhs
-  | Cfg.Jump _ | Cfg.Return _ -> false
-
 let rewrite_branch_term_before_loop loop_defs multi_defs def_instrs = function
   | Cfg.BranchZero (cond, if_zero, if_nonzero) -> (
       match resolve_operand_before_loop loop_defs multi_defs def_instrs cond with
@@ -4908,11 +4423,6 @@ let linear_expr_sub lhs rhs =
   | LinearAffine lhs, LinearAffine rhs when lhs.iv.phi_temp = rhs.iv.phi_temp ->
       Some (linear_affine lhs.iv (summary_expr_sub lhs.coeff rhs.coeff) (summary_expr_sub lhs.bias rhs.bias))
   | LinearAffine _, LinearAffine _ -> None
-
-let linear_expr_scale factor = function
-  | LinearInvariant expr -> Some (LinearInvariant (summary_expr_scale factor expr))
-  | LinearAffine { iv; coeff; bias } ->
-      Some (linear_affine iv (summary_expr_scale factor coeff) (summary_expr_scale factor bias))
 
 let linear_expr_mul_invariant factor = function
   | LinearInvariant expr -> Some (LinearInvariant (summary_expr_mul factor expr))
@@ -6394,9 +5904,6 @@ let rec emit_summary_expr_with_carriers place_carriers fresh_temp = function
       ( lhs_instrs @ rhs_instrs
         @ [ simplify_simple_instr (Tcg.Bin (dst, op, lhs_operand, rhs_operand)) ],
         Tcg.Temp dst )
-
-let emit_summary_expr fresh_temp expr =
-  emit_summary_expr_with_carriers PlaceMap.empty fresh_temp expr
 
 let build_invariant_reduction_delta place_carriers fresh_temp trip_temp step_expr =
   let step_instrs, step_operand =
@@ -9417,16 +8924,6 @@ let choose_opt_profile metrics =
       enable_gvn2 = true;
     }
 
-let stage_budget_enabled profile round stage_enabled =
-  if not stage_enabled then false
-  else
-    match profile.name with
-    | "medium" ->
-        if round = 1 then true
-        else false
-    | "large" -> false
-    | _ -> true
-
 let stage_round_enabled profile round stage =
   match profile.name with
   | "huge" -> (
@@ -9452,7 +8949,7 @@ let stage_round_enabled profile round stage =
       | _ -> true)
 
 let optimize_func global_init summaries globals (f : Cfg.func) =
-  let promoted = f |> mem2reg_func |> promote_locals_func |> promote_globals_func summaries globals in
+  let promoted = f |> mem2reg_func |> promote_globals_func summaries globals in
   let canonical = loop_canonicalize_func summaries globals promoted in
   let base_metrics = metrics_of_func f in
   let promoted_metrics = metrics_of_func promoted in
@@ -9518,12 +9015,10 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
           (const_propagate_func global_init summaries globals)
           after_simplify0
       in
-      let after_copy1 = run_stage round "copy1" copy_propagate_func after_const1 in
-      let after_sr = run_stage round "sr" strength_reduce_func after_copy1 in
+      let after_sr = run_stage round "sr" strength_reduce_func after_const1 in
       let after_gvn1 = run_stage round "gvn1" (gvn_func summaries globals) after_sr in
-      let after_copy2 = run_stage round "copy2" copy_propagate_func after_gvn1 in
       let after_dce1 =
-        run_stage round "dce1" (eliminate_dead_code_func summaries globals) after_copy2
+        run_stage round "dce1" (eliminate_dead_code_func summaries globals) after_gvn1
       in
       let after_reassoc = run_stage round "reassoc" reassociate_loop_adds_func after_dce1 in
       let after_licm = run_stage round "licm" (licm_func summaries globals) after_reassoc in
@@ -9540,11 +9035,10 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
           (const_propagate_func global_init summaries globals)
           after_unswitch
       in
-      let after_copy3 = run_stage round "copy3" copy_propagate_func after_const2 in
       let after_gvn2 =
         run_stage round ~enabled:profile.enable_gvn2 "gvn2"
           (gvn_func summaries globals)
-          after_copy3
+          after_const2
       in
       let after_dce2 =
         run_stage round "dce2" (eliminate_dead_code_func summaries globals) after_gvn2
@@ -9572,9 +9066,8 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
           (const_propagate_func global_init summaries globals)
           after_loop_guards
       in
-      let after_copy4 = run_stage round "copy4" copy_propagate_func after_const3 in
       let after_dce3 =
-        run_stage round "dce3" (eliminate_dead_code_func summaries globals) after_copy4
+        run_stage round "dce3" (eliminate_dead_code_func summaries globals) after_const3
       in
       let after_fold4 =
         run_stage round "fold4" (fold_branch_tails_func summaries globals) after_dce3
