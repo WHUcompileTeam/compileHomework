@@ -1644,6 +1644,47 @@ let all_same_operand = function
   | value :: rest ->
       if List.for_all (fun other -> other = value) rest then Some value else None
 
+let get_or_create_phi_temp phi_temps fresh_temp key =
+  match Hashtbl.find_opt phi_temps key with
+  | Some temp -> temp
+  | None ->
+      let temp = fresh_temp () in
+      Hashtbl.add phi_temps key temp;
+      temp
+
+let merge_incoming_operand preds lookup make_phi =
+  match preds with
+  | [] -> None
+  | _ -> (
+      match all_present (List.map lookup preds) with
+      | Some values -> (
+          match all_same_operand values with
+          | Some value -> Some value
+          | None -> Some (Tcg.Temp (make_phi ())))
+      | None -> None)
+
+let solve_forward_envs blocks ~empty_env ~equal_env ~compute_in_env ~transfer_env =
+  let in_envs = Hashtbl.create (List.length blocks) in
+  let out_envs = Hashtbl.create (List.length blocks) in
+  let get_env table label = table_find_or_empty table label empty_env in
+  let get_out label = get_env out_envs label in
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter
+      (fun (block : Cfg.block) ->
+        let in_env = compute_in_env get_out block in
+        let out_env = transfer_env in_env block in
+        if not (equal_env in_env (get_env in_envs block.label)) then (
+          Hashtbl.replace in_envs block.label in_env;
+          changed := true);
+        if not (equal_env out_env (get_env out_envs block.label)) then (
+          Hashtbl.replace out_envs block.label out_env;
+          changed := true))
+      blocks
+  done;
+  (in_envs, out_envs, get_env)
+
 let defs_temp = function
   | Tcg.Move (dst, _)
   | Tcg.Un (dst, _, _)
@@ -1808,36 +1849,19 @@ let mem2reg_func (f : Cfg.func) =
             else env)
           IntMap.empty current.params
       in
-      let in_envs = Hashtbl.create (List.length current.blocks) in
-      let out_envs = Hashtbl.create (List.length current.blocks) in
       let phi_temps = Hashtbl.create (max 8 (List.length current.blocks)) in
-      let get_env table label = table_find_or_empty table label IntMap.empty in
       let get_phi_temp label local_id =
-        match Hashtbl.find_opt phi_temps (label, local_id) with
-        | Some temp -> temp
-        | None ->
-            let temp = fresh_temp () in
-            Hashtbl.add phi_temps (label, local_id) temp;
-            temp
+        get_or_create_phi_temp phi_temps fresh_temp (label, local_id)
       in
-      let compute_in_env (block : Cfg.block) =
+      let compute_in_env get_out (block : Cfg.block) =
         if block.label = current.entry then seed_env
         else
           IntSet.fold
             (fun local_id env ->
-              let incoming =
-                List.map (fun pred -> IntMap.find_opt local_id (get_env out_envs pred)) block.preds
-              in
               let keep_value =
-                match block.preds with
-                | [] -> None
-                | _ ->
-                    match all_present incoming with
-                    | Some values -> (
-                        match all_same_operand values with
-                        | Some value -> Some value
-                        | None -> Some (Tcg.Temp (get_phi_temp block.label local_id)))
-                    | None -> None
+                merge_incoming_operand block.preds
+                  (fun pred -> IntMap.find_opt local_id (get_out pred))
+                  (fun () -> get_phi_temp block.label local_id)
               in
               match keep_value with
               | Some value -> IntMap.add local_id value env
@@ -1852,21 +1876,10 @@ let mem2reg_func (f : Cfg.func) =
             | _ -> env)
           env block.body
       in
-      let changed = ref true in
-      while !changed do
-        changed := false;
-        List.iter
-          (fun (block : Cfg.block) ->
-            let in_env = compute_in_env block in
-            let out_env = transfer_env in_env block in
-            if not (equal_operand_map in_env (get_env in_envs block.label)) then (
-              Hashtbl.replace in_envs block.label in_env;
-              changed := true);
-            if not (equal_operand_map out_env (get_env out_envs block.label)) then (
-              Hashtbl.replace out_envs block.label out_env;
-              changed := true))
-          current.blocks
-      done;
+      let in_envs, out_envs, get_env =
+        solve_forward_envs current.blocks ~empty_env:IntMap.empty
+          ~equal_env:equal_operand_map ~compute_in_env ~transfer_env
+      in
       let failed = ref IntSet.empty in
       List.iter
         (fun (block : Cfg.block) ->
@@ -1990,10 +2003,7 @@ let promote_globals_func summaries globals (f : Cfg.func) =
         incr next_temp;
         temp
       in
-      let in_envs = Hashtbl.create (List.length f.blocks) in
-      let out_envs = Hashtbl.create (List.length f.blocks) in
       let phi_temps = Hashtbl.create (max 8 (List.length f.blocks)) in
-      let get_env table label = table_find_or_empty table label PlaceMap.empty in
       let entry_preloads_rev = ref [] in
       let entry_env =
         PlaceSet.fold
@@ -2016,31 +2026,17 @@ let promote_globals_func summaries globals (f : Cfg.func) =
                | None -> None)
       in
       let get_phi_temp label place =
-        match Hashtbl.find_opt phi_temps (label, place) with
-        | Some temp -> temp
-        | None ->
-            let temp = fresh_temp () in
-            Hashtbl.add phi_temps (label, place) temp;
-            temp
+        get_or_create_phi_temp phi_temps fresh_temp (label, place)
       in
-      let compute_in_env (block : Cfg.block) =
+      let compute_in_env get_out (block : Cfg.block) =
         if block.label = f.entry then entry_env
         else
           PlaceSet.fold
             (fun place env ->
-              let incoming =
-                List.map (fun pred -> PlaceMap.find_opt place (get_env out_envs pred)) block.preds
-              in
               let keep_value =
-                match block.preds with
-                | [] -> None
-                | _ -> (
-                    match all_present incoming with
-                    | Some values -> (
-                        match all_same_operand values with
-                        | Some value -> Some value
-                        | None -> Some (Tcg.Temp (get_phi_temp block.label place)))
-                    | None -> None)
+                merge_incoming_operand block.preds
+                  (fun pred -> PlaceMap.find_opt place (get_out pred))
+                  (fun () -> get_phi_temp block.label place)
               in
               match keep_value with
               | Some value -> PlaceMap.add place value env
@@ -2061,21 +2057,10 @@ let promote_globals_func summaries globals (f : Cfg.func) =
             | _ -> env)
           env block.body
       in
-      let changed = ref true in
-      while !changed do
-        changed := false;
-        List.iter
-          (fun (block : Cfg.block) ->
-            let in_env = compute_in_env block in
-            let out_env = transfer_env in_env block in
-            if not (equal_place_operand_map in_env (get_env in_envs block.label)) then (
-              Hashtbl.replace in_envs block.label in_env;
-              changed := true);
-            if not (equal_place_operand_map out_env (get_env out_envs block.label)) then (
-              Hashtbl.replace out_envs block.label out_env;
-              changed := true))
-          f.blocks
-      done;
+      let in_envs, out_envs, get_env =
+        solve_forward_envs f.blocks ~empty_env:PlaceMap.empty
+          ~equal_env:equal_place_operand_map ~compute_in_env ~transfer_env
+      in
       let failed = ref PlaceSet.empty in
       List.iter
         (fun (block : Cfg.block) ->
@@ -4454,13 +4439,6 @@ let summary_expr_sub lhs rhs =
   if summary_expr_is_zero rhs then lhs
   else if summary_expr_is_zero lhs then summary_expr_neg rhs
   else SummaryBin (Sub, lhs, rhs)
-
-let summary_expr_scale factor expr =
-  match factor with
-  | 0L -> zero_summary_expr
-  | 1L -> expr
-  | -1L -> summary_expr_neg expr
-  | _ -> SummaryBin (Mul, SummaryOperand (Tcg.Imm factor), expr)
 
 let summary_expr_mul lhs rhs =
   if summary_expr_is_zero lhs || summary_expr_is_zero rhs then zero_summary_expr
