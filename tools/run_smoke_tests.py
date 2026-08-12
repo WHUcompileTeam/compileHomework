@@ -163,6 +163,8 @@ def run_asm(asm: str, limit: int = 300_000) -> tuple[int, int]:
 
         if op == "addi":
             write(args[0], read(args[1]) + int(args[2]))
+        elif op == "slli":
+            write(args[0], u32(read(args[1])) << int(args[2]))
         elif op == "add":
             write(args[0], read(args[1]) + read(args[2]))
         elif op == "sub":

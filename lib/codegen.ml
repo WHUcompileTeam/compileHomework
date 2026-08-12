@@ -3,11 +3,14 @@ open Ast
 exception Error of string
 
 module StringMap = Map.Make (String)
+module StringSet = Set.Make (String)
 module IntSet = Set.Make (Int)
 
 type layout = {
   local_offsets : (int, int) Hashtbl.t;
   temp_homes : (int, temp_home) Hashtbl.t;
+  direct_params : (int * int * int) list;
+  global_regs : (string, string) Hashtbl.t;
   frame_size : int;
   outgoing_area : int;
   saved_regs : string list;
@@ -23,12 +26,14 @@ type ctx = {
   buf : Buffer.t;
   local_offsets : (int, int) Hashtbl.t;
   temp_homes : (int, temp_home) Hashtbl.t;
+  global_regs : (string, string) Hashtbl.t;
   blocks_by_label : (string, Cfg.block) Hashtbl.t;
   live_out_temps : (string, IntSet.t) Hashtbl.t;
   epilogue : string;
   func : string;
   entry : string;
   params : Tcg.var list;
+  direct_params : (int * int * int) list;
   frame_size : int;
   saved_regs : string list;
   uses_s0 : bool;
@@ -161,6 +166,93 @@ let referenced_local_ids (f : Cfg.func) =
           | Tcg.Store (place, _) -> add_place locals place)
         locals block.body)
     IntSet.empty f.blocks
+
+let loop_global_labels (f : Cfg.func) =
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block) f.blocks;
+  let loop_blocks = ref StringSet.empty in
+  let collect_loop header tail =
+    let rec walk seen = function
+      | [] -> seen
+      | label :: rest when StringSet.mem label seen -> walk seen rest
+      | label :: rest ->
+          let seen = StringSet.add label seen in
+          let preds =
+            match Hashtbl.find_opt block_map label with
+            | Some (block : Cfg.block) when label <> header -> block.preds
+            | Some _ | None -> []
+          in
+          walk seen (preds @ rest)
+    in
+    loop_blocks := StringSet.union !loop_blocks (walk (StringSet.singleton header) [ tail ])
+  in
+  let visited = ref StringSet.empty in
+  let active = ref StringSet.empty in
+  let rec visit label =
+    if not (StringSet.mem label !visited) then begin
+      visited := StringSet.add label !visited;
+      active := StringSet.add label !active;
+      (match Hashtbl.find_opt block_map label with
+      | Some (block : Cfg.block) ->
+          List.iter
+            (fun succ ->
+              if StringSet.mem succ !active then collect_loop succ label else visit succ)
+            block.succs
+      | None -> ());
+      active := StringSet.remove label !active
+    end
+  in
+  visit f.entry;
+  List.fold_left
+    (fun globals (block : Cfg.block) ->
+      if StringSet.mem block.label !loop_blocks then
+        List.fold_left
+          (fun globals -> function
+            | Tcg.Load (_, Tcg.Global label)
+            | Tcg.Store (Tcg.Global label, _) ->
+                StringSet.add label globals
+            | _ -> globals)
+          globals block.body
+      else globals)
+    StringSet.empty f.blocks
+
+let find_direct_params (f : Cfg.func) =
+  let reads = Hashtbl.create 8 in
+  let written = Hashtbl.create 8 in
+  let leading = Hashtbl.create 8 in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter
+        (function
+          | Tcg.Load (temp, Tcg.Local id) ->
+              let old = Option.value ~default:[] (Hashtbl.find_opt reads id) in
+              Hashtbl.replace reads id ((block.label, temp) :: old)
+          | Tcg.Store (Tcg.Local id, _) -> Hashtbl.replace written id ()
+          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Call _
+          | Tcg.Load (_, Tcg.Global _) | Tcg.Store (Tcg.Global _, _) -> ())
+        block.body)
+    f.blocks;
+  Option.iter
+    (fun (block : Cfg.block) ->
+      let rec scan = function
+        | Tcg.Load (temp, Tcg.Local id) :: rest ->
+            Hashtbl.replace leading id temp;
+            scan rest
+        | _ -> ()
+      in
+      scan block.body)
+    (List.find_opt (fun (block : Cfg.block) -> block.label = f.entry) f.blocks);
+  List.mapi
+    (fun index (param : Tcg.var) ->
+      if index >= 8 || Hashtbl.mem written param.id then None
+      else
+        match Hashtbl.find_opt reads param.id with
+        | Some [ (label, temp) ]
+          when label = f.entry && Hashtbl.find_opt leading param.id = Some temp ->
+            Some (param.id, temp, index)
+        | Some _ | None -> None)
+    f.params
+  |> List.filter_map Fun.id
 
 let add_operand_temp live = function
   | Tcg.Temp temp -> IntSet.add temp live
@@ -320,6 +412,14 @@ let spill_weight use_count def_count call_crossings start_pos end_pos =
 
 let fits_simm12 n = n >= -2048L && n <= 2047L
 
+let power_of_two_shift n =
+  let rec loop value shift =
+    if value = 1L then if shift < 32 then Some shift else None
+    else if Int64.logand value 1L <> 0L then None
+    else loop (Int64.shift_right_logical value 1) (shift + 1)
+  in
+  if n > 0L then loop n 0 else None
+
 let compute_temp_intervals (f : Cfg.func) =
   let live_in, live_out = compute_temp_live_sets f in
   let stats_table = Hashtbl.create (max 8 f.temp_count) in
@@ -330,7 +430,7 @@ let compute_temp_intervals (f : Cfg.func) =
     | Tcg.Temp temp -> note_temp_use stats_table temp pos
     | Tcg.Imm _ -> ()
   in
-  let note_instr pos = function
+  let note_instr pos is_tail = function
     | Tcg.Move (dst, src) ->
         let use_pos = 2 * pos in
         let def_pos = use_pos + 1 in
@@ -360,12 +460,12 @@ let compute_temp_intervals (f : Cfg.func) =
     | Tcg.Call (dst, _, args) ->
         let use_pos = 2 * pos in
         let def_pos = use_pos + 1 in
-        call_sites_rev := def_pos :: !call_sites_rev;
+        if not is_tail then call_sites_rev := def_pos :: !call_sites_rev;
         Option.iter
           (fun temp ->
             note_temp_def stats_table temp def_pos;
             let stats = get_temp_stats stats_table temp def_pos in
-            stats.defined_by_call <- true)
+            if not is_tail then stats.defined_by_call <- true)
           dst;
         List.iteri
           (fun i arg ->
@@ -398,9 +498,16 @@ let compute_temp_intervals (f : Cfg.func) =
   List.iter
     (fun (block : Cfg.block) ->
       let block_start = 2 * !pos in
-      List.iter
-        (fun instr ->
-          note_instr !pos instr;
+      let body_len = List.length block.body in
+      let last_is_tail =
+        match (List.rev block.body, block.term) with
+        | Tcg.Call (Some dst, _, args) :: _, Cfg.Return (Some (Tcg.Temp result)) ->
+            dst = result && List.length args <= 8
+        | _ -> false
+      in
+      List.iteri
+        (fun i instr ->
+          note_instr !pos (last_is_tail && i = body_len - 1) instr;
           incr pos)
         block.body;
       note_term !pos block.term;
@@ -627,8 +734,28 @@ let allocate_temp_regs (f : Cfg.func) =
 
 let compute_layout (f : Cfg.func) =
   let local_offsets = Hashtbl.create 64 in
-  let temp_homes, saved_regs, intervals = allocate_temp_regs f in
-  let referenced_locals = referenced_local_ids f in
+  let temp_homes, temp_saved_regs, intervals = allocate_temp_regs f in
+  let direct_params = find_direct_params f in
+  let free_saved_regs =
+    List.filter (fun reg -> not (List.mem reg temp_saved_regs)) allocatable_saved_regs
+  in
+  let global_regs = Hashtbl.create 4 in
+  let rec assign_globals labels regs =
+    match (labels, regs) with
+    | label :: rest, reg :: free ->
+        Hashtbl.add global_regs label reg;
+        assign_globals rest free
+    | _ -> ()
+  in
+  assign_globals (StringSet.elements (loop_global_labels f)) free_saved_regs;
+  let saved_regs =
+    Hashtbl.fold (fun _ reg regs -> reg :: regs) global_regs temp_saved_regs |> List.sort compare
+  in
+  let referenced_locals =
+    List.fold_left
+      (fun ids (id, _, _) -> IntSet.remove id ids)
+      (referenced_local_ids f) direct_params
+  in
   let save_area_size = 4 * (2 + List.length saved_regs) in
   let next = ref (save_area_size + 4) in
   let alloc_slot () =
@@ -666,6 +793,8 @@ let compute_layout (f : Cfg.func) =
   {
     local_offsets;
     temp_homes;
+    direct_params;
+    global_regs;
     frame_size = if needs_frame then align16 frame_bytes else 0;
     outgoing_area;
     saved_regs;
@@ -675,6 +804,37 @@ let compute_layout (f : Cfg.func) =
 
 let emit_reg_copy ctx dst src =
   if dst <> src then emitf ctx "    addi %s, %s, 0" dst src
+
+let emit_parallel_copies ctx copies =
+  let rec loop pending =
+    match pending with
+    | [] -> ()
+    | _ ->
+        let sources = List.map snd pending in
+        match List.find_opt (fun (dst, _) -> not (List.mem dst sources)) pending with
+        | Some ((dst, src) as copy) ->
+            emit_reg_copy ctx dst src;
+            loop (List.filter (fun item -> item <> copy) pending)
+        | None ->
+            let _, src = List.hd pending in
+            emit_reg_copy ctx "t0" src;
+            loop
+              (List.map
+                 (fun (dst, current) -> (dst, if current = src then "t0" else current))
+                 pending)
+  in
+  loop (List.filter (fun (dst, src) -> dst <> src) copies)
+
+let init_direct_params ctx =
+  let reg_copies = ref [] in
+  List.iter
+    (fun (_, temp, index) ->
+      let src = Printf.sprintf "a%d" index in
+      match lookup_temp_home ctx.temp_homes temp with
+      | TempStack off -> emitf ctx "    sw %s, %d(s0)" src off
+      | TempReg reg -> reg_copies := (reg, src) :: !reg_copies)
+    ctx.direct_params;
+  emit_parallel_copies ctx (List.rev !reg_copies)
 
 let load_operand ctx dst = function
   | Tcg.Imm n -> emitf ctx "    li %s, %Ld" dst n
@@ -704,15 +864,17 @@ let load_place ctx dst = function
   | Tcg.Local id ->
       emitf ctx "    lw %s, %d(s0)" dst (lookup_offset ctx.local_offsets id "local")
   | Tcg.Global label ->
-      emitf ctx "    la %s, %s" global_addr_reg label;
-      emitf ctx "    lw %s, 0(%s)" dst global_addr_reg
+      let addr = Option.value ~default:global_addr_reg (Hashtbl.find_opt ctx.global_regs label) in
+      if addr = global_addr_reg then emitf ctx "    la %s, %s" addr label;
+      emitf ctx "    lw %s, 0(%s)" dst addr
 
 let store_place ctx src = function
   | Tcg.Local id ->
       emitf ctx "    sw %s, %d(s0)" src (lookup_offset ctx.local_offsets id "local")
   | Tcg.Global label ->
-      emitf ctx "    la %s, %s" global_addr_reg label;
-      emitf ctx "    sw %s, 0(%s)" src global_addr_reg
+      let addr = Option.value ~default:global_addr_reg (Hashtbl.find_opt ctx.global_regs label) in
+      if addr = global_addr_reg then emitf ctx "    la %s, %s" addr label;
+      emitf ctx "    sw %s, 0(%s)" src addr
 
 let emit_unop ctx op dst src =
   match op with
@@ -772,6 +934,24 @@ let emit_compare_zero ctx op dst reg zero_on_left =
 
 let emit_binop_operands ctx op dst lhs rhs =
   match (op, lhs, rhs) with
+  | Mul, Tcg.Imm factor, rhs -> (
+      match power_of_two_shift factor with
+      | Some shift ->
+          let rhs_reg = operand_reg ctx "t0" rhs in
+          emitf ctx "    slli %s, %s, %d" dst rhs_reg shift
+      | None ->
+          let lhs_reg = operand_reg ctx "t0" (Tcg.Imm factor) in
+          let rhs_reg = operand_reg ctx "t1" rhs in
+          emit_binop ctx op dst lhs_reg rhs_reg)
+  | Mul, lhs, Tcg.Imm factor -> (
+      match power_of_two_shift factor with
+      | Some shift ->
+          let lhs_reg = operand_reg ctx "t0" lhs in
+          emitf ctx "    slli %s, %s, %d" dst lhs_reg shift
+      | None ->
+          let lhs_reg = operand_reg ctx "t0" lhs in
+          let rhs_reg = operand_reg ctx "t1" (Tcg.Imm factor) in
+          emit_binop ctx op dst lhs_reg rhs_reg)
   | Add, Tcg.Imm imm, rhs when fits_simm12 imm ->
       let rhs_reg = operand_reg ctx "t0" rhs in
       emitf ctx "    addi %s, %s, %Ld" dst rhs_reg imm
@@ -817,6 +997,7 @@ let emit_call ctx callee args =
 
 let restart_function ctx args =
   emit_call_args ctx args;
+  init_direct_params ctx;
   List.iteri
     (fun i (param : Tcg.var) ->
       match Hashtbl.find_opt ctx.local_offsets param.id with
@@ -828,11 +1009,19 @@ let restart_function ctx args =
 let temp_live_out ctx label temp =
   IntSet.mem temp (table_find_or_empty ctx.live_out_temps label IntSet.empty)
 
+let is_direct_param ctx id temp =
+  List.exists
+    (fun (param_id, param_temp, _) -> param_id = id && param_temp = temp)
+    ctx.direct_params
+
 let replace_temp_operand dst replacement = function
   | Tcg.Temp temp when temp = dst -> replacement
   | operand -> operand
 
 let gen_simple_instr ctx = function
+  | Tcg.Load (dst, Tcg.Local id)
+    when List.exists (fun (param_id, temp, _) -> param_id = id && temp = dst) ctx.direct_params ->
+      ()
   | Tcg.Move (dst, src) ->
       begin
         match lookup_temp_home ctx.temp_homes dst with
@@ -1060,6 +1249,9 @@ let gen_tail_return_instr ctx (instr : Tcg.simple_instr) =
   | Tcg.Bin (_, op, lhs, rhs) ->
       emit_binop_operands ctx op "a0" lhs rhs;
       emitf ctx "    j %s" ctx.epilogue
+  | Tcg.Load (dst, Tcg.Local id) when is_direct_param ctx id dst ->
+      load_operand ctx "a0" (Tcg.Temp dst);
+      emitf ctx "    j %s" ctx.epilogue
   | Tcg.Load (_, place) ->
       load_place ctx "a0" place;
       emitf ctx "    j %s" ctx.epilogue
@@ -1093,6 +1285,9 @@ let gen_tail_branch_instr ctx next_label (instr : Tcg.simple_instr) if_nonzero i
           emit_branch_result ctx "t2" if_nonzero if_zero next_label
       | LAnd | LOr ->
           raise (Error "logical operators should not reach tail branch lowering"))
+  | Tcg.Load (dst, Tcg.Local id) when is_direct_param ctx id dst ->
+      let reg = operand_reg ctx "t0" (Tcg.Temp dst) in
+      emit_branch_result ctx reg if_nonzero if_zero next_label
   | Tcg.Load (_, place) ->
       load_place ctx "t0" place;
       emit_branch_result ctx "t0" if_nonzero if_zero next_label
@@ -1140,12 +1335,14 @@ let gen_func buf (f : Cfg.func) =
       buf;
       local_offsets = layout.local_offsets;
       temp_homes = layout.temp_homes;
+      global_regs = layout.global_regs;
       blocks_by_label;
       live_out_temps;
       epilogue;
       func = f.label;
       entry = f.entry;
       params = f.params;
+      direct_params = layout.direct_params;
       frame_size = layout.frame_size;
       saved_regs = layout.saved_regs;
       uses_s0 = layout.uses_s0;
@@ -1165,6 +1362,8 @@ let gen_func buf (f : Cfg.func) =
       layout.saved_regs;
     if layout.uses_s0 then emitf ctx "    addi s0, sp, %d" layout.frame_size
   end;
+  Hashtbl.iter (fun label reg -> emitf ctx "    la %s, %s" reg label) layout.global_regs;
+  init_direct_params ctx;
   List.iteri
     (fun i (param : Tcg.var) ->
       match Hashtbl.find_opt layout.local_offsets param.id with
