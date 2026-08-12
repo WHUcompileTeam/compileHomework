@@ -244,6 +244,41 @@ let referenced_local_ids (f : Cfg.func) =
         locals block.body)
     IntSet.empty f.blocks
 
+let referenced_temp_ids (f : Cfg.func) =
+  let add_operand temps = function
+    | Tcg.Temp temp -> IntSet.add temp temps
+    | Tcg.Imm _ -> temps
+  in
+  let add_instr temps = function
+    | Tcg.Move (dst, src)
+    | Tcg.Un (dst, _, src) ->
+        add_operand (IntSet.add dst temps) src
+    | Tcg.Bin (dst, _, lhs, rhs) ->
+        add_operand (add_operand (IntSet.add dst temps) lhs) rhs
+    | Tcg.Load (dst, _) -> IntSet.add dst temps
+    | Tcg.Store (_, value) -> add_operand temps value
+    | Tcg.Call (dst, _, args) ->
+        let temps =
+          match dst with
+          | Some temp -> IntSet.add temp temps
+          | None -> temps
+        in
+        List.fold_left add_operand temps args
+  in
+  let add_term temps = function
+    | Cfg.Jump _ | Cfg.Return None -> temps
+    | Cfg.BranchZero (cond, _, _)
+    | Cfg.BranchNonZero (cond, _, _)
+    | Cfg.Return (Some cond) ->
+        add_operand temps cond
+    | Cfg.BranchCompare (_, lhs, rhs, _, _) ->
+        add_operand (add_operand temps lhs) rhs
+  in
+  List.fold_left
+    (fun temps (block : Cfg.block) ->
+      add_term (List.fold_left add_instr temps block.body) block.term)
+    IntSet.empty f.blocks
+
 let add_operand_temp live = function
   | Tcg.Temp temp -> IntSet.add temp live
   | Tcg.Imm _ -> live
@@ -1111,9 +1146,12 @@ let compute_layout (f : Cfg.func) =
   in
   List.iter alloc_local f.params;
   List.iter alloc_local f.locals;
-  for temp = 0 to f.temp_count - 1 do
-    if not (Hashtbl.mem temp_homes temp) then Hashtbl.add temp_homes temp (TempStack (alloc_slot ()))
-  done;
+  let referenced_temps = referenced_temp_ids f in
+  IntSet.iter
+    (fun temp ->
+      if not (Hashtbl.mem temp_homes temp) then
+        Hashtbl.add temp_homes temp (TempStack (alloc_slot ())))
+    referenced_temps;
   let extra_args = max 0 (max_call_args f - 8) in
   let outgoing_area = align16 (extra_args * 4) in
   let frame_bytes = outgoing_area + (!next - 4) in
@@ -1567,9 +1605,52 @@ let gen_block ctx next_label (block : Cfg.block) =
       List.iter (gen_simple_instr ctx) block.body;
       gen_terminator ctx next_label block.term
 
+let func_has_call (f : Cfg.func) =
+  List.exists
+    (fun (block : Cfg.block) ->
+      List.exists
+        (function
+          | Tcg.Call _ -> true
+          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> false)
+        block.body)
+    f.blocks
+
+let layout_has_stack_homes (layout : layout) =
+  let local_stack =
+    Hashtbl.fold
+      (fun _ home found ->
+        found
+        || match home with
+           | LocalStack _ -> true
+           | LocalReg _ -> false)
+      layout.local_homes false
+  in
+  let temp_stack =
+    Hashtbl.fold
+      (fun _ home found ->
+        found
+        || match home with
+           | TempStack _ -> true
+           | TempReg _ -> false)
+      layout.temp_homes false
+  in
+  local_stack || temp_stack
+
+let can_use_frameless_leaf (f : Cfg.func) (layout : layout) =
+  (not (func_has_call f))
+  && layout.saved_regs = []
+  && layout.outgoing_area = 0
+  && not (layout_has_stack_homes layout)
+
 let gen_func buf (f : Cfg.func) =
   let f = schedule_func_blocks_with_hot_traces f in
   let layout = compute_layout f in
+  let frameless_leaf = can_use_frameless_leaf f layout in
+  if Sys.getenv_opt "TOYC_DEBUG_CODEGEN_FRAME" <> None then
+    Printf.eprintf
+      "codegen-frame func=%s frameless=%b frame=%d saved=%d locals=%d temps=%d\n%!"
+      f.name frameless_leaf layout.frame_size (List.length layout.saved_regs)
+      (Hashtbl.length layout.local_homes) (Hashtbl.length layout.temp_homes);
   let epilogue = Printf.sprintf ".L_%s_epilogue" f.label in
   let blocks_by_label = Hashtbl.create (List.length f.blocks) in
   let _, live_out_temps = compute_temp_live_sets f in
@@ -1589,32 +1670,34 @@ let gen_func buf (f : Cfg.func) =
   emit ctx "    .align 2";
   if f.name = "main" then emit ctx "    .globl main";
   emitf ctx "%s:" f.label;
-  emitf ctx "    addi sp, sp, -%d" layout.frame_size;
-  emitf ctx "    sw ra, %d(sp)" (layout.frame_size - 4);
-  emitf ctx "    sw s0, %d(sp)" (layout.frame_size - 8);
-  List.iteri
-    (fun i reg -> emitf ctx "    sw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
-    layout.saved_regs;
-  emitf ctx "    addi s0, sp, %d" layout.frame_size;
-  Hashtbl.fold (fun label reg acc -> (reg, label) :: acc) layout.global_base_regs []
-  |> List.sort (fun (a_reg, a_label) (b_reg, b_label) ->
-         match compare a_reg b_reg with
-         | 0 -> compare a_label b_label
-         | c -> c)
-  |> List.iter (fun (reg, label) -> emitf ctx "    la %s, %s" reg label);
-  List.iteri
-    (fun i (param : Tcg.var) ->
-      match Hashtbl.find_opt layout.local_homes param.id with
-      | None -> ()
-      | Some (LocalStack off) ->
-          if i < 8 then emitf ctx "    sw a%d, %d(s0)" i off
-          else (
-            emitf ctx "    lw t0, %d(s0)" ((i - 8) * 4);
-            emitf ctx "    sw t0, %d(s0)" off)
-      | Some (LocalReg reg) ->
-          if i < 8 then emit_reg_copy ctx reg (Printf.sprintf "a%d" i)
-          else emitf ctx "    lw %s, %d(s0)" reg ((i - 8) * 4))
-    f.params;
+  if not frameless_leaf then begin
+    emitf ctx "    addi sp, sp, -%d" layout.frame_size;
+    emitf ctx "    sw ra, %d(sp)" (layout.frame_size - 4);
+    emitf ctx "    sw s0, %d(sp)" (layout.frame_size - 8);
+    List.iteri
+      (fun i reg -> emitf ctx "    sw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
+      layout.saved_regs;
+    emitf ctx "    addi s0, sp, %d" layout.frame_size;
+    Hashtbl.fold (fun label reg acc -> (reg, label) :: acc) layout.global_base_regs []
+    |> List.sort (fun (a_reg, a_label) (b_reg, b_label) ->
+           match compare a_reg b_reg with
+           | 0 -> compare a_label b_label
+           | c -> c)
+    |> List.iter (fun (reg, label) -> emitf ctx "    la %s, %s" reg label);
+    List.iteri
+      (fun i (param : Tcg.var) ->
+        match Hashtbl.find_opt layout.local_homes param.id with
+        | None -> ()
+        | Some (LocalStack off) ->
+            if i < 8 then emitf ctx "    sw a%d, %d(s0)" i off
+            else (
+              emitf ctx "    lw t0, %d(s0)" ((i - 8) * 4);
+              emitf ctx "    sw t0, %d(s0)" off)
+        | Some (LocalReg reg) ->
+            if i < 8 then emit_reg_copy ctx reg (Printf.sprintf "a%d" i)
+            else emitf ctx "    lw %s, %d(s0)" reg ((i - 8) * 4))
+      f.params
+  end;
   let rec emit_blocks = function
     | [] -> ()
     | [ block ] -> gen_block ctx None block
@@ -1624,12 +1707,14 @@ let gen_func buf (f : Cfg.func) =
   in
   emit_blocks f.blocks;
   emitf ctx "%s:" epilogue;
-  List.iteri
-    (fun i reg -> emitf ctx "    lw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
-    layout.saved_regs;
-  emitf ctx "    lw ra, %d(sp)" (layout.frame_size - 4);
-  emitf ctx "    lw s0, %d(sp)" (layout.frame_size - 8);
-  emitf ctx "    addi sp, sp, %d" layout.frame_size;
+  if not frameless_leaf then begin
+    List.iteri
+      (fun i reg -> emitf ctx "    lw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
+      layout.saved_regs;
+    emitf ctx "    lw ra, %d(sp)" (layout.frame_size - 4);
+    emitf ctx "    lw s0, %d(sp)" (layout.frame_size - 8);
+    emitf ctx "    addi sp, sp, %d" layout.frame_size
+  end;
   emit ctx "    ret";
   emit ctx ""
 
