@@ -666,90 +666,6 @@ let compute_func_summaries globals funcs =
   done;
   summaries
 
-let func_cfg_is_acyclic (f : Cfg.func) =
-  let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block) f.blocks;
-  let colors = Hashtbl.create (List.length f.blocks) in
-  let rec visit label =
-    match Hashtbl.find_opt colors label with
-    | Some 1 -> false
-    | Some 2 -> true
-    | Some _ -> false
-    | None ->
-        Hashtbl.replace colors label 1;
-        begin
-          match Hashtbl.find_opt block_map label with
-          | None -> false
-          | Some block ->
-              let ok = List.for_all visit block.succs in
-              if ok then Hashtbl.replace colors label 2;
-              ok
-        end
-  in
-  visit f.entry
-
-let func_has_direct_may_trap_instr (f : Cfg.func) =
-  List.exists
-    (fun (block : Cfg.block) ->
-      List.exists
-        (function
-          | Tcg.Bin (_, (Div | Mod), _, _) -> true
-          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> false)
-        block.body)
-    f.blocks
-
-let compute_provably_terminating_funcs funcs =
-  let terminating = Hashtbl.create (max 8 (List.length funcs)) in
-  List.iter (fun (f : Cfg.func) -> Hashtbl.replace terminating f.label false) funcs;
-  let base_safe = Hashtbl.create (max 8 (List.length funcs)) in
-  List.iter
-    (fun (f : Cfg.func) ->
-      Hashtbl.replace base_safe f.label
-        (func_cfg_is_acyclic f && not (func_has_direct_may_trap_instr f)))
-    funcs;
-  let callees_all_terminating (f : Cfg.func) =
-    List.for_all
-      (fun (block : Cfg.block) ->
-        List.for_all
-          (function
-            | Tcg.Call (_, callee, _) ->
-                Option.value ~default:false (Hashtbl.find_opt terminating callee)
-            | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> true)
-          block.body)
-      f.blocks
-  in
-  let changed = ref true in
-  while !changed do
-    changed := false;
-    List.iter
-      (fun (f : Cfg.func) ->
-        let prev = Option.value ~default:false (Hashtbl.find_opt terminating f.label) in
-        let base = Option.value ~default:false (Hashtbl.find_opt base_safe f.label) in
-        let next = base && callees_all_terminating f in
-        if next <> prev then begin
-          Hashtbl.replace terminating f.label next;
-          changed := true
-        end)
-      funcs
-  done;
-  terminating
-
-let compute_dead_call_removable_funcs summaries globals funcs =
-  let terminating = compute_provably_terminating_funcs funcs in
-  let removable = Hashtbl.create (max 8 (List.length funcs)) in
-  List.iter
-    (fun (f : Cfg.func) ->
-      let terminates = Option.value ~default:false (Hashtbl.find_opt terminating f.label) in
-      let writes_globals = call_written_globals summaries globals f.label in
-      let can_remove = terminates && PlaceSet.is_empty writes_globals in
-      Hashtbl.replace removable f.label can_remove;
-      if Sys.getenv_opt "TOYC_DEBUG_DEAD_CALLS" <> None then
-        Printf.eprintf
-          "dead-call-summary func=%s terminates=%b writes_globals=%d removable=%b\n%!"
-          f.name terminates (PlaceSet.cardinal writes_globals) can_remove)
-    funcs;
-  removable
-
 let operand_is_zero = function
   | Tcg.Imm 0L -> true
   | Tcg.Temp _ | Tcg.Imm _ -> false
@@ -1548,7 +1464,7 @@ let live_out_t live_in_t (block : Cfg.block) =
       IntSet.union acc succ_live)
     IntSet.empty block.succs
 
-let scan_simple_instr ?removable_calls summaries globals instr live_t live_p =
+let scan_simple_instr summaries globals instr live_t live_p =
   match instr with
   | Tcg.Move (dst, src) ->
       if IntSet.mem dst live_t then
@@ -1579,44 +1495,26 @@ let scan_simple_instr ?removable_calls summaries globals instr live_t live_p =
           PlaceSet.remove place live_p )
       else (None, live_t, live_p)
   | Tcg.Call (dst, callee, args) ->
-      let result_dead =
+      let kept_dst =
         match dst with
-        | None -> true
-        | Some temp -> not (IntSet.mem temp live_t)
+        | Some temp when IntSet.mem temp live_t -> Some temp
+        | _ -> None
       in
-      let removable =
-        match removable_calls with
-        | Some table -> Option.value ~default:false (Hashtbl.find_opt table callee)
-        | None -> false
+      let live_t =
+        List.fold_left add_operand_temps
+          (match dst with
+           | Some temp -> IntSet.remove temp live_t
+           | None -> live_t)
+          args
       in
-      if result_dead && removable then
-        let live_t =
-          match dst with
-          | Some temp -> IntSet.remove temp live_t
-          | None -> live_t
-        in
-        (None, live_t, live_p)
-      else
-        let kept_dst =
-          match dst with
-          | Some temp when IntSet.mem temp live_t -> Some temp
-          | _ -> None
-        in
-        let live_t =
-          List.fold_left add_operand_temps
-            (match dst with
-             | Some temp -> IntSet.remove temp live_t
-             | None -> live_t)
-            args
-        in
-        let written_globals = call_written_globals summaries globals callee in
-        let read_globals = call_read_globals summaries globals callee in
-        let live_p =
-          PlaceSet.union
-            (local_places live_p)
-            (PlaceSet.union (PlaceSet.diff (global_places live_p) written_globals) read_globals)
-        in
-        (Some (Tcg.Call (kept_dst, callee, args)), live_t, live_p)
+      let written_globals = call_written_globals summaries globals callee in
+      let read_globals = call_read_globals summaries globals callee in
+      let live_p =
+        PlaceSet.union
+          (local_places live_p)
+          (PlaceSet.union (PlaceSet.diff (global_places live_p) written_globals) read_globals)
+      in
+      (Some (Tcg.Call (kept_dst, callee, args)), live_t, live_p)
 
 let scan_terminator globals (term : Cfg.terminator) live_t live_p =
   match term with
@@ -1633,14 +1531,12 @@ let scan_terminator globals (term : Cfg.terminator) live_t live_p =
         add_operand_temps live_t value,
         PlaceSet.union live_p globals )
 
-let scan_block ?removable_calls summaries globals (block : Cfg.block) live_t_out live_p_out =
+let scan_block summaries globals (block : Cfg.block) live_t_out live_p_out =
   let term, live_t, live_p = scan_terminator globals block.term live_t_out live_p_out in
   let body_rev, live_t, live_p =
     List.fold_left
       (fun (acc, live_t, live_p) instr ->
-        let kept, live_t, live_p =
-          scan_simple_instr ?removable_calls summaries globals instr live_t live_p
-        in
+        let kept, live_t, live_p = scan_simple_instr summaries globals instr live_t live_p in
         let acc =
           match kept with
           | Some instr -> instr :: acc
@@ -1677,18 +1573,16 @@ let analysis_cache_generation = ref 0
 let last_liveness_cache : liveness_cache option ref = ref None
 let last_dominator_cache : dominator_cache option ref = ref None
 
-let compute_liveness ?removable_calls summaries globals (f : Cfg.func) =
-  match (removable_calls, !last_liveness_cache) with
-  | None, Some cache
+let compute_liveness summaries globals (f : Cfg.func) =
+  match !last_liveness_cache with
+  | Some cache
     when !analysis_cache_generation <> 0
          && cache.generation = !analysis_cache_generation
          && cache.entry_label = f.entry
          && cache.temp_count = f.temp_count
          && cache.blocks_key = f.blocks ->
       (cache.live_in_t_cache, cache.live_in_p_cache)
-  | Some _, _
-  | None, Some _
-  | None, None ->
+  | Some _ | None ->
       let live_in_t = Hashtbl.create (List.length f.blocks) in
       let live_in_p = Hashtbl.create (List.length f.blocks) in
       let blocks = List.rev f.blocks in
@@ -1709,9 +1603,7 @@ let compute_liveness ?removable_calls summaries globals (f : Cfg.func) =
                   PlaceSet.union acc (table_find_or_empty live_in_p succ PlaceSet.empty))
                 PlaceSet.empty block.succs
             in
-            let _, live_t_in, live_p_in =
-              scan_block ?removable_calls summaries globals block live_t_out live_p_out
-            in
+            let _, live_t_in, live_p_in = scan_block summaries globals block live_t_out live_p_out in
             if
               not (IntSet.equal live_t_in (table_find_or_empty live_in_t block.label IntSet.empty))
             then (
@@ -1726,7 +1618,7 @@ let compute_liveness ?removable_calls summaries globals (f : Cfg.func) =
               changed := true))
           blocks
       done;
-      if !analysis_cache_generation <> 0 && removable_calls = None then
+      if !analysis_cache_generation <> 0 then
         last_liveness_cache :=
           Some
             {
@@ -8425,19 +8317,8 @@ let fold_branch_tails_func summaries globals (f : Cfg.func) =
   in
   Cfg.rebuild_edges { f with blocks }
 
-let count_calls_in_blocks blocks =
-  List.fold_left
-    (fun count (block : Cfg.block) ->
-      List.fold_left
-        (fun count -> function Tcg.Call _ -> count + 1 | _ -> count)
-        count block.body)
-    0 blocks
-
-let eliminate_dead_code_func summaries globals removable_calls (f : Cfg.func) =
-  let calls_before = count_calls_in_blocks f.blocks in
-  let live_in_t, live_in_p =
-    compute_liveness ~removable_calls summaries globals f
-  in
+let eliminate_dead_code_func summaries globals (f : Cfg.func) =
+  let live_in_t, live_in_p = compute_liveness summaries globals f in
   let blocks =
     List.map
       (fun (block : Cfg.block) ->
@@ -8453,18 +8334,10 @@ let eliminate_dead_code_func summaries globals removable_calls (f : Cfg.func) =
               PlaceSet.union acc (table_find_or_empty live_in_p succ PlaceSet.empty))
             PlaceSet.empty block.succs
         in
-        let block, _, _ =
-          scan_block ~removable_calls summaries globals block live_t_out live_p_out
-        in
+        let block, _, _ = scan_block summaries globals block live_t_out live_p_out in
         { block with succs = Cfg.successors block.term })
       f.blocks
   in
-  if Sys.getenv_opt "TOYC_DEBUG_DEAD_CALLS" <> None then begin
-    let calls_after = count_calls_in_blocks blocks in
-    if calls_after <> calls_before then
-      Printf.eprintf "dead-call-dce func=%s calls=%d->%d removed=%d\n%!"
-        f.name calls_before calls_after (calls_before - calls_after)
-  end;
   Cfg.rebuild_edges { f with blocks }
 
 let simplify_counted_loop_guards_func _summaries _globals (f : Cfg.func) =
@@ -9128,7 +9001,7 @@ let stage_round_enabled profile round stage =
       | "diamond_split" -> round <= 2
       | _ -> true)
 
-let optimize_func global_init summaries globals removable_calls (f : Cfg.func) =
+let optimize_func global_init summaries globals (f : Cfg.func) =
   let promoted = f |> mem2reg_func |> promote_globals_func summaries globals in
   let canonical = loop_canonicalize_func summaries globals promoted in
   let base_metrics = metrics_of_func f in
@@ -9200,7 +9073,7 @@ let optimize_func global_init summaries globals removable_calls (f : Cfg.func) =
       let after_sr = run_stage round "sr" strength_reduce_func after_algebra1 in
       let after_gvn1 = run_stage round "gvn1" (gvn_func summaries globals) after_sr in
       let after_dce1 =
-        run_stage round "dce1" (eliminate_dead_code_func summaries globals removable_calls) after_gvn1
+        run_stage round "dce1" (eliminate_dead_code_func summaries globals) after_gvn1
       in
       let after_reassoc = run_stage round "reassoc" reassociate_loop_adds_func after_dce1 in
       let after_licm = run_stage round "licm" (licm_func summaries globals) after_reassoc in
@@ -9225,7 +9098,7 @@ let optimize_func global_init summaries globals removable_calls (f : Cfg.func) =
           after_algebra2
       in
       let after_dce2 =
-        run_stage round "dce2" (eliminate_dead_code_func summaries globals removable_calls) after_gvn2
+        run_stage round "dce2" (eliminate_dead_code_func summaries globals) after_gvn2
       in
       let after_dead_loops =
         run_stage round "dead_loops" (eliminate_dead_loops_func summaries globals) after_dce2
@@ -9251,7 +9124,7 @@ let optimize_func global_init summaries globals removable_calls (f : Cfg.func) =
           after_loop_guards
       in
       let after_dce3 =
-        run_stage round "dce3" (eliminate_dead_code_func summaries globals removable_calls) after_const3
+        run_stage round "dce3" (eliminate_dead_code_func summaries globals) after_const3
       in
       let after_fold4 =
         run_stage round "fold4" (fold_branch_tails_func summaries globals) after_dce3
@@ -9340,11 +9213,10 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
       (PlaceMap.empty, PlaceSet.empty) analysis.globals
   in
   let summaries = compute_func_summaries globals cfg.funcs in
-  let removable_calls = compute_dead_call_removable_funcs summaries globals cfg.funcs in
   let funcs_rev =
     List.fold_left
       (fun acc (f : Cfg.func) ->
-        let optimized = optimize_func global_init summaries globals removable_calls f in
+        let optimized = optimize_func global_init summaries globals f in
         optimized :: acc)
       [] cfg.funcs
   in
