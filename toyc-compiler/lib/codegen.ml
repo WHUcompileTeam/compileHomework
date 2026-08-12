@@ -1737,10 +1737,17 @@ let can_use_frameless_leaf (f : Cfg.func) (layout : layout) =
   && not (layout_has_stack_homes layout)
   && frameless_params_ready f layout
 
+(* s0 is only needed as a frame pointer when generated code addresses a local/temp
+   stack home or must recover incoming arguments beyond a7 from the caller stack.
+   Saved registers, ra, and the outgoing-argument area are all addressed from sp. *)
+let needs_frame_pointer (f : Cfg.func) (layout : layout) =
+  layout_has_stack_homes layout || List.length f.params > 8
+
 let gen_func buf (f : Cfg.func) =
   let f = schedule_func_blocks_with_hot_traces f in
   let layout = compute_layout f in
   let frameless_leaf = can_use_frameless_leaf f layout in
+  let use_frame_pointer = (not frameless_leaf) && needs_frame_pointer f layout in
   let param_reg_count, param_stack_count =
     List.fold_left
       (fun (reg_count, stack_count) (param : Tcg.var) ->
@@ -1752,8 +1759,8 @@ let gen_func buf (f : Cfg.func) =
   in
   if Sys.getenv_opt "TOYC_DEBUG_CODEGEN_FRAME" <> None then
     Printf.eprintf
-      "codegen-frame func=%s frameless=%b frame=%d saved=%d locals=%d temps=%d param_reg=%d param_stack=%d\n%!"
-      f.name frameless_leaf layout.frame_size (List.length layout.saved_regs)
+      "codegen-frame func=%s frameless=%b fp=%b frame=%d saved=%d locals=%d temps=%d param_reg=%d param_stack=%d\n%!"
+      f.name frameless_leaf use_frame_pointer layout.frame_size (List.length layout.saved_regs)
       (Hashtbl.length layout.local_homes) (Hashtbl.length layout.temp_homes)
       param_reg_count param_stack_count;
   let epilogue = Printf.sprintf ".L_%s_epilogue" f.label in
@@ -1778,11 +1785,11 @@ let gen_func buf (f : Cfg.func) =
   if not frameless_leaf then begin
     emitf ctx "    addi sp, sp, -%d" layout.frame_size;
     emitf ctx "    sw ra, %d(sp)" (layout.frame_size - 4);
-    emitf ctx "    sw s0, %d(sp)" (layout.frame_size - 8);
+    if use_frame_pointer then emitf ctx "    sw s0, %d(sp)" (layout.frame_size - 8);
     List.iteri
       (fun i reg -> emitf ctx "    sw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
       layout.saved_regs;
-    emitf ctx "    addi s0, sp, %d" layout.frame_size;
+    if use_frame_pointer then emitf ctx "    addi s0, sp, %d" layout.frame_size;
     Hashtbl.fold (fun label reg acc -> (reg, label) :: acc) layout.global_base_regs []
     |> List.sort (fun (a_reg, a_label) (b_reg, b_label) ->
            match compare a_reg b_reg with
@@ -1817,7 +1824,7 @@ let gen_func buf (f : Cfg.func) =
       (fun i reg -> emitf ctx "    lw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
       layout.saved_regs;
     emitf ctx "    lw ra, %d(sp)" (layout.frame_size - 4);
-    emitf ctx "    lw s0, %d(sp)" (layout.frame_size - 8);
+    if use_frame_pointer then emitf ctx "    lw s0, %d(sp)" (layout.frame_size - 8);
     emitf ctx "    addi sp, sp, %d" layout.frame_size
   end;
   emit ctx "    ret";
