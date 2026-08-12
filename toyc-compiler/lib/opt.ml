@@ -3989,6 +3989,15 @@ type counted_update =
   | CountedIv of basic_induction_var
   | CountedReduction of counted_reduction
 
+let swap_compare = function
+  | Lt -> Gt
+  | Le -> Ge
+  | Gt -> Lt
+  | Ge -> Le
+  | Eq -> Eq
+  | Ne -> Ne
+  | Add | Sub | Mul | Div | Mod | LAnd | LOr -> invalid_arg "swap_compare"
+
 let invert_compare = function
   | Lt -> Ge
   | Le -> Gt
@@ -4011,6 +4020,94 @@ let contains_substring text needle =
 let is_unroll2_label label = contains_substring label "_unroll2_"
 let is_unswitch_label label = contains_substring label "_unswitch_"
 let is_rotate_guard_label label = contains_substring label "_rotate_guard_"
+
+type loop_expr_range = {
+  min_value : int64 option;
+  max_value : int64 option;
+}
+
+let iv_bias_of_operand_in_block block multi_defs def_instrs phi_temp operand =
+  let rec loop seen = function
+    | Tcg.Imm _ -> None
+    | Tcg.Temp temp as operand ->
+        if
+          resolves_to_induction_temp_in_block block multi_defs def_instrs phi_temp operand
+          || resolves_to_induction_temp multi_defs def_instrs phi_temp operand
+        then Some 0L
+        else if IntSet.mem temp seen then None
+        else
+          match def_instr_in_block_or_global block multi_defs def_instrs temp with
+          | Some (Tcg.Move (_, src))
+          | Some (Tcg.Un (_, UPlus, src)) ->
+              loop (IntSet.add temp seen) src
+          | Some (Tcg.Bin (_, Add, lhs, Tcg.Imm delta)) ->
+              Option.map (fun bias -> Int64.add bias delta) (loop (IntSet.add temp seen) lhs)
+          | Some (Tcg.Bin (_, Add, Tcg.Imm delta, rhs)) ->
+              Option.map (fun bias -> Int64.add bias delta) (loop (IntSet.add temp seen) rhs)
+          | Some (Tcg.Bin (_, Sub, lhs, Tcg.Imm delta)) ->
+              Option.map (fun bias -> Int64.sub bias delta) (loop (IntSet.add temp seen) lhs)
+          | Some _ | None -> None
+  in
+  loop IntSet.empty operand
+
+let resolve_compare_operand_in_block block multi_defs def_instrs operand =
+  let rec loop seen negate = function
+    | Tcg.Imm _ -> None
+    | Tcg.Temp temp ->
+        if IntSet.mem temp seen then None
+        else
+          match def_instr_in_block_or_global block multi_defs def_instrs temp with
+          | Some (Tcg.Move (_, src))
+          | Some (Tcg.Un (_, UPlus, src)) ->
+              loop (IntSet.add temp seen) negate src
+          | Some (Tcg.Un (_, UNot, src)) ->
+              loop (IntSet.add temp seen) (not negate) src
+          | Some (Tcg.Bin (_, op, lhs, rhs)) when is_compare_binop op ->
+              Some ((if negate then invert_compare op else op), lhs, rhs)
+          | Some _ | None -> None
+  in
+  loop IntSet.empty false operand
+
+let range_of_counted_iv_expr kind expr_bias =
+  match kind with
+  | CountUpLt (Tcg.Imm bound, control_bias) ->
+      {
+        min_value = None;
+        max_value = Some Int64.(sub (sub bound 1L) control_bias |> add expr_bias);
+      }
+  | CountUpLe (Tcg.Imm bound, control_bias) ->
+      {
+        min_value = None;
+        max_value = Some Int64.(sub bound control_bias |> add expr_bias);
+      }
+  | CountDownGt (Tcg.Imm bound, control_bias) ->
+      {
+        min_value = Some Int64.(add (sub bound control_bias) expr_bias |> add 1L);
+        max_value = None;
+      }
+  | CountDownGe (Tcg.Imm bound, control_bias) ->
+      {
+        min_value = Some Int64.(sub bound control_bias |> add expr_bias);
+        max_value = None;
+      }
+  | CountUpLt _ | CountUpLe _ | CountDownGt _ | CountDownGe _ ->
+      { min_value = None; max_value = None }
+
+let compare_truth_from_range op range constant =
+  match (range.min_value, range.max_value, op) with
+  | Some min_value, _, Lt -> Some (min_value < constant)
+  | Some min_value, _, Le -> Some (min_value <= constant)
+  | Some min_value, _, Gt -> Some (min_value > constant)
+  | Some min_value, _, Ge -> Some (min_value >= constant)
+  | _, Some max_value, Lt -> Some (max_value < constant)
+  | _, Some max_value, Le -> Some (max_value <= constant)
+  | _, Some max_value, Gt -> Some (max_value > constant)
+  | _, Some max_value, Ge -> Some (max_value >= constant)
+  | Some min_value, _, Eq when min_value > constant -> Some false
+  | _, Some max_value, Eq when max_value < constant -> Some false
+  | Some min_value, _, Ne when min_value > constant -> Some true
+  | _, Some max_value, Ne when max_value < constant -> Some true
+  | _ -> None
 
 let rewrite_term_labels rename = function
   | Cfg.Jump label -> Cfg.Jump (rename label)
@@ -8434,6 +8531,114 @@ let eliminate_dead_code_func summaries globals (f : Cfg.func) =
   in
   Cfg.rebuild_edges { f with blocks }
 
+let simplify_counted_loop_guards_func _summaries _globals (f : Cfg.func) =
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
+  let get_block label =
+    match Hashtbl.find_opt block_map label with
+    | Some block -> block
+    | None -> failwith ("internal missing block: " ^ label)
+  in
+  let doms = compute_dominators f in
+  let backedges =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        List.fold_left
+          (fun acc succ ->
+            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
+              (block.label, succ) :: acc
+            else acc)
+          acc block.succs)
+      [] f.blocks
+  in
+  if backedges = [] then f
+  else
+    let loops = Hashtbl.create 8 in
+    List.iter
+      (fun (pred, header) ->
+        let loop = natural_loop block_map header pred in
+        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
+        Hashtbl.replace loops header merged)
+      backedges;
+    let current_blocks = Hashtbl.create (List.length f.blocks) in
+    List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
+    let get_current label =
+      match Hashtbl.find_opt current_blocks label with
+      | Some block -> block
+      | None -> failwith ("internal missing block: " ^ label)
+    in
+    let changed = ref false in
+    Hashtbl.iter
+      (fun header loop ->
+        let loop_blocks = List.filter (fun (block : Cfg.block) -> LabelSet.mem block.label loop) f.blocks in
+        let loop_defs = loop_defined_temps loop f.blocks in
+        let multi_defs = multi_def_temps_of_blocks f.temp_count loop_blocks in
+        let def_instrs = temp_def_instrs_map f in
+        let loop_stable_phis = collect_header_phi_temps header get_block in
+        let ivs = collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs in
+        match
+          find_counted_loop_control loop loop_defs loop_stable_phis multi_defs def_instrs ivs
+            get_block
+        with
+        | None -> ()
+        | Some info ->
+            LabelSet.iter
+              (fun label ->
+                if label <> info.control_label then
+                  let block : Cfg.block = get_current label in
+                let fold_branch op lhs rhs if_true if_false =
+                  let try_fold op lhs rhs =
+                    match
+                      ( iv_bias_of_operand_in_block block multi_defs def_instrs info.control_iv.phi_temp lhs,
+                        operand_static_int64 loop_defs multi_defs def_instrs rhs )
+                      with
+                      | Some bias, Some constant -> (
+                          match
+                            compare_truth_from_range op (range_of_counted_iv_expr info.kind bias) constant
+                          with
+                          | Some true -> Some (Cfg.Jump if_true)
+                          | Some false -> Some (Cfg.Jump if_false)
+                          | None -> None)
+                      | _ -> None
+                  in
+                  match try_fold op lhs rhs with
+                  | Some term -> Some term
+                  | None -> try_fold (swap_compare op) rhs lhs
+                in
+                match block.term with
+                | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) -> (
+                    match fold_branch op lhs rhs if_true if_false with
+                    | Some term ->
+                        changed := true;
+                        Hashtbl.replace current_blocks label { block with term; succs = Cfg.successors term }
+                    | None -> ())
+                | Cfg.BranchZero (cond, if_zero, if_nonzero) -> (
+                    match resolve_compare_operand_in_block block multi_defs def_instrs cond with
+                    | Some (op, lhs, rhs) -> (
+                        match fold_branch op lhs rhs if_nonzero if_zero with
+                        | Some term ->
+                            changed := true;
+                            Hashtbl.replace current_blocks label { block with term; succs = Cfg.successors term }
+                        | None -> ())
+                    | None -> ())
+                | Cfg.BranchNonZero (cond, if_nonzero, if_zero) -> (
+                    match resolve_compare_operand_in_block block multi_defs def_instrs cond with
+                    | Some (op, lhs, rhs) -> (
+                        match fold_branch op lhs rhs if_nonzero if_zero with
+                        | Some term ->
+                            changed := true;
+                            Hashtbl.replace current_blocks label { block with term; succs = Cfg.successors term }
+                        | None -> ())
+                    | None -> ())
+                | Cfg.Jump _ | Cfg.Return _ -> ())
+              loop)
+      loops;
+    if not !changed then f
+    else
+      let ordered_labels = List.map (fun (block : Cfg.block) -> block.label) f.blocks in
+      let blocks = List.map get_current ordered_labels in
+      Cfg.rebuild_edges { f with blocks }
+
 type func_metrics = {
   block_count : int;
   instr_count : int;
@@ -8651,14 +8856,19 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
           (loop_canonicalize_func summaries globals)
           after_thread1
       in
+      let after_loop_guards =
+        run_stage round "loop_guards"
+          (simplify_counted_loop_guards_func summaries globals)
+          after_canon2
+      in
       let after_split =
         run_stage round
           ~enabled:
             (profile.enable_split_reductions
-             && stage_round_enabled profile round "split_reductions")
+            && stage_round_enabled profile round "split_reductions")
           "split_reductions"
           (extract_counted_reductions_func summaries globals)
-          after_canon2
+          after_loop_guards
       in
       let after_counted =
         run_stage round "counted_loops"
