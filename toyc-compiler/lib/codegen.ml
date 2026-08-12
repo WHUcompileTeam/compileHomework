@@ -1028,10 +1028,22 @@ let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.fun
     | "a7" -> Some 7
     | _ -> None
   in
+  let leaf_no_calls =
+    not
+      (List.exists
+         (fun (block : Cfg.block) ->
+           List.exists
+             (function
+               | Tcg.Call _ -> true
+               | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> false)
+             block.body)
+         f.blocks)
+  in
   let prefer_saved_regs (interval : interval) =
-    interval.loop_carried_score >= 1
-    || interval.loop_use_score + interval.loop_def_score >= 8
-    || interval.spill_weight >= 4096
+    (not leaf_no_calls)
+    && (interval.loop_carried_score >= 1
+       || interval.loop_use_score + interval.loop_def_score >= 8
+       || interval.spill_weight >= 4096)
   in
   let allowed_arg_regs (interval : interval) =
     if interval.call_crossings <> 0 then []
