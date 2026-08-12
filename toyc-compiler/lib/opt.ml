@@ -4040,6 +4040,29 @@ let find_counted_loop_control
                 block
           | Some _ | None -> None)
 
+let analyze_counted_loop header loop get_block temp_count blocks =
+  let loop_defs = loop_defined_temps loop blocks in
+  let def_blocks = temp_def_blocks_of_blocks temp_count blocks in
+  let def_instrs = temp_def_instrs_of_blocks temp_count blocks in
+  let multi_defs = multi_def_temps_of_blocks temp_count blocks in
+  let loop_stable_phis =
+    collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
+  in
+  let ivs =
+    collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs
+  in
+  let control =
+    find_counted_loop_control
+      loop
+      loop_defs
+      loop_stable_phis
+      multi_defs
+      def_instrs
+      ivs
+      get_block
+  in
+  (loop_defs, def_blocks, def_instrs, multi_defs, loop_stable_phis, ivs, control)
+
 let linear_loop_path header loop get_block entry_label =
   let rec collapse_transparent_branch seen visiting label =
     if label = header || LabelSet.mem label seen then Some header
@@ -6274,10 +6297,9 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
         let loop = table_find_or_empty loops header LabelSet.empty in
         let header_block : Cfg.block = get_block header in
         let blocks_snapshot = current_block_list () in
-        let loop_defs = loop_defined_temps loop blocks_snapshot in
-        let def_blocks = temp_def_blocks_of_blocks !next_temp blocks_snapshot in
-        let def_instrs = temp_def_instrs_of_blocks !next_temp blocks_snapshot in
-        let multi_defs = multi_def_temps_of_blocks !next_temp blocks_snapshot in
+        let (loop_defs, def_blocks, def_instrs, multi_defs, loop_stable_phis, ivs, control) =
+          analyze_counted_loop header loop get_block !next_temp blocks_snapshot
+        in
         let effects = collect_loop_effects summaries globals loop blocks_snapshot in
         let invariant_loaded_places =
           PlaceSet.diff
@@ -6286,22 +6308,7 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
         in
         let total_instrs = loop_instr_count loop blocks_snapshot in
         let memory_ops = loop_memory_ops_count loop blocks_snapshot in
-        let loop_stable_phis =
-          collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
-        in
-        let ivs =
-          collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs
-        in
-        match
-          find_counted_loop_control
-            loop
-            loop_defs
-            loop_stable_phis
-            multi_defs
-            def_instrs
-            ivs
-            get_block
-        with
+        match control with
         | None -> ()
         | Some info -> (
             match counted_loop_shape_supported info.control_label loop get_block info.inside_label with
@@ -6615,32 +6622,16 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
         let loop = table_find_or_empty loops header LabelSet.empty in
         let header_block : Cfg.block = get_block header in
         let blocks_snapshot = current_block_list () in
-        let loop_defs = loop_defined_temps loop blocks_snapshot in
-        let def_blocks = temp_def_blocks_of_blocks !next_temp blocks_snapshot in
-        let def_instrs = temp_def_instrs_of_blocks !next_temp blocks_snapshot in
-        let multi_defs = multi_def_temps_of_blocks !next_temp blocks_snapshot in
+        let (loop_defs, def_blocks, def_instrs, multi_defs, loop_stable_phis, ivs, control) =
+          analyze_counted_loop header loop get_block !next_temp blocks_snapshot
+        in
         let effects = collect_loop_effects summaries globals loop blocks_snapshot in
         let invariant_loaded_places =
           PlaceSet.diff
             (local_places (locals_in_func { f with blocks = blocks_snapshot }))
             (local_places effects.modified_places)
         in
-        let loop_stable_phis =
-          collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
-        in
-        let ivs =
-          collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs
-        in
-        match
-          find_counted_loop_control
-            loop
-            loop_defs
-            loop_stable_phis
-            multi_defs
-            def_instrs
-            ivs
-            get_block
-        with
+        match control with
         | None ->
             debugf "counted-skip func=%s header=%s reason=classify term=%s ivs=%d preds=%d"
               f.name header (term_kind header_block.term) (List.length ivs)
@@ -6926,27 +6917,11 @@ let full_unroll_counted_loops_func summaries globals (f : Cfg.func) =
       (fun header ->
         let loop = table_find_or_empty loops header LabelSet.empty in
         let blocks_snapshot = current_block_list () in
-        let loop_defs = loop_defined_temps loop blocks_snapshot in
-        let def_blocks = temp_def_blocks_of_blocks f.temp_count blocks_snapshot in
-        let def_instrs = temp_def_instrs_of_blocks f.temp_count blocks_snapshot in
-        let multi_defs = multi_def_temps_of_blocks f.temp_count blocks_snapshot in
+        let (loop_defs, _, def_instrs, multi_defs, _, _, control) =
+          analyze_counted_loop header loop get_block f.temp_count blocks_snapshot
+        in
         let effects = collect_loop_effects summaries globals loop blocks_snapshot in
-        let loop_stable_phis =
-          collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
-        in
-        let ivs =
-          collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs
-        in
-        match
-          find_counted_loop_control
-            loop
-            loop_defs
-            loop_stable_phis
-            multi_defs
-            def_instrs
-            ivs
-            get_block
-        with
+        match control with
         | None -> ()
         | Some info -> (
             let control_block : Cfg.block = get_block info.control_label in
@@ -7113,27 +7088,11 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
         if is_unroll2_label header || LabelSet.exists is_unroll2_label loop then ()
         else
           let blocks_snapshot = current_block_list () in
-          let loop_defs = loop_defined_temps loop blocks_snapshot in
-          let def_blocks = temp_def_blocks_of_blocks f.temp_count blocks_snapshot in
-          let def_instrs = temp_def_instrs_of_blocks f.temp_count blocks_snapshot in
-          let multi_defs = multi_def_temps_of_blocks f.temp_count blocks_snapshot in
+          let (_, _, _, _, _, _, control) =
+            analyze_counted_loop header loop get_block f.temp_count blocks_snapshot
+          in
           let effects = collect_loop_effects summaries globals loop blocks_snapshot in
-          let loop_stable_phis =
-            collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
-          in
-          let ivs =
-            collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs
-          in
-          match
-            find_counted_loop_control
-              loop
-              loop_defs
-              loop_stable_phis
-              multi_defs
-              def_instrs
-              ivs
-              get_block
-          with
+          match control with
           | None -> ()
           | Some info -> (
               let control_block : Cfg.block = get_block info.control_label in
