@@ -1694,6 +1694,217 @@ let defs_temp = function
   | Tcg.Store _ | Tcg.Call (None, _, _) -> None
   | Tcg.Call (Some dst, _, _) -> Some dst
 
+let add_instr_use_temps live = function
+  | Tcg.Move (_, src)
+  | Tcg.Un (_, _, src) ->
+      add_operand_temps live src
+  | Tcg.Bin (_, _, lhs, rhs) ->
+      add_operand_temps (add_operand_temps live lhs) rhs
+  | Tcg.Load _ -> live
+  | Tcg.Store (_, value) -> add_operand_temps live value
+  | Tcg.Call (_, _, args) -> List.fold_left add_operand_temps live args
+
+let add_term_use_temps live = function
+  | Cfg.Jump _ | Cfg.Return None -> live
+  | Cfg.BranchZero (cond, _, _)
+  | Cfg.BranchNonZero (cond, _, _)
+  | Cfg.Return (Some cond) ->
+      add_operand_temps live cond
+  | Cfg.BranchCompare (_, lhs, rhs, _, _) ->
+      add_operand_temps (add_operand_temps live lhs) rhs
+
+let rewrite_operand_temp rename = function
+  | Tcg.Imm _ as operand -> operand
+  | Tcg.Temp temp -> Tcg.Temp (rename temp)
+
+let rewrite_instr_temps rename = function
+  | Tcg.Move (dst, src) ->
+      Tcg.Move (rename dst, rewrite_operand_temp rename src)
+  | Tcg.Un (dst, op, src) ->
+      Tcg.Un (rename dst, op, rewrite_operand_temp rename src)
+  | Tcg.Bin (dst, op, lhs, rhs) ->
+      Tcg.Bin
+        ( rename dst,
+          op,
+          rewrite_operand_temp rename lhs,
+          rewrite_operand_temp rename rhs )
+  | Tcg.Load (dst, place) -> Tcg.Load (rename dst, place)
+  | Tcg.Store (place, value) -> Tcg.Store (place, rewrite_operand_temp rename value)
+  | Tcg.Call (dst, callee, args) ->
+      Tcg.Call
+        ( Option.map rename dst,
+          callee,
+          List.map (rewrite_operand_temp rename) args )
+
+let rewrite_term_temps rename = function
+  | Cfg.Jump _ as term -> term
+  | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
+      Cfg.BranchZero (rewrite_operand_temp rename cond, if_zero, if_nonzero)
+  | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
+      Cfg.BranchNonZero (rewrite_operand_temp rename cond, if_nonzero, if_zero)
+  | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
+      Cfg.BranchCompare
+        ( op,
+          rewrite_operand_temp rename lhs,
+          rewrite_operand_temp rename rhs,
+          if_true,
+          if_false )
+  | Cfg.Return None -> Cfg.Return None
+  | Cfg.Return (Some value) -> Cfg.Return (Some (rewrite_operand_temp rename value))
+
+let copy_coalesce_func summaries globals (f : Cfg.func) =
+  if f.temp_count <= 1 then f
+  else
+    let live_in_t, _ = compute_liveness summaries globals f in
+    let interference = Array.make f.temp_count IntSet.empty in
+    let add_edge a b =
+      if a <> b && a >= 0 && b >= 0 && a < f.temp_count && b < f.temp_count then begin
+        interference.(a) <- IntSet.add b interference.(a);
+        interference.(b) <- IntSet.add a interference.(b)
+      end
+    in
+    let candidates_rev = ref [] in
+    List.iter
+      (fun (block : Cfg.block) ->
+        let live = ref (add_term_use_temps (live_out_t live_in_t block) block.term) in
+        List.iter
+          (fun instr ->
+            begin
+              match instr with
+              | Tcg.Move (dst, Tcg.Temp src) when dst <> src ->
+                  candidates_rev := (dst, src) :: !candidates_rev;
+                  IntSet.iter
+                    (fun temp -> if temp <> src then add_edge dst temp)
+                    !live
+              | _ -> (
+                  match defs_temp instr with
+                  | Some dst -> IntSet.iter (add_edge dst) !live
+                  | None -> ())
+            end;
+            begin
+              match defs_temp instr with
+              | Some dst -> live := IntSet.remove dst !live
+              | None -> ()
+            end;
+            live := add_instr_use_temps !live instr)
+          (List.rev block.body))
+      f.blocks;
+    let parent = Array.init f.temp_count (fun temp -> temp) in
+    let members = Array.init f.temp_count (fun temp -> IntSet.singleton temp) in
+    let rec find temp =
+      let p = parent.(temp) in
+      if p = temp then temp
+      else begin
+        let root = find p in
+        parent.(temp) <- root;
+        root
+      end
+    in
+    let components_interfere a b =
+      let ra = find a in
+      let rb = find b in
+      if ra = rb then false
+      else
+        IntSet.fold
+          (fun member found ->
+            found
+            || IntSet.fold
+                 (fun neighbor found -> found || find neighbor = rb)
+                 interference.(member) false)
+          members.(ra) false
+    in
+    let merge a b =
+      let ra = find a in
+      let rb = find b in
+      if ra = rb || components_interfere ra rb then false
+      else begin
+        let keep, drop = if ra <= rb then (ra, rb) else (rb, ra) in
+        parent.(drop) <- keep;
+        members.(keep) <- IntSet.union members.(keep) members.(drop);
+        members.(drop) <- IntSet.empty;
+        true
+      end
+    in
+    let merged = ref 0 in
+    List.iter
+      (fun (dst, src) ->
+        if dst >= 0 && src >= 0 && dst < f.temp_count && src < f.temp_count && merge dst src then
+          incr merged)
+      (List.rev !candidates_rev);
+    if !merged = 0 then f
+    else
+      let rename temp =
+        if temp >= 0 && temp < f.temp_count then find temp else temp
+      in
+      let removed_moves = ref 0 in
+      let rewrite_block (block : Cfg.block) =
+        let body =
+          List.filter_map
+            (fun instr ->
+              let instr = simplify_simple_instr (rewrite_instr_temps rename instr) in
+              match instr with
+              | Tcg.Move (dst, Tcg.Temp src) when dst = src ->
+                  incr removed_moves;
+                  None
+              | _ -> Some instr)
+            block.body
+        in
+        let term = rewrite_term_temps rename block.term in
+        { block with body; term; succs = Cfg.successors term }
+      in
+      let blocks = List.map rewrite_block f.blocks in
+      let rewritten = Cfg.rebuild_edges { f with blocks } in
+      let used = ref IntSet.empty in
+      let note_operand = function
+        | Tcg.Temp temp -> used := IntSet.add temp !used
+        | Tcg.Imm _ -> ()
+      in
+      let note_instr instr =
+        begin
+          match defs_temp instr with
+          | Some temp -> used := IntSet.add temp !used
+          | None -> ()
+        end;
+        match instr with
+        | Tcg.Move (_, src)
+        | Tcg.Un (_, _, src) -> note_operand src
+        | Tcg.Bin (_, _, lhs, rhs) -> note_operand lhs; note_operand rhs
+        | Tcg.Load _ -> ()
+        | Tcg.Store (_, value) -> note_operand value
+        | Tcg.Call (_, _, args) -> List.iter note_operand args
+      in
+      let note_term = function
+        | Cfg.Jump _ | Cfg.Return None -> ()
+        | Cfg.BranchZero (cond, _, _)
+        | Cfg.BranchNonZero (cond, _, _)
+        | Cfg.Return (Some cond) -> note_operand cond
+        | Cfg.BranchCompare (_, lhs, rhs, _, _) -> note_operand lhs; note_operand rhs
+      in
+      List.iter
+        (fun (block : Cfg.block) ->
+          List.iter note_instr block.body;
+          note_term block.term)
+        rewritten.blocks;
+      let dense = Hashtbl.create (IntSet.cardinal !used) in
+      IntSet.elements !used
+      |> List.iteri (fun next old -> Hashtbl.add dense old next);
+      let dense_rename temp = Option.value ~default:temp (Hashtbl.find_opt dense temp) in
+      let blocks =
+        List.map
+          (fun (block : Cfg.block) ->
+            let body = List.map (rewrite_instr_temps dense_rename) block.body in
+            let term = rewrite_term_temps dense_rename block.term in
+            { block with body; term; succs = Cfg.successors term })
+          rewritten.blocks
+      in
+      if Sys.getenv_opt "TOYC_DEBUG_COALESCE" <> None then
+        Printf.eprintf
+          "coalesce func=%s candidates=%d merged=%d removed_moves=%d temps=%d->%d\n%!"
+          f.name (List.length !candidates_rev) !merged !removed_moves f.temp_count
+          (IntSet.cardinal !used);
+      Cfg.rebuild_edges
+        { rewritten with temp_count = IntSet.cardinal !used; blocks }
+
 let rewrite_term_target pred target redirects =
   match Hashtbl.find_opt redirects (pred, target) with
   | Some redirected -> redirected
@@ -8795,7 +9006,10 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
   in
   match debug_stop_after with
   | Some "mem2reg" -> promoted
-  | Some _ | None -> loop 1 profile.max_rounds canonical
+  | Some _ -> loop 1 profile.max_rounds canonical
+  | None ->
+      let optimized = loop 1 profile.max_rounds canonical in
+      copy_coalesce_func summaries globals optimized
 
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
