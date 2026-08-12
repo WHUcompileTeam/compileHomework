@@ -2350,6 +2350,36 @@ let natural_loop block_map header pred =
           | None -> visit rest seen
   in
   visit [ pred ] (LabelSet.singleton header)
+let discover_natural_loops (f : Cfg.func) =
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter
+    (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block)
+    f.blocks;
+  let doms = compute_dominators f in
+  let backedges =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        List.fold_left
+          (fun acc succ ->
+            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
+              (block.label, succ) :: acc
+            else acc)
+          acc block.succs)
+      [] f.blocks
+  in
+  let loops = Hashtbl.create 8 in
+  List.iter
+    (fun (pred, header) ->
+      let loop = natural_loop block_map header pred in
+      let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
+      Hashtbl.replace loops header merged)
+    backedges;
+  let headers =
+    Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
+    |> List.sort (fun (_, a) (_, b) -> compare a b)
+    |> List.map fst
+  in
+  (block_map, loops, headers)
 
 let tailrec_elim_func (f : Cfg.func) =
   let tail_loop_label = f.entry in
@@ -2461,35 +2491,10 @@ let loop_canonicalize_func summaries globals (f : Cfg.func) =
     Printf.sprintf ".L%s_canon_cmp_%d" f.label id
   in
   let rec apply (current : Cfg.func) =
-    let block_map = Hashtbl.create (List.length current.blocks) in
-    List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) current.blocks;
     let live_in_t, live_in_p = compute_liveness summaries globals current in
-    let doms = compute_dominators current in
-    let backedges =
-      List.fold_left
-        (fun acc (block : Cfg.block) ->
-          List.fold_left
-            (fun acc succ ->
-              if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-                (block.label, succ) :: acc
-              else acc)
-            acc block.succs)
-        [] current.blocks
-    in
-    if backedges = [] then current
+    let _, loops, headers = discover_natural_loops current in
+    if headers = [] then current
     else
-      let loops = Hashtbl.create 8 in
-      List.iter
-        (fun (pred, header) ->
-          let loop = natural_loop block_map header pred in
-          let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
-          Hashtbl.replace loops header merged)
-        backedges;
-      let headers =
-        Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
-        |> List.sort (fun (_, a) (_, b) -> compare a b)
-        |> List.map fst
-      in
       let current_blocks = Hashtbl.create (List.length current.blocks + (3 * List.length headers)) in
       List.iter
         (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block)
@@ -2722,34 +2727,9 @@ let loop_canonicalize_func summaries globals (f : Cfg.func) =
 let eliminate_dead_loops_func summaries globals (f : Cfg.func) =
   let debug_dead_loops = Sys.getenv_opt "TOYC_DEBUG_DEAD_LOOPS" <> None in
   let debugf fmt = Printf.ksprintf (fun s -> if debug_dead_loops then prerr_endline s) fmt in
-  let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
-  let doms = compute_dominators f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
-        List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
-  if backedges = [] then f
+  let _, loops, headers = discover_natural_loops f in
+  if headers = [] then f
   else
-    let loops = Hashtbl.create 8 in
-    List.iter
-      (fun (pred, header) ->
-        let loop = natural_loop block_map header pred in
-        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
-        Hashtbl.replace loops header merged)
-      backedges;
-    let headers =
-      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
-      |> List.sort (fun (_, a) (_, b) -> compare a b)
-      |> List.map fst
-    in
     let live_in_t, live_in_p = compute_liveness summaries globals f in
     let current_blocks = Hashtbl.create (List.length f.blocks) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
@@ -6254,34 +6234,9 @@ let split_reductions_min_instrs = 12
 let split_reductions_min_pressure = 2
 
 let extract_counted_reductions_func summaries globals (f : Cfg.func) =
-  let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
-  let doms = compute_dominators f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
-        List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
-  if backedges = [] then f
+  let _, loops, headers = discover_natural_loops f in
+  if headers = [] then f
   else
-    let loops = Hashtbl.create 8 in
-    List.iter
-      (fun (pred, header) ->
-        let loop = natural_loop block_map header pred in
-        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
-        Hashtbl.replace loops header merged)
-      backedges;
-    let headers =
-      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
-      |> List.sort (fun (_, a) (_, b) -> compare a b)
-      |> List.map fst
-    in
     let current_blocks = Hashtbl.create (List.length f.blocks + (2 * List.length headers)) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
     let get_block label =
@@ -6627,34 +6582,9 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
     | Tcg.Imm value -> Int64.to_string value
     | Tcg.Temp temp -> Printf.sprintf "t%d" temp
   in
-  let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
-  let doms = compute_dominators f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
-        List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
-  if backedges = [] then f
+  let _, loops, headers = discover_natural_loops f in
+  if headers = [] then f
   else
-    let loops = Hashtbl.create 8 in
-    List.iter
-      (fun (pred, header) ->
-        let loop = natural_loop block_map header pred in
-        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
-        Hashtbl.replace loops header merged)
-      backedges;
-    let headers =
-      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
-      |> List.sort (fun (_, a) (_, b) -> compare a b)
-      |> List.map fst
-    in
     let current_blocks = Hashtbl.create (List.length f.blocks + List.length headers) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
     let get_block label =
@@ -6967,34 +6897,9 @@ let full_unroll_counted_loops_func summaries globals (f : Cfg.func) =
     List.length body <= full_unroll_max_control_body_instrs
     && List.for_all pure_cfg_prep_instr body
   in
-  let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
-  let doms = compute_dominators f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
-        List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
-  if backedges = [] then f
+  let _, loops, headers = discover_natural_loops f in
+  if headers = [] then f
   else
-    let loops = Hashtbl.create 8 in
-    List.iter
-      (fun (pred, header) ->
-        let loop = natural_loop block_map header pred in
-        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
-        Hashtbl.replace loops header merged)
-      backedges;
-    let headers =
-      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
-      |> List.sort (fun (_, a) (_, b) -> compare a b)
-      |> List.map fst
-    in
     let current_blocks = Hashtbl.create (List.length f.blocks + (8 * List.length headers)) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
     let block_order = ref (List.map (fun (block : Cfg.block) -> block.label) f.blocks) in
@@ -7175,34 +7080,9 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
     List.length body <= unroll_max_control_body_instrs
     && List.for_all pure_cfg_prep_instr body
   in
-  let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
-  let doms = compute_dominators f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
-        List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
-  if backedges = [] then f
+  let _, loops, headers = discover_natural_loops f in
+  if headers = [] then f
   else
-    let loops = Hashtbl.create 8 in
-    List.iter
-      (fun (pred, header) ->
-        let loop = natural_loop block_map header pred in
-        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
-        Hashtbl.replace loops header merged)
-      backedges;
-    let headers =
-      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
-      |> List.sort (fun (_, a) (_, b) -> compare a b)
-      |> List.map fst
-    in
     let current_blocks = Hashtbl.create (List.length f.blocks + (2 * List.length headers)) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
     let block_order = ref (List.map (fun (block : Cfg.block) -> block.label) f.blocks) in
@@ -7403,36 +7283,9 @@ let loop_rotate_func (f : Cfg.func) =
     Printf.sprintf ".L%s_rotate_guard_%d" f.label id
   in
   let rec apply (current : Cfg.func) =
-    let block_map = Hashtbl.create (List.length current.blocks) in
-    List.iter
-      (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block)
-      current.blocks;
-    let doms = compute_dominators current in
-    let backedges =
-      List.fold_left
-        (fun acc (block : Cfg.block) ->
-          List.fold_left
-            (fun acc succ ->
-              if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-                (block.label, succ) :: acc
-              else acc)
-            acc block.succs)
-        [] current.blocks
-    in
-    if backedges = [] then current
+    let block_map, loops, headers = discover_natural_loops current in
+    if headers = [] then current
     else
-      let loops = Hashtbl.create 8 in
-      List.iter
-        (fun (pred, header) ->
-          let loop = natural_loop block_map header pred in
-          let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
-          Hashtbl.replace loops header merged)
-        backedges;
-      let headers =
-        Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
-        |> List.sort (fun (_, a) (_, b) -> compare a b)
-        |> List.map fst
-      in
       match
         List.find_map
           (fun header ->
@@ -7491,34 +7344,9 @@ let loop_rotate_func (f : Cfg.func) =
   apply f
 
 let strength_reduce_func (f : Cfg.func) =
-  let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
-  let doms = compute_dominators f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
-        List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
-  if backedges = [] then f
+  let _, loops, headers = discover_natural_loops f in
+  if headers = [] then f
   else
-    let loops = Hashtbl.create 8 in
-    List.iter
-      (fun (pred, header) ->
-        let loop = natural_loop block_map header pred in
-        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
-        Hashtbl.replace loops header merged)
-      backedges;
-    let headers =
-      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
-      |> List.sort (fun (_, a) (_, b) -> compare a b)
-      |> List.map fst
-    in
     let def_blocks = temp_def_blocks f in
     let def_instrs = temp_def_instrs_map f in
     let multi_defs = multi_def_temps f in
@@ -7717,34 +7545,9 @@ let build_reassoc_instrs mid first_shape second_shape =
       Some (inv_bin mid Sub inv2 inv1, add_mid dst variant)
 
 let reassociate_loop_adds_func (f : Cfg.func) =
-  let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
-  let doms = compute_dominators f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
-        List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
-  if backedges = [] then f
+  let _, loops, headers = discover_natural_loops f in
+  if headers = [] then f
   else
-    let loops = Hashtbl.create 8 in
-    List.iter
-      (fun (pred, header) ->
-        let loop = natural_loop block_map header pred in
-        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
-        Hashtbl.replace loops header merged)
-      backedges;
-    let headers =
-      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
-      |> List.sort (fun (_, a) (_, b) -> compare a b)
-      |> List.map fst
-    in
     let def_blocks = temp_def_blocks f in
     let def_instrs = temp_def_instrs_map f in
     let multi_defs = multi_def_temps f in
@@ -7807,34 +7610,9 @@ let unswitch_min_memory_ops = 2
 let unswitch_max_instrs = 96
 
 let unswitch_loops_func _summaries _globals (f : Cfg.func) =
-  let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
-  let doms = compute_dominators f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
-        List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
-  if backedges = [] then f
+  let block_map, loops, headers = discover_natural_loops f in
+  if headers = [] then f
   else
-    let loops = Hashtbl.create 8 in
-    List.iter
-      (fun (pred, header) ->
-        let loop = natural_loop block_map header pred in
-        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
-        Hashtbl.replace loops header merged)
-      backedges;
-    let headers =
-      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
-      |> List.sort (fun (_, a) (_, b) -> compare a b)
-      |> List.map fst
-    in
     let exception Applied of Cfg.func in
     try
       List.iter
@@ -7972,34 +7750,9 @@ let unswitch_loops_func _summaries _globals (f : Cfg.func) =
     | Applied next -> next
 
 let licm_func summaries globals (f : Cfg.func) =
-  let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
-  let doms = compute_dominators f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
-        List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
-  if backedges = [] then f
+  let _, loops, headers = discover_natural_loops f in
+  if headers = [] then f
   else
-    let loops = Hashtbl.create 8 in
-    List.iter
-      (fun (pred, header) ->
-        let loop = natural_loop block_map header pred in
-        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
-        Hashtbl.replace loops header merged)
-      backedges;
-    let headers =
-      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
-      |> List.sort (fun (_, a) (_, b) -> compare a b)
-      |> List.map fst
-    in
     let current_blocks = Hashtbl.create (List.length f.blocks + List.length headers) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
     let get_block label =
@@ -8260,34 +8013,14 @@ let eliminate_dead_code_func summaries globals (f : Cfg.func) =
   Cfg.rebuild_edges { f with blocks }
 
 let simplify_counted_loop_guards_func _summaries _globals (f : Cfg.func) =
-  let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
+  let block_map, loops, headers = discover_natural_loops f in
   let get_block label =
     match Hashtbl.find_opt block_map label with
     | Some block -> block
     | None -> failwith ("internal missing block: " ^ label)
   in
-  let doms = compute_dominators f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
-        List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
-  if backedges = [] then f
+  if headers = [] then f
   else
-    let loops = Hashtbl.create 8 in
-    List.iter
-      (fun (pred, header) ->
-        let loop = natural_loop block_map header pred in
-        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
-        Hashtbl.replace loops header merged)
-      backedges;
     let current_blocks = Hashtbl.create (List.length f.blocks) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
     let get_current label =
@@ -8368,40 +8101,15 @@ let simplify_counted_loop_guards_func _summaries _globals (f : Cfg.func) =
        Cfg.rebuild_edges { f with blocks }
 
 let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
-  let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
+  let block_map, loops, headers = discover_natural_loops f in
   let next_temp = ref f.temp_count in
   let fresh_temp () =
     let temp = !next_temp in
     incr next_temp;
     temp
   in
-  let doms = compute_dominators f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
-        List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
-  if backedges = [] then f
+  if headers = [] then f
   else
-    let loops = Hashtbl.create 8 in
-    List.iter
-      (fun (pred, header) ->
-        let loop = natural_loop block_map header pred in
-        let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
-        Hashtbl.replace loops header merged)
-      backedges;
-    let headers =
-      Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
-      |> List.sort (fun (_, a) (_, b) -> compare a b)
-      |> List.map fst
-    in
     let exception Applied of Cfg.func in
     let pure_scalar_block (block : Cfg.block) =
       List.for_all
