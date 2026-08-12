@@ -1166,12 +1166,45 @@ let run_transfer summaries globals state (block : Cfg.block) =
   let term, state = transfer_terminator state block.term in
   ({ block with body = List.rev body_rev; term; succs = Cfg.successors term }, state)
 
+let executable_successors state (term : Cfg.terminator) =
+  match term with
+  | Cfg.Jump label -> [ label ]
+  | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
+      if if_zero = if_nonzero then [ if_zero ]
+      else
+        begin
+          match eval_operand_fact state cond with
+          | CpConst value -> [ if value = 0L then if_zero else if_nonzero ]
+          | CpNac -> [ if_zero; if_nonzero ]
+          | CpUndef -> []
+        end
+  | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
+      if if_zero = if_nonzero then [ if_zero ]
+      else
+        begin
+          match eval_operand_fact state cond with
+          | CpConst value -> [ if value <> 0L then if_nonzero else if_zero ]
+          | CpNac -> [ if_nonzero; if_zero ]
+          | CpUndef -> []
+        end
+  | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
+      if if_true = if_false then [ if_true ]
+      else
+        begin
+          match fold_fact_bin op (eval_operand_fact state lhs) (eval_operand_fact state rhs) with
+          | CpConst value -> [ if truth value then if_true else if_false ]
+          | CpNac -> [ if_true; if_false ]
+          | CpUndef -> []
+        end
+  | Cfg.Return _ -> []
+
 let compute_const_states global_init summaries globals (f : Cfg.func) =
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block) f.blocks;
   let in_states = Hashtbl.create (List.length f.blocks) in
   let out_states = Hashtbl.create (List.length f.blocks) in
   let executable = ref (LabelSet.singleton f.entry) in
+  let executable_edges = Hashtbl.create (max 8 (2 * List.length f.blocks)) in
   let entry_state = initial_cp_state global_init f in
   let meet_states = function
     | [] -> empty_cp_state
@@ -1186,14 +1219,16 @@ let compute_const_states global_init summaries globals (f : Cfg.func) =
           let pred_states =
             List.filter_map
               (fun pred ->
-                if LabelSet.mem pred !executable then Hashtbl.find_opt out_states pred else None)
+                if Hashtbl.mem executable_edges (pred, block.label) then
+                  Hashtbl.find_opt out_states pred
+                else None)
               block.preds
           in
           let in_state =
             if block.label = f.entry then meet_states (entry_state :: pred_states)
             else meet_states pred_states
           in
-          let rewritten_block, out_state = run_transfer summaries globals in_state block in
+          let _, out_state = run_transfer summaries globals in_state block in
           let prev_in =
             match Hashtbl.find_opt in_states block.label with
             | Some state -> state
@@ -1212,10 +1247,14 @@ let compute_const_states global_init summaries globals (f : Cfg.func) =
             changed := true);
           List.iter
             (fun succ ->
-              if Hashtbl.mem block_map succ && not (LabelSet.mem succ !executable) then (
-                executable := LabelSet.add succ !executable;
+              if Hashtbl.mem block_map succ
+                 && not (Hashtbl.mem executable_edges (block.label, succ))
+              then (
+                Hashtbl.add executable_edges (block.label, succ) ();
+                if not (LabelSet.mem succ !executable) then
+                  executable := LabelSet.add succ !executable;
                 changed := true))
-            rewritten_block.succs))
+            (executable_successors out_state block.term)))
       f.blocks
   done;
   (!executable, in_states)
