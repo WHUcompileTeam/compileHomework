@@ -43,15 +43,40 @@ let is_jump_to line label =
 let move_line dst src =
   if dst = src then None else Some (Printf.sprintf "    addi %s, %s, 0" dst src)
 
-let rec emit_opt_lines acc = function
-  | [] -> acc
-  | None :: rest -> emit_opt_lines acc rest
-  | Some line :: rest -> emit_opt_lines (line :: acc) rest
-
 let split_lines asm =
   match List.rev (String.split_on_char '\n' asm) with
   | "" :: rest -> List.rev rest
   | rev_lines -> List.rev rev_lines
+
+let parse_la line =
+  match split_ws line with
+  | [ "la"; reg_comma; label ] -> Some (strip_trailing_comma reg_comma, label)
+  | _ -> None
+
+let clears_address line =
+  let line = trim line in
+  is_label line
+  || starts_with line "call "
+  || starts_with line "j "
+  || starts_with line "b"
+
+let reuse_global_addresses asm =
+  let rec loop known acc = function
+    | [] -> List.rev acc
+    | line :: rest -> (
+        match parse_la line with
+        | Some (reg, label) when known = Some (reg, label) -> loop known acc rest
+        | Some addr -> loop (Some addr) (line :: acc) rest
+        | None ->
+            let known = if clears_address line then None else known in
+            loop known (line :: acc) rest)
+  in
+  String.concat "\n" (loop None [] (split_lines asm)) ^ "\n"
+
+let rec emit_opt_lines acc = function
+  | [] -> acc
+  | None :: rest -> emit_opt_lines acc rest
+  | Some line :: rest -> emit_opt_lines (line :: acc) rest
 
 let peephole_pass asm =
   let lines = asm |> split_lines |> Array.of_list in
@@ -97,7 +122,7 @@ let peephole_pass asm =
 
 let peephole asm =
   let rec fix current =
-    let next = peephole_pass current in
+    let next = current |> peephole_pass |> reuse_global_addresses in
     if next = current then current else fix next
   in
   fix asm
