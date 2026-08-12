@@ -9154,12 +9154,12 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
           (const_propagate_func global_init summaries globals)
           after_simplify0
       in
-      let after_sr = run_stage round "sr" strength_reduce_func after_const1 in
       let after_algebra1 =
-        run_stage round "algebra1" algebra_canonicalize_func after_sr
+        run_stage round "algebra1" algebra_canonicalize_func after_const1
       in
+      let after_sr = run_stage round "sr" strength_reduce_func after_algebra1 in
       let after_gvn1 =
-        run_stage round "gvn1" (gvn_func summaries globals) after_algebra1
+        run_stage round "gvn1" (gvn_func summaries globals) after_sr
       in
       let after_dce1 =
         run_stage round "dce1" (eliminate_dead_code_func summaries globals) after_gvn1
