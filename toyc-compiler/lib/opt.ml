@@ -783,6 +783,31 @@ let normalize_bin_operands op lhs rhs =
   if is_commutative_binop op && Stdlib.compare lhs rhs > 0 then (rhs, lhs)
   else (lhs, rhs)
 
+let simplify_cfg_func (f : Cfg.func) =
+  let simplify_instr instr =
+    match simplify_simple_instr instr with
+    | Tcg.Move (dst, Tcg.Temp src) when dst = src -> None
+    | Tcg.Bin (dst, op, lhs, rhs) ->
+        let lhs, rhs = normalize_bin_operands op lhs rhs in
+        Some (Tcg.Bin (dst, op, lhs, rhs))
+    | instr -> Some instr
+  in
+  let simplify_term = function
+    | Cfg.BranchCompare (_, _, _, if_true, if_false) when if_true = if_false -> Cfg.Jump if_true
+    | Cfg.BranchZero (_, if_zero, if_nonzero) when if_zero = if_nonzero -> Cfg.Jump if_zero
+    | Cfg.BranchNonZero (_, if_nonzero, if_zero) when if_zero = if_nonzero -> Cfg.Jump if_zero
+    | term -> term
+  in
+  let blocks =
+    List.map
+      (fun (block : Cfg.block) ->
+        let body = List.filter_map simplify_instr block.body in
+        let term = simplify_term block.term in
+        { block with body; term; succs = Cfg.successors term })
+      f.blocks
+  in
+  Cfg.rebuild_edges { f with blocks }
+
 let meet_avail a b =
   ExprKeyMap.merge
     (fun _ va vb ->
@@ -8834,16 +8859,17 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
                else Some block.label
            | _ -> Some block.label
     in
-    let countup_outer_bound loop_defs multi_defs def_instrs = function
+    let outer_limit_of_kind loop_defs multi_defs def_instrs = function
       | CountUpLt (bound, bias) -> normalize_limit_operand loop_defs multi_defs def_instrs bound Int64.(neg bias)
       | CountUpLe (bound, bias) -> normalize_limit_operand loop_defs multi_defs def_instrs bound Int64.(sub 1L bias)
-      | CountDownGt _ | CountDownGe _ -> None
+      | CountDownGt (bound, bias) -> normalize_limit_operand loop_defs multi_defs def_instrs bound Int64.(neg bias)
+      | CountDownGe (bound, bias) -> normalize_limit_operand loop_defs multi_defs def_instrs bound Int64.(neg bias)
     in
     let split_upper_bound loop_defs multi_defs def_instrs (op, operand, bias) =
       match op with
       | Lt -> normalize_limit_operand loop_defs multi_defs def_instrs operand Int64.(neg bias)
       | Le -> normalize_limit_operand loop_defs multi_defs def_instrs operand Int64.(sub 1L bias)
-      | Gt -> normalize_limit_operand loop_defs multi_defs def_instrs operand Int64.(sub 1L bias |> add 1L)
+      | Gt -> normalize_limit_operand loop_defs multi_defs def_instrs operand Int64.(sub 1L bias)
       | Ge -> normalize_limit_operand loop_defs multi_defs def_instrs operand Int64.(neg bias)
       | Eq | Ne | Add | Sub | Mul | Div | Mod | LAnd | LOr -> None
     in
@@ -8885,12 +8911,22 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
           Some (Cfg.BranchCompare (Lt, Tcg.Temp iv_temp, Tcg.Imm bound, if_true, if_false))
       | Le, LimitConst bound ->
           Some (Cfg.BranchCompare (Le, Tcg.Temp iv_temp, Tcg.Imm bound, if_true, if_false))
+      | Gt, LimitConst bound ->
+          Some (Cfg.BranchCompare (Gt, Tcg.Temp iv_temp, Tcg.Imm bound, if_true, if_false))
+      | Ge, LimitConst bound ->
+          Some (Cfg.BranchCompare (Ge, Tcg.Temp iv_temp, Tcg.Imm bound, if_true, if_false))
       | Lt, LimitOperand (operand, 0L) ->
           Some (Cfg.BranchCompare (Lt, Tcg.Temp iv_temp, operand, if_true, if_false))
       | Le, LimitOperand (operand, 0L) ->
           Some (Cfg.BranchCompare (Le, Tcg.Temp iv_temp, operand, if_true, if_false))
+      | Gt, LimitOperand (operand, 0L) ->
+          Some (Cfg.BranchCompare (Gt, Tcg.Temp iv_temp, operand, if_true, if_false))
+      | Ge, LimitOperand (operand, 0L) ->
+          Some (Cfg.BranchCompare (Ge, Tcg.Temp iv_temp, operand, if_true, if_false))
       | Lt, LimitOperand (operand, 1L) ->
           Some (Cfg.BranchCompare (Le, Tcg.Temp iv_temp, operand, if_true, if_false))
+      | Gt, LimitOperand (operand, -1L) ->
+          Some (Cfg.BranchCompare (Ge, Tcg.Temp iv_temp, operand, if_true, if_false))
       | _ -> None
     in
     let branch_terminator_for_shifted_compare compare_op iv_temp operand bias if_true if_false =
@@ -8996,7 +9032,7 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
                          ( collapse_pure_scalar_connector loop LabelSet.empty branch_a,
                            collapse_pure_scalar_connector loop LabelSet.empty branch_b,
                            branch_compare_shape_in_block split_block multi_defs def_instrs split_block.term,
-                           countup_outer_bound loop_defs multi_defs def_instrs info.kind )
+                           outer_limit_of_kind loop_defs multi_defs def_instrs info.kind )
                        with
                        | Some join_a, Some join_b, Some (split_op0, lhs, rhs, if_true, if_false), Some outer_limit
                          when join_a = join_b -> (
@@ -9290,7 +9326,10 @@ let stage_round_enabled profile round stage =
       | "diamond_split" -> round <= 2
       | "full_unroll" | "unroll2" | "rotate" -> round <= 3
       | _ -> true)
-  | _ -> true
+  | _ -> (
+      match stage with
+      | "diamond_split" -> round <= 2
+      | _ -> true)
 
 let optimize_func global_init summaries globals (f : Cfg.func) =
   let promoted = f |> mem2reg_func |> promote_locals_func |> promote_globals_func summaries globals in
@@ -9353,10 +9392,11 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
           (loop_canonicalize_func summaries globals)
           func
       in
+      let after_simplify0 = run_stage round "simplify0" simplify_cfg_func after_canon in
       let after_const1 =
         run_stage round "const1"
           (const_propagate_func global_init summaries globals)
-          after_canon
+          after_simplify0
       in
       let after_copy1 = run_stage round "copy1" copy_propagate_func after_const1 in
       let after_sr = run_stage round "sr" strength_reduce_func after_copy1 in
@@ -9401,10 +9441,11 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
           (loop_canonicalize_func summaries globals)
           after_thread1
       in
+      let after_simplify2 = run_stage round "simplify2" simplify_cfg_func after_canon2 in
       let after_loop_guards =
         run_stage round "loop_guards"
           (simplify_counted_loop_guards_func summaries globals)
-          after_canon2
+          after_simplify2
       in
       let after_const3 =
         run_stage round "const3"
@@ -9424,10 +9465,13 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
           (loop_canonicalize_func summaries globals)
           after_thread4
       in
+      let after_simplify3 = run_stage round "simplify3" simplify_cfg_func after_canon3 in
       let after_diamond_split =
-        run_stage round "diamond_split"
+        run_stage round
+          ~enabled:(stage_round_enabled profile round "diamond_split")
+          "diamond_split"
           (split_counted_diamond_loops_func summaries globals)
-          after_canon3
+          after_simplify3
       in
       let after_split =
         run_stage round
