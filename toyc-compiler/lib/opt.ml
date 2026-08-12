@@ -1435,7 +1435,7 @@ let reachable_labels entry blocks =
   in
   visit LabelSet.empty entry
 
-let thread_and_prune_basic (f : Cfg.func) =
+let thread_and_prune_func (f : Cfg.func) =
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block) f.blocks;
   let threaded =
@@ -1453,9 +1453,11 @@ let thread_and_prune_basic (f : Cfg.func) =
   in
   Cfg.rebuild_edges { threaded_func with blocks }
 
-let find_linear_merge_candidate (f : Cfg.func) =
+let find_final_linear_merge_candidate (f : Cfg.func) =
   let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block) f.blocks;
+  List.iter
+    (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block)
+    f.blocks;
   let rec find = function
     | [] -> None
     | (block : Cfg.block) :: rest -> (
@@ -1475,9 +1477,11 @@ let find_linear_merge_candidate (f : Cfg.func) =
   in
   find f.blocks
 
-let merge_linear_pair (f : Cfg.func) pred_label succ_label =
+let merge_final_linear_pair (f : Cfg.func) pred_label succ_label =
   let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block) f.blocks;
+  List.iter
+    (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block)
+    f.blocks;
   match
     ( Hashtbl.find_opt block_map pred_label,
       Hashtbl.find_opt block_map succ_label )
@@ -1502,31 +1506,23 @@ let merge_linear_pair (f : Cfg.func) pred_label succ_label =
       Cfg.rebuild_edges { f with blocks }
   | _ -> f
 
-let merge_linear_blocks_func (f : Cfg.func) =
+let final_linear_merge_func (f : Cfg.func) =
   let before_blocks = List.length f.blocks in
   let rec loop merged current =
-    match find_linear_merge_candidate current with
+    match find_final_linear_merge_candidate current with
     | None -> (merged, current)
     | Some (pred, succ) ->
-        let next = merge_linear_pair current pred succ in
-        if List.length next.blocks >= List.length current.blocks then (merged, current)
+        let next = merge_final_linear_pair current pred succ in
+        if List.length next.blocks >= List.length current.blocks then
+          (merged, current)
         else loop (merged + 1) next
   in
   let merged, result = loop 0 f in
   if Sys.getenv_opt "TOYC_DEBUG_CFG_MERGE" <> None then
     Printf.eprintf
-      "cfg-merge func=%s blocks=%d->%d merged=%d\n%!"
+      "cfg-final-merge func=%s blocks=%d->%d merged=%d\n%!"
       f.name before_blocks (List.length result.blocks) merged;
   result
-
-let thread_and_prune_func (f : Cfg.func) =
-  let rec cleanup current =
-    let cleaned = thread_and_prune_basic current in
-    let merged = merge_linear_blocks_func cleaned in
-    if List.length merged.blocks < List.length cleaned.blocks then cleanup merged
-    else cleaned
-  in
-  cleanup f
 
 let live_out_t live_in_t (block : Cfg.block) =
   List.fold_left
@@ -9506,7 +9502,8 @@ let optimize_func global_init summaries globals return_globals (f : Cfg.func) =
   | Some _ -> loop 1 profile.max_rounds canonical
   | None ->
       let optimized = loop 1 profile.max_rounds canonical in
-      copy_coalesce_func summaries globals optimized
+      let coalesced = copy_coalesce_func summaries globals optimized in
+      final_linear_merge_func coalesced
 
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
