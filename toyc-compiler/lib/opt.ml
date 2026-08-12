@@ -4868,7 +4868,8 @@ let linear_expr_mul_invariant factor = function
   | LinearAffine { iv; coeff; bias } ->
       Some (linear_affine iv (summary_expr_mul factor coeff) (summary_expr_mul factor bias))
 
-let summary_expr_of_operand
+let summary_expr_of_operand_with_bases
+    base_temps
     invariant_loaded_places
     loop_defs
     def_blocks
@@ -4886,7 +4887,7 @@ let summary_expr_of_operand
   let rec of_operand block seen = function
     | Tcg.Imm _ as operand -> Some (SummaryOperand operand)
     | Tcg.Temp temp as operand ->
-        if invariant operand then Some (SummaryOperand operand)
+        if IntSet.mem temp base_temps || invariant operand then Some (SummaryOperand operand)
         else if IntSet.mem temp seen || IntSet.mem temp multi_defs then None
         else
           match last_def_of_temp block temp with
@@ -4923,6 +4924,29 @@ let summary_expr_of_operand
     | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> None
   in
   of_operand block IntSet.empty operand
+
+let summary_expr_of_operand
+    invariant_loaded_places
+    loop_defs
+    def_blocks
+    get_block
+    loop_stable_phis
+    multi_defs
+    def_instrs
+    (block : Cfg.block)
+    operand
+  =
+  summary_expr_of_operand_with_bases
+    IntSet.empty
+    invariant_loaded_places
+    loop_defs
+    def_blocks
+    get_block
+    loop_stable_phis
+    multi_defs
+    def_instrs
+    block
+    operand
 
 let linear_expr_of_operand
     invariant_loaded_places
@@ -6221,13 +6245,63 @@ let collect_counted_place_mirrors
              backedge_preds
          in
          match mirrored_temps with
-         | [] -> None
-         | first :: rest
-           when List.length mirrored_temps = List.length backedge_preds
-                && List.for_all (( = ) first) rest
-                && IntSet.mem first supported_temps ->
-             Some (place, first)
-         | _ -> None)
+          | [] -> None
+          | first :: rest
+            when List.length mirrored_temps = List.length backedge_preds
+                 && List.for_all (( = ) first) rest
+                 && IntSet.mem first supported_temps ->
+              Some (place, first)
+          | _ -> None)
+
+let collect_reconstructible_live_temps
+    invariant_loaded_places
+    loop_defs
+    get_block
+    def_blocks
+    loop_stable_phis
+    multi_defs
+    def_instrs
+    supported_temps
+    live_temps
+  =
+  let rec close supported order exprs =
+    let newly_found_rev =
+      IntSet.fold
+        (fun temp acc ->
+          if IntSet.mem temp supported || IntMap.mem temp exprs || IntSet.mem temp multi_defs then acc
+          else
+            match Hashtbl.find_opt def_blocks temp with
+            | None -> acc
+            | Some label -> (
+                match
+                  summary_expr_of_operand_with_bases
+                    supported
+                    invariant_loaded_places
+                    loop_defs
+                    def_blocks
+                    get_block
+                    loop_stable_phis
+                    multi_defs
+                    def_instrs
+                    (get_block label)
+                    (Tcg.Temp temp)
+                with
+                | Some expr -> (temp, expr) :: acc
+                | None -> acc))
+        live_temps []
+    in
+    match newly_found_rev with
+    | [] -> (supported, List.rev order, exprs)
+    | _ ->
+        let supported, order, exprs =
+          List.fold_left
+            (fun (supported, order, exprs) (temp, expr) ->
+              (IntSet.add temp supported, temp :: order, IntMap.add temp expr exprs))
+            (supported, order, exprs) (List.rev newly_found_rev)
+        in
+        close supported order exprs
+  in
+  close supported_temps [] IntMap.empty
 
 let build_triangle_number_instrs fresh_temp trip_temp =
   let n_minus_one = fresh_temp () in
@@ -6457,10 +6531,24 @@ let build_reduction_final_update fresh_temp trip_temp place_carriers (reduction 
               (fun temp -> simplify_simple_instr (Tcg.Move (temp, Tcg.Temp acc_temp)))
               (List.filter (fun temp -> temp <> acc_temp) reduction.alias_temps)
           in
-          acc_instrs
-          @ delta_instrs
-          @ [ update; Tcg.Store (place, Tcg.Temp acc_temp) ]
-          @ alias_updates)
+           acc_instrs
+           @ delta_instrs
+           @ [ update; Tcg.Store (place, Tcg.Temp acc_temp) ]
+           @ alias_updates)
+
+let build_live_temp_reconstruction_updates fresh_temp place_carriers reconstruction_order reconstruction_exprs
+  =
+  reconstruction_order
+  |> List.concat_map (fun temp ->
+         match IntMap.find_opt temp reconstruction_exprs with
+         | None -> []
+         | Some expr ->
+             let instrs, operand =
+               emit_summary_expr_with_carriers place_carriers fresh_temp expr
+             in
+             (match operand with
+             | Tcg.Temp src when src = temp -> instrs
+             | _ -> instrs @ [ simplify_simple_instr (Tcg.Move (temp, operand)) ]))
 
 let loop_instr_count loop blocks =
   List.fold_left
@@ -6715,6 +6803,18 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
                 in
                 let supported_live_temps =
                   IntSet.union supported_live_temps (IntSet.inter loop_live_defs loop_stable_phis)
+                in
+                let supported_live_temps, _, _ =
+                  collect_reconstructible_live_temps
+                    invariant_loaded_places
+                    loop_defs
+                    get_block
+                    def_blocks
+                    loop_stable_phis
+                    multi_defs
+                    def_instrs
+                    supported_live_temps
+                    loop_live_defs
                 in
                 let place_mirrors =
                   collect_counted_place_mirrors
@@ -7077,6 +7177,18 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
                 let supported_live_temps =
                   IntSet.union supported_live_temps (IntSet.inter loop_live_defs loop_stable_phis)
                 in
+                let supported_live_temps, reconstruction_order, reconstruction_exprs =
+                  collect_reconstructible_live_temps
+                    invariant_loaded_places
+                    loop_defs
+                    get_block
+                    def_blocks
+                    loop_stable_phis
+                    multi_defs
+                    def_instrs
+                    supported_live_temps
+                    loop_live_defs
+                in
                 let place_mirrors =
                   collect_counted_place_mirrors
                     header
@@ -7200,6 +7312,11 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
                     @ List.concat_map
                         (build_iv_final_update fresh_temp trip_temp)
                         live_ivs
+                    @ build_live_temp_reconstruction_updates
+                        fresh_temp
+                        place_carriers
+                        reconstruction_order
+                        reconstruction_exprs
                     @ List.map
                         (fun (place, temp) -> Tcg.Store (place, Tcg.Temp temp))
                         place_mirrors
@@ -8861,6 +8978,24 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
           (simplify_counted_loop_guards_func summaries globals)
           after_canon2
       in
+      let after_const3 =
+        run_stage round "const3"
+          (const_propagate_func global_init summaries globals)
+          after_loop_guards
+      in
+      let after_copy4 = run_stage round "copy4" copy_propagate_func after_const3 in
+      let after_dce3 =
+        run_stage round "dce3" (eliminate_dead_code_func summaries globals) after_copy4
+      in
+      let after_fold4 =
+        run_stage round "fold4" (fold_branch_tails_func summaries globals) after_dce3
+      in
+      let after_thread4 = run_stage round "thread4" thread_and_prune_func after_fold4 in
+      let after_canon3 =
+        run_stage round "canonicalize3"
+          (loop_canonicalize_func summaries globals)
+          after_thread4
+      in
       let after_split =
         run_stage round
           ~enabled:
@@ -8868,7 +9003,7 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
             && stage_round_enabled profile round "split_reductions")
           "split_reductions"
           (extract_counted_reductions_func summaries globals)
-          after_loop_guards
+          after_canon3
       in
       let after_counted =
         run_stage round "counted_loops"
