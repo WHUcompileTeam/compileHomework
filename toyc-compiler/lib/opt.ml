@@ -2259,21 +2259,6 @@ let compute_dominators (f : Cfg.func) =
             };
       doms
 
-let temp_def_blocks_of_blocks temp_count blocks =
-  let defs = Hashtbl.create (max 8 temp_count) in
-  List.iter
-    (fun (block : Cfg.block) ->
-      List.iter
-        (fun instr ->
-          match defs_temp instr with
-            | Some temp -> Hashtbl.replace defs temp block.label
-            | None -> ())
-        block.body)
-    blocks;
-  defs
-
-let temp_def_blocks (f : Cfg.func) = temp_def_blocks_of_blocks f.temp_count f.blocks
-
 type licm_candidate =
   | LicmPure of Tcg.temp * Tcg.operand list
   | LicmLoad of Tcg.temp * Tcg.place
@@ -2324,18 +2309,17 @@ let rewrite_term_successor term ~from_label ~to_label =
       Cfg.BranchCompare (op, lhs, rhs, rewrite if_true, rewrite if_false)
   | Cfg.Return _ as term -> term
 
-let loop_defined_temps loop blocks =
-  List.fold_left
-    (fun acc (block : Cfg.block) ->
-      if not (LabelSet.mem block.label loop) then acc
-      else
-        List.fold_left
-          (fun acc instr ->
-            match defs_temp instr with
-            | Some temp -> IntSet.add temp acc
-            | None -> acc)
-          acc block.body)
-    IntSet.empty blocks
+let loop_defined_temps loop get_block =
+  LabelSet.fold
+    (fun label acc ->
+      let block : Cfg.block = get_block label in
+      List.fold_left
+        (fun acc instr ->
+          match defs_temp instr with
+          | Some temp -> IntSet.add temp acc
+          | None -> acc)
+        acc block.body)
+    loop IntSet.empty
 
 let get_block_exn block_map label =
   match Hashtbl.find_opt block_map label with
@@ -2738,6 +2722,7 @@ let eliminate_dead_loops_func summaries globals (f : Cfg.func) =
     let removed = ref LabelSet.empty in
     let changed = ref false in
     let current_block_list () = Hashtbl.fold (fun _ block acc -> block :: acc) current_blocks [] in
+    let get_block = get_block_exn current_blocks in
     let block_exists label = Hashtbl.mem current_blocks label && not (LabelSet.mem label !removed) in
     List.iter
       (fun header ->
@@ -2769,7 +2754,7 @@ let eliminate_dead_loops_func summaries globals (f : Cfg.func) =
                 in
                 let live_t_exit = table_find_or_empty live_in_t exit_label IntSet.empty in
                 let live_p_exit = table_find_or_empty live_in_p exit_label PlaceSet.empty in
-                let defined_temps = loop_defined_temps loop blocks_snapshot in
+                let defined_temps = loop_defined_temps loop get_block in
                 let has_global_store = PlaceSet.exists place_is_global effects.modified_places in
                 if
                   not effects.has_call
@@ -2846,23 +2831,46 @@ let temp_def_instrs_of_blocks temp_count blocks =
 let temp_def_instrs_map (f : Cfg.func) = temp_def_instrs_of_blocks f.temp_count f.blocks
 
 let multi_def_temps_of_blocks temp_count blocks =
-  let counts = Hashtbl.create (max 8 temp_count) in
+  let seen = Hashtbl.create (max 8 temp_count) in
+  let multi_defs = ref IntSet.empty in
   List.iter
     (fun (block : Cfg.block) ->
       List.iter
         (fun instr ->
           match defs_temp instr with
           | Some temp ->
-              let count = Option.value ~default:0 (Hashtbl.find_opt counts temp) in
-              Hashtbl.replace counts temp (count + 1)
+              if Hashtbl.mem seen temp then multi_defs := IntSet.add temp !multi_defs
+              else Hashtbl.add seen temp ()
           | None -> ())
         block.body)
     blocks;
-  Hashtbl.fold
-    (fun temp count acc -> if count > 1 then IntSet.add temp acc else acc)
-    counts IntSet.empty
+  !multi_defs
 
-let multi_def_temps (f : Cfg.func) = multi_def_temps_of_blocks f.temp_count f.blocks
+let analyze_temp_defs_of_blocks ?loop temp_count blocks =
+  let loop_defs = ref IntSet.empty in
+  let def_blocks = Hashtbl.create (max 8 temp_count) in
+  let def_instrs = Hashtbl.create (max 8 temp_count) in
+  let multi_defs = ref IntSet.empty in
+  List.iter
+    (fun (block : Cfg.block) ->
+      let in_loop =
+        match loop with
+        | Some loop -> LabelSet.mem block.label loop
+        | None -> false
+      in
+      List.iter
+        (fun instr ->
+          match defs_temp instr with
+          | Some temp ->
+              if in_loop then loop_defs := IntSet.add temp !loop_defs;
+              Hashtbl.replace def_blocks temp block.label;
+              if Hashtbl.mem def_instrs temp then
+                multi_defs := IntSet.add temp !multi_defs
+              else Hashtbl.add def_instrs temp instr
+          | None -> ())
+        block.body)
+    blocks;
+  (!loop_defs, def_blocks, def_instrs, !multi_defs)
 
 let last_def_of_temp (block : Cfg.block) temp =
   let rec loop = function
@@ -4051,10 +4059,9 @@ let analyze_counted_control header loop get_block loop_defs loop_stable_phis mul
       loop loop_defs loop_stable_phis multi_defs def_instrs ivs get_block )
 
 let analyze_counted_loop header loop get_block temp_count blocks =
-  let loop_defs = loop_defined_temps loop blocks in
-  let def_blocks = temp_def_blocks_of_blocks temp_count blocks in
-  let def_instrs = temp_def_instrs_of_blocks temp_count blocks in
-  let multi_defs = multi_def_temps_of_blocks temp_count blocks in
+  let loop_defs, def_blocks, def_instrs, multi_defs =
+    analyze_temp_defs_of_blocks ~loop temp_count blocks
+  in
   let loop_stable_phis =
     collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
   in
@@ -7290,9 +7297,9 @@ let strength_reduce_func (f : Cfg.func) =
   let _, loops, headers = discover_natural_loops f in
   if headers = [] then f
   else
-    let def_blocks = temp_def_blocks f in
-    let def_instrs = temp_def_instrs_map f in
-    let multi_defs = multi_def_temps f in
+    let _, def_blocks, def_instrs, multi_defs =
+      analyze_temp_defs_of_blocks f.temp_count f.blocks
+    in
     let current_blocks = Hashtbl.create (List.length f.blocks) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
     let get_block = get_block_exn current_blocks in
@@ -7309,7 +7316,7 @@ let strength_reduce_func (f : Cfg.func) =
     List.iter
       (fun header ->
         let loop = table_find_or_empty loops header LabelSet.empty in
-        let loop_defs = loop_defined_temps loop f.blocks in
+        let loop_defs = loop_defined_temps loop get_block in
         let loop_stable_phis =
           collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
         in
@@ -7487,9 +7494,9 @@ let reassociate_loop_adds_func (f : Cfg.func) =
   let _, loops, headers = discover_natural_loops f in
   if headers = [] then f
   else
-    let def_blocks = temp_def_blocks f in
-    let def_instrs = temp_def_instrs_map f in
-    let multi_defs = multi_def_temps f in
+    let _, def_blocks, def_instrs, multi_defs =
+      analyze_temp_defs_of_blocks f.temp_count f.blocks
+    in
     let use_counts = temp_use_counts f.blocks in
     let current_blocks = Hashtbl.create (List.length f.blocks) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
@@ -7498,7 +7505,7 @@ let reassociate_loop_adds_func (f : Cfg.func) =
     List.iter
       (fun header ->
         let loop = table_find_or_empty loops header LabelSet.empty in
-        let loop_defs = loop_defined_temps loop f.blocks in
+        let loop_defs = loop_defined_temps loop get_block in
         let loop_stable_phis =
           collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
         in
@@ -7549,6 +7556,9 @@ let unswitch_loops_func _summaries _globals (f : Cfg.func) =
   if headers = [] then f
   else
     let exception Applied of Cfg.func in
+    let _, _, def_instrs, multi_defs =
+      analyze_temp_defs_of_blocks f.temp_count f.blocks
+    in
     try
       List.iter
         (fun header ->
@@ -7574,9 +7584,7 @@ let unswitch_loops_func _summaries _globals (f : Cfg.func) =
                 || (memory_ops < unswitch_min_memory_ops && total_instrs < (2 * unswitch_min_instrs))
               then ()
               else
-                let loop_defs = loop_defined_temps loop f.blocks in
-                let def_instrs = temp_def_instrs_map f in
-                let multi_defs = multi_def_temps f in
+                let loop_defs = loop_defined_temps loop (get_block_exn block_map) in
                 match
                   List.find_map
                     (fun (block : Cfg.block) ->
@@ -7707,10 +7715,9 @@ let licm_func summaries globals (f : Cfg.func) =
         in
         if outside_preds <> [] then begin
           let blocks_snapshot = current_block_list () in
-          let loop_defs = loop_defined_temps loop blocks_snapshot in
-          let def_blocks = temp_def_blocks_of_blocks f.temp_count blocks_snapshot in
-          let def_instrs = temp_def_instrs_of_blocks f.temp_count blocks_snapshot in
-          let multi_defs = multi_def_temps_of_blocks f.temp_count blocks_snapshot in
+          let loop_defs, def_blocks, def_instrs, multi_defs =
+            analyze_temp_defs_of_blocks ~loop f.temp_count blocks_snapshot
+          in
           let effects = collect_loop_effects summaries globals loop blocks_snapshot in
           let loop_stable_phis =
             collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
@@ -7947,13 +7954,13 @@ let simplify_counted_loop_guards_func _summaries _globals (f : Cfg.func) =
     let current_blocks = Hashtbl.create (List.length f.blocks) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
     let get_current = get_block_exn current_blocks in
+    let def_instrs = temp_def_instrs_map f in
     let changed = ref false in
     Hashtbl.iter
       (fun header loop ->
         let loop_blocks = List.filter (fun (block : Cfg.block) -> LabelSet.mem block.label loop) f.blocks in
-        let loop_defs = loop_defined_temps loop f.blocks in
+        let loop_defs = loop_defined_temps loop get_block in
         let multi_defs = multi_def_temps_of_blocks f.temp_count loop_blocks in
-        let def_instrs = temp_def_instrs_map f in
         let loop_stable_phis = collect_header_phi_temps header get_block in
         let _, control =
           analyze_counted_control header loop get_block loop_defs loop_stable_phis multi_defs def_instrs
@@ -8189,6 +8196,9 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
       in
       { func with entry = rename func.entry; blocks }
     in
+    let _, _, def_instrs, multi_defs =
+      analyze_temp_defs_of_blocks f.temp_count f.blocks
+    in
     try
       List.iter
         (fun header ->
@@ -8197,9 +8207,7 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
           let loop_blocks =
             f.blocks |> List.filter (fun (block : Cfg.block) -> LabelSet.mem block.label loop)
           in
-          let loop_defs = loop_defined_temps loop f.blocks in
-          let def_instrs = temp_def_instrs_map f in
-          let multi_defs = multi_def_temps f in
+          let loop_defs = loop_defined_temps loop (get_block_exn block_map) in
           let loop_stable_phis = collect_header_phi_temps header (Hashtbl.find block_map) in
           let _, control =
             analyze_counted_control
