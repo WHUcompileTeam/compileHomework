@@ -1060,7 +1060,10 @@ let kill_place_facts places state =
   PlaceSet.fold (fun place acc -> set_place_fact acc place CpNac) places state
 
 let initial_cp_state global_init (f : Cfg.func) =
-  let global_init = if f.name = "main" then global_init else PlaceMap.empty in
+  let global_init =
+    if f.name = "main" then global_init
+    else PlaceMap.map (fun _ -> CpNac) global_init
+  in
   let places =
     List.fold_left
       (fun places (param : Tcg.var) -> PlaceMap.add (Tcg.Local param.id) CpNac places)
@@ -1068,23 +1071,30 @@ let initial_cp_state global_init (f : Cfg.func) =
   in
   { temps = IntMap.empty; places }
 
+let fact_of_simple_instr state = function
+  | Tcg.Move (_, src) -> eval_operand_fact state src
+  | Tcg.Un (_, op, src) -> fold_fact_un op (eval_operand_fact state src)
+  | Tcg.Bin (_, op, lhs, rhs) ->
+      fold_fact_bin op (eval_operand_fact state lhs) (eval_operand_fact state rhs)
+  | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> CpNac
+
 let transfer_simple_instr summaries globals state instr =
   match instr with
   | Tcg.Move (dst, src) ->
       let src = rewrite_operand_const state src in
-      let fact = eval_operand_fact state src in
       let instr = simplify_simple_instr (Tcg.Move (dst, src)) in
+      let fact = fact_of_simple_instr state instr in
       (instr, set_temp_fact state dst fact)
   | Tcg.Un (dst, op, src) ->
       let src = rewrite_operand_const state src in
-      let fact = fold_fact_un op (eval_operand_fact state src) in
       let instr = simplify_simple_instr (Tcg.Un (dst, op, src)) in
+      let fact = fact_of_simple_instr state instr in
       (instr, set_temp_fact state dst fact)
   | Tcg.Bin (dst, op, lhs, rhs) ->
       let lhs = rewrite_operand_const state lhs in
       let rhs = rewrite_operand_const state rhs in
-      let fact = fold_fact_bin op (eval_operand_fact state lhs) (eval_operand_fact state rhs) in
       let instr = simplify_simple_instr (Tcg.Bin (dst, op, lhs, rhs)) in
+      let fact = fact_of_simple_instr state instr in
       (instr, set_temp_fact state dst fact)
   | Tcg.Load (dst, place) -> (
       let fact = get_place_fact state place in
@@ -8854,11 +8864,6 @@ type func_metrics = {
 type opt_profile = {
   name : string;
   max_rounds : int;
-  enable_unswitch : bool;
-  enable_split_reductions : bool;
-  enable_unroll : bool;
-  enable_rotate : bool;
-  enable_gvn2 : bool;
 }
 
 let metrics_of_func (f : Cfg.func) =
@@ -8879,11 +8884,6 @@ let choose_opt_profile metrics =
     {
       name = "huge";
       max_rounds = 5;
-      enable_unswitch = true;
-      enable_split_reductions = true;
-      enable_unroll = true;
-      enable_rotate = true;
-      enable_gvn2 = true;
     }
   else if
     metrics.block_count >= 48
@@ -8893,11 +8893,6 @@ let choose_opt_profile metrics =
     {
       name = "large";
       max_rounds = 5;
-      enable_unswitch = true;
-      enable_split_reductions = true;
-      enable_unroll = true;
-      enable_rotate = true;
-      enable_gvn2 = true;
     }
   else if
     metrics.block_count >= 24
@@ -8907,21 +8902,11 @@ let choose_opt_profile metrics =
     {
       name = "medium";
       max_rounds = 5;
-      enable_unswitch = true;
-      enable_split_reductions = true;
-      enable_unroll = true;
-      enable_rotate = true;
-      enable_gvn2 = true;
     }
   else
     {
       name = "full";
       max_rounds = 8;
-      enable_unswitch = true;
-      enable_split_reductions = true;
-      enable_unroll = true;
-      enable_rotate = true;
-      enable_gvn2 = true;
     }
 
 let stage_round_enabled profile round stage =
@@ -8998,10 +8983,9 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
   in
   if debug_opt_profile then
     Printf.eprintf
-      "opt-profile func=%s profile=%s rounds=%d unswitch=%b split=%b unroll=%b rotate=%b gvn2=%b base=(%s) promoted=(%s)\n%!"
-      promoted.name profile.name profile.max_rounds profile.enable_unswitch
-      profile.enable_split_reductions profile.enable_unroll profile.enable_rotate
-      profile.enable_gvn2 (format_metrics base_metrics) (format_metrics promoted_metrics);
+      "opt-profile func=%s profile=%s rounds=%d base=(%s) promoted=(%s)\n%!"
+      promoted.name profile.name profile.max_rounds
+      (format_metrics base_metrics) (format_metrics promoted_metrics);
   let step round func =
     try
       let after_canon =
@@ -9024,8 +9008,7 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
       let after_licm = run_stage round "licm" (licm_func summaries globals) after_reassoc in
       let after_unswitch =
         run_stage round
-          ~enabled:
-            (profile.enable_unswitch && stage_round_enabled profile round "unswitch")
+          ~enabled:(stage_round_enabled profile round "unswitch")
           "unswitch"
           (unswitch_loops_func summaries globals)
           after_licm
@@ -9036,7 +9019,7 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
           after_unswitch
       in
       let after_gvn2 =
-        run_stage round ~enabled:profile.enable_gvn2 "gvn2"
+        run_stage round "gvn2"
           (gvn_func summaries globals)
           after_const2
       in
@@ -9088,9 +9071,7 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
       in
       let after_split =
         run_stage round
-          ~enabled:
-            (profile.enable_split_reductions
-            && stage_round_enabled profile round "split_reductions")
+          ~enabled:(stage_round_enabled profile round "split_reductions")
           "split_reductions"
           (extract_counted_reductions_func summaries globals)
           after_diamond_split
@@ -9102,14 +9083,14 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
       in
       let after_full_unroll =
         run_stage round
-          ~enabled:(profile.enable_unroll && stage_round_enabled profile round "full_unroll")
+          ~enabled:(stage_round_enabled profile round "full_unroll")
           "full_unroll"
           (full_unroll_counted_loops_func summaries globals)
           after_counted
       in
       let after_unroll =
         run_stage round
-          ~enabled:(profile.enable_unroll && stage_round_enabled profile round "unroll2")
+          ~enabled:(stage_round_enabled profile round "unroll2")
           "unroll2"
           (unroll_counted_loops_x2_func summaries globals)
           after_full_unroll
@@ -9120,7 +9101,7 @@ let optimize_func global_init summaries globals (f : Cfg.func) =
       in
       let after_rotate =
         run_stage round
-          ~enabled:(profile.enable_rotate && stage_round_enabled profile round "rotate")
+          ~enabled:(stage_round_enabled profile round "rotate")
           "rotate"
           loop_rotate_func after_fold2
       in
