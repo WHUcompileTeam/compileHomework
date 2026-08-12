@@ -2337,6 +2337,11 @@ let loop_defined_temps loop blocks =
           acc block.body)
     IntSet.empty blocks
 
+let get_block_exn block_map label =
+  match Hashtbl.find_opt block_map label with
+  | Some block -> block
+  | None -> failwith ("internal missing block: " ^ label)
+
 let natural_loop block_map header pred =
   let rec visit work seen =
     match work with
@@ -2501,11 +2506,7 @@ let loop_canonicalize_func summaries globals (f : Cfg.func) =
         current.blocks;
       let block_order = ref (List.map (fun (block : Cfg.block) -> block.label) current.blocks) in
       let current_entry = ref current.entry in
-      let get_block label =
-        match Hashtbl.find_opt current_blocks label with
-        | Some block -> block
-        | None -> failwith ("internal missing block: " ^ label)
-      in
+      let get_block = get_block_exn current_blocks in
       let update_block (block : Cfg.block) =
         Hashtbl.replace current_blocks block.label block
       in
@@ -4040,6 +4041,15 @@ let find_counted_loop_control
                 block
           | Some _ | None -> None)
 
+let analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs =
+  collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs
+
+let analyze_counted_control header loop get_block loop_defs loop_stable_phis multi_defs def_instrs =
+  let ivs = analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs in
+  ( ivs,
+    find_counted_loop_control
+      loop loop_defs loop_stable_phis multi_defs def_instrs ivs get_block )
+
 let analyze_counted_loop header loop get_block temp_count blocks =
   let loop_defs = loop_defined_temps loop blocks in
   let def_blocks = temp_def_blocks_of_blocks temp_count blocks in
@@ -4048,18 +4058,8 @@ let analyze_counted_loop header loop get_block temp_count blocks =
   let loop_stable_phis =
     collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
   in
-  let ivs =
-    collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs
-  in
-  let control =
-    find_counted_loop_control
-      loop
-      loop_defs
-      loop_stable_phis
-      multi_defs
-      def_instrs
-      ivs
-      get_block
+  let ivs, control =
+    analyze_counted_control header loop get_block loop_defs loop_stable_phis multi_defs def_instrs
   in
   (loop_defs, def_blocks, def_instrs, multi_defs, loop_stable_phis, ivs, control)
 
@@ -6262,11 +6262,7 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
   else
     let current_blocks = Hashtbl.create (List.length f.blocks + (2 * List.length headers)) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
-    let get_block label =
-      match Hashtbl.find_opt current_blocks label with
-      | Some block -> block
-      | None -> failwith ("internal missing block: " ^ label)
-    in
+    let get_block = get_block_exn current_blocks in
     let update_block (block : Cfg.block) =
       Hashtbl.replace current_blocks block.label block
     in
@@ -6594,11 +6590,7 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
   else
     let current_blocks = Hashtbl.create (List.length f.blocks + List.length headers) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
-    let get_block label =
-      match Hashtbl.find_opt current_blocks label with
-      | Some block -> block
-      | None -> failwith ("internal missing block: " ^ label)
-    in
+    let get_block = get_block_exn current_blocks in
     let update_block (block : Cfg.block) =
       Hashtbl.replace current_blocks block.label block
     in
@@ -6894,11 +6886,7 @@ let full_unroll_counted_loops_func summaries globals (f : Cfg.func) =
     let current_blocks = Hashtbl.create (List.length f.blocks + (8 * List.length headers)) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
     let block_order = ref (List.map (fun (block : Cfg.block) -> block.label) f.blocks) in
-    let get_block label =
-      match Hashtbl.find_opt current_blocks label with
-      | Some block -> block
-      | None -> failwith ("internal missing block: " ^ label)
-    in
+    let get_block = get_block_exn current_blocks in
     let current_block_list () = List.map get_block !block_order in
     let insert_after label new_labels =
       block_order :=
@@ -7061,11 +7049,7 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
     let current_blocks = Hashtbl.create (List.length f.blocks + (2 * List.length headers)) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
     let block_order = ref (List.map (fun (block : Cfg.block) -> block.label) f.blocks) in
-    let get_block label =
-      match Hashtbl.find_opt current_blocks label with
-      | Some block -> block
-      | None -> failwith ("internal missing block: " ^ label)
-    in
+    let get_block = get_block_exn current_blocks in
     let update_block (block : Cfg.block) =
       Hashtbl.replace current_blocks block.label block
     in
@@ -7311,11 +7295,7 @@ let strength_reduce_func (f : Cfg.func) =
     let multi_defs = multi_def_temps f in
     let current_blocks = Hashtbl.create (List.length f.blocks) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
-    let get_block label =
-      match Hashtbl.find_opt current_blocks label with
-      | Some block -> block
-      | None -> failwith ("internal missing block: " ^ label)
-    in
+    let get_block = get_block_exn current_blocks in
     let update_block (block : Cfg.block) =
       Hashtbl.replace current_blocks block.label block
     in
@@ -7333,7 +7313,7 @@ let strength_reduce_func (f : Cfg.func) =
         let loop_stable_phis =
           collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
         in
-        let ivs = collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs in
+        let ivs = analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs in
         List.iter
           (fun (iv : basic_induction_var) ->
             let derived_uses = Hashtbl.create 4 in
@@ -7513,11 +7493,7 @@ let reassociate_loop_adds_func (f : Cfg.func) =
     let use_counts = temp_use_counts f.blocks in
     let current_blocks = Hashtbl.create (List.length f.blocks) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
-    let get_block label =
-      match Hashtbl.find_opt current_blocks label with
-      | Some block -> block
-      | None -> failwith ("internal missing block: " ^ label)
-    in
+    let get_block = get_block_exn current_blocks in
     let changed = ref false in
     List.iter
       (fun header ->
@@ -7616,11 +7592,7 @@ let unswitch_loops_func _summaries _globals (f : Cfg.func) =
                     let original_labels = List.map (fun (block : Cfg.block) -> block.label) f.blocks in
                     let current_blocks = Hashtbl.create (List.length f.blocks + (2 * List.length loop_blocks) + 1) in
                     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
-                    let get_block label =
-                      match Hashtbl.find_opt current_blocks label with
-                      | Some block -> block
-                      | None -> failwith ("internal missing block: " ^ label)
-                    in
+                    let get_block = get_block_exn current_blocks in
                     let update_block (block : Cfg.block) =
                       Hashtbl.replace current_blocks block.label block
                     in
@@ -7714,11 +7686,7 @@ let licm_func summaries globals (f : Cfg.func) =
   else
     let current_blocks = Hashtbl.create (List.length f.blocks + List.length headers) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
-    let get_block label =
-      match Hashtbl.find_opt current_blocks label with
-      | Some block -> block
-      | None -> failwith ("internal missing block: " ^ label)
-    in
+    let get_block = get_block_exn current_blocks in
     let update_block (block : Cfg.block) =
       Hashtbl.replace current_blocks block.Cfg.label block
     in
@@ -7973,20 +7941,12 @@ let eliminate_dead_code_func summaries globals (f : Cfg.func) =
 
 let simplify_counted_loop_guards_func _summaries _globals (f : Cfg.func) =
   let block_map, loops, headers = discover_natural_loops f in
-  let get_block label =
-    match Hashtbl.find_opt block_map label with
-    | Some block -> block
-    | None -> failwith ("internal missing block: " ^ label)
-  in
+  let get_block = get_block_exn block_map in
   if headers = [] then f
   else
     let current_blocks = Hashtbl.create (List.length f.blocks) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
-    let get_current label =
-      match Hashtbl.find_opt current_blocks label with
-      | Some block -> block
-      | None -> failwith ("internal missing block: " ^ label)
-    in
+    let get_current = get_block_exn current_blocks in
     let changed = ref false in
     Hashtbl.iter
       (fun header loop ->
@@ -7995,11 +7955,10 @@ let simplify_counted_loop_guards_func _summaries _globals (f : Cfg.func) =
         let multi_defs = multi_def_temps_of_blocks f.temp_count loop_blocks in
         let def_instrs = temp_def_instrs_map f in
         let loop_stable_phis = collect_header_phi_temps header get_block in
-        let ivs = collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs in
-        match
-          find_counted_loop_control loop loop_defs loop_stable_phis multi_defs def_instrs ivs
-            get_block
-        with
+        let _, control =
+          analyze_counted_control header loop get_block loop_defs loop_stable_phis multi_defs def_instrs
+        in
+        match control with
         | None -> ()
         | Some info ->
             LabelSet.iter
@@ -8242,14 +8201,11 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
           let def_instrs = temp_def_instrs_map f in
           let multi_defs = multi_def_temps f in
           let loop_stable_phis = collect_header_phi_temps header (Hashtbl.find block_map) in
-          let ivs =
-            collect_basic_induction_vars header loop (Hashtbl.find block_map) loop_defs multi_defs
-              def_instrs
+          let _, control =
+            analyze_counted_control
+              header loop (Hashtbl.find block_map) loop_defs loop_stable_phis multi_defs def_instrs
           in
-          match
-            find_counted_loop_control loop loop_defs loop_stable_phis multi_defs def_instrs ivs
-              (Hashtbl.find block_map)
-          with
+          match control with
           | None -> ()
           | Some info ->
               let control_block : Cfg.block = Hashtbl.find block_map info.control_label in
