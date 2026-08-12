@@ -8878,7 +8878,20 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
           | Tcg.Imm _ -> true
           | Tcg.Temp temp -> not (IntSet.mem temp loop_defs))
     in
-    let build_adjusted_rhs operand delta =
+    let normalized_limit_is_const = function
+      | LimitConst _ -> true
+      | LimitOperand _ -> false
+    in
+    let normalized_limit_equal lhs rhs =
+      match (lhs, rhs) with
+      | LimitConst a, LimitConst b -> a = b
+      | LimitOperand (Tcg.Imm a, delta_a), LimitOperand (Tcg.Imm b, delta_b) ->
+          a = b && delta_a = delta_b
+      | LimitOperand (Tcg.Temp a, delta_a), LimitOperand (Tcg.Temp b, delta_b) ->
+          a = b && delta_a = delta_b
+      | _ -> false
+    in
+    let materialize_adjusted_operand operand delta =
       match operand with
       | Tcg.Imm constant -> ([], Tcg.Imm Int64.(add constant delta))
       | _ when delta = 0L -> ([], operand)
@@ -8886,18 +8899,24 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
           let temp = fresh_temp () in
           ([ Tcg.Bin (temp, Add, operand, Tcg.Imm delta) ], Tcg.Temp temp)
     in
+    let materialize_limit_operand = function
+      | LimitConst bound -> ([], Tcg.Imm bound)
+      | LimitOperand (operand, delta) -> materialize_adjusted_operand operand delta
+    in
+    let branch_with_rhs compare_op iv_temp rhs if_true if_false =
+      Cfg.BranchCompare (compare_op, Tcg.Temp iv_temp, rhs, if_true, if_false)
+    in
     let build_branch_for_limit compare_op iv_temp limit if_true if_false =
       match limit with
       | LimitConst bound ->
-          ([],
-           Cfg.BranchCompare (compare_op, Tcg.Temp iv_temp, Tcg.Imm bound, if_true, if_false))
+          ([], branch_with_rhs compare_op iv_temp (Tcg.Imm bound) if_true if_false)
       | LimitOperand (operand, delta) ->
-          let body, rhs = build_adjusted_rhs operand delta in
-          (body, Cfg.BranchCompare (compare_op, Tcg.Temp iv_temp, rhs, if_true, if_false))
+          let body, rhs = materialize_adjusted_operand operand delta in
+          (body, branch_with_rhs compare_op iv_temp rhs if_true if_false)
     in
     let build_branch_for_shifted_compare compare_op iv_temp operand bias if_true if_false =
-      let body, rhs = build_adjusted_rhs operand Int64.(neg bias) in
-      (body, Cfg.BranchCompare (compare_op, Tcg.Temp iv_temp, rhs, if_true, if_false))
+      let body, rhs = materialize_adjusted_operand operand Int64.(neg bias) in
+      (body, branch_with_rhs compare_op iv_temp rhs if_true if_false)
     in
     let loop_counts_up = function
       | CountUpLt _ | CountUpLe _ -> true
@@ -8915,7 +8934,35 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
         | Lt | Le -> false
         | Eq | Ne | Add | Sub | Mul | Div | Mod | LAnd | LOr -> false
     in
-    let should_split_loop loop_blocks =
+    let prefix_limit_of_split loop_defs multi_defs def_instrs kind split_op operand bias =
+      let delta =
+        match kind with
+        | CountUpLt _ -> (
+            match split_op with
+            | Lt | Ge -> Int64.neg bias
+            | Le | Gt -> Int64.(sub 1L bias)
+            | Eq | Ne | Add | Sub | Mul | Div | Mod | LAnd | LOr -> 0L)
+        | CountUpLe _ -> (
+            match split_op with
+            | Lt | Ge -> Int64.(sub (neg bias) 1L)
+            | Le | Gt -> Int64.neg bias
+            | Eq | Ne | Add | Sub | Mul | Div | Mod | LAnd | LOr -> 0L)
+        | CountDownGt _ -> (
+            match split_op with
+            | Gt | Le -> Int64.neg bias
+            | Ge | Lt -> Int64.(sub (neg bias) 1L)
+            | Eq | Ne | Add | Sub | Mul | Div | Mod | LAnd | LOr -> 0L)
+        | CountDownGe _ -> (
+            match split_op with
+            | Gt | Le -> Int64.(add (neg bias) 1L)
+            | Ge | Lt -> Int64.neg bias
+            | Eq | Ne | Add | Sub | Mul | Div | Mod | LAnd | LOr -> 0L)
+      in
+      match split_op with
+      | Lt | Le | Gt | Ge -> normalize_limit_operand loop_defs multi_defs def_instrs operand delta
+      | Eq | Ne | Add | Sub | Mul | Div | Mod | LAnd | LOr -> None
+    in
+    let should_split_loop loop_blocks outer_limit prefix_limit =
       let block_count = List.length loop_blocks in
       let instr_count =
         List.fold_left (fun acc (block : Cfg.block) -> acc + List.length block.body) 0 loop_blocks
@@ -8928,9 +8975,13 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
             | Cfg.Jump _ | Cfg.Return _ -> acc)
           0 loop_blocks
       in
+      let const_benefit =
+        normalized_limit_is_const outer_limit || normalized_limit_is_const prefix_limit
+      in
       block_count <= 10
-      && instr_count <= 32
+      && instr_count <= 28
       && branchy_blocks <= 4
+      && (const_benefit || instr_count <= 18)
     in
     let relabel_func_prefix prefix (func : Cfg.func) =
       let mapping = Hashtbl.create (List.length func.blocks) in
@@ -9038,10 +9089,21 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
                            match split_info with
                            | Some (split_op, split_operand, split_bias, if_true, if_false) ->
                                begin
-                                 if
-                                   normalized_limit_is_entry_invariant loop_defs outer_limit
-                                   && should_split_loop loop_blocks
-                                 then
+                                 match
+                                   prefix_limit_of_split
+                                     loop_defs
+                                     multi_defs
+                                     def_instrs
+                                     info.kind
+                                     split_op
+                                     split_operand
+                                     split_bias
+                                 with
+                                 | Some prefix_limit
+                                   when normalized_limit_is_entry_invariant loop_defs outer_limit
+                                        && normalized_limit_is_entry_invariant loop_defs prefix_limit
+                                        && not (normalized_limit_equal outer_limit prefix_limit)
+                                        && should_split_loop loop_blocks outer_limit prefix_limit ->
                                    let first_uses_true =
                                      first_phase_uses_true_branch info.kind split_op
                                    in
@@ -9060,24 +9122,39 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
                                    let split_dispatch_label =
                                      Printf.sprintf ".L%s_split_dispatch_%s" f.label header
                                    in
-                                   let clone_loop prefix split_term_builder =
+                                   let limit_dispatch_label =
+                                     Printf.sprintf ".L%s_split_limit_dispatch_%s" f.label header
+                                   in
+                                   let limit_take_outer_label =
+                                     Printf.sprintf ".L%s_split_limit_outer_%s" f.label header
+                                   in
+                                   let limit_take_prefix_label =
+                                     Printf.sprintf ".L%s_split_limit_prefix_%s" f.label header
+                                   in
+                                   let pre_limit_temp = fresh_temp () in
+                                   let clone_loop prefix header_rhs split_term_builder =
                                      let blocks =
                                        List.map
                                          (fun (block : Cfg.block) ->
                                            if block.label = header then
-                                             let body, term =
-                                               build_branch_for_limit
-                                                 header_term_for_limit
-                                                 info.control_iv.phi_temp
-                                                 outer_limit
-                                                 info.inside_label
-                                                 info.exit_label
-                                             in
                                              {
                                                block with
-                                               body = body;
-                                               term;
-                                               succs = Cfg.successors term;
+                                               body = [];
+                                               term =
+                                                 branch_with_rhs
+                                                   header_term_for_limit
+                                                   info.control_iv.phi_temp
+                                                   header_rhs
+                                                   info.inside_label
+                                                   info.exit_label;
+                                               succs =
+                                                 Cfg.successors
+                                                   (branch_with_rhs
+                                                      header_term_for_limit
+                                                      info.control_iv.phi_temp
+                                                      header_rhs
+                                                      info.inside_label
+                                                      info.exit_label);
                                              }
                                            else if block.label = split_block.label then
                                              let body, term =
@@ -9095,27 +9172,20 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
                                      relabel_func_prefix prefix
                                        (Cfg.rebuild_edges { f with entry = header; blocks })
                                    in
+                                   let outer_limit_body, outer_limit_rhs =
+                                     materialize_limit_operand outer_limit
+                                   in
+                                   let prefix_limit_body, prefix_limit_rhs =
+                                     materialize_limit_operand prefix_limit
+                                   in
                                    let before_func =
-                                     clone_loop "split_pre" (fun first_branch _second_branch ->
-                                         if first_uses_true then
-                                           build_branch_for_shifted_compare
-                                             split_op
-                                             info.control_iv.phi_temp
-                                             split_operand
-                                             split_bias
-                                             first_branch
-                                             before_bridge_label
-                                         else
-                                           build_branch_for_shifted_compare
-                                             split_op
-                                             info.control_iv.phi_temp
-                                             split_operand
-                                             split_bias
-                                             before_bridge_label
-                                             first_branch)
+                                     clone_loop "split_pre" (Tcg.Temp pre_limit_temp)
+                                       (fun first_branch _second_branch ->
+                                         ([], Cfg.Jump first_branch))
                                    in
                                    let after_func =
-                                     clone_loop "split_post" (fun _first_branch second_branch ->
+                                     clone_loop "split_post" outer_limit_rhs
+                                       (fun _first_branch second_branch ->
                                          ([], Cfg.Jump second_branch))
                                    in
                                    let entry_dispatch_body, entry_dispatch_term =
@@ -9144,6 +9214,17 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
                                          after_func.entry
                                          before_func.entry
                                    in
+                                   let limit_choose_body =
+                                     outer_limit_body @ prefix_limit_body
+                                   in
+                                   let limit_choose_term =
+                                     if loop_counts_up info.kind then
+                                       Cfg.BranchCompare
+                                         (Lt, outer_limit_rhs, prefix_limit_rhs, limit_take_outer_label, limit_take_prefix_label)
+                                     else
+                                       Cfg.BranchCompare
+                                         (Gt, outer_limit_rhs, prefix_limit_rhs, limit_take_outer_label, limit_take_prefix_label)
+                                   in
                                    let entry_dispatch_block =
                                      {
                                        Cfg.label = entry_dispatch_label;
@@ -9160,6 +9241,33 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
                                        term = split_dispatch_term;
                                        preds = [];
                                        succs = Cfg.successors split_dispatch_term;
+                                     }
+                                   in
+                                   let limit_dispatch_block =
+                                     {
+                                       Cfg.label = limit_dispatch_label;
+                                       body = limit_choose_body;
+                                       term = limit_choose_term;
+                                       preds = [];
+                                       succs = Cfg.successors limit_choose_term;
+                                     }
+                                   in
+                                   let limit_take_outer_block =
+                                     {
+                                       Cfg.label = limit_take_outer_label;
+                                       body = [ Tcg.Move (pre_limit_temp, outer_limit_rhs) ];
+                                       term = Cfg.Jump before_func.entry;
+                                       preds = [];
+                                       succs = [ before_func.entry ];
+                                     }
+                                   in
+                                   let limit_take_prefix_block =
+                                     {
+                                       Cfg.label = limit_take_prefix_label;
+                                       body = [ Tcg.Move (pre_limit_temp, prefix_limit_rhs) ];
+                                       term = Cfg.Jump before_func.entry;
+                                       preds = [];
+                                       succs = [ before_func.entry ];
                                      }
                                    in
                                    let bridge_block =
@@ -9200,7 +9308,14 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
                                    in
                                    let blocks =
                                      base_blocks
-                                     @ [ entry_dispatch_block; split_dispatch_block; bridge_block ]
+                                     @ [
+                                         entry_dispatch_block;
+                                         split_dispatch_block;
+                                         limit_dispatch_block;
+                                         limit_take_outer_block;
+                                         limit_take_prefix_block;
+                                         bridge_block;
+                                       ]
                                      @ before_func.blocks @ after_func.blocks
                                    in
                                    let _ = join_label in
@@ -9213,6 +9328,7 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
                                              temp_count = !next_temp;
                                              blocks;
                                            }))
+                                 | Some _ | None -> ()
                                end
                            | None -> ())
                        | _ -> ())
