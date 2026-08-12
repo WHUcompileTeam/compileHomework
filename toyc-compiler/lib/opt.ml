@@ -1679,6 +1679,59 @@ let redirect_successors pred redirects = function
           rewrite_term_target pred if_false redirects )
   | Cfg.Return value -> Cfg.Return value
 
+let build_parallel_copies fresh_temp copies =
+  let rec remove_first target = function
+    | [] -> []
+    | copy :: rest ->
+        if copy = target then rest else copy :: remove_first target rest
+  in
+  let rec schedule acc copies =
+    let copies = List.filter (fun (dst, src) -> src <> Tcg.Temp dst) copies in
+    match copies with
+    | [] -> List.rev acc
+    | _ ->
+        let source_temps =
+          List.fold_left
+            (fun temps (_, src) ->
+              match src with
+              | Tcg.Temp temp -> IntSet.add temp temps
+              | Tcg.Imm _ -> temps)
+            IntSet.empty copies
+        in
+        begin
+          match
+            List.find_opt
+              (fun (dst, _) -> not (IntSet.mem dst source_temps))
+              copies
+          with
+          | Some ((dst, src) as copy) ->
+              let instr = simplify_simple_instr (Tcg.Move (dst, src)) in
+              schedule (instr :: acc) (remove_first copy copies)
+          | None ->
+              begin
+                match copies with
+                | (_, Tcg.Temp src_temp) :: _ ->
+                    let snap_temp = fresh_temp () in
+                    let snapshot =
+                      simplify_simple_instr (Tcg.Move (snap_temp, Tcg.Temp src_temp))
+                    in
+                    let replacement = Tcg.Temp snap_temp in
+                    let copies =
+                      List.map
+                        (fun (dst, src) ->
+                          if src = Tcg.Temp src_temp then (dst, replacement)
+                          else (dst, src))
+                        copies
+                    in
+                    schedule (snapshot :: acc) copies
+                | (_, Tcg.Imm _) :: _ ->
+                    failwith "internal parallel-copy cycle"
+                | [] -> List.rev acc
+              end
+        end
+  in
+  schedule [] copies
+
 let mem2reg_func (f : Cfg.func) =
   let all_candidates = collect_local_ids f in
   let rec attempt (current : Cfg.func) candidates =
@@ -1828,64 +1881,6 @@ let mem2reg_func (f : Cfg.func) =
           incr edge_id;
           Printf.sprintf ".L%s_mem2reg_edge_%d" current.label id
         in
-        let build_parallel_copies copies =
-          let rec remove_first target = function
-            | [] -> []
-            | copy :: rest ->
-                if copy = target then rest else copy :: remove_first target rest
-          in
-          let rec schedule acc copies =
-            let copies =
-              List.filter (fun (dst, src) -> src <> Tcg.Temp dst) copies
-            in
-            match copies with
-            | [] -> List.rev acc
-            | _ ->
-                let source_temps =
-                  List.fold_left
-                    (fun temps (_, src) ->
-                      match src with
-                      | Tcg.Temp temp -> IntSet.add temp temps
-                      | Tcg.Imm _ -> temps)
-                    IntSet.empty copies
-                in
-                begin
-                  match
-                    List.find_opt
-                      (fun (dst, _) -> not (IntSet.mem dst source_temps))
-                      copies
-                  with
-                  | Some ((dst, src) as copy) ->
-                      let instr = simplify_simple_instr (Tcg.Move (dst, src)) in
-                      schedule (instr :: acc) (remove_first copy copies)
-                  | None ->
-                      (* A real parallel-copy cycle remains. Snapshot one source,
-                         rewrite every use of that old value, then continue. *)
-                      begin
-                        match copies with
-                        | (_, Tcg.Temp src_temp) :: _ ->
-                            let snap_temp = fresh_temp () in
-                            let snapshot =
-                              simplify_simple_instr
-                                (Tcg.Move (snap_temp, Tcg.Temp src_temp))
-                            in
-                            let replacement = Tcg.Temp snap_temp in
-                            let copies =
-                              List.map
-                                (fun (dst, src) ->
-                                  if src = Tcg.Temp src_temp then (dst, replacement)
-                                  else (dst, src))
-                                copies
-                            in
-                            schedule (snapshot :: acc) copies
-                        | (_, Tcg.Imm _) :: _ ->
-                            failwith "internal mem2reg parallel-copy cycle"
-                        | [] -> List.rev acc
-                      end
-                end
-          in
-          schedule [] copies
-        in
         let promoted_block_map = Hashtbl.create (List.length promoted_blocks) in
         List.iter
           (fun (block : Cfg.block) -> Hashtbl.replace promoted_block_map block.label block)
@@ -1918,7 +1913,7 @@ let mem2reg_func (f : Cfg.func) =
                         | Some _ | None -> acc)
                       [] phi_copies
                   in
-                  match build_parallel_copies (List.rev copies) with
+                  match build_parallel_copies fresh_temp (List.rev copies) with
                   | [] -> ()
                   | body ->
                       let pred_block = Hashtbl.find_opt promoted_block_map pred in
@@ -2171,33 +2166,6 @@ let promote_globals_func summaries globals (f : Cfg.func) =
           incr edge_id;
           Printf.sprintf ".L%s_gprom_edge_%d" f.label id
         in
-        let build_parallel_copies copies =
-          let snapshots = Hashtbl.create (List.length copies) in
-          let snapshots_rev, assigns_rev =
-            List.fold_left
-              (fun (snapshots_rev, assigns_rev) (dst, src) ->
-                if src = Tcg.Temp dst then (snapshots_rev, assigns_rev)
-                else
-                  match src with
-                  | Tcg.Imm _ ->
-                      (snapshots_rev, simplify_simple_instr (Tcg.Move (dst, src)) :: assigns_rev)
-                  | Tcg.Temp src_temp ->
-                      let snap_temp, snapshots_rev =
-                        match Hashtbl.find_opt snapshots src_temp with
-                        | Some temp -> (temp, snapshots_rev)
-                        | None ->
-                            let temp = fresh_temp () in
-                            Hashtbl.add snapshots src_temp temp;
-                            ( temp,
-                              simplify_simple_instr (Tcg.Move (temp, Tcg.Temp src_temp))
-                              :: snapshots_rev )
-                      in
-                      ( snapshots_rev,
-                        simplify_simple_instr (Tcg.Move (dst, Tcg.Temp snap_temp)) :: assigns_rev ))
-              ([], []) copies
-          in
-          List.rev snapshots_rev @ List.rev assigns_rev
-        in
         List.iter
           (fun (succ_block : Cfg.block) ->
             let phi_copies =
@@ -2220,7 +2188,7 @@ let promote_globals_func summaries globals (f : Cfg.func) =
                         | Some _ | None -> acc)
                       [] phi_copies
                   in
-                  match build_parallel_copies (List.rev copies) with
+                  match build_parallel_copies fresh_temp (List.rev copies) with
                   | [] -> ()
                   | body ->
                       let edge_label = fresh_edge_label () in
