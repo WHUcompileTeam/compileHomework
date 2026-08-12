@@ -12,6 +12,7 @@ type layout = {
   outgoing_area : int;
   saved_regs : string list;
   uses_s0 : bool;
+  saves_ra : bool;
 }
 
 and temp_home =
@@ -31,6 +32,7 @@ type ctx = {
   frame_size : int;
   saved_regs : string list;
   uses_s0 : bool;
+  saves_ra : bool;
 }
 
 let global_addr_reg = "t3"
@@ -659,7 +661,8 @@ let compute_layout (f : Cfg.func) =
       temp_homes false
   in
   let uses_s0 = Hashtbl.length local_offsets > 0 || has_stack_temp in
-  let needs_frame = needs_return_address f || saved_regs <> [] || uses_s0 in
+  let saves_ra = needs_return_address f in
+  let needs_frame = saves_ra || saved_regs <> [] || uses_s0 in
   {
     local_offsets;
     temp_homes;
@@ -667,6 +670,7 @@ let compute_layout (f : Cfg.func) =
     outgoing_area;
     saved_regs;
     uses_s0;
+    saves_ra;
   }
 
 let emit_reg_copy ctx dst src =
@@ -1039,7 +1043,7 @@ let restore_frame ctx =
     List.iteri
       (fun i reg -> emitf ctx "    lw %s, %d(sp)" reg (ctx.frame_size - (12 + (4 * i))))
       ctx.saved_regs;
-    emitf ctx "    lw ra, %d(sp)" (ctx.frame_size - 4);
+    if ctx.saves_ra then emitf ctx "    lw ra, %d(sp)" (ctx.frame_size - 4);
     if ctx.uses_s0 then emitf ctx "    lw s0, %d(sp)" (ctx.frame_size - 8);
     emitf ctx "    addi sp, sp, %d" ctx.frame_size
   end
@@ -1145,6 +1149,7 @@ let gen_func buf (f : Cfg.func) =
       frame_size = layout.frame_size;
       saved_regs = layout.saved_regs;
       uses_s0 = layout.uses_s0;
+      saves_ra = layout.saves_ra;
     }
   in
   emit ctx "    .text";
@@ -1153,7 +1158,7 @@ let gen_func buf (f : Cfg.func) =
   emitf ctx "%s:" f.label;
   if layout.frame_size > 0 then begin
     emitf ctx "    addi sp, sp, -%d" layout.frame_size;
-    emitf ctx "    sw ra, %d(sp)" (layout.frame_size - 4);
+    if layout.saves_ra then emitf ctx "    sw ra, %d(sp)" (layout.frame_size - 4);
     if layout.uses_s0 then emitf ctx "    sw s0, %d(sp)" (layout.frame_size - 8);
     List.iteri
       (fun i reg -> emitf ctx "    sw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
