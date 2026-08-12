@@ -1829,31 +1829,71 @@ let mem2reg_func (f : Cfg.func) =
           Printf.sprintf ".L%s_mem2reg_edge_%d" current.label id
         in
         let build_parallel_copies copies =
-          let snapshots = Hashtbl.create (List.length copies) in
-          let snapshots_rev, assigns_rev =
-            List.fold_left
-              (fun (snapshots_rev, assigns_rev) (dst, src) ->
-                if src = Tcg.Temp dst then (snapshots_rev, assigns_rev)
-                else
-                  match src with
-                  | Tcg.Imm _ ->
-                      (snapshots_rev, simplify_simple_instr (Tcg.Move (dst, src)) :: assigns_rev)
-                  | Tcg.Temp src_temp ->
-                      let snap_temp, snapshots_rev =
-                        match Hashtbl.find_opt snapshots src_temp with
-                        | Some temp -> (temp, snapshots_rev)
-                        | None ->
-                            let temp = fresh_temp () in
-                            Hashtbl.add snapshots src_temp temp;
-                            ( temp,
-                              simplify_simple_instr (Tcg.Move (temp, Tcg.Temp src_temp))
-                              :: snapshots_rev )
-                      in
-                      ( snapshots_rev,
-                        simplify_simple_instr (Tcg.Move (dst, Tcg.Temp snap_temp)) :: assigns_rev ))
-              ([], []) copies
+          let rec remove_first target = function
+            | [] -> []
+            | copy :: rest ->
+                if copy = target then rest else copy :: remove_first target rest
           in
-          List.rev snapshots_rev @ List.rev assigns_rev
+          let rec schedule acc copies =
+            let copies =
+              List.filter (fun (dst, src) -> src <> Tcg.Temp dst) copies
+            in
+            match copies with
+            | [] -> List.rev acc
+            | _ ->
+                let source_temps =
+                  List.fold_left
+                    (fun temps (_, src) ->
+                      match src with
+                      | Tcg.Temp temp -> IntSet.add temp temps
+                      | Tcg.Imm _ -> temps)
+                    IntSet.empty copies
+                in
+                begin
+                  match
+                    List.find_opt
+                      (fun (dst, _) -> not (IntSet.mem dst source_temps))
+                      copies
+                  with
+                  | Some ((dst, src) as copy) ->
+                      let instr = simplify_simple_instr (Tcg.Move (dst, src)) in
+                      schedule (instr :: acc) (remove_first copy copies)
+                  | None ->
+                      (* A real parallel-copy cycle remains. Snapshot one source,
+                         rewrite every use of that old value, then continue. *)
+                      begin
+                        match copies with
+                        | (_, Tcg.Temp src_temp) :: _ ->
+                            let snap_temp = fresh_temp () in
+                            let snapshot =
+                              simplify_simple_instr
+                                (Tcg.Move (snap_temp, Tcg.Temp src_temp))
+                            in
+                            let replacement = Tcg.Temp snap_temp in
+                            let copies =
+                              List.map
+                                (fun (dst, src) ->
+                                  if src = Tcg.Temp src_temp then (dst, replacement)
+                                  else (dst, src))
+                                copies
+                            in
+                            schedule (snapshot :: acc) copies
+                        | (_, Tcg.Imm _) :: _ ->
+                            failwith "internal mem2reg parallel-copy cycle"
+                        | [] -> List.rev acc
+                      end
+                end
+          in
+          schedule [] copies
+        in
+        let promoted_block_map = Hashtbl.create (List.length promoted_blocks) in
+        List.iter
+          (fun (block : Cfg.block) -> Hashtbl.replace promoted_block_map block.label block)
+          promoted_blocks;
+        let prepended_copies = Hashtbl.create 16 in
+        let appended_copies = Hashtbl.create 16 in
+        let only_edge labels target =
+          labels <> [] && List.for_all (fun label -> label = target) labels
         in
         List.iter
           (fun (succ_block : Cfg.block) ->
@@ -1873,31 +1913,52 @@ let mem2reg_func (f : Cfg.func) =
                     List.fold_left
                       (fun acc (local_id, phi_temp) ->
                         match IntMap.find_opt local_id pred_out with
-                        | Some source when source <> Tcg.Temp phi_temp -> (phi_temp, source) :: acc
+                        | Some source when source <> Tcg.Temp phi_temp ->
+                            (phi_temp, source) :: acc
                         | Some _ | None -> acc)
                       [] phi_copies
                   in
                   match build_parallel_copies (List.rev copies) with
                   | [] -> ()
                   | body ->
-                      let edge_label = fresh_edge_label () in
-                      Hashtbl.add redirects (pred, succ_block.label) edge_label;
-                      edge_blocks_rev :=
-                        {
-                          Cfg.label = edge_label;
-                          body;
-                          term = Cfg.Jump succ_block.label;
-                          preds = [];
-                          succs = [ succ_block.label ];
-                        }
-                        :: !edge_blocks_rev)
+                      let pred_block = Hashtbl.find_opt promoted_block_map pred in
+                      begin
+                        match pred_block with
+                        | Some block when only_edge block.succs succ_block.label ->
+                            Hashtbl.replace appended_copies pred body
+                        | _ when only_edge succ_block.preds pred ->
+                            Hashtbl.replace prepended_copies succ_block.label body
+                        | _ ->
+                            let edge_label = fresh_edge_label () in
+                            Hashtbl.add redirects (pred, succ_block.label) edge_label;
+                            edge_blocks_rev :=
+                              {
+                                Cfg.label = edge_label;
+                                body;
+                                term = Cfg.Jump succ_block.label;
+                                preds = [];
+                                succs = [ succ_block.label ];
+                              }
+                              :: !edge_blocks_rev
+                      end)
                 succ_block.preds)
           promoted_blocks;
         let blocks =
           List.map
             (fun (block : Cfg.block) ->
+              let prefix =
+                Option.value ~default:[] (Hashtbl.find_opt prepended_copies block.label)
+              in
+              let suffix =
+                Option.value ~default:[] (Hashtbl.find_opt appended_copies block.label)
+              in
               let term = redirect_successors block.label redirects block.term in
-              { block with term; succs = Cfg.successors term })
+              {
+                block with
+                body = prefix @ block.body @ suffix;
+                term;
+                succs = Cfg.successors term;
+              })
             promoted_blocks
           @ List.rev !edge_blocks_rev
         in
