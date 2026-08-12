@@ -1732,6 +1732,62 @@ let build_parallel_copies fresh_temp copies =
   in
   schedule [] copies
 
+let place_edge_copies fresh_edge_label blocks edge_copies =
+  let block_map = Hashtbl.create (List.length blocks) in
+  List.iter
+    (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block)
+    blocks;
+  let prepended_copies = Hashtbl.create 16 in
+  let appended_copies = Hashtbl.create 16 in
+  let redirects = Hashtbl.create 16 in
+  let edge_blocks_rev = ref [] in
+  let only_edge labels target =
+    labels <> [] && List.for_all (fun label -> label = target) labels
+  in
+  List.iter
+    (fun (pred, succ, body) ->
+      match Hashtbl.find_opt block_map pred with
+      | Some block when only_edge block.succs succ ->
+          Hashtbl.replace appended_copies pred body
+      | _ ->
+          let succ_preds =
+            match Hashtbl.find_opt block_map succ with
+            | Some block -> block.preds
+            | None -> []
+          in
+          if only_edge succ_preds pred then
+            Hashtbl.replace prepended_copies succ body
+          else
+            let edge_label = fresh_edge_label () in
+            Hashtbl.add redirects (pred, succ) edge_label;
+            edge_blocks_rev :=
+              {
+                Cfg.label = edge_label;
+                body;
+                term = Cfg.Jump succ;
+                preds = [];
+                succs = [ succ ];
+              }
+              :: !edge_blocks_rev)
+    edge_copies;
+  List.map
+    (fun (block : Cfg.block) ->
+      let prefix =
+        Option.value ~default:[] (Hashtbl.find_opt prepended_copies block.label)
+      in
+      let suffix =
+        Option.value ~default:[] (Hashtbl.find_opt appended_copies block.label)
+      in
+      let term = redirect_successors block.label redirects block.term in
+      {
+        block with
+        body = prefix @ block.body @ suffix;
+        term;
+        succs = Cfg.successors term;
+      })
+    blocks
+  @ List.rev !edge_blocks_rev
+
 let mem2reg_func (f : Cfg.func) =
   let all_candidates = collect_local_ids f in
   let rec attempt (current : Cfg.func) candidates =
@@ -1873,23 +1929,13 @@ let mem2reg_func (f : Cfg.func) =
           { block with body }
         in
         let promoted_blocks = List.map rewrite_block current.blocks in
-        let redirects = Hashtbl.create 16 in
-        let edge_blocks_rev = ref [] in
         let edge_id = ref 0 in
         let fresh_edge_label () =
           let id = !edge_id in
           incr edge_id;
           Printf.sprintf ".L%s_mem2reg_edge_%d" current.label id
         in
-        let promoted_block_map = Hashtbl.create (List.length promoted_blocks) in
-        List.iter
-          (fun (block : Cfg.block) -> Hashtbl.replace promoted_block_map block.label block)
-          promoted_blocks;
-        let prepended_copies = Hashtbl.create 16 in
-        let appended_copies = Hashtbl.create 16 in
-        let only_edge labels target =
-          labels <> [] && List.for_all (fun label -> label = target) labels
-        in
+        let edge_copies_rev = ref [] in
         List.iter
           (fun (succ_block : Cfg.block) ->
             let phi_copies =
@@ -1916,46 +1962,12 @@ let mem2reg_func (f : Cfg.func) =
                   match build_parallel_copies fresh_temp (List.rev copies) with
                   | [] -> ()
                   | body ->
-                      let pred_block = Hashtbl.find_opt promoted_block_map pred in
-                      begin
-                        match pred_block with
-                        | Some block when only_edge block.succs succ_block.label ->
-                            Hashtbl.replace appended_copies pred body
-                        | _ when only_edge succ_block.preds pred ->
-                            Hashtbl.replace prepended_copies succ_block.label body
-                        | _ ->
-                            let edge_label = fresh_edge_label () in
-                            Hashtbl.add redirects (pred, succ_block.label) edge_label;
-                            edge_blocks_rev :=
-                              {
-                                Cfg.label = edge_label;
-                                body;
-                                term = Cfg.Jump succ_block.label;
-                                preds = [];
-                                succs = [ succ_block.label ];
-                              }
-                              :: !edge_blocks_rev
-                      end)
+                      edge_copies_rev :=
+                        (pred, succ_block.label, body) :: !edge_copies_rev)
                 succ_block.preds)
           promoted_blocks;
         let blocks =
-          List.map
-            (fun (block : Cfg.block) ->
-              let prefix =
-                Option.value ~default:[] (Hashtbl.find_opt prepended_copies block.label)
-              in
-              let suffix =
-                Option.value ~default:[] (Hashtbl.find_opt appended_copies block.label)
-              in
-              let term = redirect_successors block.label redirects block.term in
-              {
-                block with
-                body = prefix @ block.body @ suffix;
-                term;
-                succs = Cfg.successors term;
-              })
-            promoted_blocks
-          @ List.rev !edge_blocks_rev
+          place_edge_copies fresh_edge_label promoted_blocks (List.rev !edge_copies_rev)
         in
         let promoted = Cfg.rebuild_edges { current with temp_count = !next_temp; blocks } in
         if IntSet.is_empty !failed then promoted else attempt promoted !failed
@@ -2158,14 +2170,13 @@ let promote_globals_func summaries globals (f : Cfg.func) =
           { block with body }
         in
         let promoted_blocks = List.map rewrite_block f.blocks in
-        let redirects = Hashtbl.create 16 in
-        let edge_blocks_rev = ref [] in
         let edge_id = ref 0 in
         let fresh_edge_label () =
           let id = !edge_id in
           incr edge_id;
           Printf.sprintf ".L%s_gprom_edge_%d" f.label id
         in
+        let edge_copies_rev = ref [] in
         List.iter
           (fun (succ_block : Cfg.block) ->
             let phi_copies =
@@ -2191,26 +2202,12 @@ let promote_globals_func summaries globals (f : Cfg.func) =
                   match build_parallel_copies fresh_temp (List.rev copies) with
                   | [] -> ()
                   | body ->
-                      let edge_label = fresh_edge_label () in
-                      Hashtbl.add redirects (pred, succ_block.label) edge_label;
-                      edge_blocks_rev :=
-                        {
-                          Cfg.label = edge_label;
-                          body;
-                          term = Cfg.Jump succ_block.label;
-                          preds = [];
-                          succs = [ succ_block.label ];
-                        }
-                        :: !edge_blocks_rev)
+                      edge_copies_rev :=
+                        (pred, succ_block.label, body) :: !edge_copies_rev)
                 succ_block.preds)
           promoted_blocks;
         let blocks =
-          List.map
-            (fun (block : Cfg.block) ->
-              let term = redirect_successors block.label redirects block.term in
-              { block with term; succs = Cfg.successors term })
-            promoted_blocks
-          @ List.rev !edge_blocks_rev
+          place_edge_copies fresh_edge_label promoted_blocks (List.rev !edge_copies_rev)
         in
         Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
     end
