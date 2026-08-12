@@ -935,8 +935,57 @@ let compute_temp_intervals (f : Cfg.func) =
          | 0 -> compare a.temp b.temp
          | c -> c)
 
-let allocate_temp_regs ?(reserved_saved_regs = []) (f : Cfg.func) =
-  let intervals = compute_temp_intervals f in
+let find_param_seed_regs (f : Cfg.func) =
+  let first_arg_regs = Hashtbl.create 8 in
+  List.iteri
+    (fun i (param : Tcg.var) ->
+      if i < 8 then Hashtbl.replace first_arg_regs param.id (Printf.sprintf "a%d" i))
+    f.params;
+  let load_info = Hashtbl.create 8 in
+  let stored = ref IntSet.empty in
+  List.iter
+    (fun (block : Cfg.block) ->
+      let seen_call = ref false in
+      List.iter
+        (fun instr ->
+          match instr with
+          | Tcg.Load (dst, Tcg.Local id) when Hashtbl.mem first_arg_regs id ->
+              let count, _, _, _ =
+                Option.value ~default:(0, dst, false, false) (Hashtbl.find_opt load_info id)
+              in
+              let before_call = block.label = f.entry && not !seen_call in
+              Hashtbl.replace load_info id (count + 1, dst, block.label = f.entry, before_call)
+          | Tcg.Store (Tcg.Local id, _) when Hashtbl.mem first_arg_regs id ->
+              stored := IntSet.add id !stored
+          | Tcg.Call _ -> seen_call := true
+          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> ())
+        block.body)
+    f.blocks;
+  let by_local = Hashtbl.create 8 in
+  let by_temp = Hashtbl.create 8 in
+  Hashtbl.iter
+    (fun id (count, temp, in_entry, before_call) ->
+      if count = 1 && in_entry && before_call && not (IntSet.mem id !stored) then
+        match Hashtbl.find_opt first_arg_regs id with
+        | Some reg ->
+            Hashtbl.replace by_local id (temp, reg);
+            Hashtbl.replace by_temp temp reg
+        | None -> ())
+    load_info;
+  (by_local, by_temp)
+
+let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.func) =
+  let entry_reg_hints = Option.value ~default:(Hashtbl.create 0) entry_reg_hints in
+  let intervals =
+    compute_temp_intervals f
+    |> List.map (fun (interval : interval) ->
+           if Hashtbl.mem entry_reg_hints interval.temp then { interval with start_pos = 0 }
+           else interval)
+    |> List.sort (fun (a : interval) (b : interval) ->
+           match compare a.start_pos b.start_pos with
+           | 0 -> compare a.temp b.temp
+           | c -> c)
+  in
   let homes = Hashtbl.create (max 8 f.temp_count) in
   let active = ref [] in
   let temp_saved_regs =
@@ -1017,14 +1066,22 @@ let allocate_temp_regs ?(reserved_saved_regs = []) (f : Cfg.func) =
             Hashtbl.replace hinted_regs reg (total + count)
         | Some (TempReg _) | Some (TempStack _) | None -> ())
       interval.hint_temps;
+    let preferred_entry_reg =
+      match Hashtbl.find_opt entry_reg_hints interval.temp with
+      | Some reg when List.mem reg free_allowed_regs -> Some reg
+      | Some _ | None -> None
+    in
     let preferred_call_reg =
       if interval.defined_by_call && List.mem "a0" free_allowed_regs then Some "a0" else None
     in
     let preferred =
-      match preferred_call_reg with
+      match preferred_entry_reg with
       | Some reg -> Some (reg, max_int)
-      | None ->
-          Hashtbl.fold
+      | None -> (
+          match preferred_call_reg with
+          | Some reg -> Some (reg, max_int)
+          | None ->
+              Hashtbl.fold
             (fun reg count best ->
               match best with
               | None -> Some (reg, count)
@@ -1032,7 +1089,7 @@ let allocate_temp_regs ?(reserved_saved_regs = []) (f : Cfg.func) =
                   if count > best_count || (count = best_count && reg < best_reg) then
                     Some (reg, count)
                   else best)
-            hinted_regs None
+            hinted_regs None)
     in
     match preferred with
     | Some (reg, _) ->
@@ -1109,6 +1166,7 @@ let allocate_temp_regs ?(reserved_saved_regs = []) (f : Cfg.func) =
 
 let compute_layout (f : Cfg.func) =
   let local_homes = Hashtbl.create 64 in
+  let param_seed_locals, param_seed_temps = find_param_seed_regs f in
   let global_base_regs = select_global_base_regs f in
   let reserved_saved_regs =
     Hashtbl.fold
@@ -1123,7 +1181,9 @@ let compute_layout (f : Cfg.func) =
       hot_local_regs reserved_saved_regs
     |> List.sort compare
   in
-  let temp_homes, temp_saved_regs = allocate_temp_regs ~reserved_saved_regs f in
+  let temp_homes, temp_saved_regs =
+    allocate_temp_regs ~reserved_saved_regs ~entry_reg_hints:param_seed_temps f
+  in
   let saved_regs =
     List.fold_left
       (fun acc reg -> if List.mem reg acc then acc else reg :: acc)
@@ -1138,11 +1198,23 @@ let compute_layout (f : Cfg.func) =
     next := !next + 4;
     off
   in
+  let direct_param_regs = Hashtbl.create 8 in
+  Hashtbl.iter
+    (fun local_id (temp, source_reg) ->
+      match Hashtbl.find_opt temp_homes temp with
+      | Some (TempReg reg)
+        when reg = source_reg || not (List.mem reg allocatable_arg_regs) ->
+          Hashtbl.replace direct_param_regs local_id reg
+      | Some (TempReg _) | Some (TempStack _) | None -> ())
+    param_seed_locals;
   let alloc_local (var : Tcg.var) =
     if IntSet.mem var.id referenced_locals && not (Hashtbl.mem local_homes var.id) then
-      match Hashtbl.find_opt hot_local_regs var.id with
+      match Hashtbl.find_opt direct_param_regs var.id with
       | Some reg -> Hashtbl.add local_homes var.id (LocalReg reg)
-      | None -> Hashtbl.add local_homes var.id (LocalStack (alloc_slot ()))
+      | None -> (
+          match Hashtbl.find_opt hot_local_regs var.id with
+          | Some reg -> Hashtbl.add local_homes var.id (LocalReg reg)
+          | None -> Hashtbl.add local_homes var.id (LocalStack (alloc_slot ())))
   in
   List.iter alloc_local f.params;
   List.iter alloc_local f.locals;
@@ -1636,21 +1708,42 @@ let layout_has_stack_homes (layout : layout) =
   in
   local_stack || temp_stack
 
+let frameless_params_ready (f : Cfg.func) (layout : layout) =
+  List.mapi
+    (fun i (param : Tcg.var) ->
+      match Hashtbl.find_opt layout.local_homes param.id with
+      | None -> true
+      | Some (LocalReg reg) when i < 8 -> reg = Printf.sprintf "a%d" i
+      | Some (LocalReg _) | Some (LocalStack _) -> false)
+    f.params
+  |> List.for_all (fun ready -> ready)
+
 let can_use_frameless_leaf (f : Cfg.func) (layout : layout) =
   (not (func_has_call f))
   && layout.saved_regs = []
   && layout.outgoing_area = 0
   && not (layout_has_stack_homes layout)
+  && frameless_params_ready f layout
 
 let gen_func buf (f : Cfg.func) =
   let f = schedule_func_blocks_with_hot_traces f in
   let layout = compute_layout f in
   let frameless_leaf = can_use_frameless_leaf f layout in
+  let param_reg_count, param_stack_count =
+    List.fold_left
+      (fun (reg_count, stack_count) (param : Tcg.var) ->
+        match Hashtbl.find_opt layout.local_homes param.id with
+        | Some (LocalReg _) -> (reg_count + 1, stack_count)
+        | Some (LocalStack _) -> (reg_count, stack_count + 1)
+        | None -> (reg_count, stack_count))
+      (0, 0) f.params
+  in
   if Sys.getenv_opt "TOYC_DEBUG_CODEGEN_FRAME" <> None then
     Printf.eprintf
-      "codegen-frame func=%s frameless=%b frame=%d saved=%d locals=%d temps=%d\n%!"
+      "codegen-frame func=%s frameless=%b frame=%d saved=%d locals=%d temps=%d param_reg=%d param_stack=%d\n%!"
       f.name frameless_leaf layout.frame_size (List.length layout.saved_regs)
-      (Hashtbl.length layout.local_homes) (Hashtbl.length layout.temp_homes);
+      (Hashtbl.length layout.local_homes) (Hashtbl.length layout.temp_homes)
+      param_reg_count param_stack_count;
   let epilogue = Printf.sprintf ".L_%s_epilogue" f.label in
   let blocks_by_label = Hashtbl.create (List.length f.blocks) in
   let _, live_out_temps = compute_temp_live_sets f in
