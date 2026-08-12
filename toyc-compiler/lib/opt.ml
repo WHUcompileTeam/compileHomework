@@ -1753,8 +1753,14 @@ let rewrite_term_temps rename = function
   | Cfg.Return (Some value) -> Cfg.Return (Some (rewrite_operand_temp rename value))
 
 let copy_coalesce_func summaries globals (f : Cfg.func) =
-  if f.temp_count <= 1 then f
-  else
+  let debug_coalesce = Sys.getenv_opt "TOYC_DEBUG_COALESCE" <> None in
+  if f.temp_count <= 1 then begin
+    if debug_coalesce then
+      Printf.eprintf
+        "coalesce func=%s candidates=0 merged=0 removed_moves=0 temps=%d->%d\n%!"
+        f.name f.temp_count f.temp_count;
+    f
+  end else
     let live_in_t, _ = compute_liveness summaries globals f in
     let interference = Array.make f.temp_count IntSet.empty in
     let add_edge a b =
@@ -1831,8 +1837,13 @@ let copy_coalesce_func summaries globals (f : Cfg.func) =
         if dst >= 0 && src >= 0 && dst < f.temp_count && src < f.temp_count && merge dst src then
           incr merged)
       (List.rev !candidates_rev);
-    if !merged = 0 then f
-    else
+    if !merged = 0 then begin
+      if debug_coalesce then
+        Printf.eprintf
+          "coalesce func=%s candidates=%d merged=0 removed_moves=0 temps=%d->%d\n%!"
+          f.name (List.length !candidates_rev) f.temp_count f.temp_count;
+      f
+    end else
       let rename temp =
         if temp >= 0 && temp < f.temp_count then find temp else temp
       in
@@ -1897,7 +1908,7 @@ let copy_coalesce_func summaries globals (f : Cfg.func) =
             { block with body; term; succs = Cfg.successors term })
           rewritten.blocks
       in
-      if Sys.getenv_opt "TOYC_DEBUG_COALESCE" <> None then
+      if debug_coalesce then
         Printf.eprintf
           "coalesce func=%s candidates=%d merged=%d removed_moves=%d temps=%d->%d\n%!"
           f.name (List.length !candidates_rev) !merged !removed_moves f.temp_count
