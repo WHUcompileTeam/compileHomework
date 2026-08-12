@@ -259,7 +259,23 @@ let simplify_simple_instr = function
           match fold_binop op a b with
           | Some folded -> Tcg.Move (dst, Tcg.Imm folded)
           | None -> Tcg.Bin (dst, op, lhs, rhs))
-      | _ -> Tcg.Bin (dst, op, lhs, rhs))
+      | _ -> (
+          match (op, lhs, rhs) with
+          | Add, value, Tcg.Imm 0L
+          | Add, Tcg.Imm 0L, value
+          | Sub, value, Tcg.Imm 0L
+          | Mul, value, Tcg.Imm 1L
+          | Mul, Tcg.Imm 1L, value
+          | Div, value, Tcg.Imm 1L ->
+              Tcg.Move (dst, value)
+          | Mul, _, Tcg.Imm 0L
+          | Mul, Tcg.Imm 0L, _
+          | Mod, _, Tcg.Imm 1L
+          | Mod, _, Tcg.Imm (-1L) ->
+              Tcg.Move (dst, Tcg.Imm 0L)
+          | (Eq | Le | Ge), a, b when a = b -> Tcg.Move (dst, Tcg.Imm 1L)
+          | (Ne | Lt | Gt), a, b when a = b -> Tcg.Move (dst, Tcg.Imm 0L)
+          | _ -> Tcg.Bin (dst, op, lhs, rhs)))
   | instr -> instr
 
 let is_compare_binop = function
@@ -2479,24 +2495,17 @@ let linear_expr_of_operand
                       | Some instr -> of_instr (IntSet.add temp seen) instr
                       | None -> None)))
   and of_instr seen = function
-    | Tcg.Move (_, src) -> of_operand seen (resolve_block_operand block src)
+    | Tcg.Move (_, src) -> of_operand seen src
     | Tcg.Un (_, UMinus, src) ->
-        let src = resolve_block_operand block src in
         Option.map linear_expr_neg (of_operand seen src)
     | Tcg.Un _ -> None
     | Tcg.Bin (_, Add, lhs, rhs) ->
-        let lhs = resolve_block_operand block lhs in
-        let rhs = resolve_block_operand block rhs in
         Option.bind (of_operand seen lhs) (fun lhs ->
             Option.bind (of_operand seen rhs) (linear_expr_add lhs))
     | Tcg.Bin (_, Sub, lhs, rhs) ->
-        let lhs = resolve_block_operand block lhs in
-        let rhs = resolve_block_operand block rhs in
         Option.bind (of_operand seen lhs) (fun lhs ->
             Option.bind (of_operand seen rhs) (linear_expr_sub lhs))
     | Tcg.Bin (_, Mul, lhs, rhs) -> (
-        let lhs = resolve_block_operand block lhs in
-        let rhs = resolve_block_operand block rhs in
         match (lhs, rhs) with
         | Tcg.Imm factor, rhs -> Option.bind (of_operand seen rhs) (linear_expr_scale factor)
         | lhs, Tcg.Imm factor -> Option.bind (of_operand seen lhs) (linear_expr_scale factor)
@@ -2556,8 +2565,6 @@ let reduction_update_of_temp
   and of_instr seen = function
     | Tcg.Move (_, src) -> of_operand seen src
     | Tcg.Bin (_, Add, lhs, rhs) ->
-        let lhs = resolve_block_operand block lhs in
-        let rhs = resolve_block_operand block rhs in
         if resolves_to_induction_temp multi_defs def_instrs phi_temp lhs then
           Option.map
             (fun step -> { phi_temp; subtract = false; step })
@@ -2582,8 +2589,6 @@ let reduction_update_of_temp
                block lhs)
         else None
     | Tcg.Bin (_, Sub, lhs, rhs) ->
-        let lhs = resolve_block_operand block lhs in
-        let rhs = resolve_block_operand block rhs in
         if resolves_to_induction_temp multi_defs def_instrs phi_temp lhs then
           Option.map
             (fun step -> { phi_temp; subtract = true; step })
@@ -2598,7 +2603,9 @@ let reduction_update_of_temp
         else None
     | Tcg.Un _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ | Tcg.Bin _ -> None
   in
-  of_operand IntSet.empty (Tcg.Temp temp)
+  match last_def_of_temp block temp with
+  | Some instr -> of_instr IntSet.empty instr
+  | None -> None
 
 let collect_counted_reductions
     header
@@ -3565,6 +3572,109 @@ let optimize_func global_init globals (f : Cfg.func) =
   | Some "mem2reg" -> promoted
   | Some _ | None -> loop 8 promoted
 
+type inline_func = {
+  params : Tcg.var list;
+  body : Tcg.simple_instr list;
+  result : Tcg.operand;
+}
+
+let small_inline_func (f : Cfg.func) =
+  match f.blocks with
+  | [ block ] when List.length f.params <= 8 && List.length block.body <= 10 ->
+      let param_ids =
+        List.fold_left (fun ids (param : Tcg.var) -> IntSet.add param.id ids) IntSet.empty f.params
+      in
+      let safe_instr = function
+        | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ -> true
+        | Tcg.Load (_, Tcg.Local id) -> IntSet.mem id param_ids
+        | Tcg.Load (_, Tcg.Global _) -> true
+        | Tcg.Store _ | Tcg.Call _ -> false
+      in
+      if List.for_all safe_instr block.body then
+        match block.term with
+        | Cfg.Return (Some result) -> Some { params = f.params; body = block.body; result }
+        | Cfg.Jump _ | Cfg.BranchZero _ | Cfg.BranchNonZero _
+        | Cfg.BranchCompare _ | Cfg.Return None -> None
+      else None
+  | _ -> None
+
+let inline_small_funcs funcs =
+  let choices = Hashtbl.create 8 in
+  List.iter
+    (fun (f : Cfg.func) ->
+      if f.name <> "main" then
+        Option.iter (fun info -> Hashtbl.replace choices f.label info) (small_inline_func f))
+    funcs;
+  let inline_func (f : Cfg.func) =
+    let next_temp = ref f.temp_count in
+    let fresh_temp () =
+      let temp = !next_temp in
+      incr next_temp;
+      temp
+    in
+    let inline_call dst args info =
+      if List.length args <> List.length info.params then None
+      else
+        let param_values =
+          List.fold_left2
+            (fun values (param : Tcg.var) arg -> IntMap.add param.id arg values)
+            IntMap.empty info.params args
+        in
+        let temps = Hashtbl.create 8 in
+        let operand = function
+          | Tcg.Imm _ as value -> Some value
+          | Tcg.Temp old -> Option.map (fun temp -> Tcg.Temp temp) (Hashtbl.find_opt temps old)
+        in
+        let define old =
+          let temp = fresh_temp () in
+          Hashtbl.replace temps old temp;
+          temp
+        in
+        let rec clone acc = function
+          | [] -> (
+              match operand info.result with
+              | Some result -> Some (List.rev (Tcg.Move (dst, result) :: acc))
+              | None -> None)
+          | instr :: rest -> (
+              match instr with
+              | Tcg.Load (old, Tcg.Local id) -> (
+                  match IntMap.find_opt id param_values with
+                  | Some value -> clone (Tcg.Move (define old, value) :: acc) rest
+                  | None -> None)
+              | Tcg.Move (old, src) ->
+                  Option.bind (operand src) (fun src -> clone (Tcg.Move (define old, src) :: acc) rest)
+              | Tcg.Un (old, op, src) ->
+                  Option.bind (operand src) (fun src -> clone (Tcg.Un (define old, op, src) :: acc) rest)
+              | Tcg.Bin (old, op, lhs, rhs) ->
+                  Option.bind (operand lhs) (fun lhs ->
+                      Option.bind (operand rhs) (fun rhs ->
+                          clone (Tcg.Bin (define old, op, lhs, rhs) :: acc) rest))
+              | Tcg.Load (old, Tcg.Global label) ->
+                  clone (Tcg.Load (define old, Tcg.Global label) :: acc) rest
+              | Tcg.Store _ | Tcg.Call _ -> None)
+        in
+        clone [] info.body
+    in
+    let blocks =
+      List.map
+        (fun (block : Cfg.block) ->
+          let body =
+            List.concat_map
+              (function
+                | Tcg.Call (Some dst, callee, args) as call -> (
+                    match Hashtbl.find_opt choices callee with
+                    | Some info -> Option.value ~default:[ call ] (inline_call dst args info)
+                    | None -> [ call ])
+                | instr -> [ instr ])
+              block.body
+          in
+          { block with body })
+        f.blocks
+    in
+    Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
+  in
+  List.map inline_func funcs
+
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let global_init, globals =
     List.fold_left
@@ -3573,4 +3683,6 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
         (PlaceMap.add place (CpConst g.init) init, PlaceSet.add place set))
       (PlaceMap.empty, PlaceSet.empty) analysis.globals
   in
-  { Cfg.funcs = List.map (optimize_func global_init globals) cfg.funcs }
+  let funcs = List.map (optimize_func global_init globals) cfg.funcs in
+  let funcs = inline_small_funcs funcs in
+  { Cfg.funcs = List.map (optimize_func global_init globals) funcs }
