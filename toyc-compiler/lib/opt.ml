@@ -9713,7 +9713,33 @@ let optimize_func global_init summaries globals return_globals (f : Cfg.func) =
   | Some _ -> loop 1 profile.max_rounds canonical
   | None ->
       let optimized = loop 1 profile.max_rounds canonical in
-      let coalesced = copy_coalesce_func summaries globals optimized in
+      (* Loop canonicalization/unrolling/rotation can expose locals that the
+         early mem2reg could not safely promote.  Run mem2reg once more after
+         all iterative CFG transforms have settled, then immediately coalesce
+         the copies it introduces.  Keeping this final-only avoids feeding the
+         newly-created phi/edge copies back into the main optimization loop. *)
+      let late_promoted = mem2reg_func optimized in
+      if Sys.getenv_opt "TOYC_DEBUG_LATE_MEM2REG" <> None then begin
+        let count_local_accesses (func : Cfg.func) =
+          List.fold_left
+            (fun count (block : Cfg.block) ->
+              List.fold_left
+                (fun count instr ->
+                  match instr with
+                  | Tcg.Load (_, Tcg.Local _) | Tcg.Store (Tcg.Local _, _) -> count + 1
+                  | _ -> count)
+                count block.body)
+            0 func.blocks
+        in
+        let before_locals = count_local_accesses optimized in
+        let after_locals = count_local_accesses late_promoted in
+        if before_locals <> after_locals || optimized.temp_count <> late_promoted.temp_count then
+          Printf.eprintf
+            "late-mem2reg func=%s local-accesses=%d->%d temps=%d->%d\n%!"
+            optimized.name before_locals after_locals optimized.temp_count
+            late_promoted.temp_count
+      end;
+      let coalesced = copy_coalesce_func summaries globals late_promoted in
       let with_hoisted_loop_bounds =
         hoist_unrolled_loop_branch_immediates_func summaries globals coalesced
       in
