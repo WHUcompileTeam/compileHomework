@@ -10118,6 +10118,229 @@ let compute_dead_call_removable_funcs summaries globals funcs =
     funcs;
   removable
 
+
+(* -------------------------------------------------------------------------- *)
+(* Late trivial-call folding                                                  *)
+(*                                                                            *)
+(* DCE can turn a formerly complicated helper into a side-effect-free          *)
+(* straight-line function that merely returns a constant or one of its         *)
+(* arguments.  AST inlining has already happened by then, so without a late    *)
+(* interprocedural cleanup the caller still pays the full call/RA-frame cost.  *)
+(*                                                                            *)
+(* Recognize only extremely safe callees: after jump-threading/final merging    *)
+(* there must be exactly one reachable block, no Store/Call/global Load, no     *)
+(* Div/Mod, and the return must symbolically reduce to a constant or parameter. *)
+(* -------------------------------------------------------------------------- *)
+
+type trivial_return_summary =
+  | TrivialConst of int64
+  | TrivialArg of int
+
+type trivial_value =
+  | TvConst of int64
+  | TvArg of int
+
+let trivial_value_of_operand env = function
+  | Tcg.Imm value -> Some (TvConst (i32 value))
+  | Tcg.Temp temp -> IntMap.find_opt temp env
+
+let trivial_return_summary_of_func (f : Cfg.func) =
+  let analysis_view =
+    f
+    |> thread_and_prune_func
+    |> simplify_cfg_func
+    |> final_linear_merge_func
+    |> thread_and_prune_func
+  in
+  let reachable = reachable_labels analysis_view.entry analysis_view.blocks in
+  let blocks =
+    List.filter
+      (fun (block : Cfg.block) -> LabelSet.mem block.label reachable)
+      analysis_view.blocks
+  in
+  match blocks with
+  | [ (block : Cfg.block) ] when block.label = analysis_view.entry ->
+      let param_index_by_local = Hashtbl.create (List.length f.params) in
+      List.iteri
+        (fun index (param : Tcg.var) ->
+          Hashtbl.replace param_index_by_local param.id index)
+        f.params;
+      let rec scan env = function
+        | [] -> Some env
+        | instr :: rest -> (
+            match instr with
+            | Tcg.Move (dst, src) -> (
+                match trivial_value_of_operand env src with
+                | Some value -> scan (IntMap.add dst value env) rest
+                | None -> None)
+            | Tcg.Un (dst, op, src) -> (
+                match trivial_value_of_operand env src with
+                | Some (TvConst value) -> (
+                    match fold_unop op value with
+                    | Some value -> scan (IntMap.add dst (TvConst value) env) rest
+                    | None -> None)
+                | Some (TvArg _) | None -> None)
+            | Tcg.Bin (_, (Div | Mod), _, _) ->
+                (* Even if constant-foldable, keep the proof deliberately
+                   conservative around potentially trapping operators. *)
+                None
+            | Tcg.Bin (dst, op, lhs, rhs) -> (
+                match
+                  (trivial_value_of_operand env lhs, trivial_value_of_operand env rhs)
+                with
+                | Some (TvConst lhs), Some (TvConst rhs) -> (
+                    match fold_binop op lhs rhs with
+                    | Some value -> scan (IntMap.add dst (TvConst value) env) rest
+                    | None -> None)
+                | _ -> None)
+            | Tcg.Load (dst, Tcg.Local local) -> (
+                match Hashtbl.find_opt param_index_by_local local with
+                | Some index -> scan (IntMap.add dst (TvArg index) env) rest
+                | None -> None)
+            | Tcg.Load (_, Tcg.Global _)
+            | Tcg.Store _
+            | Tcg.Call _ ->
+                None)
+      in
+      begin
+        match scan IntMap.empty block.body with
+        | None -> None
+        | Some env -> (
+            match block.term with
+            | Cfg.Return (Some operand) -> (
+                match trivial_value_of_operand env operand with
+                | Some (TvConst value) -> Some (TrivialConst value)
+                | Some (TvArg index) -> Some (TrivialArg index)
+                | None -> None)
+            | Cfg.Return None
+            | Cfg.Jump _
+            | Cfg.BranchZero _
+            | Cfg.BranchNonZero _
+            | Cfg.BranchCompare _ ->
+                None)
+      end
+  | _ -> None
+
+let build_trivial_return_table funcs =
+  let table = Hashtbl.create (max 8 (List.length funcs)) in
+  List.iter
+    (fun (f : Cfg.func) ->
+      match trivial_return_summary_of_func f with
+      | None -> ()
+      | Some summary ->
+          Hashtbl.replace table f.label summary;
+          if Sys.getenv_opt "TOYC_DEBUG_TRIVIAL_CALLS" <> None then
+            let summary_text =
+              match summary with
+              | TrivialConst value -> Printf.sprintf "const:%Ld" value
+              | TrivialArg index -> Printf.sprintf "arg:%d" index
+            in
+            Printf.eprintf
+              "trivial-call-summary func=%s summary=%s\n%!"
+              f.name summary_text)
+    funcs;
+  table
+
+let rewrite_trivial_calls_func table (f : Cfg.func) =
+  let changed = ref false in
+  let replaced = ref 0 in
+  let rewrite_instr = function
+    | Tcg.Call (dst, callee, args) as instr -> (
+        match Hashtbl.find_opt table callee with
+        | None -> Some instr
+        | Some summary -> (
+            match dst with
+            | None ->
+                changed := true;
+                incr replaced;
+                None
+            | Some dst -> (
+                let replacement =
+                  match summary with
+                  | TrivialConst value ->
+                      Some (Tcg.Move (dst, Tcg.Imm value))
+                  | TrivialArg index -> (
+                      match List.nth_opt args index with
+                      | Some operand -> Some (Tcg.Move (dst, operand))
+                      | None -> None)
+                in
+                match replacement with
+                | Some instr ->
+                    changed := true;
+                    incr replaced;
+                    Some (simplify_simple_instr instr)
+                | None -> Some instr)))
+    | instr -> Some instr
+  in
+  let blocks =
+    List.map
+      (fun (block : Cfg.block) ->
+        { block with body = List.filter_map rewrite_instr block.body })
+      f.blocks
+  in
+  let result =
+    if !changed then Cfg.rebuild_edges { f with blocks }
+    else f
+  in
+  if !changed && Sys.getenv_opt "TOYC_DEBUG_TRIVIAL_CALLS" <> None then
+    Printf.eprintf
+      "trivial-call-fold func=%s replaced=%d\n%!"
+      f.name !replaced;
+  result
+
+let cleanup_after_trivial_call_fold
+    global_init summaries globals return_globals removable_calls
+    (f : Cfg.func) =
+  let candidate =
+    f
+    |> const_propagate_func global_init summaries globals
+    |> algebra_canonicalize_func
+    |> eliminate_dead_code_func ~removable_calls summaries globals return_globals
+    |> fold_branch_tails_func summaries globals
+    |> thread_and_prune_func
+    |> simplify_cfg_func
+    |> final_linear_merge_func
+  in
+  if cfg_targets_valid candidate then candidate
+  else begin
+    debug_cfg_validation "late-trivial-call-cleanup" candidate;
+    f
+  end
+
+let fold_trivial_calls_program
+    global_init summaries globals return_global_demands removable_calls
+    (funcs : Cfg.func list) =
+  let rec iterate fuel current =
+    if fuel = 0 then current
+    else
+      let table = build_trivial_return_table current in
+      if Hashtbl.length table = 0 then current
+      else
+        let changed = ref false in
+        let next =
+          List.map
+            (fun (f : Cfg.func) ->
+              let rewritten = rewrite_trivial_calls_func table f in
+              if rewritten <> f then changed := true;
+              if rewritten = f then f
+              else
+                let return_globals =
+                  match Hashtbl.find_opt return_global_demands f.label with
+                  | Some return_globals -> return_globals
+                  | None -> globals
+                in
+                cleanup_after_trivial_call_fold
+                  global_init summaries globals return_globals removable_calls
+                  rewritten)
+            current
+        in
+        if not !changed || next = current then current
+        else iterate (fuel - 1) next
+  in
+  (* A few waves are enough for chains such as main -> f -> g, where g becomes
+     trivial first and f becomes trivial only after its call is folded. *)
+  iterate 4 funcs
+
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
   last_liveness_cache := None;
@@ -10151,4 +10374,10 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
         optimized :: acc)
       [] cfg.funcs
   in
-  { Cfg.funcs = List.rev funcs_rev }
+  let optimized_funcs = List.rev funcs_rev in
+  let optimized_funcs =
+    fold_trivial_calls_program
+      global_init summaries globals return_global_demands removable_calls
+      optimized_funcs
+  in
+  { Cfg.funcs = optimized_funcs }
