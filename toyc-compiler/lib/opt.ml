@@ -8331,35 +8331,81 @@ let algebra_canonicalize_func (f : Cfg.func) =
     else if factor = -1L then Tcg.Un (dst, UMinus, base)
     else Tcg.Bin (dst, Mul, base, Tcg.Imm factor)
   in
+  let unique_def_of_operand = function
+    | Tcg.Temp temp when not (IntSet.mem temp multi_defs) ->
+        Hashtbl.find_opt def_instrs temp
+    | Tcg.Temp _ | Tcg.Imm _ -> None
+  in
+  let cancel_add_sub dst lhs rhs =
+    (* i32 arithmetic is modulo 2^32, so these cancellations remain valid
+       even when the intermediate addition/subtraction wraps.  Only follow
+       unique temporary definitions; phi/multi-definition temporaries are
+       deliberately excluded. *)
+    match unique_def_of_operand lhs with
+    | Some (Tcg.Bin (_, Add, a, b)) when operand_equal rhs a ->
+        Some (Tcg.Move (dst, b))
+    | Some (Tcg.Bin (_, Add, a, b)) when operand_equal rhs b ->
+        Some (Tcg.Move (dst, a))
+    | _ -> (
+        match unique_def_of_operand rhs with
+        | Some (Tcg.Bin (_, Sub, a, b)) when operand_equal lhs a ->
+            Some (Tcg.Move (dst, b))
+        | _ -> None)
+  in
+  let cancel_sub_add dst lhs rhs =
+    let from_mid mid other =
+      match unique_def_of_operand mid with
+      | Some (Tcg.Bin (_, Sub, a, b)) when operand_equal other b ->
+          Some (Tcg.Move (dst, a))
+      | _ -> None
+    in
+    match from_mid lhs rhs with
+    | Some _ as rewritten -> rewritten
+    | None -> from_mid rhs lhs
+  in
   let rewrites = ref 0 in
+  let cancellation_rewrites = ref 0 in
   let rewrite_instr instr =
     let initial = simplify_simple_instr instr in
     let rewritten =
       match initial with
-      | Tcg.Bin (dst, Add, lhs, rhs) ->
-          let lhs, rhs =
-            match (lhs, rhs) with
-            | Tcg.Imm c, other -> (other, Tcg.Imm c)
-            | _ -> (lhs, rhs)
-          in
-          begin match rhs with
-          | Tcg.Imm c -> (
-              match affine_of_operand IntSet.empty lhs with
-              | Some (base, sign, bias, true) ->
-                  build_affine dst (base, sign, add_i32 bias c)
-              | Some _ | None -> Tcg.Bin (dst, Add, lhs, rhs))
-          | Tcg.Temp _ -> Tcg.Bin (dst, Add, lhs, rhs)
-          end
-      | Tcg.Bin (dst, Sub, lhs, Tcg.Imm c) -> (
-          match affine_of_operand IntSet.empty lhs with
-          | Some (base, sign, bias, true) ->
-              build_affine dst (base, sign, sub_i32 bias c)
-          | Some _ | None -> initial)
-      | Tcg.Bin (dst, Sub, Tcg.Imm c, rhs) -> (
-          match affine_of_operand IntSet.empty rhs with
-          | Some (base, sign, bias, true) ->
-              build_affine dst (base, -sign, sub_i32 c bias)
-          | Some _ | None -> initial)
+      | Tcg.Bin (dst, Add, lhs, rhs) -> (
+          match cancel_sub_add dst lhs rhs with
+          | Some rewritten ->
+              incr cancellation_rewrites;
+              rewritten
+          | None ->
+              let lhs, rhs =
+                match (lhs, rhs) with
+                | Tcg.Imm c, other -> (other, Tcg.Imm c)
+                | _ -> (lhs, rhs)
+              in
+              begin match rhs with
+              | Tcg.Imm c -> (
+                  match affine_of_operand IntSet.empty lhs with
+                  | Some (base, sign, bias, true) ->
+                      build_affine dst (base, sign, add_i32 bias c)
+                  | Some _ | None -> Tcg.Bin (dst, Add, lhs, rhs))
+              | Tcg.Temp _ -> Tcg.Bin (dst, Add, lhs, rhs)
+              end)
+      | Tcg.Bin (dst, Sub, lhs, rhs) -> (
+          match cancel_add_sub dst lhs rhs with
+          | Some rewritten ->
+              incr cancellation_rewrites;
+              rewritten
+          | None -> (
+              match (lhs, rhs) with
+              | lhs, Tcg.Imm c -> (
+                  match affine_of_operand IntSet.empty lhs with
+                  | Some (base, sign, bias, true) ->
+                      build_affine dst (base, sign, sub_i32 bias c)
+                  | Some _ | None -> initial)
+              | Tcg.Imm c, rhs -> (
+                  match affine_of_operand IntSet.empty rhs with
+                  | Some (base, sign, bias, true) ->
+                      build_affine dst (base, -sign, sub_i32 c bias)
+                  | Some _ | None -> initial)
+              | Tcg.Temp _, Tcg.Temp _ -> initial))
       | Tcg.Bin (dst, Mul, lhs, rhs) ->
           let lhs, rhs =
             match (lhs, rhs) with
@@ -8394,7 +8440,9 @@ let algebra_canonicalize_func (f : Cfg.func) =
       f.blocks
   in
   if Sys.getenv_opt "TOYC_DEBUG_ALGEBRA" <> None then
-    Printf.eprintf "algebra func=%s rewrites=%d\n%!" f.name !rewrites;
+    Printf.eprintf
+      "algebra func=%s rewrites=%d cancellations=%d\n%!"
+      f.name !rewrites !cancellation_rewrites;
   if !rewrites = 0 then f else Cfg.rebuild_edges { f with blocks }
 
 type reassoc_first =
