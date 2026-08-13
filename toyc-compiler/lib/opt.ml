@@ -1945,6 +1945,29 @@ let merge_incoming_operand preds lookup make_phi =
           | None -> Some (Tcg.Temp (make_phi ())))
       | None -> None)
 
+(* mem2reg needs a slightly more optimistic merge at loop headers.
+   During the first dataflow iterations a backedge may not have an out-value
+   yet even though it will acquire one once the loop phi exists.  Treat a
+   mixture of present and temporarily-missing predecessors as a provisional
+   phi so the fixed point can bootstrap.  A later validation step still
+   rejects the candidate if any predecessor remains genuinely undefined. *)
+let merge_incoming_operand_mem2reg preds lookup make_phi =
+  match preds with
+  | [] -> None
+  | _ ->
+      let incoming = List.map lookup preds in
+      begin
+        match all_present incoming with
+        | Some values -> (
+            match all_same_operand values with
+            | Some value -> Some value
+            | None -> Some (Tcg.Temp (make_phi ())))
+        | None ->
+            if List.exists Option.is_some incoming then
+              Some (Tcg.Temp (make_phi ()))
+            else None
+      end
+
 let solve_forward_envs blocks ~empty_env ~equal_env ~compute_in_env ~transfer_env =
   let in_envs = Hashtbl.create (List.length blocks) in
   let out_envs = Hashtbl.create (List.length blocks) in
@@ -2363,7 +2386,7 @@ let mem2reg_func (f : Cfg.func) =
           IntSet.fold
             (fun local_id env ->
               let keep_value =
-                merge_incoming_operand block.preds
+                merge_incoming_operand_mem2reg block.preds
                   (fun pred -> IntMap.find_opt local_id (get_out pred))
                   (fun () -> get_phi_temp block.label local_id)
               in
@@ -2411,6 +2434,14 @@ let mem2reg_func (f : Cfg.func) =
             phi_temps)
         current.blocks;
       let succeeded = IntSet.diff candidates !failed in
+      if Sys.getenv_opt "TOYC_DEBUG_MEM2REG_LOOP_PHI" <> None then
+        Printf.eprintf
+          "mem2reg-loop-phi func=%s candidates=%d succeeded=%d failed=%d phis=%d\n%!"
+          current.name
+          (IntSet.cardinal candidates)
+          (IntSet.cardinal succeeded)
+          (IntSet.cardinal !failed)
+          (Hashtbl.length phi_temps);
       if IntSet.is_empty succeeded then current
       else
         let entry_seed_instrs =
@@ -2459,7 +2490,15 @@ let mem2reg_func (f : Cfg.func) =
               IntSet.fold
                 (fun local_id acc ->
                   match Hashtbl.find_opt phi_temps (succ_block.label, local_id) with
-                  | Some phi_temp -> (local_id, phi_temp) :: acc
+                  | Some phi_temp -> (
+                      (* A provisional phi may have been created during an
+                         intermediate solver iteration and later become
+                         unnecessary.  Emit edge copies only when the final
+                         fixed-point in-env actually uses this phi. *)
+                      match IntMap.find_opt local_id (get_env in_envs succ_block.label) with
+                      | Some (Tcg.Temp temp) when temp = phi_temp ->
+                          (local_id, phi_temp) :: acc
+                      | Some _ | None -> acc)
                   | None -> acc)
                 succeeded []
             in
