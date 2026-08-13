@@ -9739,26 +9739,24 @@ let optimize_func global_init summaries globals return_globals (f : Cfg.func) =
             optimized.name before_locals after_locals optimized.temp_count
             late_promoted.temp_count
       end;
-      let coalesced = copy_coalesce_func summaries globals late_promoted in
-      (* Late mem2reg and loop transforms can expose fresh one-use affine chains
-         such as [t1 = x + 1; t2 = t1 + 2].  The ordinary algebra pass ran
-         before those shapes existed, so run the same proven canonicalizer once
-         more here, then immediately delete the now-dead intermediate temps.
-         This is final-only: no loop/CFG transform will consume the rewritten
-         shape afterwards. *)
-      let late_algebra = algebra_canonicalize_func coalesced in
+      (* IMPORTANT: run late algebra BEFORE copy coalescing.  Late mem2reg
+         deliberately creates fresh, mostly single-definition/single-use temp
+         chains.  [algebra_canonicalize_func] can safely follow those chains,
+         but coalescing first can merge unrelated definitions onto one temp and
+         make the canonicalizer reject them as multi-def/use-heavy. *)
+      let late_algebra = algebra_canonicalize_func late_promoted in
       let late_dce =
         eliminate_dead_code_func summaries globals return_globals late_algebra
       in
       let late_coalesced = copy_coalesce_func summaries globals late_dce in
       if Sys.getenv_opt "TOYC_DEBUG_LATE_ALGEBRA" <> None then begin
-        let before = metrics_of_func coalesced in
+        let before = metrics_of_func late_promoted in
         let after_algebra = metrics_of_func late_algebra in
         let after_dce = metrics_of_func late_coalesced in
-        if late_coalesced <> coalesced then
+        if late_coalesced <> late_promoted then
           Printf.eprintf
             "late-algebra func=%s instrs=%d->%d->%d temps=%d->%d\n%!"
-            coalesced.name before.instr_count after_algebra.instr_count
+            late_promoted.name before.instr_count after_algebra.instr_count
             after_dce.instr_count before.temp_count after_dce.temp_count
       end;
       let with_hoisted_loop_bounds =
