@@ -9305,29 +9305,24 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
                                      Printf.sprintf ".L%s_split_limit_prefix_%s" f.label header
                                    in
                                    let pre_limit_temp = fresh_temp () in
-                                   let clone_loop prefix header_rhs split_term_builder =
+                                   let clone_loop prefix header_rhs exit_target split_term_builder =
                                      let blocks =
                                        List.map
                                          (fun (block : Cfg.block) ->
                                            if block.label = header then
+                                             let term =
+                                               branch_with_rhs
+                                                 header_term_for_limit
+                                                 info.control_iv.phi_temp
+                                                 header_rhs
+                                                 info.inside_label
+                                                 exit_target
+                                             in
                                              {
                                                block with
                                                body = [];
-                                               term =
-                                                 branch_with_rhs
-                                                   header_term_for_limit
-                                                   info.control_iv.phi_temp
-                                                   header_rhs
-                                                   info.inside_label
-                                                   info.exit_label;
-                                               succs =
-                                                 Cfg.successors
-                                                   (branch_with_rhs
-                                                      header_term_for_limit
-                                                      info.control_iv.phi_temp
-                                                      header_rhs
-                                                      info.inside_label
-                                                      info.exit_label);
+                                               term;
+                                               succs = Cfg.successors term;
                                              }
                                            else if block.label = split_block.label then
                                              let body, term =
@@ -9352,12 +9347,12 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
                                      materialize_limit_operand prefix_limit
                                    in
                                    let before_func =
-                                     clone_loop "split_pre" (Tcg.Temp pre_limit_temp)
+                                     clone_loop "split_pre" (Tcg.Temp pre_limit_temp) before_bridge_label
                                        (fun first_branch _second_branch ->
                                          ([], Cfg.Jump first_branch))
                                    in
                                    let after_func =
-                                     clone_loop "split_post" outer_limit_rhs
+                                     clone_loop "split_post" outer_limit_rhs info.exit_label
                                        (fun _first_branch second_branch ->
                                          ([], Cfg.Jump second_branch))
                                    in
@@ -9376,7 +9371,7 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
                                          info.control_iv.phi_temp
                                          split_operand
                                          split_bias
-                                         before_func.entry
+                                         limit_dispatch_label
                                          after_func.entry
                                      else
                                        build_branch_for_shifted_compare
@@ -9385,7 +9380,7 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
                                          split_operand
                                          split_bias
                                          after_func.entry
-                                         before_func.entry
+                                         limit_dispatch_label
                                    in
                                    let limit_choose_body =
                                      outer_limit_body @ prefix_limit_body
@@ -9479,6 +9474,11 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
                                    let entry =
                                      if header = f.entry then entry_dispatch_label else f.entry
                                    in
+                                   if Sys.getenv_opt "TOYC_DEBUG_DIAMOND_SPLIT" <> None then
+                                     Printf.eprintf
+                                       "diamond-split func=%s header=%s pre=%s post=%s limit=%s bridge=%s\n%!"
+                                       f.name header before_func.entry after_func.entry
+                                       limit_dispatch_label before_bridge_label;
                                    let blocks =
                                      base_blocks
                                      @ [
@@ -9613,7 +9613,7 @@ let optimize_func global_init summaries globals return_globals (f : Cfg.func) =
     end else
       let before_metrics = if debug_pass_times then Some (metrics_of_func current) else None in
       let start_time = if debug_pass_times then Sys.time () else 0.0 in
-      let next =
+      let candidate =
         try pass current with
         | Failure message when has_prefix "internal missing block: " message ->
             if debug_pass_times then
@@ -9621,6 +9621,23 @@ let optimize_func global_init summaries globals return_globals (f : Cfg.func) =
                 "pass-time func=%s round=%d stage=%s recovered_missing_block=%s\n%!"
                 promoted.name round stage message;
             current
+      in
+      (* Stage-local CFG correctness guard.
+         A loop/CFG transform must never be allowed to poison all later stages.
+         If one pass creates a terminator whose target block no longer exists,
+         discard only that pass and continue from the last valid CFG. *)
+      let next =
+        if cfg_targets_valid candidate then candidate
+        else begin
+          debug_cfg_validation
+            (Printf.sprintf "round=%d:%s" round stage)
+            candidate;
+          if Sys.getenv_opt "TOYC_DEBUG_CFG_VALIDATE" <> None then
+            Printf.eprintf
+              "cfg-stage-reject func=%s round=%d stage=%s\n%!"
+              promoted.name round stage;
+          current
+        end
       in
       if debug_pass_times then begin
         let elapsed_ms = (Sys.time () -. start_time) *. 1000.0 in
