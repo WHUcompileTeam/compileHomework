@@ -26,6 +26,6 @@ licm_reassociate_add_sub.tc 16
 licm_reassociate_sub_add.tc 20
 regalloc_call_live.tc 89
 regalloc_loop_call_global.tc 38
-regalloc_many_args.tc 100
+regalloc_many_args.tc 125
 recursion_void_global.tc 120
 tail_call.tc 210

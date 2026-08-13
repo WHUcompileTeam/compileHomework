@@ -273,6 +273,13 @@ let simplify_simple_instr = function
           | Mod, _, Tcg.Imm 1L
           | Mod, _, Tcg.Imm (-1L) ->
               Tcg.Move (dst, Tcg.Imm 0L)
+          | (Sub | Mod), a, b when a = b ->
+              Tcg.Move (dst, Tcg.Imm 0L)
+          | Div, a, b when a = b -> Tcg.Move (dst, Tcg.Imm 1L)
+          | Add, a, b when a = b -> Tcg.Bin (dst, Mul, a, Tcg.Imm 2L)
+          | Mul, value, Tcg.Imm (-1L)
+          | Mul, Tcg.Imm (-1L), value ->
+              Tcg.Un (dst, UMinus, value)
           | (Eq | Le | Ge), a, b when a = b -> Tcg.Move (dst, Tcg.Imm 1L)
           | (Ne | Lt | Gt), a, b when a = b -> Tcg.Move (dst, Tcg.Imm 0L)
           | _ -> Tcg.Bin (dst, op, lhs, rhs)))

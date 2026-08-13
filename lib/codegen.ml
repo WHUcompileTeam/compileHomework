@@ -1011,13 +1011,13 @@ let emit_call ctx callee args =
 
 let restart_function ctx args =
   emit_call_args ctx args;
-  init_direct_params ctx;
   List.iteri
     (fun i (param : Tcg.var) ->
       match Hashtbl.find_opt ctx.local_offsets param.id with
       | Some off -> emitf ctx "    sw a%d, %d(s0)" i off
       | None -> ())
     ctx.params;
+  init_direct_params ctx;
   emitf ctx "    j %s" ctx.entry
 
 let temp_live_out ctx label temp =
@@ -1343,13 +1343,13 @@ let emit_value_instr ctx dst = function
   | Tcg.Store _ | Tcg.Call _ -> raise (Error "tail argument is not a pure value")
 
 let finish_self_restart ctx =
-  init_direct_params ctx;
   List.iteri
     (fun i (param : Tcg.var) ->
       match Hashtbl.find_opt ctx.local_offsets param.id with
       | Some off -> emitf ctx "    sw a%d, %d(s0)" i off
       | None -> ())
     ctx.params;
+  init_direct_params ctx;
   emitf ctx "    j %s" ctx.entry
 
 let try_direct_self_restart ctx rev_prefix args =
@@ -1488,7 +1488,6 @@ let gen_func buf (f : Cfg.func) =
     if layout.uses_s0 then emitf ctx "    addi s0, sp, %d" layout.frame_size
   end;
   Hashtbl.iter (fun label reg -> emitf ctx "    la %s, %s" reg label) layout.global_regs;
-  init_direct_params ctx;
   List.iteri
     (fun i (param : Tcg.var) ->
       match Hashtbl.find_opt layout.local_offsets param.id with
@@ -1499,6 +1498,7 @@ let gen_func buf (f : Cfg.func) =
             emitf ctx "    lw t0, %d(s0)" ((i - 8) * 4);
             emitf ctx "    sw t0, %d(s0)" off))
     f.params;
+  init_direct_params ctx;
   let rec emit_blocks = function
     | [] -> ()
     | [ block ] -> gen_block ctx None block
