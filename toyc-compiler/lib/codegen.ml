@@ -1040,23 +1040,10 @@ let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.fun
     | "a7" -> Some 7
     | _ -> None
   in
-  let leaf_no_calls =
-    not
-      (List.exists
-         (fun (block : Cfg.block) ->
-           List.exists
-             (function
-               | Tcg.Call _ -> true
-               | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> false)
-             block.body)
-         f.blocks)
-  in
-  let prefer_saved_regs (interval : interval) =
-    (not leaf_no_calls)
-    && (interval.loop_carried_score >= 1
-       || interval.loop_use_score + interval.loop_def_score >= 8
-       || interval.spill_weight >= 4096)
-  in
+  (* Register class choice must be interval-local, not function-wide.  A value
+     that does not survive any call is safe in caller-saved registers even if
+     the containing function calls other functions.  Only values genuinely
+     live across a call are forced into callee-saved registers. *)
   let allowed_arg_regs (interval : interval) =
     if interval.call_crossings <> 0 then []
     else
@@ -1070,9 +1057,7 @@ let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.fun
   in
   let allowed_regs (interval : interval) =
     if interval.call_crossings = 0 then
-      if prefer_saved_regs interval then
-        temp_saved_regs @ allocatable_temp_regs @ allowed_arg_regs interval
-      else allocatable_temp_regs @ allowed_arg_regs interval @ temp_saved_regs
+      allocatable_temp_regs @ allowed_arg_regs interval @ temp_saved_regs
     else temp_saved_regs
   in
   let allowed_free_regs interval =
@@ -1095,17 +1080,29 @@ let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.fun
       | Some reg when List.mem reg free_allowed_regs -> Some reg
       | Some _ | None -> None
     in
-    let preferred_call_reg =
+    let preferred_result_reg =
       if interval.defined_by_call && List.mem "a0" free_allowed_regs then Some "a0" else None
+    in
+    let preferred_arg_reg =
+      if interval.call_crossings = 0 && interval.used_in_call_args then
+        match interval.max_call_arg_index with
+        | Some index when index < 8 ->
+            let reg = Printf.sprintf "a%d" index in
+            if List.mem reg free_allowed_regs then Some reg else None
+        | Some _ | None -> None
+      else None
     in
     let preferred =
       match preferred_entry_reg with
       | Some reg -> Some (reg, max_int)
       | None -> (
-          match preferred_call_reg with
+          match preferred_result_reg with
           | Some reg -> Some (reg, max_int)
-          | None ->
-              Hashtbl.fold
+          | None -> (
+              match preferred_arg_reg with
+              | Some reg -> Some (reg, max_int - 1)
+              | None ->
+                  Hashtbl.fold
             (fun reg count best ->
               match best with
               | None -> Some (reg, count)
@@ -1113,7 +1110,7 @@ let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.fun
                   if count > best_count || (count = best_count && reg < best_reg) then
                     Some (reg, count)
                   else best)
-            hinted_regs None)
+                    hinted_regs None))
     in
     match preferred with
     | Some (reg, _) ->
