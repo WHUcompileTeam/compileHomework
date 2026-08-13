@@ -1511,6 +1511,31 @@ let merge_final_linear_pair (f : Cfg.func) pred_label succ_label =
       Cfg.rebuild_edges { f with blocks }
   | _ -> f
 
+let cfg_missing_targets (f : Cfg.func) =
+  let labels =
+    List.fold_left
+      (fun acc (block : Cfg.block) -> LabelSet.add block.label acc)
+      LabelSet.empty f.blocks
+  in
+  List.fold_left
+    (fun missing (block : Cfg.block) ->
+      List.fold_left
+        (fun missing target ->
+          if LabelSet.mem target labels then missing
+          else LabelSet.add target missing)
+        missing (Cfg.successors block.term))
+    LabelSet.empty f.blocks
+
+let cfg_targets_valid (f : Cfg.func) =
+  LabelSet.is_empty (cfg_missing_targets f)
+
+let debug_cfg_validation stage (f : Cfg.func) =
+  if Sys.getenv_opt "TOYC_DEBUG_CFG_VALIDATE" <> None then
+    let missing = cfg_missing_targets f |> LabelSet.elements in
+    if missing <> [] then
+      Printf.eprintf "cfg-invalid func=%s stage=%s missing=%s\n%!"
+        f.name stage (String.concat "," missing)
+
 let final_linear_merge_func (f : Cfg.func) =
   let before_blocks = List.length f.blocks in
   let rec loop merged current =
@@ -1518,7 +1543,11 @@ let final_linear_merge_func (f : Cfg.func) =
     | None -> (merged, current)
     | Some (pred, succ) ->
         let next = merge_final_linear_pair current pred succ in
-        if List.length next.blocks >= List.length current.blocks then
+        if not (cfg_targets_valid next) then begin
+          debug_cfg_validation
+            (Printf.sprintf "final-merge:%s->%s" pred succ) next;
+          (merged, current)
+        end else if List.length next.blocks >= List.length current.blocks then
           (merged, current)
         else loop (merged + 1) next
   in
@@ -9801,7 +9830,41 @@ let optimize_func global_init summaries globals return_globals (f : Cfg.func) =
       let with_hoisted_loop_bounds =
         hoist_unrolled_loop_branch_immediates_func summaries globals late_coalesced
       in
-      final_linear_merge_func with_hoisted_loop_bounds
+      let final_candidate =
+        final_linear_merge_func with_hoisted_loop_bounds
+      in
+      if cfg_targets_valid final_candidate then final_candidate
+      else begin
+        debug_cfg_validation "final-candidate" final_candidate;
+        (* Correctness guard: never hand codegen a CFG containing a terminator
+           whose target block was removed by a late transform.  Prefer the
+           closest valid pre-final form so successful loop-phi promotion is
+           retained whenever possible. *)
+        let fallbacks =
+          [
+            ("pre-final-merge", with_hoisted_loop_bounds);
+            ("late-coalesced", late_coalesced);
+            ("pre-late-mem2reg", optimized);
+            ("canonical", canonical);
+            ("promoted", promoted);
+            ("original", f);
+          ]
+        in
+        let rec choose = function
+          | [] -> f
+          | (stage, candidate) :: rest ->
+              if cfg_targets_valid candidate then begin
+                if Sys.getenv_opt "TOYC_DEBUG_CFG_VALIDATE" <> None then
+                  Printf.eprintf "cfg-fallback func=%s stage=%s\n%!"
+                    f.name stage;
+                candidate
+              end else begin
+                debug_cfg_validation stage candidate;
+                choose rest
+              end
+        in
+        choose fallbacks
+      end
 
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
