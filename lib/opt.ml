@@ -1591,29 +1591,16 @@ let has_cfg_cycle (f : Cfg.func) =
   visit f.entry
 
 let cfg_backedges (f : Cfg.func) =
-  let blocks = Hashtbl.create (List.length f.blocks) in
-  List.iter (fun (block : Cfg.block) -> Hashtbl.add blocks block.label block) f.blocks;
-  let state = Hashtbl.create (List.length f.blocks) in
-  let edges = ref [] in
-  let rec visit label =
-    match Hashtbl.find_opt state label with
-    | Some _ -> ()
-    | None ->
-        Hashtbl.add state label 1;
-        (match Hashtbl.find_opt blocks label with
-        | Some (block : Cfg.block) ->
-            List.iter
-              (fun succ ->
-                match Hashtbl.find_opt state succ with
-                | Some 1 -> edges := (label, succ) :: !edges
-                | Some _ -> ()
-                | None -> visit succ)
-              block.succs
-        | None -> ());
-        Hashtbl.replace state label 2
-  in
-  visit f.entry;
-  List.rev !edges
+  let doms = compute_dominators f in
+  List.fold_left
+    (fun edges (block : Cfg.block) ->
+      List.fold_left
+        (fun edges succ ->
+          if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
+            (block.label, succ) :: edges
+          else edges)
+        edges block.succs)
+    [] f.blocks
 
 let temp_def_blocks_of_blocks temp_count blocks =
   let defs = Hashtbl.create (max 8 temp_count) in
@@ -3667,9 +3654,9 @@ let optimize_func global_init globals (f : Cfg.func) =
   in
   let fuel =
     let blocks = List.length promoted.blocks in
-    if blocks > 220 then 1 else if blocks > 120 then 2 else 8
+    if blocks > 120 then 1 else 8
   in
-  let run_step = if List.length promoted.blocks > 220 then light_step else step in
+  let run_step = if List.length promoted.blocks > 120 then light_step else step in
   match debug_stop_after with
   | Some "mem2reg" -> promoted
   | Some _ | None ->
