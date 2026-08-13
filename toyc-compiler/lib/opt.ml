@@ -7532,6 +7532,7 @@ let full_unroll_counted_loops_func summaries globals (f : Cfg.func) =
     else f
 
 let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
+  let debug_unroll_pair = Sys.getenv_opt "TOYC_DEBUG_UNROLL_PAIR" <> None in
   let unroll_single_path_max_blocks = 6 in
   let unroll_linear_path_max_blocks = 4 in
   let unroll_single_block_min_instrs = 4 in
@@ -7578,7 +7579,7 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
         if is_unroll2_label header || LabelSet.exists is_unroll2_label loop then ()
         else
           let blocks_snapshot = current_block_list () in
-          let (_, _, _, _, _, _, control) =
+          let (loop_defs, _, def_instrs, multi_defs, _, _, control) =
             analyze_counted_loop header loop get_block f.temp_count blocks_snapshot
           in
           let effects = collect_loop_effects summaries globals loop blocks_snapshot in
@@ -7653,6 +7654,66 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
                     List.iter (fun (block : Cfg.block) -> List.iter note_instr block.body) path;
                     Hashtbl.length defs
                   in
+                  (* A constant even trip count lets the x2 unroll execute the two
+                     bodies as an inseparable pair.  The guard between the first
+                     and second copies can then never exit.  Only use this fast
+                     path when the pure control-preparation temps are private to
+                     the guard; otherwise skipping that preparation could change
+                     a value observed elsewhere. *)
+                  let control_body_defs_are_guard_private =
+                    let defs =
+                      List.fold_left
+                        (fun acc instr ->
+                          match defs_temp instr with
+                          | Some temp -> IntSet.add temp acc
+                          | None -> acc)
+                        IntSet.empty control_block.body
+                    in
+                    IntSet.for_all
+                      (fun temp ->
+                        List.for_all
+                          (fun (block : Cfg.block) ->
+                            if block.label = info.control_label then true
+                            else
+                              not
+                                (List.exists (instr_uses_temp temp) block.body
+                                || term_uses_temp temp block.term))
+                          blocks_snapshot)
+                      defs
+                  in
+                  let exact_trip_count =
+                    let resolve_const operand =
+                      match resolve_operand_before_loop loop_defs multi_defs def_instrs operand with
+                      | Some (Tcg.Imm value) -> Some value
+                      | Some (Tcg.Temp _) | None -> None
+                    in
+                    let init_values =
+                      info.control_iv.outside_inputs
+                      |> List.filter_map (fun (_, operand) -> resolve_const operand)
+                      |> List.sort_uniq compare
+                    in
+                    match init_values with
+                    | [ init_value ] ->
+                        constant_trip_count_of_kind
+                          resolve_const init_value info.control_iv.step info.kind
+                    | _ -> None
+                  in
+                  let control_body_nontrapping =
+                    List.for_all
+                      (function
+                        | Tcg.Bin (_, (Div | Mod), _, _) -> false
+                        | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ -> true
+                        | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> false)
+                      control_block.body
+                  in
+                  let can_pair_without_mid_guard =
+                    control_body_defs_are_guard_private
+                    && control_body_nontrapping
+                    &&
+                    match exact_trip_count with
+                    | Some trip -> trip >= 2L && Int64.rem trip 2L = 0L
+                    | None -> false
+                  in
                   let enough_benefit =
                     total_instrs >= min_instrs
                     && (memory_ops >= 2 || total_instrs >= (if one_block_path then 8 else 10))
@@ -7694,14 +7755,27 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
                         | first :: _ -> first.label
                         | [] -> failwith "internal empty unroll path"
                       in
-                      let term =
-                        rewrite_term_successor control_block.term
-                          ~from_label:info.inside_label ~to_label:copied_entry
+                      if can_pair_without_mid_guard && debug_unroll_pair then
+                        Printf.eprintf
+                          "unroll2-pair func=%s header=%s trip=%s\n%!"
+                          f.name header
+                          (match exact_trip_count with
+                          | Some trip -> Int64.to_string trip
+                          | None -> "?");
+                      let body, term =
+                        if can_pair_without_mid_guard then
+                          (last_block.body, Cfg.Jump copied_entry)
+                        else
+                          let term =
+                            rewrite_term_successor control_block.term
+                              ~from_label:info.inside_label ~to_label:copied_entry
+                          in
+                          (last_block.body @ control_block.body, term)
                       in
                       update_block
                         {
                           last_block with
-                          body = last_block.body @ control_block.body;
+                          body;
                           term;
                           succs = Cfg.successors term;
                         };
