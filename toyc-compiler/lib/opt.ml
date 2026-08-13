@@ -10168,6 +10168,374 @@ let compute_dead_call_removable_funcs summaries globals funcs =
 
 
 (* -------------------------------------------------------------------------- *)
+(* Small hot-loop leaf CFG inlining                                           *)
+(*                                                                            *)
+(* The AST expression inliner intentionally rejects runtime-controlled [if]    *)
+(* bodies.  That leaves small pure helpers such as                             *)
+(*                                                                            *)
+(*   adjust(x, bias, limit) { if (...) ...; return ...; }                     *)
+(*                                                                            *)
+(* as real calls even when they execute on every loop iteration.  By the time *)
+(* we reach this late program pass, each function has already been optimized, *)
+(* so we can clone a very small callee CFG directly into a hot caller block.   *)
+(*                                                                            *)
+(* Keep the first version deliberately conservative:                          *)
+(*   - only call sites already inside a natural loop;                          *)
+(*   - TInt leaf callees, 2..4 reachable blocks, <= 20 scalar instructions;   *)
+(*   - acyclic CFG;                                                            *)
+(*   - no Call, Store, global Load, or Div/Mod;                                *)
+(*   - the only remaining local Loads may read formal parameters;              *)
+(*   - every return carries an integer value.                                 *)
+(*                                                                            *)
+(* Argument operands have already been evaluated at the original call site.   *)
+(* Parameter Loads in the clone are therefore replaced by Moves from those     *)
+(* operands, preserving call-by-value while giving const/algebra/DCE another   *)
+(* chance after the function boundary disappears.                             *)
+(* -------------------------------------------------------------------------- *)
+
+let small_hot_inline_max_blocks = 4
+let small_hot_inline_max_instrs = 20
+let small_hot_inline_max_sites_per_func = 4
+
+let hot_loop_labels_of_func (f : Cfg.func) =
+  let _, loops, headers = discover_natural_loops f in
+  List.fold_left
+    (fun acc header ->
+      LabelSet.union acc (table_find_or_empty loops header LabelSet.empty))
+    LabelSet.empty headers
+
+let small_leaf_inline_candidate (f : Cfg.func) : Cfg.func option =
+  if f.ret <> TInt then None
+  else
+    let view =
+      f
+      |> thread_and_prune_func
+      |> simplify_cfg_func
+      |> final_linear_merge_func
+      |> thread_and_prune_func
+    in
+    if not (cfg_targets_valid view) then None
+    else
+      let reachable = reachable_labels view.entry view.blocks in
+      let blocks =
+        List.filter
+          (fun (block : Cfg.block) -> LabelSet.mem block.label reachable)
+          view.blocks
+      in
+      let block_count = List.length blocks in
+      let instr_count =
+        List.fold_left
+          (fun acc (block : Cfg.block) -> acc + List.length block.body)
+          0 blocks
+      in
+      let param_ids =
+        List.fold_left
+          (fun acc (param : Tcg.var) -> IntSet.add param.id acc)
+          IntSet.empty f.params
+      in
+      let instr_safe = function
+        | Tcg.Move _ | Tcg.Un _ -> true
+        | Tcg.Bin (_, (Div | Mod), _, _) -> false
+        | Tcg.Bin _ -> true
+        | Tcg.Load (_, Tcg.Local id) -> IntSet.mem id param_ids
+        | Tcg.Load (_, Tcg.Global _) -> false
+        | Tcg.Store _ | Tcg.Call _ -> false
+      in
+      let term_safe = function
+        | Cfg.Return (Some _) -> true
+        | Cfg.Jump _
+        | Cfg.BranchZero _
+        | Cfg.BranchNonZero _
+        | Cfg.BranchCompare _ ->
+            true
+        | Cfg.Return None -> false
+      in
+      let has_value_return =
+        List.exists
+          (fun (block : Cfg.block) ->
+            match block.term with
+            | Cfg.Return (Some _) -> true
+            | Cfg.Jump _
+            | Cfg.BranchZero _
+            | Cfg.BranchNonZero _
+            | Cfg.BranchCompare _
+            | Cfg.Return None ->
+                false)
+          blocks
+      in
+      let ignored = Hashtbl.create 1 in
+      if
+        block_count >= 2
+        && block_count <= small_hot_inline_max_blocks
+        && instr_count <= small_hot_inline_max_instrs
+        && f.temp_count <= 48
+        && has_value_return
+        && List.for_all
+             (fun (block : Cfg.block) ->
+               List.for_all instr_safe block.body && term_safe block.term)
+             blocks
+        && cfg_acyclic_ignoring_edges view ignored
+      then Some { view with blocks }
+      else None
+
+type small_hot_inline_site =
+  Tcg.label
+  * Tcg.simple_instr list
+  * Tcg.temp
+  * string
+  * Tcg.operand list
+  * Tcg.simple_instr list
+  * Cfg.func
+
+let build_small_hot_inline_table (funcs : Cfg.func list) :
+    (string, Cfg.func) Hashtbl.t =
+  let table : (string, Cfg.func) Hashtbl.t =
+    Hashtbl.create (max 8 (List.length funcs))
+  in
+  List.iter
+    (fun (f : Cfg.func) ->
+      match small_leaf_inline_candidate f with
+      | None -> ()
+      | Some (candidate : Cfg.func) ->
+          Hashtbl.replace table f.label candidate;
+          if Sys.getenv_opt "TOYC_DEBUG_CFG_INLINE" <> None then begin
+            let metrics = metrics_of_func candidate in
+            Printf.eprintf
+              "cfg-inline-candidate func=%s %s params=%d\n%!"
+              f.name (format_metrics metrics) (List.length f.params)
+          end)
+    funcs;
+  table
+
+let find_hot_inline_site
+    (table : (string, Cfg.func) Hashtbl.t)
+    (f : Cfg.func) : small_hot_inline_site option =
+  let hot_labels = hot_loop_labels_of_func f in
+  if LabelSet.is_empty hot_labels then None
+  else
+    let rec find_in_body block_label rev_prefix = function
+      | [] -> None
+      | Tcg.Call (Some dst, callee, args) :: rest -> (
+          match Hashtbl.find_opt table callee with
+          | Some (candidate : Cfg.func)
+            when callee <> f.label
+                 && List.length args = List.length candidate.params ->
+              Some
+                ( block_label,
+                  List.rev rev_prefix,
+                  dst,
+                  callee,
+                  args,
+                  rest,
+                  candidate )
+          | Some _ | None ->
+              find_in_body block_label
+                (Tcg.Call (Some dst, callee, args) :: rev_prefix)
+                rest)
+      | (Tcg.Call (None, _, _) as instr) :: rest ->
+          find_in_body block_label (instr :: rev_prefix) rest
+      | instr :: rest ->
+          find_in_body block_label (instr :: rev_prefix) rest
+    in
+    let rec find = function
+      | [] -> None
+      | (block : Cfg.block) :: rest ->
+          if LabelSet.mem block.label hot_labels then
+            match find_in_body block.label [] block.body with
+            | Some _ as site -> site
+            | None -> find rest
+          else find rest
+    in
+    find f.blocks
+
+let inline_one_small_hot_call serial
+    (f : Cfg.func)
+    ((site_label, prefix, call_dst, callee_label, args, suffix, callee)
+      : small_hot_inline_site) =
+  let temp_base = f.temp_count in
+  let rename_temp temp = temp_base + temp in
+  let rename_operand = rewrite_operand_temp rename_temp in
+  let param_args = Hashtbl.create (max 4 (List.length callee.params)) in
+  List.iter2
+    (fun (param : Tcg.var) arg -> Hashtbl.replace param_args param.id arg)
+    callee.params args;
+
+  let used_labels =
+    List.fold_left
+      (fun acc (block : Cfg.block) -> LabelSet.add block.label acc)
+      LabelSet.empty f.blocks
+    |> ref
+  in
+  let fresh_label base =
+    let rec choose attempt =
+      let label =
+        if attempt = 0 then base else Printf.sprintf "%s_%d" base attempt
+      in
+      if LabelSet.mem label !used_labels then choose (attempt + 1)
+      else begin
+        used_labels := LabelSet.add label !used_labels;
+        label
+      end
+    in
+    choose 0
+  in
+  let continuation_label =
+    fresh_label
+      (Printf.sprintf ".L%s_cfg_inline_cont_%d" f.label serial)
+  in
+  let label_map = Hashtbl.create (List.length callee.blocks) in
+  List.iteri
+    (fun index (block : Cfg.block) ->
+      let label =
+        fresh_label
+          (Printf.sprintf ".L%s_cfg_inline_%d_%d" f.label serial index)
+      in
+      Hashtbl.replace label_map block.label label)
+    callee.blocks;
+  let rename_label label =
+    match Hashtbl.find_opt label_map label with
+    | Some renamed -> renamed
+    | None -> label
+  in
+  let clone_instr = function
+    | Tcg.Load (dst, Tcg.Local id) -> (
+        match Hashtbl.find_opt param_args id with
+        | Some arg -> simplify_simple_instr (Tcg.Move (rename_temp dst, arg))
+        | None ->
+            (* Candidate construction excludes this case.  Keep the shape
+               total here so a future relaxation cannot silently capture a
+               caller-local id. *)
+            Tcg.Load (rename_temp dst, Tcg.Local id))
+    | instr -> rewrite_instr_temps rename_temp instr
+  in
+  let clone_block (block : Cfg.block) =
+    let body = List.map clone_instr block.body in
+    let body, term =
+      match block.term with
+      | Cfg.Return (Some value) ->
+          ( body
+            @ [
+                simplify_simple_instr
+                  (Tcg.Move (call_dst, rename_operand value));
+              ],
+            Cfg.Jump continuation_label )
+      | Cfg.Return None ->
+          (* Rejected by [small_leaf_inline_candidate]. *)
+          (body, Cfg.Jump continuation_label)
+      | term ->
+          (body, rewrite_term rename_label rename_operand term)
+    in
+    {
+      Cfg.label = rename_label block.label;
+      body;
+      term;
+      preds = [];
+      succs = Cfg.successors term;
+    }
+  in
+  let cloned_blocks = List.map clone_block callee.blocks in
+  let cloned_entry = rename_label callee.entry in
+  let blocks =
+    List.concat_map
+      (fun (block : Cfg.block) ->
+        if block.label <> site_label then [ block ]
+        else
+          let before =
+            {
+              block with
+              body = prefix;
+              term = Cfg.Jump cloned_entry;
+              succs = [ cloned_entry ];
+            }
+          in
+          let continuation =
+            {
+              Cfg.label = continuation_label;
+              body = suffix;
+              term = block.term;
+              preds = [];
+              succs = Cfg.successors block.term;
+            }
+          in
+          before :: cloned_blocks @ [ continuation ])
+      f.blocks
+  in
+  let candidate =
+    Cfg.rebuild_edges
+      { f with temp_count = temp_base + callee.temp_count; blocks }
+  in
+  if cfg_targets_valid candidate then begin
+    if Sys.getenv_opt "TOYC_DEBUG_CFG_INLINE" <> None then
+      Printf.eprintf
+        "cfg-inline caller=%s callee=%s site=%s clone_blocks=%d temps=%d->%d\n%!"
+        f.name callee.name site_label (List.length cloned_blocks)
+        f.temp_count candidate.temp_count;
+    Some candidate
+  end else begin
+    debug_cfg_validation
+      (Printf.sprintf "cfg-inline:%s->%s" f.name callee_label)
+      candidate;
+    None
+  end
+
+let inline_small_hot_calls_func
+    (table : (string, Cfg.func) Hashtbl.t)
+    (f : Cfg.func) : Cfg.func * int =
+  let rec apply serial fuel count (current : Cfg.func) : Cfg.func * int =
+    if fuel = 0 then (current, count)
+    else
+      match find_hot_inline_site table current with
+      | None -> (current, count)
+      | Some (site : small_hot_inline_site) -> (
+          match inline_one_small_hot_call serial current site with
+          | None -> (current, count)
+          | Some (next : Cfg.func) ->
+              apply (serial + 1) (fuel - 1) (count + 1) next)
+  in
+  apply 0 small_hot_inline_max_sites_per_func 0 f
+
+let inline_small_hot_calls_program
+    global_init summaries globals return_global_demands removable_calls
+    (funcs : Cfg.func list) =
+  let table : (string, Cfg.func) Hashtbl.t =
+    build_small_hot_inline_table funcs
+  in
+  if Hashtbl.length table = 0 then funcs
+  else
+    List.map
+      (fun (f : Cfg.func) ->
+        let inlined, count = inline_small_hot_calls_func table f in
+        if count = 0 then f
+        else
+          let return_globals =
+            match Hashtbl.find_opt return_global_demands f.label with
+            | Some return_globals -> return_globals
+            | None -> globals
+          in
+          let before = metrics_of_func f in
+          let expanded = metrics_of_func inlined in
+          let cleaned =
+            optimize_func
+              global_init summaries globals return_globals removable_calls
+              inlined
+          in
+          if cfg_targets_valid cleaned then begin
+            if Sys.getenv_opt "TOYC_DEBUG_CFG_INLINE" <> None then
+              Printf.eprintf
+                "cfg-inline-cleanup func=%s sites=%d %s -> expanded(%s) -> %s\n%!"
+                f.name count (format_metrics before)
+                (format_metrics expanded)
+                (format_metrics (metrics_of_func cleaned));
+            cleaned
+          end else begin
+            debug_cfg_validation "cfg-inline-cleanup" cleaned;
+            f
+          end)
+      funcs
+
+
+
+(* -------------------------------------------------------------------------- *)
 (* Late trivial-call folding                                                  *)
 (*                                                                            *)
 (* DCE can turn a formerly complicated helper into a side-effect-free          *)
@@ -10423,6 +10791,11 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
       [] cfg.funcs
   in
   let optimized_funcs = List.rev funcs_rev in
+  let optimized_funcs =
+    inline_small_hot_calls_program
+      global_init summaries globals return_global_demands removable_calls
+      optimized_funcs
+  in
   let optimized_funcs =
     fold_trivial_calls_program
       global_init summaries globals return_global_demands removable_calls
