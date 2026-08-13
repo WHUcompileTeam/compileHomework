@@ -3532,6 +3532,55 @@ let incoming_phi_chain get_block succ_label pred_label =
   in
   walk LabelSet.empty pred_label []
 
+(* Counted-loop seed recovery.
+   After mem2reg/guard canonicalization a loop often looks like
+
+       entry:  i = 0; acc = 0; if (...) goto edge_in else exit
+       edge_in: goto body
+       body:   ...
+
+   The natural-loop header sees [edge_in] as its outside predecessor, while
+   [incoming_phi_chain] intentionally stops before [entry] because [entry]
+   branches.  For counted-loop induction/reduction analysis that loses the
+   unconditionally executed seed definitions.
+
+   Starting from an already selected outside edge, it is safe to walk
+   backwards through UNIQUE predecessor links outside the loop: every block
+   reached this way necessarily executed before control arrived at that edge.
+   We keep the chain in the same newest-to-oldest order used by
+   [last_def_of_temp_on_chain]. *)
+let extend_counted_outside_seed_chain get_block loop chain =
+  let debug = Sys.getenv_opt "TOYC_DEBUG_COUNTED_SEEDS" <> None in
+  let rec last_block = function
+    | [] -> None
+    | [ block ] -> Some block
+    | _ :: rest -> last_block rest
+  in
+  let rec grow seen acc =
+    match last_block acc with
+    | None -> acc
+    | Some (oldest : Cfg.block) -> (
+        match oldest.preds with
+        | [ prev ]
+          when not (LabelSet.mem prev loop)
+               && not (LabelSet.mem prev seen) ->
+            let prev_block : Cfg.block = get_block prev in
+            if debug then
+              Printf.eprintf
+                "counted-seed-extend from=%s prev=%s\n%!"
+                oldest.label prev;
+            grow
+              (LabelSet.add prev seen)
+              (acc @ [ prev_block ])
+        | _ -> acc)
+  in
+  let seen =
+    List.fold_left
+      (fun acc (block : Cfg.block) -> LabelSet.add block.label acc)
+      LabelSet.empty chain
+  in
+  grow seen chain
+
 let incoming_update_chain get_block succ_label pred_label =
   let rec walk seen label acc =
     if LabelSet.mem label seen || label = succ_label then List.rev acc
@@ -4002,6 +4051,11 @@ let collect_basic_induction_vars header loop get_block loop_defs multi_defs def_
     | Some chain -> chain
     | None -> [ get_block pred ]
   in
+  let outside_seed_chain_for_pred pred =
+    let chain = chain_for_pred pred in
+    if LabelSet.mem pred loop then chain
+    else extend_counted_outside_seed_chain get_block loop chain
+  in
   let step_of_chain_source phi_temp chain src =
     let resolved = resolve_chain_operand chain src in
     match resolved with
@@ -4109,7 +4163,11 @@ let collect_basic_induction_vars header loop get_block loop_defs multi_defs def_
           let outside_inputs =
             List.filter_map
               (fun pred ->
-                match last_def_of_temp_on_chain (chain_for_pred pred) phi_temp with
+                match
+                  last_def_of_temp_on_chain
+                    (outside_seed_chain_for_pred pred)
+                    phi_temp
+                with
                 | Some _ -> Some (pred, Tcg.Temp phi_temp)
                 | None -> None)
               outside_preds
@@ -4126,7 +4184,12 @@ let collect_basic_induction_vars header loop get_block loop_defs multi_defs def_
               if
                 List.length outside_inputs = List.length outside_preds
                 && List.for_all (Int64.equal step) rest
-              then
+              then begin
+                if Sys.getenv_opt "TOYC_DEBUG_COUNTED_SEEDS" <> None then
+                  Printf.eprintf
+                    "counted-seed-self-iv header=%s temp=%d step=%Ld outside=%d
+%!"
+                    header phi_temp step (List.length outside_inputs);
                 {
                   phi_temp;
                   outside_inputs;
@@ -4134,6 +4197,7 @@ let collect_basic_induction_vars header loop get_block loop_defs multi_defs def_
                   step;
                 }
                 :: acc
+              end
               else acc
           | _ -> acc)
         self_update_candidates []
@@ -5578,6 +5642,10 @@ let collect_counted_reductions
   let outside_preds = List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds in
   let backedge_preds = List.filter (fun pred -> LabelSet.mem pred loop) header_block.preds in
   let phi_chain_for_pred pred = incoming_phi_chain get_block header pred in
+  let outside_seed_chain_for_pred pred =
+    extend_counted_outside_seed_chain
+      get_block loop (phi_chain_for_pred pred)
+  in
   let update_chain_for_pred pred =
     if LabelSet.mem pred loop then incoming_update_chain get_block header pred
     else phi_chain_for_pred pred
@@ -6337,7 +6405,10 @@ let collect_counted_reductions
                  (fun seed_temp ->
                    List.for_all
                      (fun pred ->
-                       Option.is_some (last_def_of_temp_on_chain (phi_chain_for_pred pred) seed_temp))
+                       Option.is_some
+                         (last_def_of_temp_on_chain
+                            (outside_seed_chain_for_pred pred)
+                            seed_temp))
                      outside_preds)
                  common_self_temps
              in
