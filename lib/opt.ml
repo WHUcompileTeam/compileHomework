@@ -1259,14 +1259,6 @@ let collect_local_ids (f : Cfg.func) =
     (fun acc (var : Tcg.var) -> IntSet.add var.id acc)
     IntSet.empty (f.params @ f.locals)
 
-let first_some values =
-  let rec loop = function
-    | [] -> None
-    | Some value :: _ -> Some value
-    | None :: rest -> loop rest
-  in
-  loop values
-
 let all_present values =
   let rec loop acc = function
     | [] -> Some (List.rev acc)
@@ -1371,10 +1363,7 @@ let mem2reg_func (f : Cfg.func) =
                       match all_same_operand values with
                       | Some value -> Some value
                       | None -> Some (Tcg.Temp (get_phi_temp block.label local_id)))
-                  | None -> (
-                      match first_some incoming with
-                      | Some _ -> Some (Tcg.Temp (get_phi_temp block.label local_id))
-                      | None -> None)
+                  | None -> None
               in
               match keep_value with
               | Some value -> IntMap.add local_id value env
@@ -3344,6 +3333,13 @@ let licm_func (f : Cfg.func) =
         let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
         Hashtbl.replace loops header merged)
       backedges;
+    let loop_is_nested target =
+      Hashtbl.fold
+        (fun _ other nested ->
+          nested
+          || (LabelSet.subset target other && not (LabelSet.equal target other)))
+        loops false
+    in
     let headers =
       Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
       |> List.sort (fun (_, a) (_, b) -> compare a b)
@@ -3375,7 +3371,7 @@ let licm_func (f : Cfg.func) =
         let outside_preds =
           List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds
         in
-        if outside_preds <> [] then begin
+        if outside_preds <> [] && not (loop_is_nested loop) then begin
           let blocks_snapshot = current_block_list () in
           let def_blocks = temp_def_blocks_of_blocks f.temp_count blocks_snapshot in
           let def_instrs = temp_def_instrs_of_blocks f.temp_count blocks_snapshot in
