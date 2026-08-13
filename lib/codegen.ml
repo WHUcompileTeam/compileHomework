@@ -985,11 +985,25 @@ let emit_binop_operands ctx op dst lhs rhs =
 let emit_call_args ctx args =
   List.iteri
     (fun i arg ->
-      if i < 8 then load_operand ctx (Printf.sprintf "a%d" i) arg
-      else (
+      if i >= 8 then
         let arg_reg = operand_reg ctx "t0" arg in
-        emitf ctx "    sw %s, %d(sp)" arg_reg ((i - 8) * 4)))
-    args
+        emitf ctx "    sw %s, %d(sp)" arg_reg ((i - 8) * 4))
+    args;
+  let copies = ref [] in
+  let delayed = ref [] in
+  List.iteri
+    (fun i arg ->
+      if i < 8 then
+        let dst = Printf.sprintf "a%d" i in
+        match arg with
+        | Tcg.Temp temp -> (
+            match lookup_temp_home ctx.temp_homes temp with
+            | TempReg src -> copies := (dst, src) :: !copies
+            | TempStack _ -> delayed := (dst, arg) :: !delayed)
+        | Tcg.Imm _ -> delayed := (dst, arg) :: !delayed)
+    args;
+  emit_parallel_copies ctx (List.rev !copies);
+  List.iter (fun (dst, arg) -> load_operand ctx dst arg) (List.rev !delayed)
 
 let emit_call ctx callee args =
   emit_call_args ctx args;
@@ -1296,9 +1310,120 @@ let gen_tail_branch_instr ctx next_label (instr : Tcg.simple_instr) if_nonzero i
       emit_call ctx callee args;
       emit_branch_result ctx "a0" if_nonzero if_zero next_label
 
+let instr_operand_temps = function
+  | Tcg.Move (_, Tcg.Temp temp)
+  | Tcg.Un (_, _, Tcg.Temp temp)
+  | Tcg.Store (_, Tcg.Temp temp) ->
+      [ temp ]
+  | Tcg.Bin (_, _, lhs, rhs) ->
+      List.filter_map (function Tcg.Temp temp -> Some temp | Tcg.Imm _ -> None) [ lhs; rhs ]
+  | Tcg.Call (_, _, args) ->
+      List.filter_map (function Tcg.Temp temp -> Some temp | Tcg.Imm _ -> None) args
+  | Tcg.Move (_, Tcg.Imm _)
+  | Tcg.Un (_, _, Tcg.Imm _)
+  | Tcg.Load _
+  | Tcg.Store (_, Tcg.Imm _) ->
+      []
+
+let instr_read_regs ctx instr =
+  List.filter_map
+    (fun temp ->
+      match lookup_temp_home ctx.temp_homes temp with
+      | TempReg reg -> Some reg
+      | TempStack _ -> None)
+    (instr_operand_temps instr)
+
+let emit_value_instr ctx dst = function
+  | Tcg.Move (_, src) -> load_operand ctx dst src
+  | Tcg.Un (_, op, src) ->
+      let src_reg = operand_reg ctx "t0" src in
+      emit_unop ctx op dst src_reg
+  | Tcg.Bin (_, op, lhs, rhs) -> emit_binop_operands ctx op dst lhs rhs
+  | Tcg.Load (_, place) -> load_place ctx dst place
+  | Tcg.Store _ | Tcg.Call _ -> raise (Error "tail argument is not a pure value")
+
+let finish_self_restart ctx =
+  init_direct_params ctx;
+  List.iteri
+    (fun i (param : Tcg.var) ->
+      match Hashtbl.find_opt ctx.local_offsets param.id with
+      | Some off -> emitf ctx "    sw a%d, %d(s0)" i off
+      | None -> ())
+    ctx.params;
+  emitf ctx "    j %s" ctx.entry
+
+let try_direct_self_restart ctx rev_prefix args =
+  if args = [] || List.length args > 8 then false
+  else
+    let arg_index = Hashtbl.create (List.length args) in
+    let unique = ref true in
+    List.iteri
+      (fun i -> function
+        | Tcg.Temp temp ->
+            if Hashtbl.mem arg_index temp then unique := false
+            else Hashtbl.add arg_index temp i
+        | Tcg.Imm _ -> unique := false)
+      args;
+    if not !unique then false
+    else
+      let rec take chosen = function
+        | instr :: rest -> (
+            match defs_temp instr with
+            | Some temp when Hashtbl.mem arg_index temp -> take (instr :: chosen) rest
+            | Some _ | None -> (chosen, instr :: rest))
+        | [] -> (chosen, [])
+      in
+      let chosen, remaining_rev = take [] rev_prefix in
+      let defined =
+        List.fold_left
+          (fun temps instr -> Option.fold ~none:temps ~some:(fun temp -> IntSet.add temp temps) (defs_temp instr))
+          IntSet.empty chosen
+      in
+      let independent =
+        List.for_all
+          (fun instr ->
+            List.for_all (fun temp -> not (IntSet.mem temp defined)) (instr_operand_temps instr))
+          chosen
+      in
+      if List.length chosen <> List.length args || not independent then false
+      else
+        let items =
+          List.map
+            (fun instr ->
+              let temp = Option.get (defs_temp instr) in
+              let index = Hashtbl.find arg_index temp in
+              (Printf.sprintf "a%d" index, instr))
+            chosen
+        in
+        let rec schedule done_items pending =
+          match pending with
+          | [] -> Some (List.rev done_items)
+          | _ -> (
+              match
+                List.find_opt
+                  (fun (dst, item) ->
+                    List.for_all
+                      (fun (_, other) -> item == other || not (List.mem dst (instr_read_regs ctx other)))
+                      pending)
+                  pending
+              with
+              | None -> None
+              | Some item -> schedule (item :: done_items) (List.filter (fun x -> x != item) pending))
+        in
+        match schedule [] items with
+        | None -> false
+        | Some ordered ->
+            List.iter (gen_simple_instr ctx) (List.rev remaining_rev);
+            List.iter (fun (dst, instr) -> emit_value_instr ctx dst instr) ordered;
+            finish_self_restart ctx;
+            true
+
 let gen_block ctx next_label (block : Cfg.block) =
   emitf ctx "%s:" block.label;
   match (List.rev block.body, block.term) with
+  | (Tcg.Call (Some dst, callee, args) :: rev_prefix), Cfg.Return (Some (Tcg.Temp result))
+    when dst = result && callee = ctx.func && try_direct_self_restart ctx rev_prefix args ->
+      ()
   | (last_instr :: rev_prefix), Cfg.Return (Some (Tcg.Temp temp))
     when defs_temp last_instr = Some temp ->
       List.iter (gen_simple_instr ctx) (List.rev rev_prefix);
