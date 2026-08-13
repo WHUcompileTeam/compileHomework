@@ -526,12 +526,17 @@ let optimize_ast_once program =
   in
   loop empty_env base_func_env [] program
 
-let optimize_ast program =
+let optimize_ast_impl program =
   let rec iterate fuel current =
     let next = optimize_ast_once current in
     if fuel = 0 || next = current then next else iterate (fuel - 1) next
   in
   iterate 2 program
+
+(* Public AST optimizer entry point used by [Driver].  Keep this explicit in
+   step20 so backend-only additions cannot accidentally hide or replace the
+   driver-facing symbol. *)
+let optimize_ast program = optimize_ast_impl program
 
 let fold_unop op v =
   let v = i32 v in
@@ -7788,6 +7793,128 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
       Cfg.rebuild_edges { f with blocks }
     else f
 
+(* Final-only loop-bound materialization.  BranchCompare has no immediate
+   RISC-V form, so codegen otherwise emits a fresh [li] every dynamic trip
+   through the branch.  For small, call-free loops that came from our x2
+   counted-loop unroller, keep one invariant bound temp in the existing direct
+   preheader instead.  This pass deliberately runs after all iterative
+   middle-end passes so constant propagation cannot fold the temp back into an
+   immediate. *)
+let hoist_unrolled_loop_branch_immediates_func summaries globals (f : Cfg.func) =
+  let debug_bound_hoist = Sys.getenv_opt "TOYC_DEBUG_LOOP_BOUND_HOIST" <> None in
+  let _, loops, headers = discover_natural_loops f in
+  if headers = [] then f
+  else
+    let current_blocks = Hashtbl.create (List.length f.blocks) in
+    List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
+    let get_block = get_block_exn current_blocks in
+    let update_block (block : Cfg.block) = Hashtbl.replace current_blocks block.label block in
+    let next_temp = ref f.temp_count in
+    let fresh_temp () =
+      let temp = !next_temp in
+      incr next_temp;
+      temp
+    in
+    let changed = ref false in
+    List.iter
+      (fun header ->
+        let loop = table_find_or_empty loops header LabelSet.empty in
+        (* Restrict this to loops already selected by the profitable x2 unroller.
+           That keeps the extra long-lived register away from unrelated loops. *)
+        if not (LabelSet.exists is_unroll2_label loop) then ()
+        else
+          let blocks_snapshot = List.map get_block (List.map (fun (b : Cfg.block) -> b.label) f.blocks) in
+          let effects = collect_loop_effects summaries globals loop blocks_snapshot in
+          if effects.has_call then ()
+          else
+            let loop_temps =
+              List.fold_left
+                (fun acc (block : Cfg.block) ->
+                  if not (LabelSet.mem block.label loop) then acc
+                  else
+                    let acc =
+                      List.fold_left
+                        (fun acc instr ->
+                          let acc = add_instr_use_temps acc instr in
+                          match defs_temp instr with
+                          | Some temp -> IntSet.add temp acc
+                          | None -> acc)
+                        acc block.body
+                    in
+                    add_term_use_temps acc block.term)
+                IntSet.empty blocks_snapshot
+            in
+            (* t4-t6 + a0-a7 give eleven ordinary caller-saved allocation homes.
+               Leave headroom for codegen scratch/short-lived values rather than
+               forcing a spill merely to save a repeated [li]. *)
+            if IntSet.cardinal loop_temps > 8 then ()
+            else
+              let candidates =
+                blocks_snapshot
+                |> List.filter_map (fun (block : Cfg.block) ->
+                     if not (LabelSet.mem block.label loop) then None
+                     else
+                       match block.term with
+                       | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
+                           let true_inside = LabelSet.mem if_true loop in
+                           let false_inside = LabelSet.mem if_false loop in
+                           if true_inside = false_inside then None
+                           else (
+                             match lhs, rhs with
+                             | Tcg.Imm imm, Tcg.Temp _ when imm <> 0L ->
+                                 Some (block.label, op, `Left imm, lhs, rhs, if_true, if_false)
+                             | Tcg.Temp _, Tcg.Imm imm when imm <> 0L ->
+                                 Some (block.label, op, `Right imm, lhs, rhs, if_true, if_false)
+                             | _ -> None)
+                       | Cfg.Jump _ | Cfg.BranchZero _ | Cfg.BranchNonZero _ | Cfg.Return _ -> None)
+              in
+              match candidates with
+              | [ (branch_label, op, side, lhs, rhs, if_true, if_false) ] ->
+                  let header_block = get_block header in
+                  let outside_preds =
+                    List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds
+                  in
+                  (* Final-only and deliberately conservative: use an existing
+                     direct preheader only.  This avoids changing loop topology
+                     after the optimizer has reached its fixed point. *)
+                  (match outside_preds with
+                  | [ preheader_label ] ->
+                      let preheader = get_block preheader_label in
+                      if preheader.succs <> [ header ] then ()
+                      else
+                        let bound =
+                          match side with
+                          | `Left imm | `Right imm -> imm
+                        in
+                        let bound_temp = fresh_temp () in
+                        update_block
+                          { preheader with body = preheader.body @ [ Tcg.Move (bound_temp, Tcg.Imm bound) ] };
+                        let branch_block = get_block branch_label in
+                        let term =
+                          match side with
+                          | `Left _ ->
+                              Cfg.BranchCompare
+                                (op, Tcg.Temp bound_temp, rhs, if_true, if_false)
+                          | `Right _ ->
+                              Cfg.BranchCompare
+                                (op, lhs, Tcg.Temp bound_temp, if_true, if_false)
+                        in
+                        update_block { branch_block with term; succs = Cfg.successors term };
+                        if debug_bound_hoist then
+                          Printf.eprintf
+                            "loop-bound-hoist func=%s header=%s branch=%s imm=%Ld temp=t%d pressure=%d\n%!"
+                            f.name header branch_label bound bound_temp (IntSet.cardinal loop_temps);
+                        changed := true
+                  | [] | _ :: _ :: _ -> ())
+              | [] | _ :: _ :: _ -> ())
+      headers;
+    if !changed then
+      let blocks =
+        List.map (fun (block : Cfg.block) -> get_block block.label) f.blocks
+      in
+      Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
+    else f
+
 let classify_loop_rotate_targets loop (term : Cfg.terminator) =
   match branch_term_outcomes term with
   | Some (first_label, second_label) ->
@@ -9577,7 +9704,10 @@ let optimize_func global_init summaries globals return_globals (f : Cfg.func) =
   | None ->
       let optimized = loop 1 profile.max_rounds canonical in
       let coalesced = copy_coalesce_func summaries globals optimized in
-      final_linear_merge_func coalesced
+      let with_hoisted_loop_bounds =
+        hoist_unrolled_loop_branch_immediates_func summaries globals coalesced
+      in
+      final_linear_merge_func with_hoisted_loop_bounds
 
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
