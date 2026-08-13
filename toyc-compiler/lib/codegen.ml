@@ -30,6 +30,7 @@ type ctx = {
   global_base_regs : (string, string) Hashtbl.t;
   blocks_by_label : (string, Cfg.block) Hashtbl.t;
   live_out_temps : (string, IntSet.t) Hashtbl.t;
+  frame_size : int;
   epilogue : string;
 }
 
@@ -48,6 +49,17 @@ let emit ctx s =
   Buffer.add_char ctx.buf '\n'
 
 let emitf ctx fmt = Printf.ksprintf (emit ctx) fmt
+
+(* Stack-home offsets are recorded relative to the incoming sp.  The generated
+   function keeps sp fixed after its prologue, so the same address is
+   frame_size + off from the current sp. *)
+let sp_slot_offset ctx off = ctx.frame_size + off
+
+let emit_lw_slot ctx dst off =
+  emitf ctx "    lw %s, %d(sp)" dst (sp_slot_offset ctx off)
+
+let emit_sw_slot ctx src off =
+  emitf ctx "    sw %s, %d(sp)" src (sp_slot_offset ctx off)
 
 let lookup_offset table id kind =
   match Hashtbl.find_opt table id with
@@ -1255,7 +1267,7 @@ let load_operand ctx dst = function
   | Tcg.Imm n -> emitf ctx "    li %s, %Ld" dst n
   | Tcg.Temp temp -> (
       match lookup_temp_home ctx.temp_homes temp with
-      | TempStack off -> emitf ctx "    lw %s, %d(s0)" dst off
+      | TempStack off -> emit_lw_slot ctx dst off
       | TempReg reg -> emit_reg_copy ctx dst reg)
 
 let operand_reg ctx scratch operand =
@@ -1272,7 +1284,7 @@ let operand_reg ctx scratch operand =
 
 let store_temp ctx temp src =
   match lookup_temp_home ctx.temp_homes temp with
-  | TempStack off -> emitf ctx "    sw %s, %d(s0)" src off
+  | TempStack off -> emit_sw_slot ctx src off
   | TempReg reg -> emit_reg_copy ctx reg src
 
 let cached_global_base_reg ctx label = Hashtbl.find_opt ctx.global_base_regs label
@@ -1280,7 +1292,7 @@ let cached_global_base_reg ctx label = Hashtbl.find_opt ctx.global_base_regs lab
 let load_place ctx dst = function
   | Tcg.Local id -> (
       match lookup_local_home ctx.local_homes id with
-      | LocalStack off -> emitf ctx "    lw %s, %d(s0)" dst off
+      | LocalStack off -> emit_lw_slot ctx dst off
       | LocalReg reg -> emit_reg_copy ctx dst reg)
   | Tcg.Global label -> (
       match cached_global_base_reg ctx label with
@@ -1292,7 +1304,7 @@ let load_place ctx dst = function
 let store_place ctx src = function
   | Tcg.Local id -> (
       match lookup_local_home ctx.local_homes id with
-      | LocalStack off -> emitf ctx "    sw %s, %d(s0)" src off
+      | LocalStack off -> emit_sw_slot ctx src off
       | LocalReg reg -> emit_reg_copy ctx reg src)
   | Tcg.Global label -> (
       match cached_global_base_reg ctx label with
@@ -1418,13 +1430,13 @@ let gen_simple_instr ctx = function
             match src with
             | Tcg.Temp temp -> (
                 match lookup_temp_home ctx.temp_homes temp with
-                | TempReg reg -> emitf ctx "    sw %s, %d(s0)" reg off
+                | TempReg reg -> emit_sw_slot ctx reg off
                 | TempStack _ ->
                     load_operand ctx "t0" src;
-                    emitf ctx "    sw t0, %d(s0)" off)
+                    emit_sw_slot ctx "t0" off)
             | Tcg.Imm _ ->
                 load_operand ctx "t0" src;
-                emitf ctx "    sw t0, %d(s0)" off)
+                emit_sw_slot ctx "t0" off)
       end
   | Tcg.Un (dst, op, src) ->
       let src_reg = operand_reg ctx "t0" src in
@@ -1433,7 +1445,7 @@ let gen_simple_instr ctx = function
         | TempReg reg -> emit_unop ctx op reg src_reg
         | TempStack off ->
             emit_unop ctx op "t2" src_reg;
-            emitf ctx "    sw t2, %d(s0)" off
+            emit_sw_slot ctx "t2" off
       end
   | Tcg.Bin (dst, op, lhs, rhs) ->
       begin
@@ -1441,7 +1453,7 @@ let gen_simple_instr ctx = function
         | TempReg reg -> emit_binop_operands ctx op reg lhs rhs
         | TempStack off ->
             emit_binop_operands ctx op "t2" lhs rhs;
-            emitf ctx "    sw t2, %d(s0)" off
+            emit_sw_slot ctx "t2" off
       end
   | Tcg.Load (dst, place) ->
       begin
@@ -1737,17 +1749,13 @@ let can_use_frameless_leaf (f : Cfg.func) (layout : layout) =
   && not (layout_has_stack_homes layout)
   && frameless_params_ready f layout
 
-(* s0 is only needed as a frame pointer when generated code addresses a local/temp
-   stack home or must recover incoming arguments beyond a7 from the caller stack.
-   Saved registers, ra, and the outgoing-argument area are all addressed from sp. *)
-let needs_frame_pointer (f : Cfg.func) (layout : layout) =
-  layout_has_stack_homes layout || List.length f.params > 8
-
 let gen_func buf (f : Cfg.func) =
   let f = schedule_func_blocks_with_hot_traces f in
   let layout = compute_layout f in
   let frameless_leaf = can_use_frameless_leaf f layout in
-  let use_frame_pointer = (not frameless_leaf) && needs_frame_pointer f layout in
+  (* Step5 uses sp-relative addressing for every stack home and incoming
+     stack argument, so s0 is never materialized as a frame pointer. *)
+  let use_frame_pointer = false in
   let param_reg_count, param_stack_count =
     List.fold_left
       (fun (reg_count, stack_count) (param : Tcg.var) ->
@@ -1775,6 +1783,7 @@ let gen_func buf (f : Cfg.func) =
       global_base_regs = layout.global_base_regs;
       blocks_by_label;
       live_out_temps;
+      frame_size = layout.frame_size;
       epilogue;
     }
   in
@@ -1785,11 +1794,9 @@ let gen_func buf (f : Cfg.func) =
   if not frameless_leaf then begin
     emitf ctx "    addi sp, sp, -%d" layout.frame_size;
     emitf ctx "    sw ra, %d(sp)" (layout.frame_size - 4);
-    if use_frame_pointer then emitf ctx "    sw s0, %d(sp)" (layout.frame_size - 8);
     List.iteri
       (fun i reg -> emitf ctx "    sw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
       layout.saved_regs;
-    if use_frame_pointer then emitf ctx "    addi s0, sp, %d" layout.frame_size;
     Hashtbl.fold (fun label reg acc -> (reg, label) :: acc) layout.global_base_regs []
     |> List.sort (fun (a_reg, a_label) (b_reg, b_label) ->
            match compare a_reg b_reg with
@@ -1801,13 +1808,13 @@ let gen_func buf (f : Cfg.func) =
         match Hashtbl.find_opt layout.local_homes param.id with
         | None -> ()
         | Some (LocalStack off) ->
-            if i < 8 then emitf ctx "    sw a%d, %d(s0)" i off
+            if i < 8 then emit_sw_slot ctx (Printf.sprintf "a%d" i) off
             else (
-              emitf ctx "    lw t0, %d(s0)" ((i - 8) * 4);
-              emitf ctx "    sw t0, %d(s0)" off)
+              emitf ctx "    lw t0, %d(sp)" (layout.frame_size + ((i - 8) * 4));
+              emit_sw_slot ctx "t0" off)
         | Some (LocalReg reg) ->
             if i < 8 then emit_reg_copy ctx reg (Printf.sprintf "a%d" i)
-            else emitf ctx "    lw %s, %d(s0)" reg ((i - 8) * 4))
+            else emitf ctx "    lw %s, %d(sp)" reg (layout.frame_size + ((i - 8) * 4)))
       f.params
   end;
   let rec emit_blocks = function
@@ -1824,7 +1831,6 @@ let gen_func buf (f : Cfg.func) =
       (fun i reg -> emitf ctx "    lw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
       layout.saved_regs;
     emitf ctx "    lw ra, %d(sp)" (layout.frame_size - 4);
-    if use_frame_pointer then emitf ctx "    lw s0, %d(sp)" (layout.frame_size - 8);
     emitf ctx "    addi sp, sp, %d" layout.frame_size
   end;
   emit ctx "    ret";
