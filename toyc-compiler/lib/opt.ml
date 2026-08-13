@@ -2385,7 +2385,7 @@ let place_edge_copies fresh_edge_label blocks edge_copies =
     blocks
   @ List.rev !edge_blocks_rev
 
-let mem2reg_func (f : Cfg.func) =
+let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
   let all_candidates = collect_local_ids f in
   let rec attempt (current : Cfg.func) candidates =
     if IntSet.is_empty candidates then current
@@ -2414,8 +2414,12 @@ let mem2reg_func (f : Cfg.func) =
         else
           IntSet.fold
             (fun local_id env ->
+              let merge =
+                if optimistic_loop_phi then merge_incoming_operand_mem2reg
+                else merge_incoming_operand
+              in
               let keep_value =
-                merge_incoming_operand_mem2reg block.preds
+                merge block.preds
                   (fun pred -> IntMap.find_opt local_id (get_out pred))
                   (fun () -> get_phi_temp block.label local_id)
               in
@@ -2465,8 +2469,9 @@ let mem2reg_func (f : Cfg.func) =
       let succeeded = IntSet.diff candidates !failed in
       if Sys.getenv_opt "TOYC_DEBUG_MEM2REG_LOOP_PHI" <> None then
         Printf.eprintf
-          "mem2reg-loop-phi func=%s candidates=%d succeeded=%d failed=%d phis=%d\n%!"
+          "mem2reg-loop-phi func=%s mode=%s candidates=%d succeeded=%d failed=%d phis=%d\n%!"
           current.name
+          (if optimistic_loop_phi then "optimistic" else "conservative")
           (IntSet.cardinal candidates)
           (IntSet.cardinal succeeded)
           (IntSet.cardinal !failed)
@@ -9781,12 +9786,12 @@ let optimize_func global_init summaries globals return_globals (f : Cfg.func) =
   | Some _ -> loop 1 profile.max_rounds canonical
   | None ->
       let optimized = loop 1 profile.max_rounds canonical in
-      (* Loop canonicalization/unrolling/rotation can expose locals that the
-         early mem2reg could not safely promote.  Run mem2reg once more after
-         all iterative CFG transforms have settled, then immediately coalesce
-         the copies it introduces.  Keeping this final-only avoids feeding the
-         newly-created phi/edge copies back into the main optimization loop. *)
-      let late_promoted = mem2reg_func optimized in
+      (* Keep the early mem2reg conservative so downstream CFG/loop transforms
+         see the same stable shape as step24.  After all iterative transforms
+         have settled, run a final optimistic loop-phi mem2reg: provisional
+         loop-header phis can now bootstrap loop-carried locals without feeding
+         the new phi/edge-copy CFG back into rotate/split/unroll passes. *)
+      let late_promoted = mem2reg_func ~optimistic_loop_phi:true optimized in
       if Sys.getenv_opt "TOYC_DEBUG_LATE_MEM2REG" <> None then begin
         let count_local_accesses (func : Cfg.func) =
           List.fold_left
