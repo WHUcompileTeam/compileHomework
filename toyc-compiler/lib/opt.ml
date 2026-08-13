@@ -7844,10 +7844,20 @@ let hoist_unrolled_loop_branch_immediates_func summaries globals (f : Cfg.func) 
                     add_term_use_temps acc block.term)
                 IntSet.empty blocks_snapshot
             in
-            (* t4-t6 + a0-a7 give eleven ordinary caller-saved allocation homes.
-               Leave headroom for codegen scratch/short-lived values rather than
-               forcing a spill merely to save a repeated [li]. *)
-            if IntSet.cardinal loop_temps > 8 then ()
+            (* A hoisted bound lives for the whole loop instead of only at the
+               exit compare.  Be deliberately stricter than the raw number of
+               caller-saved homes: hidden loops near register-pressure limits can
+               lose more to one new spill than they save by removing a repeated
+               [li].  The proven hot_local_loop_mix case has pressure=5, so this
+               cap preserves the observed 69 -> 65 win while declining denser
+               loops. *)
+            let loop_pressure = IntSet.cardinal loop_temps in
+            let max_safe_bound_hoist_pressure = 5 in
+            if loop_pressure > max_safe_bound_hoist_pressure then (
+              if debug_bound_hoist then
+                Printf.eprintf
+                  "loop-bound-hoist-skip func=%s header=%s pressure=%d limit=%d\n%!"
+                  f.name header loop_pressure max_safe_bound_hoist_pressure)
             else
               let candidates =
                 blocks_snapshot
@@ -7903,7 +7913,7 @@ let hoist_unrolled_loop_branch_immediates_func summaries globals (f : Cfg.func) 
                         if debug_bound_hoist then
                           Printf.eprintf
                             "loop-bound-hoist func=%s header=%s branch=%s imm=%Ld temp=t%d pressure=%d\n%!"
-                            f.name header branch_label bound bound_temp (IntSet.cardinal loop_temps);
+                            f.name header branch_label bound bound_temp loop_pressure;
                         changed := true
                   | [] | _ :: _ :: _ -> ())
               | [] | _ :: _ :: _ -> ())
