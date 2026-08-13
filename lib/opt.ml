@@ -696,16 +696,28 @@ let run_transfer globals state (block : Cfg.block) =
 let compute_const_states global_init globals (f : Cfg.func) =
   let in_states = Hashtbl.create (List.length f.blocks) in
   let out_states = Hashtbl.create (List.length f.blocks) in
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
   let entry_state = initial_cp_state global_init f in
   let meet_states = function
     | [] -> empty_cp_state
     | state :: rest -> List.fold_left meet_cp_state state rest
   in
-  let changed = ref true in
-  while !changed do
-    changed := false;
-    List.iter
-      (fun (block : Cfg.block) ->
+  let pending = Queue.create () in
+  let queued = Hashtbl.create (List.length f.blocks) in
+  let enqueue label =
+    if Hashtbl.mem block_map label && not (Hashtbl.mem queued label) then begin
+      Queue.add label pending;
+      Hashtbl.add queued label ()
+    end
+  in
+  enqueue f.entry;
+  while not (Queue.is_empty pending) do
+    let label = Queue.take pending in
+    Hashtbl.remove queued label;
+    match Hashtbl.find_opt block_map label with
+    | None -> ()
+    | Some (block : Cfg.block) ->
         let pred_states =
           List.filter_map (fun pred -> Hashtbl.find_opt out_states pred) block.preds
         in
@@ -714,23 +726,20 @@ let compute_const_states global_init globals (f : Cfg.func) =
           else meet_states pred_states
         in
         let _, out_state = run_transfer globals in_state block in
-        let prev_in =
+        if
           match Hashtbl.find_opt in_states block.label with
-          | Some state -> state
-          | None -> empty_cp_state
-        in
-        let prev_out =
-          match Hashtbl.find_opt out_states block.label with
-          | Some state -> state
-          | None -> empty_cp_state
-        in
-        if not (equal_cp_state in_state prev_in) then (
+          | Some prev -> not (equal_cp_state in_state prev)
+          | None -> true
+        then
           Hashtbl.replace in_states block.label in_state;
-          changed := true);
-        if not (equal_cp_state out_state prev_out) then (
+        if
+          match Hashtbl.find_opt out_states block.label with
+          | Some prev -> not (equal_cp_state out_state prev)
+          | None -> true
+        then begin
           Hashtbl.replace out_states block.label out_state;
-          changed := true))
-      f.blocks
+          List.iter enqueue block.succs
+        end
   done;
   in_states
 
@@ -762,6 +771,8 @@ let run_gvn_transfer globals state (block : Cfg.block) =
 let compute_gvn_states globals (f : Cfg.func) =
   let in_states = Hashtbl.create (List.length f.blocks) in
   let out_states = Hashtbl.create (List.length f.blocks) in
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
   let find_state table label =
     match Hashtbl.find_opt table label with
     | Some state -> state
@@ -775,22 +786,37 @@ let compute_gvn_states globals (f : Cfg.func) =
           (fun acc pred -> meet_gvn_state acc (find_state out_states pred))
           (find_state out_states pred) rest
   in
-  let changed = ref true in
-  while !changed do
-    changed := false;
-    List.iter
-      (fun (block : Cfg.block) ->
+  let pending = Queue.create () in
+  let queued = Hashtbl.create (List.length f.blocks) in
+  let enqueue label =
+    if Hashtbl.mem block_map label && not (Hashtbl.mem queued label) then begin
+      Queue.add label pending;
+      Hashtbl.add queued label ()
+    end
+  in
+  enqueue f.entry;
+  while not (Queue.is_empty pending) do
+    let label = Queue.take pending in
+    Hashtbl.remove queued label;
+    match Hashtbl.find_opt block_map label with
+    | None -> ()
+    | Some (block : Cfg.block) ->
         let in_state = meet_preds block.preds in
         let _, out_state = run_gvn_transfer globals in_state block in
-        let prev_in = find_state in_states block.label in
-        let prev_out = find_state out_states block.label in
-        if not (equal_gvn_state in_state prev_in) then (
+        if
+          match Hashtbl.find_opt in_states block.label with
+          | Some prev -> not (equal_gvn_state in_state prev)
+          | None -> true
+        then
           Hashtbl.replace in_states block.label in_state;
-          changed := true);
-        if not (equal_gvn_state out_state prev_out) then (
+        if
+          match Hashtbl.find_opt out_states block.label with
+          | Some prev -> not (equal_gvn_state out_state prev)
+          | None -> true
+        then begin
           Hashtbl.replace out_states block.label out_state;
-          changed := true))
-      f.blocks
+          List.iter enqueue block.succs
+        end
   done;
   in_states
 
@@ -956,15 +982,27 @@ let run_copy_transfer state (block : Cfg.block) =
 let compute_copy_states (f : Cfg.func) =
   let in_states = Hashtbl.create (List.length f.blocks) in
   let out_states = Hashtbl.create (List.length f.blocks) in
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
   let meet_states = function
     | [] -> empty_copy_state
     | state :: rest -> List.fold_left meet_copy_state state rest
   in
-  let changed = ref true in
-  while !changed do
-    changed := false;
-    List.iter
-      (fun (block : Cfg.block) ->
+  let pending = Queue.create () in
+  let queued = Hashtbl.create (List.length f.blocks) in
+  let enqueue label =
+    if Hashtbl.mem block_map label && not (Hashtbl.mem queued label) then begin
+      Queue.add label pending;
+      Hashtbl.add queued label ()
+    end
+  in
+  enqueue f.entry;
+  while not (Queue.is_empty pending) do
+    let label = Queue.take pending in
+    Hashtbl.remove queued label;
+    match Hashtbl.find_opt block_map label with
+    | None -> ()
+    | Some (block : Cfg.block) ->
         let pred_states =
           List.filter_map (fun pred -> Hashtbl.find_opt out_states pred) block.preds
         in
@@ -973,23 +1011,20 @@ let compute_copy_states (f : Cfg.func) =
           else meet_states pred_states
         in
         let _, out_state = run_copy_transfer in_state block in
-        let prev_in =
+        if
           match Hashtbl.find_opt in_states block.label with
-          | Some state -> state
-          | None -> empty_copy_state
-        in
-        let prev_out =
-          match Hashtbl.find_opt out_states block.label with
-          | Some state -> state
-          | None -> empty_copy_state
-        in
-        if not (equal_copy_state in_state prev_in) then (
+          | Some prev -> not (equal_copy_state in_state prev)
+          | None -> true
+        then
           Hashtbl.replace in_states block.label in_state;
-          changed := true);
-        if not (equal_copy_state out_state prev_out) then (
+        if
+          match Hashtbl.find_opt out_states block.label with
+          | Some prev -> not (equal_copy_state out_state prev)
+          | None -> true
+        then begin
           Hashtbl.replace out_states block.label out_state;
-          changed := true))
-      f.blocks
+          List.iter enqueue block.succs
+        end
   done;
   in_states
 
@@ -1167,12 +1202,23 @@ let table_find_or_empty table key empty =
 let compute_liveness globals (f : Cfg.func) =
   let live_in_t = Hashtbl.create (List.length f.blocks) in
   let live_in_p = Hashtbl.create (List.length f.blocks) in
-  let blocks = List.rev f.blocks in
-  let changed = ref true in
-  while !changed do
-    changed := false;
-    List.iter
-      (fun (block : Cfg.block) ->
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
+  let pending = Queue.create () in
+  let queued = Hashtbl.create (List.length f.blocks) in
+  let enqueue label =
+    if Hashtbl.mem block_map label && not (Hashtbl.mem queued label) then begin
+      Queue.add label pending;
+      Hashtbl.add queued label ()
+    end
+  in
+  List.iter (fun (block : Cfg.block) -> enqueue block.label) (List.rev f.blocks);
+  while not (Queue.is_empty pending) do
+    let label = Queue.take pending in
+    Hashtbl.remove queued label;
+    match Hashtbl.find_opt block_map label with
+    | None -> ()
+    | Some (block : Cfg.block) ->
         let live_t_out =
           List.fold_left
             (fun acc succ ->
@@ -1186,17 +1232,18 @@ let compute_liveness globals (f : Cfg.func) =
             PlaceSet.empty block.succs
         in
         let _, live_t_in, live_p_in = scan_block globals block live_t_out live_p_out in
-        if not (IntSet.equal live_t_in (table_find_or_empty live_in_t block.label IntSet.empty)) then (
-          Hashtbl.replace live_in_t block.label live_t_in;
-          changed := true);
-        if
+        let changed_t =
+          not (IntSet.equal live_t_in (table_find_or_empty live_in_t block.label IntSet.empty))
+        in
+        let changed_p =
           not
             (PlaceSet.equal live_p_in
                (table_find_or_empty live_in_p block.label PlaceSet.empty))
-        then (
-          Hashtbl.replace live_in_p block.label live_p_in;
-          changed := true))
-      blocks
+        in
+        if changed_t then
+          Hashtbl.replace live_in_t block.label live_t_in;
+        if changed_p then Hashtbl.replace live_in_p block.label live_p_in;
+        if changed_t || changed_p then List.iter enqueue block.preds
   done;
   (live_in_t, live_in_p)
 
@@ -1523,6 +1570,51 @@ let compute_dominators (f : Cfg.func) =
   done;
   doms
 
+let has_cfg_cycle (f : Cfg.func) =
+  let blocks = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add blocks block.label block) f.blocks;
+  let state = Hashtbl.create (List.length f.blocks) in
+  let rec visit label =
+    match Hashtbl.find_opt state label with
+    | Some 1 -> true
+    | Some _ -> false
+    | None ->
+        Hashtbl.add state label 1;
+        let found =
+          match Hashtbl.find_opt blocks label with
+          | Some (block : Cfg.block) -> List.exists visit block.succs
+          | None -> false
+        in
+        Hashtbl.replace state label 2;
+        found
+  in
+  visit f.entry
+
+let cfg_backedges (f : Cfg.func) =
+  let blocks = Hashtbl.create (List.length f.blocks) in
+  List.iter (fun (block : Cfg.block) -> Hashtbl.add blocks block.label block) f.blocks;
+  let state = Hashtbl.create (List.length f.blocks) in
+  let edges = ref [] in
+  let rec visit label =
+    match Hashtbl.find_opt state label with
+    | Some _ -> ()
+    | None ->
+        Hashtbl.add state label 1;
+        (match Hashtbl.find_opt blocks label with
+        | Some (block : Cfg.block) ->
+            List.iter
+              (fun succ ->
+                match Hashtbl.find_opt state succ with
+                | Some 1 -> edges := (label, succ) :: !edges
+                | Some _ -> ()
+                | None -> visit succ)
+              block.succs
+        | None -> ());
+        Hashtbl.replace state label 2
+  in
+  visit f.entry;
+  List.rev !edges
+
 let temp_def_blocks_of_blocks temp_count blocks =
   let defs = Hashtbl.create (max 8 temp_count) in
   List.iter
@@ -1621,22 +1713,13 @@ let natural_loop block_map header pred =
   visit [ pred ] (LabelSet.singleton header)
 
 let eliminate_dead_loops_func (f : Cfg.func) =
+  if not (has_cfg_cycle f) then f
+  else
   let debug_dead_loops = Sys.getenv_opt "TOYC_DEBUG_DEAD_LOOPS" <> None in
   let debugf fmt = Printf.ksprintf (fun s -> if debug_dead_loops then prerr_endline s) fmt in
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
-  let doms = compute_dominators f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
-        List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
+  let backedges = cfg_backedges f in
   if backedges = [] then f
   else
     let loops = Hashtbl.create 8 in
@@ -2533,6 +2616,31 @@ let reduction_step_of_operand
       Some (ReductionAffine { iv; coeff; bias })
   | Some (LinearAffine _) | None -> None
 
+let make_reduction_affine iv coeff bias =
+  if coeff = 0L then ReductionInvariant bias
+  else ReductionAffine { iv; coeff; bias }
+
+let add_reduction_steps lhs rhs =
+  match (lhs, rhs) with
+  | ReductionInvariant lhs, ReductionInvariant rhs ->
+      Some (ReductionInvariant (summary_expr_add lhs rhs))
+  | ReductionAffine { iv; coeff; bias }, ReductionInvariant rhs
+  | ReductionInvariant rhs, ReductionAffine { iv; coeff; bias } ->
+      Some (make_reduction_affine iv coeff (summary_expr_add bias rhs))
+  | ReductionAffine lhs, ReductionAffine rhs when lhs.iv.phi_temp = rhs.iv.phi_temp ->
+      Some
+        (make_reduction_affine lhs.iv Int64.(add lhs.coeff rhs.coeff)
+           (summary_expr_add lhs.bias rhs.bias))
+  | ReductionAffine _, ReductionAffine _ -> None
+
+let negate_reduction_step = function
+  | ReductionInvariant expr -> ReductionInvariant (summary_expr_neg expr)
+  | ReductionAffine { iv; coeff; bias } ->
+      make_reduction_affine iv Int64.(neg coeff) (summary_expr_neg bias)
+
+let normalize_reduction_step (reduction : counted_reduction) =
+  if reduction.subtract then negate_reduction_step reduction.step else reduction.step
+
 let reduction_update_of_temp
     loop
     def_blocks
@@ -2587,7 +2695,18 @@ let reduction_update_of_temp
                def_instrs
                ivs
                block lhs)
-        else None
+        else
+          let extend base extra =
+            Option.bind (of_operand seen base) (fun update ->
+                Option.bind
+                  (reduction_step_of_operand
+                     loop def_blocks loop_stable_phis multi_defs def_instrs ivs block extra)
+                  (fun step ->
+                    Option.map
+                      (fun step -> { phi_temp; subtract = false; step })
+                      (add_reduction_steps (normalize_reduction_step update) step)))
+          in
+          (match extend lhs rhs with Some update -> Some update | None -> extend rhs lhs)
     | Tcg.Bin (_, Sub, lhs, rhs) ->
         if resolves_to_induction_temp multi_defs def_instrs phi_temp lhs then
           Option.map
@@ -2600,7 +2719,17 @@ let reduction_update_of_temp
                def_instrs
                ivs
                block rhs)
-        else None
+        else
+          Option.bind (of_operand seen lhs) (fun update ->
+              Option.bind
+                (reduction_step_of_operand
+                   loop def_blocks loop_stable_phis multi_defs def_instrs ivs block rhs)
+                (fun step ->
+                  Option.map
+                    (fun step -> { phi_temp; subtract = false; step })
+                    (add_reduction_steps
+                       (normalize_reduction_step update)
+                       (negate_reduction_step step))))
     | Tcg.Un _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ | Tcg.Bin _ -> None
   in
   match last_def_of_temp block temp with
@@ -2760,20 +2889,11 @@ let build_reduction_final_update fresh_temp trip_temp (reduction : counted_reduc
       delta_instrs @ [ update ]
 
 let eliminate_counted_loops_func (f : Cfg.func) =
+  if not (has_cfg_cycle f) then f
+  else
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
-  let doms = compute_dominators f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
-        List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
+  let backedges = cfg_backedges f in
   if backedges = [] then f
   else
     let loops = Hashtbl.create 8 in
@@ -2925,21 +3045,12 @@ let eliminate_counted_loops_func (f : Cfg.func) =
     else f
 
 let strength_reduce_func (f : Cfg.func) =
+  if not (has_cfg_cycle f) then f
+  else
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
-  let doms = compute_dominators f in
   let def_blocks = temp_def_blocks f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
-        List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
+  let backedges = cfg_backedges f in
   if backedges = [] then f
   else
     let loops = Hashtbl.create 8 in
@@ -3150,20 +3261,11 @@ let build_reassoc_instrs mid first_shape second_shape =
       Some (inv_bin mid Sub inv2 inv1, add_mid dst variant)
 
 let reassociate_loop_adds_func (f : Cfg.func) =
+  if not (has_cfg_cycle f) then f
+  else
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
-  let doms = compute_dominators f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
-        List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
+  let backedges = cfg_backedges f in
   if backedges = [] then f
   else
     let loops = Hashtbl.create 8 in
@@ -3234,20 +3336,11 @@ let reassociate_loop_adds_func (f : Cfg.func) =
     else f
 
 let licm_func (f : Cfg.func) =
+  if not (has_cfg_cycle f) then f
+  else
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block) f.blocks;
-  let doms = compute_dominators f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
-        List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
+  let backedges = cfg_backedges f in
   if backedges = [] then f
   else
     let loops = Hashtbl.create 8 in
@@ -3562,15 +3655,31 @@ let optimize_func global_init globals (f : Cfg.func) =
     with
     | StopPass current -> current
   in
-  let rec loop fuel current =
-    if fuel = 0 then current
-    else
-      let next = step current in
-      if next = current then current else loop (fuel - 1) next
+  let light_step func =
+    try
+      let after_const = const_propagate_func global_init globals func |> stop_after "const1" in
+      let after_gvn = gvn_func globals after_const |> stop_after "gvn1" in
+      let after_dce = eliminate_dead_code_func after_gvn |> stop_after "dce1" in
+      let after_fold = fold_branch_tails_func after_dce |> stop_after "fold" in
+      thread_and_prune_func after_fold |> stop_after "thread2"
+    with
+    | StopPass current -> current
   in
+  let fuel =
+    let blocks = List.length promoted.blocks in
+    if blocks > 220 then 1 else if blocks > 120 then 2 else 8
+  in
+  let run_step = if List.length promoted.blocks > 220 then light_step else step in
   match debug_stop_after with
   | Some "mem2reg" -> promoted
-  | Some _ | None -> loop 8 promoted
+  | Some _ | None ->
+      let rec run fuel current =
+        if fuel = 0 then current
+        else
+          let next = run_step current in
+          if next = current then current else run (fuel - 1) next
+      in
+      run fuel promoted
 
 type inline_func = {
   params : Tcg.var list;
