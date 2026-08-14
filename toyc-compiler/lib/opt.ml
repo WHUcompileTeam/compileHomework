@@ -2965,8 +2965,16 @@ let discover_natural_loops (f : Cfg.func) =
       Hashtbl.replace loops header merged)
     backedges;
   let headers =
-    Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
-    |> List.sort (fun (_, a) (_, b) -> compare a b)
+    Hashtbl.fold
+      (fun header loop acc ->
+        (header, LabelSet.cardinal loop) :: acc)
+      loops
+      []
+    |> List.sort
+         (fun (header_a, size_a) (header_b, size_b) ->
+           let by_size = compare size_a size_b in
+           if by_size <> 0 then by_size
+           else String.compare header_a header_b)
     |> List.map fst
   in
   (block_map, loops, headers)
@@ -3322,7 +3330,34 @@ let eliminate_dead_loops_func summaries globals (f : Cfg.func) =
     let current_entry = ref f.entry in
     let removed = ref LabelSet.empty in
     let changed = ref false in
-    let current_block_list () = Hashtbl.fold (fun _ block acc -> block :: acc) current_blocks [] in
+    let original_block_labels =
+      List.map (fun (block : Cfg.block) -> block.label) f.blocks
+    in
+    let original_block_set =
+      List.fold_left
+        (fun acc label -> LabelSet.add label acc)
+        LabelSet.empty
+        original_block_labels
+    in
+    let current_block_list () =
+      let original_blocks =
+        List.filter_map
+          (fun label -> Hashtbl.find_opt current_blocks label)
+          original_block_labels
+      in
+      let extra_blocks =
+        Hashtbl.fold
+          (fun label block acc ->
+            if LabelSet.mem label original_block_set then acc
+            else block :: acc)
+          current_blocks
+          []
+        |> List.sort
+             (fun (a : Cfg.block) (b : Cfg.block) ->
+               String.compare a.label b.label)
+      in
+      original_blocks @ extra_blocks
+    in
     let get_block = get_block_exn current_blocks in
     let block_exists label = Hashtbl.mem current_blocks label && not (LabelSet.mem label !removed) in
     List.iter
@@ -7764,7 +7799,34 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
     let update_block (block : Cfg.block) =
       Hashtbl.replace current_blocks block.label block
     in
-    let current_block_list () = Hashtbl.fold (fun _ block acc -> block :: acc) current_blocks [] in
+    let original_block_labels =
+      List.map (fun (block : Cfg.block) -> block.label) f.blocks
+    in
+    let original_block_set =
+      List.fold_left
+        (fun acc label -> LabelSet.add label acc)
+        LabelSet.empty
+        original_block_labels
+    in
+    let current_block_list () =
+      let original_blocks =
+        List.filter_map
+          (fun label -> Hashtbl.find_opt current_blocks label)
+          original_block_labels
+      in
+      let extra_blocks =
+        Hashtbl.fold
+          (fun label block acc ->
+            if LabelSet.mem label original_block_set then acc
+            else block :: acc)
+          current_blocks
+          []
+        |> List.sort
+             (fun (a : Cfg.block) (b : Cfg.block) ->
+               String.compare a.label b.label)
+      in
+      original_blocks @ extra_blocks
+    in
     let next_temp = ref f.temp_count in
     let fresh_temp () =
       let temp = !next_temp in
@@ -8102,7 +8164,34 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
     let update_block (block : Cfg.block) =
       Hashtbl.replace current_blocks block.label block
     in
-    let current_block_list () = Hashtbl.fold (fun _ block acc -> block :: acc) current_blocks [] in
+    let original_block_labels =
+      List.map (fun (block : Cfg.block) -> block.label) f.blocks
+    in
+    let original_block_set =
+      List.fold_left
+        (fun acc label -> LabelSet.add label acc)
+        LabelSet.empty
+        original_block_labels
+    in
+    let current_block_list () =
+      let original_blocks =
+        List.filter_map
+          (fun label -> Hashtbl.find_opt current_blocks label)
+          original_block_labels
+      in
+      let extra_blocks =
+        Hashtbl.fold
+          (fun label block acc ->
+            if LabelSet.mem label original_block_set then acc
+            else block :: acc)
+          current_blocks
+          []
+        |> List.sort
+             (fun (a : Cfg.block) (b : Cfg.block) ->
+               String.compare a.label b.label)
+      in
+      original_blocks @ extra_blocks
+    in
     let next_temp = ref f.temp_count in
     let fresh_temp () =
       let temp = !next_temp in
@@ -8788,7 +8877,7 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
                     loop_live_places
                     supported_live_temps
                 in
-                if debug_counted then
+                if debug_counted then begin
                   let backedge_preds =
                     List.filter (fun pred -> LabelSet.mem pred loop) header_block.preds
                   in
@@ -8828,7 +8917,8 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
                       in
                       debugf "counted-place-detail func=%s header=%s place=%s stores=[%s]"
                         f.name header (string_of_place place) stores)
-                    loop_live_places;
+                    loop_live_places
+                end;
                 let supported_live_places =
                   List.fold_left
                     (fun acc update ->
@@ -10564,7 +10654,34 @@ let licm_func summaries globals (f : Cfg.func) =
     let update_block (block : Cfg.block) =
       Hashtbl.replace current_blocks block.Cfg.label block
     in
-    let current_block_list () = Hashtbl.fold (fun _ block acc -> block :: acc) current_blocks [] in
+    let original_block_labels =
+      List.map (fun (block : Cfg.block) -> block.label) f.blocks
+    in
+    let original_block_set =
+      List.fold_left
+        (fun acc label -> LabelSet.add label acc)
+        LabelSet.empty
+        original_block_labels
+    in
+    let current_block_list () =
+      let original_blocks =
+        List.filter_map
+          (fun label -> Hashtbl.find_opt current_blocks label)
+          original_block_labels
+      in
+      let extra_blocks =
+        Hashtbl.fold
+          (fun label block acc ->
+            if LabelSet.mem label original_block_set then acc
+            else block :: acc)
+          current_blocks
+          []
+        |> List.sort
+             (fun (a : Cfg.block) (b : Cfg.block) ->
+               String.compare a.label b.label)
+      in
+      original_blocks @ extra_blocks
+    in
     let new_blocks_rev = ref [] in
     let preheader_id = ref 0 in
     let fresh_preheader_label () =
