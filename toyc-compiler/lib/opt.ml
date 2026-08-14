@@ -8150,6 +8150,9 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
         loop
         (info : counted_loop_info)
         effects
+        loop_defs
+        multi_defs
+        def_instrs
       =
       let modified_globals = global_places effects.modified_places in
       let control_iv = info.control_iv in
@@ -8219,6 +8222,114 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
             false
       in
 
+      let known_control_init () =
+        match control_iv.outside_inputs with
+        | [] -> None
+        | inputs ->
+            let values =
+              List.map
+                (fun (pred, operand) ->
+                  let chain =
+                    incoming_phi_chain get_block header pred
+                    |> extend_counted_outside_seed_chain get_block loop
+                  in
+                  operand_static_int64_on_chain
+                    chain
+                    loop_defs
+                    multi_defs
+                    def_instrs
+                    operand)
+                inputs
+            in
+            if List.exists Option.is_none values then None
+            else
+              match
+                values
+                |> List.filter_map (fun value -> value)
+                |> List.sort_uniq compare
+              with
+              | [ value ] -> Some value
+              | _ -> None
+      in
+
+      let bounded_triangle_instrs trip_temp =
+        let n_minus_one = fresh_temp () in
+        let product = fresh_temp () in
+        let triangle = fresh_temp () in
+        ( [ simplify_simple_instr
+              (Tcg.Bin
+                 (n_minus_one, Sub, Tcg.Temp trip_temp, Tcg.Imm 1L));
+            simplify_simple_instr
+              (Tcg.Bin
+                 (product, Mul, Tcg.Temp trip_temp, Tcg.Temp n_minus_one));
+            simplify_simple_instr
+              (Tcg.Bin
+                 (triangle, Div, Tcg.Temp product, Tcg.Imm 2L)) ],
+          triangle )
+      in
+
+      let affine_delta_from_triangle trip_temp triangle base =
+        let base = i32 base in
+        if base = 0L then ([], Tcg.Temp triangle)
+        else if base = 1L then
+          let delta = fresh_temp () in
+          ( [ simplify_simple_instr
+                (Tcg.Bin
+                   (delta, Add, Tcg.Temp triangle, Tcg.Temp trip_temp)) ],
+            Tcg.Temp delta )
+        else if base = -1L then
+          let delta = fresh_temp () in
+          ( [ simplify_simple_instr
+                (Tcg.Bin
+                   (delta, Sub, Tcg.Temp triangle, Tcg.Temp trip_temp)) ],
+            Tcg.Temp delta )
+        else
+          let scaled = fresh_temp () in
+          let delta = fresh_temp () in
+          ( [ simplify_simple_instr
+                (Tcg.Bin
+                   (scaled, Mul, Tcg.Temp trip_temp, Tcg.Imm base));
+              simplify_simple_instr
+                (Tcg.Bin
+                   (delta, Add, Tcg.Temp scaled, Tcg.Temp triangle)) ],
+            Tcg.Temp delta )
+      in
+
+      let adjust_delta_by_trip base_delta trip_temp amount =
+        let amount = i32 amount in
+        if amount = 0L then ([], base_delta)
+        else if amount = 1L then
+          let delta = fresh_temp () in
+          ( [ simplify_simple_instr
+                (Tcg.Bin
+                   (delta, Add, base_delta, Tcg.Temp trip_temp)) ],
+            Tcg.Temp delta )
+        else if amount = -1L then
+          let delta = fresh_temp () in
+          ( [ simplify_simple_instr
+                (Tcg.Bin
+                   (delta, Sub, base_delta, Tcg.Temp trip_temp)) ],
+            Tcg.Temp delta )
+        else
+          let scaled = fresh_temp () in
+          let delta = fresh_temp () in
+          ( [ simplify_simple_instr
+                (Tcg.Bin
+                   (scaled, Mul, Tcg.Temp trip_temp, Tcg.Imm amount));
+              simplify_simple_instr
+                (Tcg.Bin (delta, Add, base_delta, Tcg.Temp scaled)) ],
+            Tcg.Temp delta )
+      in
+
+      let preload_two_places then_place else_place =
+        let then_carrier = fresh_temp () in
+        let else_carrier = fresh_temp () in
+        ( [ simplify_simple_instr (Tcg.Load (then_carrier, then_place));
+            simplify_simple_instr (Tcg.Load (else_carrier, else_place)) ],
+          then_carrier,
+          else_carrier )
+      in
+
       if
         effects.has_call
         || not (PlaceSet.is_empty modified_globals)
@@ -8246,125 +8357,255 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
                    && LabelSet.mem then_join loop
                    && exact_join_update then_join
                    && List.mem then_join control_iv.backedge_preds ->
-                let total_trip_instrs, total_trip =
-                  build_trip_count_instrs
-                    fresh_temp
-                    control_iv.phi_temp
-                    control_iv.step
-                    info.kind
+                let generic_summary () =
+                  let total_trip_instrs, total_trip =
+                    build_trip_count_instrs
+                      fresh_temp
+                      control_iv.phi_temp
+                      control_iv.step
+                      info.kind
+                  in
+
+                  (* prefix_raw = max(K - i0, 0) *)
+                  let prefix_diff = fresh_temp () in
+                  let prefix_clamp_instrs, prefix_nonnegative =
+                    clamp_nonnegative_temp fresh_temp prefix_diff
+                  in
+
+                  let min_delta = fresh_temp () in
+                  let choose_prefix = fresh_temp () in
+                  let selected_delta = fresh_temp () in
+                  let prefix_trip = fresh_temp () in
+                  let prefix_instrs =
+                    [ simplify_simple_instr
+                        (Tcg.Bin
+                           ( prefix_diff,
+                             Sub,
+                             Tcg.Imm threshold,
+                             Tcg.Temp control_iv.phi_temp )) ]
+                    @ prefix_clamp_instrs
+                    @ [ simplify_simple_instr
+                          (Tcg.Bin
+                             ( min_delta,
+                               Sub,
+                               Tcg.Temp prefix_nonnegative,
+                               Tcg.Temp total_trip ));
+                        simplify_simple_instr
+                          (Tcg.Bin
+                             ( choose_prefix,
+                               Lt,
+                               Tcg.Temp prefix_nonnegative,
+                               Tcg.Temp total_trip ));
+                        simplify_simple_instr
+                          (Tcg.Bin
+                             ( selected_delta,
+                               Mul,
+                               Tcg.Temp min_delta,
+                               Tcg.Temp choose_prefix ));
+                        simplify_simple_instr
+                          (Tcg.Bin
+                             ( prefix_trip,
+                               Add,
+                               Tcg.Temp total_trip,
+                               Tcg.Temp selected_delta )) ]
+                  in
+
+                  let affine place bias subtract =
+                    {
+                      target = ReductionPlaceTarget place;
+                      subtract;
+                      step =
+                        ReductionAffine
+                          {
+                            iv = control_iv;
+                            coeff = one_summary_expr;
+                            bias = SummaryOperand (Tcg.Imm bias);
+                          };
+                      carrier_temp = None;
+                      alias_temps = [];
+                    }
+                  in
+                  let then_reduction = affine then_place then_bias false in
+                  let else_all_reduction = affine else_place else_bias false in
+                  let else_prefix_reduction = affine else_place else_bias true in
+                  let reductions, carrier_preloads =
+                    materialize_place_reduction_carriers
+                      fresh_temp
+                      [ then_reduction;
+                        else_all_reduction;
+                        else_prefix_reduction ]
+                  in
+                  let place_carriers =
+                    place_carriers_of_reductions reductions
+                  in
+                  let then_reduction, else_all_reduction, else_prefix_reduction =
+                    match reductions with
+                    | [ a; b; c ] -> (a, b, c)
+                    | _ -> assert false
+                  in
+                  let updates =
+                    carrier_preloads
+                    @ build_reduction_final_update
+                        fresh_temp
+                        prefix_trip
+                        place_carriers
+                        then_reduction
+                    @ build_reduction_final_update
+                        fresh_temp
+                        total_trip
+                        place_carriers
+                        else_all_reduction
+                    @ build_reduction_final_update
+                        fresh_temp
+                        prefix_trip
+                        place_carriers
+                        else_prefix_reduction
+                    @ build_iv_final_update
+                        fresh_temp
+                        total_trip
+                        control_iv
+                  in
+                  (total_trip_instrs, prefix_instrs, updates, false)
                 in
 
-                (* prefix_raw = max(K - i0, 0) *)
-                let prefix_diff = fresh_temp () in
-                let prefix_clamp_instrs, prefix_nonnegative =
-                  clamp_nonnegative_temp fresh_temp prefix_diff
-                in
+                let fast_summary init_value prefix_cap bound =
+                  (* The summary block is reached only from the true edge of
+                     [i < bound].  With a known nonnegative [i0], [bound-i0] is
+                     strictly positive and cannot overflow signed i32, so the
+                     generic nonnegative clamp is redundant here. *)
+                  let total_trip = fresh_temp () in
+                  let total_trip_instrs =
+                    [ simplify_simple_instr
+                        (Tcg.Bin
+                           ( total_trip,
+                             Sub,
+                             bound,
+                             Tcg.Temp control_iv.phi_temp )) ]
+                  in
 
-                (* prefix = min(prefix_nonnegative, total_trip)
-                   Implement min without a branch:
-
-                     d = prefix_nonnegative - total
-                     c = prefix_nonnegative < total
-                     prefix = total + d*c
-                *)
-                let min_delta = fresh_temp () in
-                let choose_prefix = fresh_temp () in
-                let selected_delta = fresh_temp () in
-                let prefix_trip = fresh_temp () in
-                let prefix_instrs =
-                  [ simplify_simple_instr
-                      (Tcg.Bin
-                         ( prefix_diff,
-                           Sub,
-                           Tcg.Imm threshold,
-                           Tcg.Temp control_iv.phi_temp )) ]
-                  @ prefix_clamp_instrs
-                  @ [ simplify_simple_instr
+                  (* prefix = min(prefix_cap, total_trip). *)
+                  let min_delta = fresh_temp () in
+                  let choose_cap = fresh_temp () in
+                  let selected_delta = fresh_temp () in
+                  let prefix_trip = fresh_temp () in
+                  let prefix_instrs =
+                    [ simplify_simple_instr
                         (Tcg.Bin
                            ( min_delta,
                              Sub,
-                             Tcg.Temp prefix_nonnegative,
+                             Tcg.Imm prefix_cap,
                              Tcg.Temp total_trip ));
                       simplify_simple_instr
                         (Tcg.Bin
-                           ( choose_prefix,
+                           ( choose_cap,
                              Lt,
-                             Tcg.Temp prefix_nonnegative,
+                             Tcg.Imm prefix_cap,
                              Tcg.Temp total_trip ));
                       simplify_simple_instr
                         (Tcg.Bin
                            ( selected_delta,
                              Mul,
                              Tcg.Temp min_delta,
-                             Tcg.Temp choose_prefix ));
+                             Tcg.Temp choose_cap ));
                       simplify_simple_instr
                         (Tcg.Bin
                            ( prefix_trip,
                              Add,
                              Tcg.Temp total_trip,
                              Tcg.Temp selected_delta )) ]
-                in
+                  in
 
-                let affine place bias subtract =
-                  {
-                    target = ReductionPlaceTarget place;
-                    subtract;
-                    step =
-                      ReductionAffine
-                        {
-                          iv = control_iv;
-                          coeff = one_summary_expr;
-                          bias = SummaryOperand (Tcg.Imm bias);
-                        };
-                    carrier_temp = None;
-                    alias_temps = [];
-                  }
-                in
+                  (* [prefix_trip <= prefix_cap <= 46340], hence
+                     prefix*(prefix-1) cannot overflow signed i32 before /2. *)
+                  let prefix_triangle_instrs, prefix_triangle =
+                    bounded_triangle_instrs prefix_trip
+                  in
+                  let total_triangle_instrs, total_triangle =
+                    build_triangle_number_instrs fresh_temp total_trip
+                  in
 
-                (* then-place gets only the prefix.
-                   else-place gets all iterations, then subtracts the prefix
-                   computed with the else-arm bias. *)
-                let then_reduction = affine then_place then_bias false in
-                let else_all_reduction = affine else_place else_bias false in
-                let else_prefix_reduction = affine else_place else_bias true in
+                  let then_base = i32 Int64.(add init_value then_bias) in
+                  let else_base = i32 Int64.(add init_value else_bias) in
+                  let then_delta_instrs, then_delta =
+                    affine_delta_from_triangle
+                      prefix_trip prefix_triangle then_base
+                  in
+                  let else_all_instrs, else_all_delta =
+                    affine_delta_from_triangle
+                      total_trip total_triangle else_base
+                  in
 
-                let reductions, carrier_preloads =
-                  materialize_place_reduction_carriers
-                    fresh_temp
-                    [ then_reduction;
-                      else_all_reduction;
-                      else_prefix_reduction ]
-                in
-                let place_carriers =
-                  place_carriers_of_reductions reductions
-                in
-                let then_reduction, else_all_reduction, else_prefix_reduction =
-                  match reductions with
-                  | [ a; b; c ] -> (a, b, c)
-                  | _ -> assert false
-                in
-
-                let updates =
-                  carrier_preloads
-                  @ build_reduction_final_update
-                      fresh_temp
+                  (* Both prefix sums share the same IV series:
+                       else_prefix
+                         = then_prefix
+                           + prefix * (else_bias - then_bias). *)
+                  let else_prefix_instrs, else_prefix_delta =
+                    adjust_delta_by_trip
+                      then_delta
                       prefix_trip
-                      place_carriers
-                      then_reduction
-                  @ build_reduction_final_update
-                      fresh_temp
-                      total_trip
-                      place_carriers
-                      else_all_reduction
-                  @ build_reduction_final_update
-                      fresh_temp
-                      prefix_trip
-                      place_carriers
-                      else_prefix_reduction
-                  @ build_iv_final_update
-                      fresh_temp
-                      total_trip
-                      control_iv
+                      Int64.(sub else_bias then_bias)
+                  in
+
+                  let carrier_preloads, then_carrier, else_carrier =
+                    preload_two_places then_place else_place
+                  in
+                  let then_update =
+                    simplify_simple_instr
+                      (Tcg.Bin
+                         ( then_carrier,
+                           Add,
+                           Tcg.Temp then_carrier,
+                           then_delta ))
+                  in
+                  let else_add_all =
+                    simplify_simple_instr
+                      (Tcg.Bin
+                         ( else_carrier,
+                           Add,
+                           Tcg.Temp else_carrier,
+                           else_all_delta ))
+                  in
+                  let else_remove_prefix =
+                    simplify_simple_instr
+                      (Tcg.Bin
+                         ( else_carrier,
+                           Sub,
+                           Tcg.Temp else_carrier,
+                           else_prefix_delta ))
+                  in
+                  let updates =
+                    carrier_preloads
+                    @ prefix_triangle_instrs
+                    @ then_delta_instrs
+                    @ total_triangle_instrs
+                    @ else_all_instrs
+                    @ else_prefix_instrs
+                    @ [ then_update;
+                        Tcg.Store (then_place, Tcg.Temp then_carrier);
+                        else_add_all;
+                        else_remove_prefix;
+                        Tcg.Store (else_place, Tcg.Temp else_carrier) ]
+                    @ build_iv_final_update
+                        fresh_temp
+                        total_trip
+                        control_iv
+                  in
+                  (total_trip_instrs, prefix_instrs, updates, true)
+                in
+
+                let total_trip_instrs, prefix_instrs, updates, fast_piecewise =
+                  match (known_control_init (), info.kind) with
+                  | Some init_value, CountUpLt (bound, 0L)
+                    when then_place <> else_place
+                         && init_value >= 0L
+                         && threshold >= init_value ->
+                      let prefix_cap = Int64.sub threshold init_value in
+                      if prefix_cap <= 46_340L then
+                        fast_summary init_value prefix_cap bound
+                      else
+                        generic_summary ()
+                  | _ ->
+                      generic_summary ()
                 in
 
                 let summary_label = fresh_summary_label () in
@@ -8394,7 +8635,7 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
                     succs = [ info.exit_label ];
                   };
                 debugf
-                  "counted-piecewise-apply func=%s header=%s summary=%s threshold=%Ld then=%s:%Ld else=%s:%Ld"
+                  "counted-piecewise-apply func=%s header=%s summary=%s threshold=%Ld then=%s:%Ld else=%s:%Ld fast=%b"
                   f.name
                   header
                   summary_label
@@ -8402,7 +8643,8 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
                   (string_of_place then_place)
                   then_bias
                   (string_of_place else_place)
-                  else_bias;
+                  else_bias
+                  fast_piecewise;
                 new_blocks_rev := summary_label :: !new_blocks_rev;
                 changed := true;
                 true
@@ -8435,7 +8677,13 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
                 if
                   not
                     (try_eliminate_piecewise_threshold_loop
-                       header loop info effects)
+                       header
+                       loop
+                       info
+                       effects
+                       loop_defs
+                       multi_defs
+                       def_instrs)
                 then
                   debugf
                     "counted-skip func=%s header=%s reason=nonlinear_path"
