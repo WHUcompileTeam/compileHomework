@@ -8117,6 +8117,299 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
     in
     let new_blocks_rev = ref [] in
     let changed = ref false in
+
+    (* Special-case a strict monotone threshold diamond:
+
+         while (i < bound) {
+           if (i < K)
+             x = x + i + A;
+           else
+             y = y + i + B;
+           i = i + 1;
+         }
+
+       This is not an arbitrary nonlinear loop.  Since [i] increases
+       monotonically by one and [K] is constant, the branch changes side at
+       most once.  Let
+
+         total = number of loop iterations
+         prefix = min(total, max(K - i0, 0))
+
+       Then the loop is exactly:
+
+         x += sum_{k=0}^{prefix-1} (i0 + k + A)
+         y += sum_{k=0}^{total-1}  (i0 + k + B)
+              - sum_{k=0}^{prefix-1} (i0 + k + B)
+         i += total
+
+       The matcher below is intentionally narrow: five loop blocks, an empty
+       branch block, two exact local-place reduction arms, one exact IV update
+       join, positive unit IV step, and no calls/global writes. *)
+    let try_eliminate_piecewise_threshold_loop
+        header
+        loop
+        (info : counted_loop_info)
+        effects
+      =
+      let modified_globals = global_places effects.modified_places in
+      let control_iv = info.control_iv in
+
+      let add_is a b lhs rhs =
+        (lhs = a && rhs = b) || (lhs = b && rhs = a)
+      in
+
+      let match_arm label =
+        let block : Cfg.block = get_block label in
+        match (block.body, block.term) with
+        | ( [ Tcg.Load (loaded, (Tcg.Local _ as place));
+              Tcg.Bin (mid, Add, lhs1, rhs1);
+              Tcg.Bin (out_temp, Add, lhs2, rhs2);
+              Tcg.Store (stored_place, Tcg.Temp stored_temp) ],
+            Cfg.Jump join_label )
+          when stored_place = place
+               && stored_temp = out_temp
+               && loaded <> control_iv.phi_temp
+               && mid <> control_iv.phi_temp
+               && out_temp <> control_iv.phi_temp
+               && add_is
+                    (Tcg.Temp loaded)
+                    (Tcg.Temp control_iv.phi_temp)
+                    lhs1 rhs1 -> (
+            let bias =
+              match (lhs2, rhs2) with
+              | Tcg.Temp temp, Tcg.Imm bias when temp = mid -> Some bias
+              | Tcg.Imm bias, Tcg.Temp temp when temp = mid -> Some bias
+              | _ -> None
+            in
+            Option.map
+              (fun bias -> (place, bias, join_label))
+              bias)
+        | _ -> None
+      in
+
+      let exact_join_update join_label =
+        let block : Cfg.block = get_block join_label in
+        match (block.body, block.term) with
+        | ( [ Tcg.Bin (next_temp, Add, Tcg.Temp src, Tcg.Imm 1L);
+              Tcg.Move (dst, Tcg.Temp moved) ],
+            Cfg.Jump next )
+          when src = control_iv.phi_temp
+               && dst = control_iv.phi_temp
+               && moved = next_temp
+               && next = header ->
+            true
+        | ( [ Tcg.Bin (next_temp, Add, Tcg.Imm 1L, Tcg.Temp src);
+              Tcg.Move (dst, Tcg.Temp moved) ],
+            Cfg.Jump next )
+          when src = control_iv.phi_temp
+               && dst = control_iv.phi_temp
+               && moved = next_temp
+               && next = header ->
+            true
+        | _ -> false
+      in
+
+      let control_kind_supported =
+        match info.kind with
+        | CountUpLt (_, 0L) -> true
+        | CountUpLt _
+        | CountUpLe _
+        | CountDownGt _
+        | CountDownGe _ ->
+            false
+      in
+
+      if
+        effects.has_call
+        || not (PlaceSet.is_empty modified_globals)
+        || control_iv.step <> 1L
+        || not control_kind_supported
+        || info.control_label <> header
+        || LabelSet.cardinal loop <> 5
+      then false
+      else
+        let control_block : Cfg.block = get_block info.control_label in
+        let inside_block : Cfg.block = get_block info.inside_label in
+        match (control_block.body, inside_block.body, inside_block.term) with
+        | ( [],
+            [],
+            Cfg.BranchCompare
+              (Lt, Tcg.Temp branch_iv, Tcg.Imm threshold, then_label, else_label) )
+          when branch_iv = control_iv.phi_temp
+               && then_label <> else_label
+               && LabelSet.mem then_label loop
+               && LabelSet.mem else_label loop -> (
+            match (match_arm then_label, match_arm else_label) with
+            | ( Some (then_place, then_bias, then_join),
+                Some (else_place, else_bias, else_join) )
+              when then_join = else_join
+                   && LabelSet.mem then_join loop
+                   && exact_join_update then_join
+                   && List.mem then_join control_iv.backedge_preds ->
+                let total_trip_instrs, total_trip =
+                  build_trip_count_instrs
+                    fresh_temp
+                    control_iv.phi_temp
+                    control_iv.step
+                    info.kind
+                in
+
+                (* prefix_raw = max(K - i0, 0) *)
+                let prefix_diff = fresh_temp () in
+                let prefix_clamp_instrs, prefix_nonnegative =
+                  clamp_nonnegative_temp fresh_temp prefix_diff
+                in
+
+                (* prefix = min(prefix_nonnegative, total_trip)
+                   Implement min without a branch:
+
+                     d = prefix_nonnegative - total
+                     c = prefix_nonnegative < total
+                     prefix = total + d*c
+                *)
+                let min_delta = fresh_temp () in
+                let choose_prefix = fresh_temp () in
+                let selected_delta = fresh_temp () in
+                let prefix_trip = fresh_temp () in
+                let prefix_instrs =
+                  [ simplify_simple_instr
+                      (Tcg.Bin
+                         ( prefix_diff,
+                           Sub,
+                           Tcg.Imm threshold,
+                           Tcg.Temp control_iv.phi_temp )) ]
+                  @ prefix_clamp_instrs
+                  @ [ simplify_simple_instr
+                        (Tcg.Bin
+                           ( min_delta,
+                             Sub,
+                             Tcg.Temp prefix_nonnegative,
+                             Tcg.Temp total_trip ));
+                      simplify_simple_instr
+                        (Tcg.Bin
+                           ( choose_prefix,
+                             Lt,
+                             Tcg.Temp prefix_nonnegative,
+                             Tcg.Temp total_trip ));
+                      simplify_simple_instr
+                        (Tcg.Bin
+                           ( selected_delta,
+                             Mul,
+                             Tcg.Temp min_delta,
+                             Tcg.Temp choose_prefix ));
+                      simplify_simple_instr
+                        (Tcg.Bin
+                           ( prefix_trip,
+                             Add,
+                             Tcg.Temp total_trip,
+                             Tcg.Temp selected_delta )) ]
+                in
+
+                let affine place bias subtract =
+                  {
+                    target = ReductionPlaceTarget place;
+                    subtract;
+                    step =
+                      ReductionAffine
+                        {
+                          iv = control_iv;
+                          coeff = one_summary_expr;
+                          bias = SummaryOperand (Tcg.Imm bias);
+                        };
+                    carrier_temp = None;
+                    alias_temps = [];
+                  }
+                in
+
+                (* then-place gets only the prefix.
+                   else-place gets all iterations, then subtracts the prefix
+                   computed with the else-arm bias. *)
+                let then_reduction = affine then_place then_bias false in
+                let else_all_reduction = affine else_place else_bias false in
+                let else_prefix_reduction = affine else_place else_bias true in
+
+                let reductions, carrier_preloads =
+                  materialize_place_reduction_carriers
+                    fresh_temp
+                    [ then_reduction;
+                      else_all_reduction;
+                      else_prefix_reduction ]
+                in
+                let place_carriers =
+                  place_carriers_of_reductions reductions
+                in
+                let then_reduction, else_all_reduction, else_prefix_reduction =
+                  match reductions with
+                  | [ a; b; c ] -> (a, b, c)
+                  | _ -> assert false
+                in
+
+                let updates =
+                  carrier_preloads
+                  @ build_reduction_final_update
+                      fresh_temp
+                      prefix_trip
+                      place_carriers
+                      then_reduction
+                  @ build_reduction_final_update
+                      fresh_temp
+                      total_trip
+                      place_carriers
+                      else_all_reduction
+                  @ build_reduction_final_update
+                      fresh_temp
+                      prefix_trip
+                      place_carriers
+                      else_prefix_reduction
+                  @ build_iv_final_update
+                      fresh_temp
+                      total_trip
+                      control_iv
+                in
+
+                let summary_label = fresh_summary_label () in
+                let rewritten_term =
+                  rewrite_term_successor
+                    control_block.term
+                    ~from_label:info.inside_label
+                    ~to_label:summary_label
+                in
+                update_block
+                  {
+                    control_block with
+                    term = rewritten_term;
+                    succs = Cfg.successors rewritten_term;
+                  };
+                Hashtbl.add
+                  current_blocks
+                  summary_label
+                  {
+                    Cfg.label = summary_label;
+                    body =
+                      total_trip_instrs
+                      @ prefix_instrs
+                      @ updates;
+                    term = Cfg.Jump info.exit_label;
+                    preds = [];
+                    succs = [ info.exit_label ];
+                  };
+                debugf
+                  "counted-piecewise-apply func=%s header=%s summary=%s threshold=%Ld then=%s:%Ld else=%s:%Ld"
+                  f.name
+                  header
+                  summary_label
+                  threshold
+                  (string_of_place then_place)
+                  then_bias
+                  (string_of_place else_place)
+                  else_bias;
+                new_blocks_rev := summary_label :: !new_blocks_rev;
+                changed := true;
+                true
+            | _ -> false)
+        | _ -> false
+    in
+
     List.iter
       (fun header ->
         let loop = table_find_or_empty loops header LabelSet.empty in
@@ -8139,7 +8432,14 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
         | Some info -> (
             match counted_loop_shape_supported info.control_label loop get_block info.inside_label with
             | false ->
-                debugf "counted-skip func=%s header=%s reason=nonlinear_path" f.name header
+                if
+                  not
+                    (try_eliminate_piecewise_threshold_loop
+                       header loop info effects)
+                then
+                  debugf
+                    "counted-skip func=%s header=%s reason=nonlinear_path"
+                    f.name header
             | true ->
                 let live_in_t, live_in_p =
                   compute_liveness summaries globals { f with blocks = blocks_snapshot }
