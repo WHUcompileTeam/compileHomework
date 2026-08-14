@@ -6219,6 +6219,29 @@ let linear_expr_of_operand
     | Tcg.Imm value -> Int64.to_string value
     | Tcg.Temp temp -> Printf.sprintf "t%d" temp
   in
+  let prefix_before_instr (block : Cfg.block) current_instr =
+    let rec physical acc = function
+      | [] -> None
+      | instr :: rest ->
+          if instr == current_instr then Some (List.rev acc)
+          else physical (instr :: acc) rest
+    in
+    let rec structural acc best = function
+      | [] -> best
+      | instr :: rest ->
+          let best =
+            if instr = current_instr then Some (List.rev acc)
+            else best
+          in
+          structural (instr :: acc) best rest
+    in
+    match physical [] block.body with
+    | Some prefix -> prefix
+    | None ->
+        Option.value
+          (structural [] None block.body)
+          ~default:block.body
+  in
   let debug_def block operand =
     match resolve_block_operand block operand with
     | Tcg.Imm value ->
@@ -6282,15 +6305,32 @@ let linear_expr_of_operand
                       | Some instr
                         when allow_local_multidef
                              || not (IntSet.mem temp multi_defs) ->
-                          if
-                            allow_local_multidef
-                            && IntSet.mem temp multi_defs
-                            && debug_triangle_enabled ()
-                          then
-                            Printf.eprintf
-                              "counted-poly-local-multidef block=%s temp=t%d def=%s\n%!"
-                              block.label temp (debug_def block (Tcg.Temp temp));
-                          of_instr block (IntSet.add temp seen) instr
+                          let instr_block =
+                            if
+                              allow_local_multidef
+                              && IntSet.mem temp multi_defs
+                            then
+                              let prefix =
+                                prefix_before_instr block instr
+                              in
+                              let point_block =
+                                { block with body = prefix }
+                              in
+                              if debug_triangle_enabled () then
+                                Printf.eprintf
+                                  "counted-poly-local-multidef block=%s temp=t%d def=%s prefix=%d/%d\n%!"
+                                  block.label temp
+                                  (debug_def block (Tcg.Temp temp))
+                                  (List.length prefix)
+                                  (List.length block.body);
+                              point_block
+                            else
+                              block
+                          in
+                          of_instr
+                            instr_block
+                            (IntSet.add temp seen)
+                            instr
                       | Some _ ->
                           None
                       | None ->
@@ -11034,9 +11074,26 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                   let probe_body = trip_instrs @ probe_updates in
                   let summary_label = fresh_summary_label () in
                   let control_block = get_block info.control_label in
-                  let zero_trip_elided =
-                    zero_trip_safe_body probe_body
+                  let zero_trip_state_simple =
+                    f.params = []
+                    && reconstruction_order = []
+                    && place_mirrors = []
                   in
+                  let zero_trip_elided =
+                    zero_trip_state_simple
+                    && zero_trip_safe_body probe_body
+                  in
+                  if
+                    Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None
+                    && zero_trip_safe_body probe_body
+                    && not zero_trip_state_simple
+                  then
+                    Printf.eprintf
+                      "counted-zero-trip-keep-guard func=%s header=%s params=%d reconstruction=%d mirrors=%d\n%!"
+                      f.name header
+                      (List.length f.params)
+                      (List.length reconstruction_order)
+                      (List.length place_mirrors);
                   let body, term =
                     if zero_trip_elided then
                       (* [build_trip_count_instrs] is defined from the exact
