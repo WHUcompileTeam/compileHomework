@@ -15015,65 +15015,318 @@ let constant_param_simple_loop_shape (f : Cfg.func) =
       conditional_blocks <= 1)
     headers
 
+(* Source-based constant-parameter re-specialization for one exact
+   nonlinear loop shape.
+
+   The initial CFG can contain transparent blocks introduced by lowering, e.g.
+
+       guard -> dead_0 -> body
+       body  -> dead_1 -> then
+
+   where [dead_0]/[dead_1] have an empty body and an unconditional jump.
+   Those blocks do not change the loop's semantics, but requiring the natural
+   loop to contain literally five blocks rejects the source threshold diamond.
+
+   Recognize the shape only after collapsing chains of such transparent blocks:
+
+       guard
+        |
+       body (threshold branch)
+      /    \
+    then  else
+      \    /
+       join
+        |
+       guard
+
+   Safety rules:
+   - exactly one natural-loop header;
+   - every non-core loop block must be an empty unconditional-jump block;
+   - collapsed control flow must be exactly the five core blocks above;
+   - one guard successor must leave the loop;
+   - both threshold arms must reconverge at one join;
+   - the join must return to the guard after transparent-edge collapsing.
+
+   Once observed call arguments are constant, specialization is applied to
+   this original CFG and optimized from scratch.  The existing transaction
+   still accepts it only if the loop is completely eliminated. *)
+let constant_param_source_threshold_diamond_shape (f : Cfg.func) =
+  let block_map, loops, headers = discover_natural_loops f in
+
+  let find_block label =
+    Hashtbl.find_opt block_map label
+  in
+
+  let is_transparent_jump label =
+    match find_block label with
+    | Some (block : Cfg.block) ->
+        begin
+          match (block.body, block.term) with
+          | [], Cfg.Jump target ->
+              Some target
+          | _ ->
+              None
+        end
+    | None ->
+        None
+  in
+
+  let rec collapse_target loop seen label =
+    if LabelSet.mem label seen then
+      None
+    else
+      match is_transparent_jump label with
+      | Some target when LabelSet.mem label loop ->
+          collapse_target
+            loop
+            (LabelSet.add label seen)
+            target
+      | Some _
+      | None ->
+          Some label
+  in
+
+  let collapsed_branch_outcomes loop label =
+    match find_block label with
+    | Some (block : Cfg.block) ->
+        begin
+          match branch_term_outcomes block.term with
+          | Some (yes_label, no_label) ->
+              begin
+                match
+                  ( collapse_target loop LabelSet.empty yes_label,
+                    collapse_target loop LabelSet.empty no_label )
+                with
+                | Some yes_label, Some no_label ->
+                    Some (yes_label, no_label)
+                | Some _, None
+                | None, Some _
+                | None, None ->
+                    None
+              end
+          | None ->
+              None
+        end
+    | None ->
+        None
+  in
+
+  let collapsed_jump_target loop label =
+    match find_block label with
+    | Some (block : Cfg.block) ->
+        begin
+          match block.term with
+          | Cfg.Jump target ->
+              collapse_target loop LabelSet.empty target
+          | Cfg.BranchZero _
+          | Cfg.BranchNonZero _
+          | Cfg.BranchCompare _
+          | Cfg.Return _ ->
+              None
+        end
+    | None ->
+        None
+  in
+
+  let all_extra_blocks_transparent loop core =
+    LabelSet.for_all
+      (fun label ->
+        if LabelSet.mem label core then
+          true
+        else
+          match is_transparent_jump label with
+          | Some _ -> true
+          | None -> false)
+      loop
+  in
+
+  match headers with
+  | [ header ] ->
+      let loop =
+        table_find_or_empty loops header LabelSet.empty
+      in
+      begin
+        match collapsed_branch_outcomes loop header with
+        | None ->
+            false
+        | Some (succ1, succ2) ->
+            let succ1_inside = LabelSet.mem succ1 loop in
+            let succ2_inside = LabelSet.mem succ2 loop in
+            if succ1_inside = succ2_inside then
+              false
+            else
+              let body_label =
+                if succ1_inside then succ1 else succ2
+              in
+              let exit_label =
+                if succ1_inside then succ2 else succ1
+              in
+              if LabelSet.mem exit_label loop then
+                false
+              else begin
+                match collapsed_branch_outcomes loop body_label with
+                | None ->
+                    false
+                | Some (arm1, arm2) ->
+                    if
+                      arm1 = arm2
+                      || not (LabelSet.mem arm1 loop)
+                      || not (LabelSet.mem arm2 loop)
+                    then
+                      false
+                    else begin
+                      match
+                        ( collapsed_jump_target loop arm1,
+                          collapsed_jump_target loop arm2 )
+                      with
+                      | Some join1, Some join2
+                        when join1 = join2
+                             && LabelSet.mem join1 loop
+                             && join1 <> header
+                             && join1 <> body_label
+                             && join1 <> arm1
+                             && join1 <> arm2 ->
+                          begin
+                            match collapsed_jump_target loop join1 with
+                            | Some back when back = header ->
+                                let core =
+                                  List.fold_left
+                                    (fun set label ->
+                                      LabelSet.add label set)
+                                    LabelSet.empty
+                                    [ header;
+                                      body_label;
+                                      arm1;
+                                      arm2;
+                                      join1 ]
+                                in
+                                LabelSet.cardinal core = 5
+                                && all_extra_blocks_transparent loop core
+                            | Some _
+                            | None ->
+                                false
+                          end
+                      | Some _, Some _
+                      | Some _, None
+                      | None, Some _
+                      | None, None ->
+                          false
+                    end
+              end
+      end
+  | []
+  | _ :: _ :: _ ->
+      false
+
 let function_has_natural_loop (f : Cfg.func) =
   let _, _, headers = discover_natural_loops f in
   headers <> []
 
 let specialize_constant_params_program_once
+    source_funcs
     global_init summaries globals return_global_demands removable_calls
     (funcs : Cfg.func list) =
   let observations = observe_constant_call_arguments funcs in
+  let source_by_label =
+    Hashtbl.create (max 8 (List.length source_funcs))
+  in
+  List.iter
+    (fun (source : Cfg.func) ->
+      Hashtbl.replace source_by_label source.label source)
+    source_funcs;
   let changed = ref false in
   let funcs =
     List.map
       (fun (f : Cfg.func) ->
-        if not (constant_param_simple_loop_shape f) then begin
-          if Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None then
-            Printf.eprintf
-              "const-param-skip func=%s reason=complex_loop_shape\n%!"
-              f.name;
-          f
-        end
-        else
-          let specialized, replacements =
-            specialize_constant_params_func observations f
-          in
-          if replacements = 0 then f
-          else begin
-            let had_loop = function_has_natural_loop f in
-            let return_globals =
-              match Hashtbl.find_opt return_global_demands f.label with
-              | Some return_globals -> return_globals
-              | None -> globals
+        let late_simple =
+          constant_param_simple_loop_shape f
+        in
+        let source_threshold =
+          if late_simple || not (function_has_natural_loop f) then
+            None
+          else
+            match Hashtbl.find_opt source_by_label f.label with
+            | Some source
+              when constant_param_source_threshold_diamond_shape source ->
+                Some source
+            | Some _
+            | None ->
+                None
+        in
+        let specialization_base, specialization_mode =
+          if late_simple then
+            (Some f, "late-simple")
+          else
+            match source_threshold with
+            | Some source ->
+                (Some source, "source-threshold-diamond")
+            | None ->
+                (None, "")
+        in
+        match specialization_base with
+        | None ->
+            if Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None then
+              Printf.eprintf
+                "const-param-skip func=%s reason=complex_loop_shape\n%!"
+                f.name;
+            f
+        | Some base ->
+            if
+              specialization_mode = "source-threshold-diamond"
+              && Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None
+            then
+              Printf.eprintf
+                "const-param-respecialize func=%s base=source-threshold-diamond\n%!"
+                f.name;
+            let specialized, replacements =
+              specialize_constant_params_func observations base
             in
-            let cleaned =
-              optimize_func
-                global_init summaries globals return_globals removable_calls
-                specialized
-            in
-            debug_cfg_validation "const-param-specialize-cleanup" cleaned;
-            let still_has_loop = function_has_natural_loop cleaned in
-            if had_loop && still_has_loop then begin
-              if Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None then
-                Printf.eprintf
-                  "const-param-rollback func=%s reason=loop_remains\n%!"
-                  f.name;
+            if replacements = 0 then
               f
-            end
             else begin
-              changed := true;
-              if Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None then
-                Printf.eprintf
-                  "const-param-accept func=%s had_loop=%b loop_after=%b\n%!"
-                  f.name had_loop still_has_loop;
-              cleaned
-            end
-          end)
+              let had_loop =
+                function_has_natural_loop f
+              in
+              let return_globals =
+                match Hashtbl.find_opt return_global_demands f.label with
+                | Some return_globals ->
+                    return_globals
+                | None ->
+                    globals
+              in
+              let cleaned =
+                optimize_func
+                  global_init summaries globals return_globals removable_calls
+                  specialized
+              in
+              debug_cfg_validation
+                "const-param-specialize-cleanup" cleaned;
+              let still_has_loop =
+                function_has_natural_loop cleaned
+              in
+              if had_loop && still_has_loop then begin
+                if Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None then
+                  Printf.eprintf
+                    "const-param-rollback func=%s mode=%s reason=loop_remains\n%!"
+                    f.name specialization_mode;
+                f
+              end
+              else begin
+                if cleaned <> f then
+                  changed := true;
+                if Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None then
+                  Printf.eprintf
+                    "const-param-accept func=%s mode=%s had_loop=%b loop_after=%b\n%!"
+                    f.name specialization_mode had_loop still_has_loop;
+                cleaned
+              end
+            end)
       funcs
   in
   (funcs, !changed)
 
 let specialize_constant_params_program
+    source_funcs
     global_init summaries globals return_global_demands removable_calls
     (funcs : Cfg.func list) =
   let rec iterate fuel current =
@@ -15081,6 +15334,7 @@ let specialize_constant_params_program
     else
       let next, changed =
         specialize_constant_params_program_once
+          source_funcs
           global_init summaries globals return_global_demands removable_calls
           current
       in
@@ -15830,339 +16084,6 @@ let constant_eval_func
     in
     run f.entry
 
-
-(* -------------------------------------------------------------------------- *)
-(* Bounded whole-program evaluation of closed ToyC programs                   *)
-(*                                                                            *)
-(* The existing [constant_eval_func] deliberately rejects global accesses and *)
-(* nested calls, which is appropriate for memoized call folding but leaves a  *)
-(* large class of completely closed programs untouched:                       *)
-(*                                                                            *)
-(*   globals have constant initial values;                                    *)
-(*   main has no runtime input;                                                *)
-(*   helper calls and loops are fully determined by source state.              *)
-(*                                                                            *)
-(* Evaluate such a [main] with one shared concrete global store.  This is NOT  *)
-(* an unbounded interpreter: every block/instruction/call consumes from one    *)
-(* global budget, recursive depth is capped, and any unsupported/failed        *)
-(* operation returns [None] and leaves the emitted CFG unchanged.              *)
-(*                                                                            *)
-(* A successful evaluation may replace [main] by a single constant return.     *)
-(* Final global contents are unobservable after main returns in ToyC's closed  *)
-(* execution model, so only the return value needs to be emitted.              *)
-(* -------------------------------------------------------------------------- *)
-
-let whole_eval_max_depth = 64
-
-let whole_eval_main
-    global_init
-    (funcs : Cfg.func list) =
-  let func_by_label =
-    Hashtbl.create (max 8 (List.length funcs))
-  in
-  List.iter
-    (fun (f : Cfg.func) ->
-      Hashtbl.replace func_by_label f.label f)
-    funcs;
-
-  let global_state : (string, int64) Hashtbl.t =
-    Hashtbl.create 16
-  in
-  PlaceMap.iter
-    (fun place value ->
-      match (place, value) with
-      | Tcg.Global label, CpConst value ->
-          Hashtbl.replace global_state label (i32 value)
-      | Tcg.Global _, CpUndef
-      | Tcg.Global _, CpNac
-      | Tcg.Local _, CpConst _
-      | Tcg.Local _, CpUndef
-      | Tcg.Local _, CpNac ->
-          ())
-    global_init;
-
-  let budget = ref constant_eval_call_budget in
-  let consume () =
-    decr budget;
-    !budget >= 0
-  in
-
-  let rec eval_func depth (f : Cfg.func) args =
-    if depth > whole_eval_max_depth
-       || List.length args <> List.length f.params
-    then
-      None
-    else
-      let blocks =
-        Hashtbl.create (max 8 (List.length f.blocks))
-      in
-      List.iter
-        (fun (block : Cfg.block) ->
-          Hashtbl.replace blocks block.label block)
-        f.blocks;
-
-      let temps : (int, int64) Hashtbl.t =
-        Hashtbl.create (max 16 f.temp_count)
-      in
-      let locals : (int, int64) Hashtbl.t =
-        Hashtbl.create
-          (max 8 (List.length f.locals + List.length f.params))
-      in
-      List.iter2
-        (fun (param : Tcg.var) value ->
-          Hashtbl.replace locals param.id (i32 value))
-        f.params args;
-
-      let eval_operand = function
-        | Tcg.Imm value ->
-            Some (i32 value)
-        | Tcg.Temp temp ->
-            Hashtbl.find_opt temps temp
-      in
-      let set_temp temp value =
-        Hashtbl.replace temps temp (i32 value)
-      in
-      let rec eval_operands acc = function
-        | [] ->
-            Some (List.rev acc)
-        | operand :: rest -> (
-            match eval_operand operand with
-            | Some value ->
-                eval_operands (i32 value :: acc) rest
-            | None ->
-                None)
-      in
-
-      let exec_instr = function
-        | Tcg.Move (dst, src) -> (
-            match eval_operand src with
-            | Some value ->
-                set_temp dst value;
-                true
-            | None ->
-                false)
-        | Tcg.Un (dst, op, src) -> (
-            match eval_operand src with
-            | Some value -> (
-                match fold_unop op value with
-                | Some result ->
-                    set_temp dst result;
-                    true
-                | None ->
-                    false)
-            | None ->
-                false)
-        | Tcg.Bin (dst, op, lhs, rhs) -> (
-            match (eval_operand lhs, eval_operand rhs) with
-            | Some lhs, Some rhs -> (
-                match fold_binop op lhs rhs with
-                | Some result ->
-                    set_temp dst result;
-                    true
-                | None ->
-                    false)
-            | Some _, None
-            | None, Some _
-            | None, None ->
-                false)
-        | Tcg.Load (dst, Tcg.Local id) -> (
-            match Hashtbl.find_opt locals id with
-            | Some value ->
-                set_temp dst value;
-                true
-            | None ->
-                false)
-        | Tcg.Load (dst, Tcg.Global label) -> (
-            match Hashtbl.find_opt global_state label with
-            | Some value ->
-                set_temp dst value;
-                true
-            | None ->
-                false)
-        | Tcg.Store (Tcg.Local id, src) -> (
-            match eval_operand src with
-            | Some value ->
-                Hashtbl.replace locals id (i32 value);
-                true
-            | None ->
-                false)
-        | Tcg.Store (Tcg.Global label, src) -> (
-            match eval_operand src with
-            | Some value ->
-                Hashtbl.replace
-                  global_state label (i32 value);
-                true
-            | None ->
-                false)
-        | Tcg.Call (dst, callee, call_args) -> (
-            match
-              ( Hashtbl.find_opt func_by_label callee,
-                eval_operands [] call_args )
-            with
-            | Some callee_func, Some call_args -> (
-                match
-                  eval_func
-                    (depth + 1)
-                    callee_func call_args
-                with
-                | Some return_value -> (
-                    match (dst, return_value) with
-                    | None, _ ->
-                        true
-                    | Some dst, Some value ->
-                        set_temp dst value;
-                        true
-                    | Some _, None ->
-                        false)
-                | None ->
-                    false)
-            | Some _, None
-            | None, Some _
-            | None, None ->
-                false)
-      in
-
-      let rec exec_body = function
-        | [] ->
-            true
-        | instr :: rest ->
-            if consume () && exec_instr instr then
-              exec_body rest
-            else
-              false
-      in
-
-      let rec run label =
-        if not (consume ()) then
-          None
-        else
-          match Hashtbl.find_opt blocks label with
-          | None ->
-              None
-          | Some (block : Cfg.block) ->
-              if not (exec_body block.body) then
-                None
-              else
-                match block.term with
-                | Cfg.Jump next ->
-                    run next
-                | Cfg.BranchZero
-                    (cond, if_zero, if_nonzero) -> (
-                    match eval_operand cond with
-                    | Some value ->
-                        run
-                          (if i32 value = 0L
-                           then if_zero
-                           else if_nonzero)
-                    | None ->
-                        None)
-                | Cfg.BranchNonZero
-                    (cond, if_nonzero, if_zero) -> (
-                    match eval_operand cond with
-                    | Some value ->
-                        run
-                          (if i32 value <> 0L
-                           then if_nonzero
-                           else if_zero)
-                    | None ->
-                        None)
-                | Cfg.BranchCompare
-                    ( op,
-                      lhs,
-                      rhs,
-                      if_true,
-                      if_false ) -> (
-                    match
-                      (eval_operand lhs, eval_operand rhs)
-                    with
-                    | Some lhs, Some rhs -> (
-                        match fold_binop op lhs rhs with
-                        | Some result ->
-                            run
-                              (if truth result
-                               then if_true
-                               else if_false)
-                        | None ->
-                            None)
-                    | Some _, None
-                    | None, Some _
-                    | None, None ->
-                        None)
-                | Cfg.Return (Some value) -> (
-                    match eval_operand value with
-                    | Some value ->
-                        Some (Some (i32 value))
-                    | None ->
-                        None)
-                | Cfg.Return None ->
-                    Some None
-      in
-      run f.entry
-  in
-
-  match
-    List.find_opt
-      (fun (f : Cfg.func) -> f.name = "main")
-      funcs
-  with
-  | Some main when main.params = [] ->
-      eval_func 0 main []
-  | Some _
-  | None ->
-      None
-
-let fold_whole_main_program
-    global_init
-    (funcs : Cfg.func list) =
-  let debug =
-    Sys.getenv_opt "TOYC_DEBUG_WHOLE_EVAL" <> None
-  in
-  match whole_eval_main global_init funcs with
-  | Some (Some value) ->
-      let changed = ref false in
-      let funcs =
-        List.map
-          (fun (f : Cfg.func) ->
-            if f.name <> "main" then
-              f
-            else begin
-              changed := true;
-              let block : Cfg.block =
-                {
-                  label = f.entry;
-                  body = [];
-                  term =
-                    Cfg.Return
-                      (Some (Tcg.Imm (i32 value)));
-                  preds = [];
-                  succs = [];
-                }
-              in
-              {
-                f with
-                temp_count = 0;
-                blocks = [ block ];
-              }
-            end)
-          funcs
-      in
-      if debug && !changed then
-        Printf.eprintf
-          "whole-eval-main-fold value=%Ld budget=%d\n%!"
-          (i32 value)
-          constant_eval_call_budget;
-      funcs
-  | Some None ->
-      if debug then
-        Printf.eprintf
-          "whole-eval-main-skip reason=void-main\n%!";
-      funcs
-  | None ->
-      if debug then
-        Printf.eprintf
-          "whole-eval-main-skip reason=unsupported-or-budget\n%!";
-      funcs
-
 let fold_constant_calls_program
     global_init summaries globals return_global_demands removable_calls
     (funcs : Cfg.func list) =
@@ -16279,6 +16200,7 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   last_liveness_cache := None;
   last_dominator_cache := None;
   let cfg = { Cfg.funcs = List.map tailrec_elim_func cfg.funcs } in
+  let source_funcs = cfg.funcs in
   let global_init, globals =
     List.fold_left
       (fun (init, set) (g : Semant.global_decl) ->
@@ -16315,6 +16237,7 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   in
   let optimized_funcs =
     specialize_constant_params_program
+      source_funcs
       global_init summaries globals return_global_demands removable_calls
       optimized_funcs
   in
@@ -16327,9 +16250,5 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
     fold_trivial_calls_program
       global_init summaries globals return_global_demands removable_calls
       optimized_funcs
-  in
-  let optimized_funcs =
-    fold_whole_main_program
-      global_init optimized_funcs
   in
   { Cfg.funcs = optimized_funcs }
