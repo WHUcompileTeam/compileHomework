@@ -2433,23 +2433,116 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
       let get_phi_temp label local_id =
         get_or_create_phi_temp phi_temps fresh_temp (label, local_id)
       in
+      (* Local live-in analysis for mem2reg phi placement.
+
+         A source-level local declared inside an enclosing loop can be
+         reinitialized before every use in that enclosing iteration.  Such a
+         local is not live into the outer header and must not receive a phi
+         there.  The old optimistic merge created provisional phis solely from
+         "some predecessor has a value", which made an inner-loop IV such as
+         [j] appear to need a value on the function-entry edge and therefore
+         fail validation.
+
+         Compute ordinary backward liveness for Local ids:
+           use[b] = loads before the first store in b
+           def[b] = locals stored in b
+           in[b]  = use[b] U (out[b] - def[b])
+           out[b] = U in[succ]
+
+         Phi/merge state is needed only for locals live at block entry. *)
+      let local_use = Hashtbl.create (List.length current.blocks) in
+      let local_def = Hashtbl.create (List.length current.blocks) in
+      List.iter
+        (fun (block : Cfg.block) ->
+          let defs = ref IntSet.empty in
+          let uses = ref IntSet.empty in
+          List.iter
+            (function
+              | Tcg.Load (_, Tcg.Local id) when IntSet.mem id candidates ->
+                  if not (IntSet.mem id !defs) then
+                    uses := IntSet.add id !uses
+              | Tcg.Store (Tcg.Local id, _) when IntSet.mem id candidates ->
+                  defs := IntSet.add id !defs
+              | Tcg.Move _
+              | Tcg.Un _
+              | Tcg.Bin _
+              | Tcg.Load _
+              | Tcg.Store _
+              | Tcg.Call _ ->
+                  ())
+            block.body;
+          Hashtbl.replace local_use block.label !uses;
+          Hashtbl.replace local_def block.label !defs)
+        current.blocks;
+      let local_live_in = Hashtbl.create (List.length current.blocks) in
+      let local_live_out = Hashtbl.create (List.length current.blocks) in
+      let get_local_set table label =
+        Option.value ~default:IntSet.empty (Hashtbl.find_opt table label)
+      in
+      let live_changed = ref true in
+      while !live_changed do
+        live_changed := false;
+        List.iter
+          (fun (block : Cfg.block) ->
+            let out_set =
+              List.fold_left
+                (fun acc succ ->
+                  IntSet.union acc (get_local_set local_live_in succ))
+                IntSet.empty block.succs
+            in
+            let use_set = get_local_set local_use block.label in
+            let def_set = get_local_set local_def block.label in
+            let in_set =
+              IntSet.union
+                use_set
+                (IntSet.diff out_set def_set)
+            in
+            if not (IntSet.equal out_set (get_local_set local_live_out block.label)) then begin
+              Hashtbl.replace local_live_out block.label out_set;
+              live_changed := true
+            end;
+            if not (IntSet.equal in_set (get_local_set local_live_in block.label)) then begin
+              Hashtbl.replace local_live_in block.label in_set;
+              live_changed := true
+            end)
+          (List.rev current.blocks)
+      done;
+      let local_is_live_in label local_id =
+        IntSet.mem local_id (get_local_set local_live_in label)
+      in
+      if Sys.getenv_opt "TOYC_DEBUG_MEM2REG_LOOP_PHI" <> None then
+        List.iter
+          (fun (block : Cfg.block) ->
+            let live =
+              get_local_set local_live_in block.label
+              |> IntSet.elements
+              |> List.map string_of_int
+              |> String.concat ","
+            in
+            Printf.eprintf
+              "mem2reg-livein func=%s label=%s locals={%s}\n%!"
+              current.name block.label live)
+          current.blocks;
       let compute_in_env get_out (block : Cfg.block) =
         if block.label = current.entry then seed_env
         else
           IntSet.fold
             (fun local_id env ->
-              let merge =
-                if optimistic_loop_phi then merge_incoming_operand_mem2reg
-                else merge_incoming_operand
-              in
-              let keep_value =
-                merge block.preds
-                  (fun pred -> IntMap.find_opt local_id (get_out pred))
-                  (fun () -> get_phi_temp block.label local_id)
-              in
-              match keep_value with
-              | Some value -> IntMap.add local_id value env
-              | None -> IntMap.remove local_id env)
+              if not (local_is_live_in block.label local_id) then
+                IntMap.remove local_id env
+              else
+                let merge =
+                  if optimistic_loop_phi then merge_incoming_operand_mem2reg
+                  else merge_incoming_operand
+                in
+                let keep_value =
+                  merge block.preds
+                    (fun pred -> IntMap.find_opt local_id (get_out pred))
+                    (fun () -> get_phi_temp block.label local_id)
+                in
+                match keep_value with
+                | Some value -> IntMap.add local_id value env
+                | None -> IntMap.remove local_id env)
             candidates IntMap.empty
       in
       let transfer_env env (block : Cfg.block) =
@@ -2479,7 +2572,9 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
             block.body;
           Hashtbl.iter
             (fun (phi_label, local_id) _ ->
-              if phi_label = block.label then
+              if phi_label = block.label
+                 && local_is_live_in block.label local_id
+              then
                 match IntMap.find_opt local_id (get_env in_envs block.label) with
                 | Some (Tcg.Temp _) ->
                     List.iter
@@ -3629,15 +3724,49 @@ let incoming_update_chain get_block succ_label pred_label =
   walk LabelSet.empty pred_label []
 
 let resolve_chain_operand chain operand =
+  (* [chain] is ordered newest block -> older block.  Inside each block scan
+     newest instruction -> older instruction.
+
+     The previous implementation remembered only Move definitions.  That is
+     unsound when a temp is redefined later by a non-Move:
+
+         t22 = move t39;
+         ...
+         t22 = add t22, t37;
+         t41 = move t22;
+
+     Looking up t22 must stop at the later Add.  Ignoring that Add allowed the
+     resolver to "see through" it and incorrectly use the stale
+     [t22 = move t39], collapsing the real recurrence into t39 -> t39.
+
+     Record the first (therefore newest) definition of every temp.  Only when
+     that newest definition itself is a Move may it participate in alias
+     resolution. *)
   let move_defs = Hashtbl.create 8 in
+  let seen_defs = Hashtbl.create 8 in
+  let record_def dst move_src =
+    if not (Hashtbl.mem seen_defs dst) then begin
+      Hashtbl.add seen_defs dst ();
+      match move_src with
+      | Some src -> Hashtbl.add move_defs dst src
+      | None -> ()
+    end
+  in
   List.iter
     (fun (block : Cfg.block) ->
       List.iter
         (function
-          | Tcg.Move (dst, src) when not (Hashtbl.mem move_defs dst) ->
-              Hashtbl.add move_defs dst src
-          | Tcg.Move _ -> ()
-          | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> ())
+          | Tcg.Move (dst, src) ->
+              record_def dst (Some src)
+          | Tcg.Un (dst, _, _)
+          | Tcg.Bin (dst, _, _, _)
+          | Tcg.Load (dst, _) ->
+              record_def dst None
+          | Tcg.Store _
+          | Tcg.Call (None, _, _) ->
+              ()
+          | Tcg.Call (Some dst, _, _) ->
+              record_def dst None)
         (List.rev block.body))
     chain;
   let rec resolve seen = function
@@ -5899,6 +6028,98 @@ let reduction_update_of_place
     place
     (block : Cfg.block)
   =
+  let reduction_step_of_linear_expr = function
+    | LinearInvariant expr ->
+        if summary_expr_is_zero expr then None
+        else Some (ReductionInvariant expr)
+    | LinearAffine { iv; coeff; bias } ->
+        if summary_expr_is_zero coeff then
+          if summary_expr_is_zero bias then None
+          else Some (ReductionInvariant bias)
+        else
+          Some (ReductionAffine { iv; coeff; bias })
+  in
+  let nested_additive_place_step block lhs rhs =
+    let add_deltas lhs rhs =
+      match (lhs, rhs) with
+      | None, None -> Some None
+      | Some expr, None
+      | None, Some expr ->
+          Some (Some expr)
+      | Some lhs, Some rhs ->
+          Option.map
+            (fun expr -> Some expr)
+            (linear_expr_add lhs rhs)
+    in
+    let combine_parts lhs rhs =
+      Option.bind lhs (fun (lhs_self, lhs_delta) ->
+          Option.bind rhs (fun (rhs_self, rhs_delta) ->
+              if lhs_self && rhs_self then None
+              else
+                Option.map
+                  (fun delta -> (lhs_self || rhs_self, delta))
+                  (add_deltas lhs_delta rhs_delta)))
+    in
+    let rec split seen operand =
+      if
+        operand_resolves_to_place_value
+          multi_defs place block IntSet.empty operand
+      then
+        Some (true, None)
+      else
+        match
+          linear_expr_of_operand
+            invariant_loaded_places
+            loop_defs
+            def_blocks
+            get_block
+            loop_stable_phis
+            multi_defs
+            def_instrs
+            ivs
+            block
+            operand
+        with
+        | Some expr -> Some (false, Some expr)
+        | None -> (
+            match operand with
+            | Tcg.Imm _ -> None
+            | Tcg.Temp current ->
+                if
+                  IntSet.mem current seen
+                  || IntSet.mem current multi_defs
+                then
+                  None
+                else
+                  let seen = IntSet.add current seen in
+                  match last_def_of_temp block current with
+                  | Some (Tcg.Move (_, src))
+                  | Some (Tcg.Un (_, UPlus, src)) ->
+                      split seen src
+                  | Some (Tcg.Bin (_, Add, def_lhs, def_rhs)) ->
+                      combine_parts
+                        (split seen def_lhs)
+                        (split seen def_rhs)
+                  | Some (Tcg.Un _)
+                  | Some (Tcg.Bin _)
+                  | Some (Tcg.Load _)
+                  | Some (Tcg.Store _)
+                  | Some (Tcg.Call _)
+                  | None ->
+                      None)
+    in
+    match
+      combine_parts
+        (split IntSet.empty lhs)
+        (split IntSet.empty rhs)
+    with
+    | Some (true, Some delta) ->
+        reduction_step_of_linear_expr delta
+    | Some (true, None)
+    | Some (false, _)
+    | None ->
+        None
+  in
   let rec of_operand block seen = function
     | Tcg.Imm _ -> None
     | Tcg.Temp _ as operand ->
@@ -5957,7 +6178,17 @@ let reduction_update_of_place
                def_instrs
                ivs
                block lhs)
-        else None
+        else
+          Option.map
+            (fun step ->
+              {
+                target = ReductionPlaceTarget place;
+                subtract = false;
+                step;
+                carrier_temp = None;
+                alias_temps = [];
+              })
+            (nested_additive_place_step block lhs rhs)
     | Tcg.Bin (_, Sub, lhs, rhs) ->
         let lhs = resolve_block_operand block lhs in
         let rhs = resolve_block_operand block rhs in
@@ -5985,7 +6216,17 @@ let reduction_update_of_place
     | Tcg.Un _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ | Tcg.Bin _ -> None
   in
   match last_store_of_place place block with
-  | Some (_, value) -> of_operand block IntSet.empty value
+  | Some (store_index, value) ->
+      let rec take_prefix index acc = function
+        | [] -> List.rev acc
+        | _ when index <= 0 -> List.rev acc
+        | instr :: rest ->
+            take_prefix (index - 1) (instr :: acc) rest
+      in
+      let point_block =
+        { block with body = take_prefix store_index [] block.body }
+      in
+      of_operand point_block IntSet.empty value
   | None -> None
 
 let collect_counted_reductions
@@ -6724,16 +6965,25 @@ let collect_counted_reductions
           | Tcg.Imm _ -> None
           | Tcg.Temp current ->
               if current = temp then None
-              else if IntSet.mem current seen || IntSet.mem current multi_defs then None
+              else if IntSet.mem current seen then None
               else
                 match last_def_of_temp block current with
-                | Some instr -> of_instr block older_chain (IntSet.add current seen) instr
+                | Some instr ->
+                    if debug_counted_local && IntSet.mem current multi_defs then
+                      Printf.eprintf
+                        "counted-point-multidef header=%s target=%d current=%d source=block block=%s\n%!"
+                        header temp current block.label;
+                    of_instr block older_chain (IntSet.add current seen) instr
                 | None -> (
                     match last_def_of_temp_on_chain_with_block older_chain current with
                     | Some (older_block, instr, older_rest) ->
+                        if debug_counted_local && IntSet.mem current multi_defs then
+                          Printf.eprintf
+                            "counted-point-multidef header=%s target=%d current=%d source=chain block=%s\n%!"
+                            header temp current older_block.label;
                         of_instr older_block older_rest (IntSet.add current seen) instr
                     | None ->
-                        if invariant operand then None
+                        if invariant operand || IntSet.mem current multi_defs then None
                         else
                           match Hashtbl.find_opt def_instrs current with
                           | Some instr -> (
@@ -7302,6 +7552,15 @@ let collect_counted_reductions
                   (fun pred -> reduction_update_of_place_on_chain place (update_chain_for_pred pred))
                   backedge_preds
               in
+              if debug_counted_local then
+                Printf.eprintf
+                  "counted-place-updates header=%s place=%s count=%d preds=%d\n%!"
+                  header
+                  (match place with
+                   | Tcg.Local slot -> Printf.sprintf "local:%d" slot
+                   | Tcg.Global name -> Printf.sprintf "global:%s" name)
+                  (List.length updates)
+                  (List.length backedge_preds);
               match updates with
               | [] -> acc
               | first :: rest
@@ -8113,7 +8372,7 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
       Cfg.rebuild_edges { f with entry = !current_entry; temp_count = !next_temp; blocks }
     else f
 
-let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
+let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
   let debug_counted = Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None in
   let debugf fmt = Printf.ksprintf (fun s -> if debug_counted then prerr_endline s) fmt in
   let term_kind = function
@@ -9038,6 +9297,96 @@ let eliminate_counted_loops_func summaries globals (f : Cfg.func) =
       let blocks = List.map get_block ordered_labels @ List.rev_map get_block !new_blocks_rev in
       Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
     else f
+
+
+let eliminate_counted_loops_func global_init summaries globals (f : Cfg.func) =
+  (* Nested counted-loop cascading.
+
+     After an inner loop is summarized, enclosing source variables can still be
+     represented as local load/store recurrences.  [analyze_induction_vars]
+     intentionally works on temp/phi recurrences, so merely rediscovering the
+     outer natural loop is not enough.
+
+     Use optimistic mem2reg only as a bridge between successful counted-loop
+     eliminations:
+
+       inner counted summary
+         -> CFG cleanup
+         -> optimistic mem2reg / loop canonicalization
+         -> try the next enclosing counted loop
+
+     If the promoted view does NOT enable another counted-loop elimination, keep
+     the cleaned pre-promotion CFG.  This avoids feeding promotion-only CFG
+     changes into the rest of the normal rotate/split/unroll pipeline. *)
+  let debug_enabled () =
+    Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None
+  in
+
+  let cleanup current =
+    current
+    |> thread_and_prune_func
+    |> simplify_cfg_func
+  in
+
+  let prepare_promoted_view current =
+    current
+    |> mem2reg_func ~optimistic_loop_phi:true
+    |> loop_canonicalize_func summaries globals
+    |> const_propagate_func global_init summaries globals
+    |> thread_and_prune_func
+    |> simplify_cfg_func
+    |> loop_canonicalize_func summaries globals
+    |> thread_and_prune_func
+    |> simplify_cfg_func
+  in
+
+  let rec cascade fuel current =
+    if fuel <= 0 then current
+    else
+      let first =
+        eliminate_counted_loops_func_once summaries globals current
+      in
+      if first = current then current
+      else
+        let cleaned = cleanup first in
+        if debug_enabled () then
+          Printf.eprintf
+            "counted-cascade func=%s phase=clean remaining=%d blocks=%d->%d\n%!"
+            f.name
+            (fuel - 1)
+            (List.length current.blocks)
+            (List.length cleaned.blocks);
+
+        if fuel <= 1 then cleaned
+        else
+          let promoted = prepare_promoted_view cleaned in
+          let second =
+            eliminate_counted_loops_func_once summaries globals promoted
+          in
+          if second = promoted then begin
+            if debug_enabled () then
+              Printf.eprintf
+                "counted-cascade func=%s phase=promotion-const-no-followup remaining=%d locals-view-blocks=%d\n%!"
+                f.name
+                (fuel - 1)
+                (List.length promoted.blocks);
+            (* Promotion was useful only as an analysis bridge candidate, but it
+               did not expose another eliminable counted loop.  Preserve the
+               cleaned CFG from the successful first elimination. *)
+            cleaned
+          end else begin
+            let second_cleaned = cleanup second in
+            if debug_enabled () then
+              Printf.eprintf
+                "counted-cascade func=%s phase=promotion-const-followup remaining=%d blocks=%d->%d\n%!"
+                f.name
+                (fuel - 2)
+                (List.length promoted.blocks)
+                (List.length second_cleaned.blocks);
+            cascade (fuel - 2) second_cleaned
+          end
+  in
+  cascade 4 f
 
 let full_unroll_counted_loops_func summaries globals (f : Cfg.func) =
   let full_unroll_max_trip = 8L in
@@ -11816,7 +12165,7 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       in
       let after_counted =
         run_stage round "counted_loops"
-          (eliminate_counted_loops_func summaries globals)
+          (eliminate_counted_loops_func global_init summaries globals)
           after_split
       in
       let after_full_unroll =
