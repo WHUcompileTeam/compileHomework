@@ -4399,6 +4399,20 @@ type counted_reduction_step =
       coeff : summary_expr;
       bias : summary_expr;
     }
+  | ReductionQuadratic of {
+      iv : basic_induction_var;
+      quad : summary_expr;
+      triangle : summary_expr;
+      coeff : summary_expr;
+      bias : summary_expr;
+    }
+  | ReductionCubic of {
+      iv : basic_induction_var;
+      choose3 : summary_expr;
+      triangle : summary_expr;
+      coeff : summary_expr;
+      bias : summary_expr;
+    }
   | ReductionCarrierProgression of {
       carrier_temp : Tcg.temp;
       step_expr : summary_expr;
@@ -5308,6 +5322,8 @@ let ambiguous_updated_iv_carrier_reduction
       temp_depends_on_iv IntSet.empty carrier_temp
   | ReductionInvariant _
   | ReductionAffine _
+  | ReductionQuadratic _
+  | ReductionCubic _
   | ReductionCarrierProgression { include_updated = false; _ } ->
       false
 
@@ -5548,6 +5564,8 @@ let resolve_counted_carrier_order
     | ( _,
         ( ReductionInvariant _
         | ReductionAffine _
+        | ReductionQuadratic _
+        | ReductionCubic _
         | ReductionCarrierProgression { include_updated = false; _ } ) ) ->
         (reduction, false)
 
@@ -5624,6 +5642,20 @@ type linear_expr =
       coeff : summary_expr;
       bias : summary_expr;
     }
+  | LinearQuadratic of {
+      iv : basic_induction_var;
+      quad : summary_expr;
+      triangle : summary_expr;
+      coeff : summary_expr;
+      bias : summary_expr;
+    }
+  | LinearCubic of {
+      iv : basic_induction_var;
+      choose3 : summary_expr;
+      triangle : summary_expr;
+      coeff : summary_expr;
+      bias : summary_expr;
+    }
 
 let zero_summary_expr = SummaryOperand (Tcg.Imm 0L)
 let one_summary_expr = SummaryOperand (Tcg.Imm 1L)
@@ -5661,39 +5693,360 @@ let summary_expr_mul lhs rhs =
   else if summary_expr_is_minus_one rhs then summary_expr_neg lhs
   else SummaryBin (Mul, lhs, rhs)
 
+let summary_expr_const value =
+  SummaryOperand (Tcg.Imm value)
+
+let summary_expr_scale value expr =
+  summary_expr_mul (summary_expr_const value) expr
+
 let linear_affine iv coeff bias =
-  if summary_expr_is_zero coeff then LinearInvariant bias else LinearAffine { iv; coeff; bias }
+  if summary_expr_is_zero coeff then LinearInvariant bias
+  else LinearAffine { iv; coeff; bias }
+
+let linear_quadratic iv quad triangle coeff bias =
+  if summary_expr_is_zero quad && summary_expr_is_zero triangle then
+    linear_affine iv coeff bias
+  else
+    LinearQuadratic { iv; quad; triangle; coeff; bias }
+
+let linear_cubic iv choose3 triangle coeff bias =
+  if summary_expr_is_zero choose3 then
+    linear_quadratic iv zero_summary_expr triangle coeff bias
+  else
+    LinearCubic { iv; choose3; triangle; coeff; bias }
+
+let basic_iv_known_nonnegative_step1 (iv : basic_induction_var) =
+  iv.step = 1L
+  &&
+  match iv.outside_inputs with
+  | [] -> false
+  | inputs ->
+      List.for_all
+        (fun (_, operand) ->
+          match operand with
+          | Tcg.Imm value -> value >= 0L
+          | Tcg.Temp _ -> false)
+        inputs
+
 
 let linear_expr_neg = function
-  | LinearInvariant expr -> LinearInvariant (summary_expr_neg expr)
+  | LinearInvariant expr ->
+      LinearInvariant (summary_expr_neg expr)
   | LinearAffine { iv; coeff; bias } ->
       linear_affine iv (summary_expr_neg coeff) (summary_expr_neg bias)
+  | LinearQuadratic { iv; quad; triangle; coeff; bias } ->
+      linear_quadratic
+        iv
+        (summary_expr_neg quad)
+        (summary_expr_neg triangle)
+        (summary_expr_neg coeff)
+        (summary_expr_neg bias)
+  | LinearCubic { iv; choose3; triangle; coeff; bias } ->
+      linear_cubic
+        iv
+        (summary_expr_neg choose3)
+        (summary_expr_neg triangle)
+        (summary_expr_neg coeff)
+        (summary_expr_neg bias)
 
 let linear_expr_add lhs rhs =
+  let add_cubic_quadratic
+      iv
+      cubic_choose3
+      cubic_triangle
+      cubic_coeff
+      cubic_bias
+      quad_quad
+      quad_triangle
+      quad_coeff
+      quad_bias
+    =
+    let q_triangle =
+      summary_expr_add
+        (summary_expr_scale 2L quad_quad)
+        quad_triangle
+    in
+    let q_coeff =
+      summary_expr_add quad_quad quad_coeff
+    in
+    linear_cubic
+      iv
+      cubic_choose3
+      (summary_expr_add cubic_triangle q_triangle)
+      (summary_expr_add cubic_coeff q_coeff)
+      (summary_expr_add cubic_bias quad_bias)
+  in
   match (lhs, rhs) with
-  | LinearInvariant lhs, LinearInvariant rhs -> Some (LinearInvariant (summary_expr_add lhs rhs))
+  | LinearInvariant lhs, LinearInvariant rhs ->
+      Some (LinearInvariant (summary_expr_add lhs rhs))
+
   | LinearAffine { iv; coeff; bias }, LinearInvariant rhs
   | LinearInvariant rhs, LinearAffine { iv; coeff; bias } ->
       Some (linear_affine iv coeff (summary_expr_add bias rhs))
-  | LinearAffine lhs, LinearAffine rhs when lhs.iv.phi_temp = rhs.iv.phi_temp ->
-      Some (linear_affine lhs.iv (summary_expr_add lhs.coeff rhs.coeff) (summary_expr_add lhs.bias rhs.bias))
-  | LinearAffine _, LinearAffine _ -> None
+
+  | LinearQuadratic { iv; quad; triangle; coeff; bias }, LinearInvariant rhs
+  | LinearInvariant rhs, LinearQuadratic { iv; quad; triangle; coeff; bias } ->
+      Some
+        (linear_quadratic
+           iv quad triangle coeff
+           (summary_expr_add bias rhs))
+
+  | LinearCubic { iv; choose3; triangle; coeff; bias }, LinearInvariant rhs
+  | LinearInvariant rhs, LinearCubic { iv; choose3; triangle; coeff; bias } ->
+      Some
+        (linear_cubic
+           iv choose3 triangle coeff
+           (summary_expr_add bias rhs))
+
+  | LinearAffine lhs, LinearAffine rhs
+    when lhs.iv.phi_temp = rhs.iv.phi_temp ->
+      Some
+        (linear_affine
+           lhs.iv
+           (summary_expr_add lhs.coeff rhs.coeff)
+           (summary_expr_add lhs.bias rhs.bias))
+
+  | LinearQuadratic lhs, LinearAffine rhs
+    when lhs.iv.phi_temp = rhs.iv.phi_temp ->
+      Some
+        (linear_quadratic
+           lhs.iv
+           lhs.quad
+           lhs.triangle
+           (summary_expr_add lhs.coeff rhs.coeff)
+           (summary_expr_add lhs.bias rhs.bias))
+
+  | LinearAffine lhs, LinearQuadratic rhs
+    when lhs.iv.phi_temp = rhs.iv.phi_temp ->
+      Some
+        (linear_quadratic
+           rhs.iv
+           rhs.quad
+           rhs.triangle
+           (summary_expr_add lhs.coeff rhs.coeff)
+           (summary_expr_add lhs.bias rhs.bias))
+
+  | LinearQuadratic lhs, LinearQuadratic rhs
+    when lhs.iv.phi_temp = rhs.iv.phi_temp ->
+      Some
+        (linear_quadratic
+           lhs.iv
+           (summary_expr_add lhs.quad rhs.quad)
+           (summary_expr_add lhs.triangle rhs.triangle)
+           (summary_expr_add lhs.coeff rhs.coeff)
+           (summary_expr_add lhs.bias rhs.bias))
+
+  | LinearCubic lhs, LinearAffine rhs
+    when lhs.iv.phi_temp = rhs.iv.phi_temp ->
+      Some
+        (linear_cubic
+           lhs.iv
+           lhs.choose3
+           lhs.triangle
+           (summary_expr_add lhs.coeff rhs.coeff)
+           (summary_expr_add lhs.bias rhs.bias))
+
+  | LinearAffine lhs, LinearCubic rhs
+    when lhs.iv.phi_temp = rhs.iv.phi_temp ->
+      Some
+        (linear_cubic
+           rhs.iv
+           rhs.choose3
+           rhs.triangle
+           (summary_expr_add lhs.coeff rhs.coeff)
+           (summary_expr_add lhs.bias rhs.bias))
+
+  | LinearCubic lhs, LinearQuadratic rhs
+    when lhs.iv.phi_temp = rhs.iv.phi_temp ->
+      Some
+        (add_cubic_quadratic
+           lhs.iv
+           lhs.choose3
+           lhs.triangle
+           lhs.coeff
+           lhs.bias
+           rhs.quad
+           rhs.triangle
+           rhs.coeff
+           rhs.bias)
+
+  | LinearQuadratic lhs, LinearCubic rhs
+    when lhs.iv.phi_temp = rhs.iv.phi_temp ->
+      Some
+        (add_cubic_quadratic
+           rhs.iv
+           rhs.choose3
+           rhs.triangle
+           rhs.coeff
+           rhs.bias
+           lhs.quad
+           lhs.triangle
+           lhs.coeff
+           lhs.bias)
+
+  | LinearCubic lhs, LinearCubic rhs
+    when lhs.iv.phi_temp = rhs.iv.phi_temp ->
+      Some
+        (linear_cubic
+           lhs.iv
+           (summary_expr_add lhs.choose3 rhs.choose3)
+           (summary_expr_add lhs.triangle rhs.triangle)
+           (summary_expr_add lhs.coeff rhs.coeff)
+           (summary_expr_add lhs.bias rhs.bias))
+
+  | LinearAffine _, LinearAffine _
+  | LinearAffine _, LinearQuadratic _
+  | LinearQuadratic _, LinearAffine _
+  | LinearQuadratic _, LinearQuadratic _
+  | LinearAffine _, LinearCubic _
+  | LinearCubic _, LinearAffine _
+  | LinearQuadratic _, LinearCubic _
+  | LinearCubic _, LinearQuadratic _
+  | LinearCubic _, LinearCubic _ ->
+      None
 
 let linear_expr_sub lhs rhs =
-  match (lhs, rhs) with
-  | LinearInvariant lhs, LinearInvariant rhs -> Some (LinearInvariant (summary_expr_sub lhs rhs))
-  | LinearAffine { iv; coeff; bias }, LinearInvariant rhs ->
-      Some (linear_affine iv coeff (summary_expr_sub bias rhs))
-  | LinearInvariant lhs, LinearAffine { iv; coeff; bias } ->
-      Some (linear_affine iv (summary_expr_neg coeff) (summary_expr_sub lhs bias))
-  | LinearAffine lhs, LinearAffine rhs when lhs.iv.phi_temp = rhs.iv.phi_temp ->
-      Some (linear_affine lhs.iv (summary_expr_sub lhs.coeff rhs.coeff) (summary_expr_sub lhs.bias rhs.bias))
-  | LinearAffine _, LinearAffine _ -> None
+  linear_expr_add lhs (linear_expr_neg rhs)
 
 let linear_expr_mul_invariant factor = function
-  | LinearInvariant expr -> Some (LinearInvariant (summary_expr_mul factor expr))
+  | LinearInvariant expr ->
+      Some (LinearInvariant (summary_expr_mul factor expr))
   | LinearAffine { iv; coeff; bias } ->
-      Some (linear_affine iv (summary_expr_mul factor coeff) (summary_expr_mul factor bias))
+      Some
+        (linear_affine
+           iv
+           (summary_expr_mul factor coeff)
+           (summary_expr_mul factor bias))
+  | LinearQuadratic { iv; quad; triangle; coeff; bias } ->
+      Some
+        (linear_quadratic
+           iv
+           (summary_expr_mul factor quad)
+           (summary_expr_mul factor triangle)
+           (summary_expr_mul factor coeff)
+           (summary_expr_mul factor bias))
+  | LinearCubic { iv; choose3; triangle; coeff; bias } ->
+      Some
+        (linear_cubic
+           iv
+           (summary_expr_mul factor choose3)
+           (summary_expr_mul factor triangle)
+           (summary_expr_mul factor coeff)
+           (summary_expr_mul factor bias))
+
+let linear_expr_mul_affine_quadratic
+    affine_iv
+    affine_coeff
+    affine_bias
+    quad_iv
+    quad_quad
+    quad_triangle
+    quad_coeff
+    quad_bias
+  =
+  if
+    affine_iv.phi_temp <> quad_iv.phi_temp
+    || not (basic_iv_known_nonnegative_step1 affine_iv)
+  then
+    None
+  else
+    let a = affine_coeff in
+    let b = affine_bias in
+    let q = quad_quad in
+    let t = quad_triangle in
+    let c = quad_coeff in
+    let d = quad_bias in
+
+    (* (a*i+b) * (q*i^2+t*T+c*i+d)
+
+       i^3 = 6*C3 + 6*T + i
+       i*T = 3*C3 + 2*T
+       i^2 = 2*T + i
+    *)
+    let choose3 =
+      summary_expr_mul
+        a
+        (summary_expr_add
+           (summary_expr_scale 6L q)
+           (summary_expr_scale 3L t))
+    in
+
+    let triangle_from_a =
+      summary_expr_mul
+        a
+        (summary_expr_add
+           (summary_expr_scale 6L q)
+           (summary_expr_add
+              (summary_expr_scale 2L t)
+              (summary_expr_scale 2L c)))
+    in
+    let triangle_from_b =
+      summary_expr_mul
+        b
+        (summary_expr_add
+           (summary_expr_scale 2L q)
+           t)
+    in
+    let triangle =
+      summary_expr_add triangle_from_a triangle_from_b
+    in
+
+    let coeff_from_a =
+      summary_expr_mul
+        a
+        (summary_expr_add
+           q
+           (summary_expr_add c d))
+    in
+    let coeff_from_b =
+      summary_expr_mul
+        b
+        (summary_expr_add q c)
+    in
+    let coeff =
+      summary_expr_add coeff_from_a coeff_from_b
+    in
+
+    let bias = summary_expr_mul b d in
+    Some (linear_cubic affine_iv choose3 triangle coeff bias)
+
+let linear_expr_mul lhs rhs =
+  match (lhs, rhs) with
+  | LinearInvariant lhs, rhs ->
+      linear_expr_mul_invariant lhs rhs
+  | lhs, LinearInvariant rhs ->
+      linear_expr_mul_invariant rhs lhs
+
+  | LinearAffine lhs, LinearAffine rhs
+    when lhs.iv.phi_temp = rhs.iv.phi_temp ->
+      let quad = summary_expr_mul lhs.coeff rhs.coeff in
+      let coeff =
+        summary_expr_add
+          (summary_expr_mul lhs.coeff rhs.bias)
+          (summary_expr_mul rhs.coeff lhs.bias)
+      in
+      let bias = summary_expr_mul lhs.bias rhs.bias in
+      Some
+        (linear_quadratic
+           lhs.iv quad zero_summary_expr coeff bias)
+
+  | LinearAffine affine, LinearQuadratic quad ->
+      linear_expr_mul_affine_quadratic
+        affine.iv affine.coeff affine.bias
+        quad.iv quad.quad quad.triangle quad.coeff quad.bias
+  | LinearQuadratic quad, LinearAffine affine ->
+      linear_expr_mul_affine_quadratic
+        affine.iv affine.coeff affine.bias
+        quad.iv quad.quad quad.triangle quad.coeff quad.bias
+
+  | LinearAffine _, LinearAffine _
+  | LinearAffine _, LinearCubic _
+  | LinearCubic _, LinearAffine _
+  | LinearQuadratic _, LinearQuadratic _
+  | LinearQuadratic _, LinearCubic _
+  | LinearCubic _, LinearQuadratic _
+  | LinearCubic _, LinearCubic _ ->
+      None
 
 let summary_expr_of_operand_with_bases
     base_temps
@@ -5776,6 +6129,7 @@ let summary_expr_of_operand
     operand
 
 let linear_expr_of_operand
+    ?(allow_local_multidef = false)
     invariant_loaded_places
     loop_defs
     def_blocks
@@ -5787,40 +6141,505 @@ let linear_expr_of_operand
     (block : Cfg.block)
     operand
   =
-  let direct_scaled operand =
+  let direct_iv operand =
     let operand = resolve_block_operand block operand in
-    List.find_map
+    List.find_opt
       (fun (iv : basic_induction_var) ->
-        if resolves_to_induction_temp multi_defs def_instrs iv.phi_temp operand then
-          Some (LinearAffine { iv; coeff = one_summary_expr; bias = zero_summary_expr })
-        else None)
+        resolves_to_induction_temp multi_defs def_instrs iv.phi_temp operand)
       ivs
+  in
+  let direct_scaled operand =
+    match direct_iv operand with
+    | Some iv ->
+        Some
+          (LinearAffine
+             { iv; coeff = one_summary_expr; bias = zero_summary_expr })
+    | None -> None
+  in
+  let immediate_iv_init (iv : basic_induction_var) =
+    match iv.outside_inputs with
+    | [] -> None
+    | inputs ->
+        let values =
+          List.map
+            (fun (_, operand) ->
+              match operand with
+              | Tcg.Imm value -> Some value
+              | Tcg.Temp _ -> None)
+            inputs
+        in
+        if List.exists Option.is_none values then None
+        else
+          match
+            values
+            |> List.filter_map (fun value -> value)
+            |> List.sort_uniq compare
+          with
+          | [ value ] -> Some value
+          | _ -> None
+  in
+  let monotone_iv_range (iv : basic_induction_var) =
+    match immediate_iv_init iv with
+    | None -> None
+    | Some init when iv.step > 0L ->
+        Some { min_value = Some init; max_value = None }
+    | Some init when iv.step < 0L ->
+        Some { min_value = None; max_value = Some init }
+    | Some init ->
+        Some { min_value = Some init; max_value = Some init }
+  in
+  let compare_constant_from_iv op lhs rhs =
+    let lhs = resolve_block_operand block lhs in
+    let rhs = resolve_block_operand block rhs in
+    let check op iv constant =
+      Option.bind
+        (monotone_iv_range iv)
+        (fun range -> compare_truth_from_range op range constant)
+    in
+    match (direct_iv lhs, rhs, lhs, direct_iv rhs) with
+    | Some iv, Tcg.Imm constant, _, _ ->
+        check op iv constant
+    | _, _, Tcg.Imm constant, Some iv ->
+        check (swap_compare op) iv constant
+    | _ ->
+        None
+  in
+  let operand_def block operand =
+    match resolve_block_operand block operand with
+    | Tcg.Imm _ -> None
+    | Tcg.Temp temp -> last_def_of_temp block temp
+  in
+  let operand_same block lhs rhs =
+    resolve_block_operand block lhs = resolve_block_operand block rhs
+  in
+  let debug_triangle_enabled () =
+    Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None
+  in
+  let debug_operand = function
+    | Tcg.Imm value -> Int64.to_string value
+    | Tcg.Temp temp -> Printf.sprintf "t%d" temp
+  in
+  let debug_def block operand =
+    match resolve_block_operand block operand with
+    | Tcg.Imm value ->
+        Printf.sprintf "imm(%Ld)" value
+    | Tcg.Temp temp -> (
+        match last_def_of_temp block temp with
+        | None ->
+            Printf.sprintf "t%d:<none>" temp
+        | Some (Tcg.Move (_, src)) ->
+            Printf.sprintf "t%d=move(%s)" temp (debug_operand src)
+        | Some (Tcg.Un (_, op, src)) ->
+            Printf.sprintf "t%d=un(%s,%s)"
+              temp
+              (match op with UPlus -> "+" | UMinus -> "-" | UNot -> "!")
+              (debug_operand src)
+        | Some (Tcg.Bin (_, op, lhs, rhs)) ->
+            Printf.sprintf "t%d=%s(%s,%s)"
+              temp
+              (match op with
+               | Add -> "add" | Sub -> "sub" | Mul -> "mul"
+               | Div -> "div" | Mod -> "mod"
+               | Lt -> "lt" | Le -> "le" | Gt -> "gt" | Ge -> "ge"
+               | Eq -> "eq" | Ne -> "ne"
+               | LAnd -> "land" | LOr -> "lor")
+              (debug_operand lhs)
+              (debug_operand rhs)
+        | Some (Tcg.Load (_, place)) ->
+            Printf.sprintf "t%d=load(%s)"
+              temp
+              (match place with
+               | Tcg.Local id -> Printf.sprintf "local:%d" id
+               | Tcg.Global name -> Printf.sprintf "global:%s" name)
+        | Some (Tcg.Store _) ->
+            Printf.sprintf "t%d=<store-impossible>" temp
+        | Some (Tcg.Call (_, name, _)) ->
+            Printf.sprintf "t%d=call(%s)" temp name)
   in
   let rec of_operand block seen operand =
     match direct_scaled operand with
     | Some expr -> Some expr
     | None -> (
-        match
-          summary_expr_of_operand
-            invariant_loaded_places
-            loop_defs def_blocks get_block loop_stable_phis multi_defs def_instrs block operand
-        with
-        | Some expr -> Some (LinearInvariant expr)
+        match generated_choose3 block seen operand with
+        | Some expr -> Some expr
         | None -> (
-            match operand with
-            | Tcg.Imm _ -> None
-            | Tcg.Temp temp ->
-                if IntSet.mem temp seen || IntSet.mem temp multi_defs then None
-                else
-                  match last_def_of_temp block temp with
-                  | Some instr -> of_instr block (IntSet.add temp seen) instr
-                  | None -> (
-                      match Hashtbl.find_opt def_instrs temp with
-                      | Some instr -> (
-                          match Hashtbl.find_opt def_blocks temp with
-                          | Some label -> of_instr (get_block label) (IntSet.add temp seen) instr
-                          | None -> None)
-                      | None -> None)))
+            match generated_triangle block seen operand with
+            | Some expr -> Some expr
+            | None -> (
+                match
+              summary_expr_of_operand
+                invariant_loaded_places
+                loop_defs def_blocks get_block loop_stable_phis multi_defs def_instrs block operand
+            with
+            | Some expr -> Some (LinearInvariant expr)
+            | None -> (
+                match operand with
+                | Tcg.Imm _ -> None
+                | Tcg.Temp temp ->
+                    if IntSet.mem temp seen then None
+                    else
+                      match last_def_of_temp block temp with
+                      | Some instr
+                        when allow_local_multidef
+                             || not (IntSet.mem temp multi_defs) ->
+                          if
+                            allow_local_multidef
+                            && IntSet.mem temp multi_defs
+                            && debug_triangle_enabled ()
+                          then
+                            Printf.eprintf
+                              "counted-poly-local-multidef block=%s temp=t%d def=%s\n%!"
+                              block.label temp (debug_def block (Tcg.Temp temp));
+                          of_instr block (IntSet.add temp seen) instr
+                      | Some _ ->
+                          None
+                      | None ->
+                          if IntSet.mem temp multi_defs then None
+                          else (
+                            match Hashtbl.find_opt def_instrs temp with
+                            | Some instr -> (
+                                match Hashtbl.find_opt def_blocks temp with
+                                | Some label ->
+                                    of_instr
+                                      (get_block label)
+                                      (IntSet.add temp seen)
+                                      instr
+                                | None -> None)
+                            | None -> None)))))
+  and generated_choose3 block seen operand =
+    let resolved = resolve_block_operand block operand in
+
+    let bin_of_operand op operand =
+      match operand_def block operand with
+      | Some (Tcg.Bin (_, actual, lhs, rhs)) when actual = op ->
+          Some (lhs, rhs)
+      | _ ->
+          None
+    in
+
+    let match_commutative_bin op operand =
+      bin_of_operand op operand
+    in
+
+    let match_sub_const operand constant =
+      match bin_of_operand Sub operand with
+      | Some (lhs, Tcg.Imm rhs) when rhs = constant ->
+          Some lhs
+      | _ ->
+          None
+    in
+
+    let match_div_const operand constant =
+      match bin_of_operand Div operand with
+      | Some (lhs, Tcg.Imm rhs) when rhs = constant ->
+          Some lhs
+      | _ ->
+          None
+    in
+
+    let match_mod_const operand constant =
+      match bin_of_operand Mod operand with
+      | Some (lhs, Tcg.Imm rhs) when rhs = constant ->
+          Some lhs
+      | _ ->
+          None
+    in
+
+    let match_eq_const operand constant =
+      match bin_of_operand Eq operand with
+      | Some (lhs, Tcg.Imm rhs) when rhs = constant ->
+          Some lhs
+      | Some (Tcg.Imm lhs, rhs) when lhs = constant ->
+          Some rhs
+      | _ ->
+          None
+    in
+
+    let match_select operand =
+      (* Exact shape emitted by [build_select_operand_instrs]:
+
+           diff   = if_true - if_false
+           scaled = cond * diff
+           dst    = if_false + scaled
+
+         Add/Mul are accepted in either operand order. *)
+      let try_add if_false scaled =
+        match match_commutative_bin Mul scaled with
+        | None -> None
+        | Some (mul_a, mul_b) ->
+            let try_mul cond diff =
+              match bin_of_operand Sub diff with
+              | Some (if_true, diff_false)
+                when operand_same block if_false diff_false ->
+                  Some (cond, if_true, if_false)
+              | _ ->
+                  None
+            in
+            (match try_mul mul_a mul_b with
+             | Some _ as result -> result
+             | None -> try_mul mul_b mul_a)
+      in
+      match match_commutative_bin Add operand with
+      | None -> None
+      | Some (lhs, rhs) -> (
+          match try_add lhs rhs with
+          | Some _ as result -> result
+          | None -> try_add rhs lhs)
+    in
+
+    let match_divided_select expected_rem operand =
+      match match_select operand with
+      | Some (cond, if_true, if_false) -> (
+          match
+            ( match_eq_const cond expected_rem,
+              match_div_const if_true 3L )
+          with
+          | Some rem3, Some divided_base
+            when operand_same block divided_base if_false ->
+              Some (rem3, if_false)
+          | _ ->
+              None)
+      | None ->
+          None
+    in
+
+    let match_a2 operand =
+      match match_select operand with
+      | Some (even_cond, if_true, if_false) -> (
+          match
+            ( match_eq_const even_cond 0L,
+              match_div_const if_true 2L )
+          with
+          | Some rem2, Some n
+            when operand_same block n if_false -> (
+              match match_mod_const rem2 2L with
+              | Some n2 when operand_same block n n2 ->
+                  Some (even_cond, n)
+              | _ ->
+                  None)
+          | _ ->
+              None)
+      | None ->
+          None
+    in
+
+    let match_b2 operand =
+      match match_select operand with
+      | Some (even_cond, if_true, if_false) -> (
+          match match_div_const if_false 2L with
+          | Some b when operand_same block b if_true ->
+              Some (even_cond, b)
+          | _ ->
+              None)
+      | None ->
+          None
+    in
+
+    let try_root ab c3 =
+      match match_commutative_bin Mul ab with
+      | None -> None
+      | Some (ab_left, ab_right) ->
+          let try_ab a3 b3 =
+            match
+              ( match_divided_select 0L a3,
+                match_divided_select 1L b3,
+                match_divided_select 2L c3 )
+            with
+            | ( Some (rem3_a, a2),
+                Some (rem3_b, b2),
+                Some (rem3_c, c) )
+              when operand_same block rem3_a rem3_b
+                   && operand_same block rem3_a rem3_c -> (
+                match match_mod_const rem3_a 3L with
+                | None -> None
+                | Some n_from_rem3 -> (
+                    match (match_a2 a2, match_b2 b2) with
+                    | Some (even_a, n), Some (even_b, b)
+                      when operand_same block even_a even_b
+                           && operand_same block n n_from_rem3 -> (
+                        match
+                          ( match_eq_const even_a 0L,
+                            match_sub_const b 1L,
+                            match_sub_const c 2L )
+                        with
+                        | Some rem2, Some n_from_b, Some n_from_c -> (
+                            match match_mod_const rem2 2L with
+                            | Some n_from_rem2
+                              when operand_same block n n_from_b
+                                   && operand_same block n n_from_c
+                                   && operand_same block n n_from_rem2 ->
+                                let result =
+                                  Option.bind
+                                    (of_operand block seen n)
+                                    (function
+                                      | LinearAffine { iv; coeff; bias }
+                                        when summary_expr_is_one coeff
+                                             && summary_expr_is_zero bias
+                                             && basic_iv_known_nonnegative_step1 iv ->
+                                          Some
+                                            (linear_cubic
+                                               iv
+                                               one_summary_expr
+                                               zero_summary_expr
+                                               zero_summary_expr
+                                               zero_summary_expr)
+                                      | LinearInvariant _
+                                      | LinearAffine _
+                                      | LinearQuadratic _
+                                      | LinearCubic _ ->
+                                          None)
+                                in
+                                if debug_triangle_enabled () then
+                                  Printf.eprintf
+                                    "counted-choose3-result target=%s base=%s matched=%b\n%!"
+                                    (debug_operand resolved)
+                                    (debug_operand n)
+                                    (Option.is_some result);
+                                result
+                            | _ ->
+                                None)
+                        | _ ->
+                            None)
+                    | _ ->
+                        None))
+            | _ ->
+                None
+          in
+          (match try_ab ab_left ab_right with
+           | Some _ as result -> result
+           | None -> try_ab ab_right ab_left)
+    in
+
+    match resolved with
+    | Tcg.Imm _ ->
+        None
+    | Tcg.Temp temp ->
+        if IntSet.mem temp seen then None
+        else
+          match match_commutative_bin Mul resolved with
+          | Some (lhs, rhs) -> (
+              match try_root lhs rhs with
+              | Some _ as result -> result
+              | None -> try_root rhs lhs)
+          | None ->
+              None
+
+  and generated_triangle block seen operand =
+    let resolved = resolve_block_operand block operand in
+    let parse_orientation left right =
+      if debug_triangle_enabled () then
+        Printf.eprintf
+          "counted-triangle-orient target=%s left=%s{%s} right=%s{%s}\n%!"
+          (debug_operand resolved)
+          (debug_operand left) (debug_def block left)
+          (debug_operand right) (debug_def block right);
+      match (operand_def block left, operand_def block right) with
+      | ( Some (Tcg.Bin (_, Mul, left_a, left_b)),
+          Some (Tcg.Bin (_, Mul, right_a, right_b)) ) ->
+          let classify_left first second =
+            match (operand_def block first, operand_def block second) with
+            | ( Some (Tcg.Bin (_, Div, n_half, Tcg.Imm 2L)),
+                Some (Tcg.Bin (_, Sub, n_minus, Tcg.Imm 1L)) ) ->
+                Some (first, second, n_half, n_minus)
+            | _ -> None
+          in
+          let classify_right first second =
+            match (operand_def block first, operand_def block second) with
+            | ( Some (Tcg.Bin (_, Mod, n_parity, Tcg.Imm 2L)),
+                Some (Tcg.Bin (_, Div, n_minus_half, Tcg.Imm 2L)) ) ->
+                Some (first, second, n_parity, n_minus_half)
+            | _ -> None
+          in
+          let left_shape =
+            match classify_left left_a left_b with
+            | Some _ as result -> result
+            | None -> classify_left left_b left_a
+          in
+          let right_shape =
+            match classify_right right_a right_b with
+            | Some _ as result -> result
+            | None -> classify_right right_b right_a
+          in
+          (match (left_shape, right_shape) with
+           | ( Some (half_n, n_minus_one_a, n_a, n_c),
+               Some (parity, half_n_minus_one, n_b, n_minus_one_b) )
+             when operand_same block n_a n_b
+                  && operand_same block n_a n_c
+                  && operand_same block n_minus_one_a n_minus_one_b ->
+               if debug_triangle_enabled () then begin
+                 Printf.eprintf
+                   "counted-triangle-muls target=%s half=%s{%s} nminus=%s{%s} parity=%s{%s} halfminus=%s{%s}\n%!"
+                   (debug_operand resolved)
+                   (debug_operand half_n) (debug_def block half_n)
+                   (debug_operand n_minus_one_a) (debug_def block n_minus_one_a)
+                   (debug_operand parity) (debug_def block parity)
+                   (debug_operand half_n_minus_one) (debug_def block half_n_minus_one);
+                 Printf.eprintf
+                   "counted-triangle-base target=%s n=%s{%s}\n%!"
+                   (debug_operand resolved)
+                   (debug_operand n_a) (debug_def block n_a)
+               end;
+               let result =
+                 Option.bind
+                   (of_operand block seen n_a)
+                   (function
+                     | LinearAffine { iv; coeff; bias }
+                       when summary_expr_is_one coeff
+                            && summary_expr_is_zero bias
+                            && iv.step = 1L
+                            && (match immediate_iv_init iv with
+                                | Some init -> init >= 0L
+                                | None -> false) ->
+                         Some
+                           (linear_quadratic
+                              iv
+                              zero_summary_expr
+                              one_summary_expr
+                              zero_summary_expr
+                              zero_summary_expr)
+                     | LinearInvariant _
+                     | LinearAffine _
+                     | LinearQuadratic _
+                     | LinearCubic _ ->
+                         None)
+               in
+               if debug_triangle_enabled () then
+                 Printf.eprintf
+                   "counted-triangle-result target=%s matched=%b\n%!"
+                   (debug_operand resolved)
+                   (Option.is_some result);
+               result
+           | _ ->
+               if debug_triangle_enabled () then
+                 Printf.eprintf
+                   "counted-triangle-miss target=%s stage=inner-shape\n%!"
+                   (debug_operand resolved);
+               None)
+      | _ ->
+          if debug_triangle_enabled () then
+            Printf.eprintf
+              "counted-triangle-miss target=%s stage=mul-pair\n%!"
+              (debug_operand resolved);
+          None
+    in
+    match resolved with
+    | Tcg.Imm _ -> None
+    | Tcg.Temp temp ->
+        if IntSet.mem temp seen then None
+        else
+          match last_def_of_temp block temp with
+          | Some (Tcg.Bin (_, Add, lhs, rhs)) -> (
+              if debug_triangle_enabled () then
+                Printf.eprintf
+                  "counted-triangle-try target=t%d def=add(%s,%s) block=%s\n%!"
+                  temp (debug_operand lhs) (debug_operand rhs) block.label;
+              match parse_orientation lhs rhs with
+              | Some _ as result -> result
+              | None -> parse_orientation rhs lhs)
+          | Some _ ->
+              None
+          | None ->
+              None
   and of_instr block seen = function
     | Tcg.Move (_, src) -> of_operand block seen (resolve_block_operand block src)
     | Tcg.Un (_, UMinus, src) ->
@@ -5837,27 +6656,22 @@ let linear_expr_of_operand
         let rhs = resolve_block_operand block rhs in
         Option.bind (of_operand block seen lhs) (fun lhs ->
             Option.bind (of_operand block seen rhs) (linear_expr_sub lhs))
-    | Tcg.Bin (_, Mul, lhs, rhs) -> (
+    | Tcg.Bin (_, Mul, lhs, rhs) ->
         let lhs = resolve_block_operand block lhs in
         let rhs = resolve_block_operand block rhs in
-        match
-          ( summary_expr_of_operand
-              invariant_loaded_places
-              loop_defs def_blocks get_block loop_stable_phis multi_defs def_instrs block lhs,
-            of_operand block seen rhs,
-            summary_expr_of_operand
-              invariant_loaded_places
-              loop_defs def_blocks get_block loop_stable_phis multi_defs def_instrs block rhs,
-            of_operand block seen lhs )
-        with
-        | Some factor, Some rhs_expr, _, _ -> linear_expr_mul_invariant factor rhs_expr
-        | _, _, Some factor, Some lhs_expr -> linear_expr_mul_invariant factor lhs_expr
-        | _ -> None)
+        Option.bind (of_operand block seen lhs) (fun lhs_expr ->
+            Option.bind (of_operand block seen rhs) (linear_expr_mul lhs_expr))
+    | Tcg.Bin (_, op, lhs, rhs) when is_compare_binop op -> (
+        match compare_constant_from_iv op lhs rhs with
+        | Some true -> Some (LinearInvariant one_summary_expr)
+        | Some false -> Some (LinearInvariant zero_summary_expr)
+        | None -> None)
     | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> None
   in
   of_operand block IntSet.empty operand
 
 let reduction_step_of_operand
+    ?(allow_local_multidef = false)
     invariant_loaded_places
     loop_defs
     def_blocks
@@ -5869,16 +6683,180 @@ let reduction_step_of_operand
     (block : Cfg.block)
     operand
   =
-  match
+  let parsed =
     linear_expr_of_operand
+      ~allow_local_multidef
       invariant_loaded_places
       loop_defs def_blocks get_block loop_stable_phis multi_defs def_instrs ivs block operand
-  with
-  | Some (LinearInvariant expr) -> Some (ReductionInvariant expr)
-  | Some (LinearAffine { iv; coeff; bias }) when not (summary_expr_is_zero coeff) ->
-      Some (ReductionAffine { iv; coeff; bias })
-  | Some (LinearAffine _) -> None
-  | None -> None
+  in
+
+  let debug_enabled =
+    Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None
+  in
+
+  let string_of_operand = function
+    | Tcg.Imm value -> Printf.sprintf "%Ld" value
+    | Tcg.Temp temp -> Printf.sprintf "t%d" temp
+  in
+
+  let string_of_binop = function
+    | Add -> "add"
+    | Sub -> "sub"
+    | Mul -> "mul"
+    | Div -> "div"
+    | Mod -> "mod"
+    | Lt -> "lt"
+    | Le -> "le"
+    | Gt -> "gt"
+    | Ge -> "ge"
+    | Eq -> "eq"
+    | Ne -> "ne"
+    | LAnd -> "land"
+    | LOr -> "lor"
+  in
+
+  let string_of_unop = function
+    | UMinus -> "uminus"
+    | UNot -> "unot"
+    | UPlus -> "uplus"
+  in
+
+  let string_of_place = function
+    | Tcg.Local id -> Printf.sprintf "local:%d" id
+    | Tcg.Global name -> Printf.sprintf "global:%s" name
+  in
+
+  let rec dump_operand depth seen (dump_block : Cfg.block) operand =
+    if depth > 7 then
+      Printf.eprintf
+        "counted-poly-tree depth=%d block=%s operand=%s kind=<depth-limit>\n%!"
+        depth dump_block.label (string_of_operand operand)
+    else
+      let resolved = resolve_block_operand dump_block operand in
+      match resolved with
+      | Tcg.Imm value ->
+          Printf.eprintf
+            "counted-poly-tree depth=%d block=%s operand=%s resolved=%Ld kind=imm\n%!"
+            depth dump_block.label (string_of_operand operand) value
+      | Tcg.Temp temp ->
+          if IntSet.mem temp seen then
+            Printf.eprintf
+              "counted-poly-tree depth=%d block=%s operand=%s resolved=t%d kind=cycle multi=%b\n%!"
+              depth dump_block.label (string_of_operand operand) temp
+              (IntSet.mem temp multi_defs)
+          else
+            let seen = IntSet.add temp seen in
+            let def_with_block =
+              match last_def_of_temp dump_block temp with
+              | Some instr ->
+                  Some (dump_block, instr)
+              | None -> (
+                  match
+                    ( Hashtbl.find_opt def_blocks temp,
+                      Hashtbl.find_opt def_instrs temp )
+                  with
+                  | Some label, Some instr ->
+                      Some (get_block label, instr)
+                  | _ ->
+                      None)
+            in
+            match def_with_block with
+            | None ->
+                Printf.eprintf
+                  "counted-poly-tree depth=%d block=%s operand=%s resolved=t%d kind=<no-def> multi=%b\n%!"
+                  depth dump_block.label (string_of_operand operand) temp
+                  (IntSet.mem temp multi_defs)
+            | Some (def_block, instr) -> (
+                match instr with
+                | Tcg.Move (_, src) ->
+                    Printf.eprintf
+                      "counted-poly-tree depth=%d block=%s operand=%s resolved=t%d defblock=%s kind=move src=%s multi=%b\n%!"
+                      depth dump_block.label (string_of_operand operand) temp
+                      def_block.label (string_of_operand src)
+                      (IntSet.mem temp multi_defs);
+                    dump_operand (depth + 1) seen def_block src
+
+                | Tcg.Un (_, op, src) ->
+                    Printf.eprintf
+                      "counted-poly-tree depth=%d block=%s operand=%s resolved=t%d defblock=%s kind=%s src=%s multi=%b\n%!"
+                      depth dump_block.label (string_of_operand operand) temp
+                      def_block.label (string_of_unop op)
+                      (string_of_operand src)
+                      (IntSet.mem temp multi_defs);
+                    dump_operand (depth + 1) seen def_block src
+
+                | Tcg.Bin (_, op, lhs, rhs) ->
+                    Printf.eprintf
+                      "counted-poly-tree depth=%d block=%s operand=%s resolved=t%d defblock=%s kind=%s lhs=%s rhs=%s multi=%b\n%!"
+                      depth dump_block.label (string_of_operand operand) temp
+                      def_block.label (string_of_binop op)
+                      (string_of_operand lhs)
+                      (string_of_operand rhs)
+                      (IntSet.mem temp multi_defs);
+                    dump_operand (depth + 1) seen def_block lhs;
+                    dump_operand (depth + 1) seen def_block rhs
+
+                | Tcg.Load (_, place) ->
+                    Printf.eprintf
+                      "counted-poly-tree depth=%d block=%s operand=%s resolved=t%d defblock=%s kind=load place=%s multi=%b\n%!"
+                      depth dump_block.label (string_of_operand operand) temp
+                      def_block.label (string_of_place place)
+                      (IntSet.mem temp multi_defs)
+
+                | Tcg.Store (place, value) ->
+                    Printf.eprintf
+                      "counted-poly-tree depth=%d block=%s operand=%s resolved=t%d defblock=%s kind=store place=%s value=%s multi=%b\n%!"
+                      depth dump_block.label (string_of_operand operand) temp
+                      def_block.label (string_of_place place)
+                      (string_of_operand value)
+                      (IntSet.mem temp multi_defs)
+
+                | Tcg.Call (_, callee, args) ->
+                    Printf.eprintf
+                      "counted-poly-tree depth=%d block=%s operand=%s resolved=t%d defblock=%s kind=call callee=%s argc=%d multi=%b\n%!"
+                      depth dump_block.label (string_of_operand operand) temp
+                      def_block.label callee (List.length args)
+                      (IntSet.mem temp multi_defs))
+  in
+
+  let result =
+    match parsed with
+    | Some (LinearInvariant expr) ->
+        Some (ReductionInvariant expr)
+    | Some (LinearAffine { iv; coeff; bias })
+      when not (summary_expr_is_zero coeff) ->
+        Some (ReductionAffine { iv; coeff; bias })
+    | Some (LinearAffine _) ->
+        None
+    | Some (LinearQuadratic { iv; quad; triangle; coeff; bias })
+      when not (summary_expr_is_zero quad && summary_expr_is_zero triangle) ->
+        Some (ReductionQuadratic { iv; quad; triangle; coeff; bias })
+    | Some (LinearQuadratic _) ->
+        None
+    | Some (LinearCubic { iv; choose3; triangle; coeff; bias })
+      when not (summary_expr_is_zero choose3) ->
+        Some (ReductionCubic { iv; choose3; triangle; coeff; bias })
+    | Some (LinearCubic _) ->
+        None
+    | None ->
+        None
+  in
+
+  if debug_enabled && Option.is_none result then begin
+    Printf.eprintf
+      "counted-poly-fail block=%s operand=%s parsed=%s\n%!"
+      block.label
+      (string_of_operand operand)
+      (match parsed with
+       | None -> "none"
+       | Some (LinearInvariant _) -> "invariant-zero-or-unsupported"
+       | Some (LinearAffine _) -> "affine-zero"
+       | Some (LinearQuadratic _) -> "quadratic-zero"
+       | Some (LinearCubic _) -> "cubic-zero");
+    dump_operand 0 IntSet.empty block operand
+  end;
+
+  result
 
 let reduction_update_of_temp
     invariant_loaded_places
@@ -6038,6 +7016,35 @@ let reduction_update_of_place
           else Some (ReductionInvariant bias)
         else
           Some (ReductionAffine { iv; coeff; bias })
+    | LinearQuadratic { iv; quad; triangle; coeff; bias } ->
+        if summary_expr_is_zero quad && summary_expr_is_zero triangle then
+          if summary_expr_is_zero coeff then
+            if summary_expr_is_zero bias then None
+            else Some (ReductionInvariant bias)
+          else
+            Some (ReductionAffine { iv; coeff; bias })
+        else
+          Some (ReductionQuadratic { iv; quad; triangle; coeff; bias })
+    | LinearCubic { iv; choose3; triangle; coeff; bias } ->
+        if summary_expr_is_zero choose3 then
+          if summary_expr_is_zero triangle then
+            if summary_expr_is_zero coeff then
+              if summary_expr_is_zero bias then None
+              else Some (ReductionInvariant bias)
+            else
+              Some (ReductionAffine { iv; coeff; bias })
+          else
+            Some
+              (ReductionQuadratic
+                 {
+                   iv;
+                   quad = zero_summary_expr;
+                   triangle;
+                   coeff;
+                   bias;
+                 })
+        else
+          Some (ReductionCubic { iv; choose3; triangle; coeff; bias })
   in
   let nested_additive_place_step block lhs rhs =
     let add_deltas lhs rhs =
@@ -6271,6 +7278,39 @@ let collect_counted_reductions
     | UMinus -> "uminus"
     | UNot -> "unot"
     | UPlus -> "uplus"
+  in
+  let string_of_place = function
+    | Tcg.Local id -> Printf.sprintf "local:%d" id
+    | Tcg.Global name -> Printf.sprintf "global:%s" name
+  in
+  let string_of_simple_instr = function
+    | Tcg.Move (dst, src) ->
+        Printf.sprintf "t%d=move(%s)" dst (string_of_operand src)
+    | Tcg.Un (dst, op, src) ->
+        Printf.sprintf "t%d=%s(%s)"
+          dst (string_of_unop op) (string_of_operand src)
+    | Tcg.Bin (dst, op, lhs, rhs) ->
+        Printf.sprintf "t%d=%s(%s,%s)"
+          dst
+          (string_of_binop op)
+          (string_of_operand lhs)
+          (string_of_operand rhs)
+    | Tcg.Load (dst, place) ->
+        Printf.sprintf "t%d=load(%s)" dst (string_of_place place)
+    | Tcg.Store (place, value) ->
+        Printf.sprintf "store(%s,%s)"
+          (string_of_place place)
+          (string_of_operand value)
+    | Tcg.Call (dst, callee, args) ->
+        let dst =
+          match dst with
+          | None -> "_"
+          | Some temp -> Printf.sprintf "t%d" temp
+        in
+        Printf.sprintf "%s=call(%s,%s)"
+          dst
+          callee
+          (args |> List.map string_of_operand |> String.concat ",")
   in
   let debug_operand_def operand =
     match operand with
@@ -6806,6 +7846,7 @@ let collect_counted_reductions
       | Some _ as step -> step
       | None ->
           reduction_step_of_operand
+            ~allow_local_multidef:true
             invariant_loaded_places
             loop_defs
             def_blocks
@@ -6841,6 +7882,35 @@ let collect_counted_reductions
             else Some (ReductionInvariant bias)
           else
             Some (ReductionAffine { iv; coeff; bias })
+      | LinearQuadratic { iv; quad; triangle; coeff; bias } ->
+          if summary_expr_is_zero quad && summary_expr_is_zero triangle then
+            if summary_expr_is_zero coeff then
+              if summary_expr_is_zero bias then None
+              else Some (ReductionInvariant bias)
+            else
+              Some (ReductionAffine { iv; coeff; bias })
+          else
+            Some (ReductionQuadratic { iv; quad; triangle; coeff; bias })
+      | LinearCubic { iv; choose3; triangle; coeff; bias } ->
+          if summary_expr_is_zero choose3 then
+            if summary_expr_is_zero triangle then
+              if summary_expr_is_zero coeff then
+                if summary_expr_is_zero bias then None
+                else Some (ReductionInvariant bias)
+              else
+                Some (ReductionAffine { iv; coeff; bias })
+            else
+              Some
+                (ReductionQuadratic
+                   {
+                     iv;
+                     quad = zero_summary_expr;
+                     triangle;
+                     coeff;
+                     bias;
+                   })
+          else
+            Some (ReductionCubic { iv; choose3; triangle; coeff; bias })
     in
     let nested_additive_reduction_step block older_chain lhs rhs =
       let prefix_before_instr (block : Cfg.block) current_instr =
@@ -6964,8 +8034,27 @@ let collect_counted_reductions
           match operand with
           | Tcg.Imm _ -> None
           | Tcg.Temp current ->
-              if current = temp then None
-              else if IntSet.mem current seen then None
+              if debug_counted_local then
+                Printf.eprintf
+                  "counted-point-follow header=%s target=%d current=t%d block=%s self_target=%b seen=%b multi=%b invariant=%b older=%d\n%!"
+                  header temp current block.label
+                  (current = temp)
+                  (IntSet.mem current seen)
+                  (IntSet.mem current multi_defs)
+                  (invariant operand)
+                  (List.length older_chain);
+              if current = temp then (
+                if debug_counted_local then
+                  Printf.eprintf
+                    "counted-point-stop header=%s target=%d current=t%d reason=self-target\n%!"
+                    header temp current;
+                None)
+              else if IntSet.mem current seen then (
+                if debug_counted_local then
+                  Printf.eprintf
+                    "counted-point-stop header=%s target=%d current=t%d reason=cycle\n%!"
+                    header temp current;
+                None)
               else
                 match last_def_of_temp block current with
                 | Some instr ->
@@ -6983,7 +8072,118 @@ let collect_counted_reductions
                             header temp current older_block.label;
                         of_instr older_block older_rest (IntSet.add current seen) instr
                     | None ->
-                        if invariant operand || IntSet.mem current multi_defs then None
+                        if invariant operand then (
+                          if debug_counted_local then
+                            Printf.eprintf
+                              "counted-point-stop header=%s target=%d current=t%d reason=invariant\n%!"
+                              header temp current;
+                          None)
+                        else if IntSet.mem current multi_defs then (
+                          (* Point-sensitive predecessor recovery.
+
+                             A temp may be multi-def over the whole loop while
+                             still having one unambiguous reaching definition
+                             at this exact program point.  This happens after
+                             nested counted-loop summarization:
+
+                                 summary: t47 = t46 + delta
+                                 exit:    t46 = t47
+
+                             [t47] also has initialization / earlier-scope defs,
+                             so the function-wide table marks it multi-def.
+                             However, if [block] has exactly one distinct
+                             in-loop predecessor, every execution reaching
+                             [block] passes through that same predecessor path.
+
+                             Follow only that unique CFG path and reuse the
+                             existing [incoming_update_chain] machinery.  Do
+                             not fall back to an arbitrary function-wide def. *)
+                          let unique_preds =
+                            block.preds
+                            |> List.sort_uniq String.compare
+                          in
+                          let pred_reaching_def =
+                            match unique_preds with
+                            | [ pred ] when LabelSet.mem pred loop ->
+                                let pred_chain =
+                                  incoming_update_chain
+                                    get_block block.label pred
+                                in
+                                (match
+                                   last_def_of_temp_on_chain_with_block
+                                     pred_chain current
+                                 with
+                                 | Some
+                                     ( pred_block,
+                                       pred_instr,
+                                       pred_rest ) ->
+                                     Some
+                                       ( pred_block,
+                                         pred_instr,
+                                         pred_rest )
+                                 | None ->
+                                     None)
+                            | _ ->
+                                None
+                          in
+                          match pred_reaching_def with
+                          | Some (pred_block, pred_instr, pred_rest) ->
+                              if debug_counted_local then
+                                Printf.eprintf
+                                  "counted-point-pred-def header=%s target=%d current=t%d block=%s def_block=%s def=%s\n%!"
+                                  header temp current block.label
+                                  pred_block.label
+                                  (string_of_simple_instr pred_instr);
+                              of_instr
+                                pred_block
+                                pred_rest
+                                (IntSet.add current seen)
+                                pred_instr
+                          | None ->
+                              if debug_counted_local then begin
+                                let chain_labels =
+                                  (block :: older_chain)
+                                  |> List.map
+                                       (fun (b : Cfg.block) -> b.label)
+                                  |> String.concat " <- "
+                                in
+                                Printf.eprintf
+                                  "counted-point-stop header=%s target=%d current=t%d reason=multidef-no-point-def chain=[%s]\n%!"
+                                  header temp current chain_labels;
+
+                                let defs = ref [] in
+                                LabelSet.iter
+                                  (fun label ->
+                                    let def_block : Cfg.block =
+                                      get_block label
+                                    in
+                                    List.iteri
+                                      (fun index instr ->
+                                        match defs_temp instr with
+                                        | Some dst when dst = current ->
+                                            defs :=
+                                              ( label,
+                                                index,
+                                                string_of_simple_instr instr )
+                                              :: !defs
+                                        | Some _
+                                        | None ->
+                                            ())
+                                      def_block.body)
+                                  loop;
+                                let defs =
+                                  List.rev !defs
+                                  |> List.map
+                                       (fun (label, index, instr) ->
+                                         Printf.sprintf "%s#%d:%s"
+                                           label index instr)
+                                  |> String.concat " | "
+                                in
+                                Printf.eprintf
+                                  "counted-point-multidef-all header=%s target=%d current=t%d defs=[%s]\n%!"
+                                  header temp current defs
+                              end;
+                              None)
                         else
                           match Hashtbl.find_opt def_instrs current with
                           | Some instr -> (
@@ -7172,8 +8372,44 @@ let collect_counted_reductions
           (List.length prefix_before_current)
           (List.length block.body);
       match current_instr with
-      | Tcg.Move (_, src) ->
-          of_operand point_block older_chain seen (resolve_at_point src)
+      | Tcg.Move (dst, src) ->
+          let resolved_src = resolve_at_point src in
+          if debug_counted_local then begin
+            Printf.eprintf
+              "counted-point-move header=%s target=%d dst=t%d raw=%s resolved=%s self=%b block=%s prefix=%d/%d\n%!"
+              header temp dst
+              (string_of_operand src)
+              (string_of_operand resolved_src)
+              (resolves_to_self point_block older_chain IntSet.empty resolved_src)
+              block.label
+              (List.length prefix_before_current)
+              (List.length block.body);
+            (match resolved_src with
+             | Tcg.Imm _ -> ()
+             | Tcg.Temp current ->
+                 let local_def =
+                   last_def_of_temp point_block current
+                 in
+                 let chain_def =
+                   last_def_of_temp_on_chain_with_block older_chain current
+                 in
+                 Printf.eprintf
+                   "counted-point-move-def header=%s target=%d current=t%d local=%s chain=%s multi=%b seen=%b same_target=%b\n%!"
+                   header temp current
+                   (match local_def with
+                    | None -> "<none>"
+                    | Some instr -> string_of_simple_instr instr)
+                   (match chain_def with
+                    | None -> "<none>"
+                    | Some (def_block, instr, _) ->
+                        Printf.sprintf "%s:%s"
+                          def_block.label
+                          (string_of_simple_instr instr))
+                   (IntSet.mem current multi_defs)
+                   (IntSet.mem current seen)
+                   (current = temp))
+          end;
+          of_operand point_block older_chain seen resolved_src
       | Tcg.Bin (_, Add, raw_lhs, raw_rhs) ->
           let lhs = resolve_at_point raw_lhs in
           let rhs = resolve_at_point raw_rhs in
@@ -7712,7 +8948,16 @@ let collect_reconstructible_live_temps
   in
   close supported_temps [] IntMap.empty
 
-let build_triangle_number_instrs fresh_temp trip_temp =
+let build_select_operand_instrs fresh_temp cond if_true if_false =
+  let diff = fresh_temp () in
+  let scaled = fresh_temp () in
+  let dst = fresh_temp () in
+  ( [ simplify_simple_instr (Tcg.Bin (diff, Sub, if_true, if_false));
+      simplify_simple_instr (Tcg.Bin (scaled, Mul, cond, Tcg.Temp diff));
+      simplify_simple_instr (Tcg.Bin (dst, Add, if_false, Tcg.Temp scaled)) ],
+    Tcg.Temp dst )
+
+let build_triangle_number_operand_instrs fresh_temp n_operand =
   let n_minus_one = fresh_temp () in
   let half_n = fresh_temp () in
   let parity = fresh_temp () in
@@ -7720,14 +8965,167 @@ let build_triangle_number_instrs fresh_temp trip_temp =
   let left = fresh_temp () in
   let right = fresh_temp () in
   let triangle = fresh_temp () in
-  ( [ simplify_simple_instr (Tcg.Bin (n_minus_one, Sub, Tcg.Temp trip_temp, Tcg.Imm 1L));
-      simplify_simple_instr (Tcg.Bin (half_n, Div, Tcg.Temp trip_temp, Tcg.Imm 2L));
-      simplify_simple_instr (Tcg.Bin (parity, Mod, Tcg.Temp trip_temp, Tcg.Imm 2L));
-      simplify_simple_instr (Tcg.Bin (half_n_minus_one, Div, Tcg.Temp n_minus_one, Tcg.Imm 2L));
-      simplify_simple_instr (Tcg.Bin (left, Mul, Tcg.Temp half_n, Tcg.Temp n_minus_one));
-      simplify_simple_instr (Tcg.Bin (right, Mul, Tcg.Temp parity, Tcg.Temp half_n_minus_one));
-      simplify_simple_instr (Tcg.Bin (triangle, Add, Tcg.Temp left, Tcg.Temp right)) ],
+  ( [ simplify_simple_instr (Tcg.Bin (n_minus_one, Sub, n_operand, Tcg.Imm 1L));
+      simplify_simple_instr (Tcg.Bin (half_n, Div, n_operand, Tcg.Imm 2L));
+      simplify_simple_instr (Tcg.Bin (parity, Mod, n_operand, Tcg.Imm 2L));
+      simplify_simple_instr
+        (Tcg.Bin (half_n_minus_one, Div, Tcg.Temp n_minus_one, Tcg.Imm 2L));
+      simplify_simple_instr
+        (Tcg.Bin (left, Mul, Tcg.Temp half_n, Tcg.Temp n_minus_one));
+      simplify_simple_instr
+        (Tcg.Bin (right, Mul, Tcg.Temp parity, Tcg.Temp half_n_minus_one));
+      simplify_simple_instr
+        (Tcg.Bin (triangle, Add, Tcg.Temp left, Tcg.Temp right)) ],
     triangle )
+
+let build_triangle_number_instrs fresh_temp trip_temp =
+  build_triangle_number_operand_instrs fresh_temp (Tcg.Temp trip_temp)
+
+let build_choose3_operand_instrs fresh_temp n_operand =
+  (* C(n,3) = n(n-1)(n-2)/6 for nonnegative n.
+
+     Divide exact factors by 2 and 3 before any final multiplication, so
+     modular 32-bit multiplication afterwards is equivalent to the source's
+     repeated-addition result modulo 2^32. *)
+  let b = fresh_temp () in
+  let c = fresh_temp () in
+  let rem2 = fresh_temp () in
+  let even = fresh_temp () in
+  let a_half = fresh_temp () in
+  let b_half = fresh_temp () in
+  let prefix =
+    [ simplify_simple_instr (Tcg.Bin (b, Sub, n_operand, Tcg.Imm 1L));
+      simplify_simple_instr (Tcg.Bin (c, Sub, n_operand, Tcg.Imm 2L));
+      simplify_simple_instr (Tcg.Bin (rem2, Mod, n_operand, Tcg.Imm 2L));
+      simplify_simple_instr
+        (Tcg.Bin (even, Eq, Tcg.Temp rem2, Tcg.Imm 0L));
+      simplify_simple_instr (Tcg.Bin (a_half, Div, n_operand, Tcg.Imm 2L));
+      simplify_simple_instr
+        (Tcg.Bin (b_half, Div, Tcg.Temp b, Tcg.Imm 2L)) ]
+  in
+  let a2_instrs, a2 =
+    build_select_operand_instrs
+      fresh_temp (Tcg.Temp even) (Tcg.Temp a_half) n_operand
+  in
+  let b2_instrs, b2 =
+    build_select_operand_instrs
+      fresh_temp (Tcg.Temp even) (Tcg.Temp b) (Tcg.Temp b_half)
+  in
+  let rem3 = fresh_temp () in
+  let is0 = fresh_temp () in
+  let is1 = fresh_temp () in
+  let is2 = fresh_temp () in
+  let a_div3 = fresh_temp () in
+  let b_div3 = fresh_temp () in
+  let c_div3 = fresh_temp () in
+  let thirds =
+    [ simplify_simple_instr (Tcg.Bin (rem3, Mod, n_operand, Tcg.Imm 3L));
+      simplify_simple_instr
+        (Tcg.Bin (is0, Eq, Tcg.Temp rem3, Tcg.Imm 0L));
+      simplify_simple_instr
+        (Tcg.Bin (is1, Eq, Tcg.Temp rem3, Tcg.Imm 1L));
+      simplify_simple_instr
+        (Tcg.Bin (is2, Eq, Tcg.Temp rem3, Tcg.Imm 2L));
+      simplify_simple_instr (Tcg.Bin (a_div3, Div, a2, Tcg.Imm 3L));
+      simplify_simple_instr (Tcg.Bin (b_div3, Div, b2, Tcg.Imm 3L));
+      simplify_simple_instr
+        (Tcg.Bin (c_div3, Div, Tcg.Temp c, Tcg.Imm 3L)) ]
+  in
+  let a3_instrs, a3 =
+    build_select_operand_instrs
+      fresh_temp (Tcg.Temp is0) (Tcg.Temp a_div3) a2
+  in
+  let b3_instrs, b3 =
+    build_select_operand_instrs
+      fresh_temp (Tcg.Temp is1) (Tcg.Temp b_div3) b2
+  in
+  let c3_instrs, c3 =
+    build_select_operand_instrs
+      fresh_temp (Tcg.Temp is2) (Tcg.Temp c_div3) (Tcg.Temp c)
+  in
+  let ab = fresh_temp () in
+  let result = fresh_temp () in
+  ( prefix
+    @ a2_instrs
+    @ b2_instrs
+    @ thirds
+    @ a3_instrs
+    @ b3_instrs
+    @ c3_instrs
+    @ [ simplify_simple_instr (Tcg.Bin (ab, Mul, a3, b3));
+        simplify_simple_instr (Tcg.Bin (result, Mul, Tcg.Temp ab, c3)) ],
+    result )
+
+
+let build_choose4_operand_instrs fresh_temp n_operand =
+  let choose3_instrs, choose3 =
+    build_choose3_operand_instrs fresh_temp n_operand
+  in
+  let n_minus_three = fresh_temp () in
+  let rem4 = fresh_temp () in
+  let is0 = fresh_temp () in
+  let is2 = fresh_temp () in
+  let choose3_div4 = fresh_temp () in
+  let choose3_div2 = fresh_temp () in
+  let nm3_div4 = fresh_temp () in
+  let nm3_div2 = fresh_temp () in
+  let prefix =
+    [ simplify_simple_instr
+        (Tcg.Bin (n_minus_three, Sub, n_operand, Tcg.Imm 3L));
+      simplify_simple_instr
+        (Tcg.Bin (rem4, Mod, Tcg.Temp choose3, Tcg.Imm 4L));
+      simplify_simple_instr
+        (Tcg.Bin (is0, Eq, Tcg.Temp rem4, Tcg.Imm 0L));
+      simplify_simple_instr
+        (Tcg.Bin (is2, Eq, Tcg.Temp rem4, Tcg.Imm 2L));
+      simplify_simple_instr
+        (Tcg.Bin (choose3_div4, Div, Tcg.Temp choose3, Tcg.Imm 4L));
+      simplify_simple_instr
+        (Tcg.Bin (choose3_div2, Div, Tcg.Temp choose3, Tcg.Imm 2L));
+      simplify_simple_instr
+        (Tcg.Bin (nm3_div4, Div, Tcg.Temp n_minus_three, Tcg.Imm 4L));
+      simplify_simple_instr
+        (Tcg.Bin (nm3_div2, Div, Tcg.Temp n_minus_three, Tcg.Imm 2L)) ]
+  in
+
+  let lhs_non0_instrs, lhs_non0 =
+    build_select_operand_instrs
+      fresh_temp
+      (Tcg.Temp is2)
+      (Tcg.Temp choose3_div2)
+      (Tcg.Temp choose3)
+  in
+  let rhs_non0_instrs, rhs_non0 =
+    build_select_operand_instrs
+      fresh_temp
+      (Tcg.Temp is2)
+      (Tcg.Temp nm3_div2)
+      (Tcg.Temp nm3_div4)
+  in
+  let lhs_instrs, lhs =
+    build_select_operand_instrs
+      fresh_temp
+      (Tcg.Temp is0)
+      (Tcg.Temp choose3_div4)
+      lhs_non0
+  in
+  let rhs_instrs, rhs =
+    build_select_operand_instrs
+      fresh_temp
+      (Tcg.Temp is0)
+      (Tcg.Temp n_minus_three)
+      rhs_non0
+  in
+  let result = fresh_temp () in
+  ( choose3_instrs
+    @ prefix
+    @ lhs_non0_instrs
+    @ rhs_non0_instrs
+    @ lhs_instrs
+    @ rhs_instrs
+    @ [ simplify_simple_instr (Tcg.Bin (result, Mul, lhs, rhs)) ],
+    result )
+
 
 let rec emit_summary_expr_with_carriers place_carriers fresh_temp = function
   | SummaryOperand operand -> ([], operand)
@@ -7828,6 +9226,323 @@ let build_affine_reduction_delta
     ( base_instrs @ base_adjust_instrs @ delta_instrs @ triangle_instrs @ series_instrs @ [ combine ],
       Some (Tcg.Temp delta) )
 
+let build_sum_squares_progression_instrs fresh_temp trip_temp (iv : basic_induction_var) =
+  let triangle_instrs, triangle =
+    build_triangle_number_instrs fresh_temp trip_temp
+  in
+  let choose3_instrs, choose3 =
+    build_choose3_operand_instrs fresh_temp (Tcg.Temp trip_temp)
+  in
+  let twice_choose3 = fresh_temp () in
+  let index_square_sum = fresh_temp () in
+  let index_instrs =
+    [ simplify_simple_instr
+        (Tcg.Bin (twice_choose3, Mul, Tcg.Temp choose3, Tcg.Imm 2L));
+      simplify_simple_instr
+        (Tcg.Bin
+           (index_square_sum, Add, Tcg.Temp twice_choose3, Tcg.Temp triangle)) ]
+  in
+  let base_square = fresh_temp () in
+  let base_term = fresh_temp () in
+  let base_instrs =
+    [ simplify_simple_instr
+        (Tcg.Bin
+           (base_square, Mul, Tcg.Temp iv.phi_temp, Tcg.Temp iv.phi_temp));
+      simplify_simple_instr
+        (Tcg.Bin (base_term, Mul, Tcg.Temp base_square, Tcg.Temp trip_temp)) ]
+  in
+  let cross_operand, cross_instrs =
+    if iv.step = 0L then
+      (Tcg.Imm 0L, [])
+    else
+      let two_base = fresh_temp () in
+      let scaled_base = fresh_temp () in
+      let cross = fresh_temp () in
+      ( Tcg.Temp cross,
+        [ simplify_simple_instr
+            (Tcg.Bin (two_base, Mul, Tcg.Temp iv.phi_temp, Tcg.Imm 2L));
+          simplify_simple_instr
+            (Tcg.Bin (scaled_base, Mul, Tcg.Temp two_base, Tcg.Imm iv.step));
+          simplify_simple_instr
+            (Tcg.Bin (cross, Mul, Tcg.Temp scaled_base, Tcg.Temp triangle)) ] )
+  in
+  let square_step_operand, square_step_instrs =
+    if iv.step = 0L then
+      (Tcg.Imm 0L, [])
+    else if iv.step = 1L || iv.step = -1L then
+      (Tcg.Temp index_square_sum, [])
+    else
+      let step_square = fresh_temp () in
+      let scaled = fresh_temp () in
+      ( Tcg.Temp scaled,
+        [ simplify_simple_instr
+            (Tcg.Bin (step_square, Mul, Tcg.Imm iv.step, Tcg.Imm iv.step));
+          simplify_simple_instr
+            (Tcg.Bin
+               (scaled, Mul, Tcg.Temp step_square, Tcg.Temp index_square_sum)) ] )
+  in
+  let after_cross, cross_combine =
+    match cross_operand with
+    | Tcg.Imm 0L -> (Tcg.Temp base_term, [])
+    | _ ->
+        let dst = fresh_temp () in
+        ( Tcg.Temp dst,
+          [ simplify_simple_instr
+              (Tcg.Bin (dst, Add, Tcg.Temp base_term, cross_operand)) ] )
+  in
+  let total, total_combine =
+    match square_step_operand with
+    | Tcg.Imm 0L -> (after_cross, [])
+    | _ ->
+        let dst = fresh_temp () in
+        ( Tcg.Temp dst,
+          [ simplify_simple_instr
+              (Tcg.Bin (dst, Add, after_cross, square_step_operand)) ] )
+  in
+  ( triangle_instrs
+    @ choose3_instrs
+    @ index_instrs
+    @ base_instrs
+    @ cross_instrs
+    @ square_step_instrs
+    @ cross_combine
+    @ total_combine,
+    total )
+
+let build_triangle_progression_sum_instrs fresh_temp trip_temp (iv : basic_induction_var) =
+  (* For step=1:
+       T(x+r) = T(x) + x*r + T(r)
+     hence
+       sum T(x+r)
+         = N*T(x) + x*T(N) + C(N,3). *)
+  if iv.step <> 1L then
+    ([], None)
+  else
+    let base_triangle_instrs, base_triangle =
+      build_triangle_number_operand_instrs
+        fresh_temp (Tcg.Temp iv.phi_temp)
+    in
+    let trip_triangle_instrs, trip_triangle =
+      build_triangle_number_instrs fresh_temp trip_temp
+    in
+    let choose3_instrs, choose3 =
+      build_choose3_operand_instrs fresh_temp (Tcg.Temp trip_temp)
+    in
+    let base_sum = fresh_temp () in
+    let cross = fresh_temp () in
+    let first = fresh_temp () in
+    let total = fresh_temp () in
+    ( base_triangle_instrs
+      @ trip_triangle_instrs
+      @ choose3_instrs
+      @ [ simplify_simple_instr
+            (Tcg.Bin
+               (base_sum, Mul, Tcg.Temp base_triangle, Tcg.Temp trip_temp));
+          simplify_simple_instr
+            (Tcg.Bin
+               (cross, Mul, Tcg.Temp iv.phi_temp, Tcg.Temp trip_triangle));
+          simplify_simple_instr
+            (Tcg.Bin (first, Add, Tcg.Temp base_sum, Tcg.Temp cross));
+          simplify_simple_instr
+            (Tcg.Bin (total, Add, Tcg.Temp first, Tcg.Temp choose3)) ],
+      Some (Tcg.Temp total) )
+
+
+let build_choose3_progression_sum_instrs
+    fresh_temp
+    trip_temp
+    (iv : basic_induction_var)
+  =
+  if not (basic_iv_known_nonnegative_step1 iv) then
+    ([], None)
+  else
+    let final_value = fresh_temp () in
+    let final_instr =
+      simplify_simple_instr
+        (Tcg.Bin
+           (final_value, Add, Tcg.Temp iv.phi_temp, Tcg.Temp trip_temp))
+    in
+    let start_choose4_instrs, start_choose4 =
+      build_choose4_operand_instrs fresh_temp (Tcg.Temp iv.phi_temp)
+    in
+    let final_choose4_instrs, final_choose4 =
+      build_choose4_operand_instrs fresh_temp (Tcg.Temp final_value)
+    in
+    let sum = fresh_temp () in
+    ( [ final_instr ]
+      @ start_choose4_instrs
+      @ final_choose4_instrs
+      @ [ simplify_simple_instr
+            (Tcg.Bin
+               (sum, Sub, Tcg.Temp final_choose4, Tcg.Temp start_choose4)) ],
+      Some (Tcg.Temp sum) )
+
+let build_cubic_reduction_delta
+    place_carriers
+    fresh_temp
+    trip_temp
+    (iv : basic_induction_var)
+    choose3
+    triangle
+    coeff
+    bias
+  =
+  let scale_sum coeff_expr sum_operand =
+    let coeff_instrs, coeff_operand =
+      emit_summary_expr_with_carriers place_carriers fresh_temp coeff_expr
+    in
+    match coeff_operand with
+    | Tcg.Imm 0L ->
+        (coeff_instrs, None)
+    | Tcg.Imm 1L ->
+        (coeff_instrs, Some sum_operand)
+    | _ ->
+        let dst = fresh_temp () in
+        ( coeff_instrs
+          @ [ simplify_simple_instr
+                (Tcg.Bin (dst, Mul, sum_operand, coeff_operand)) ],
+          Some (Tcg.Temp dst) )
+  in
+
+  let choose3_sum_instrs, choose3_sum =
+    if summary_expr_is_zero choose3 then
+      ([], Some (Tcg.Imm 0L))
+    else
+      build_choose3_progression_sum_instrs fresh_temp trip_temp iv
+  in
+
+  let choose3_instrs, choose3_delta =
+    match choose3_sum with
+    | None ->
+        (choose3_sum_instrs, None)
+    | Some sum ->
+        let scale_instrs, delta =
+          scale_sum choose3 sum
+        in
+        (choose3_sum_instrs @ scale_instrs, delta)
+  in
+
+  let triangle_sum_instrs, triangle_sum =
+    if summary_expr_is_zero triangle then
+      ([], Some (Tcg.Imm 0L))
+    else
+      build_triangle_progression_sum_instrs fresh_temp trip_temp iv
+  in
+
+  let triangle_instrs, triangle_delta =
+    match triangle_sum with
+    | None ->
+        (triangle_sum_instrs, None)
+    | Some sum ->
+        let scale_instrs, delta =
+          scale_sum triangle sum
+        in
+        (triangle_sum_instrs @ scale_instrs, delta)
+  in
+
+  let affine_instrs, affine_delta =
+    build_affine_reduction_delta
+      place_carriers fresh_temp trip_temp iv coeff bias
+  in
+
+  let terms =
+    [ choose3_delta; triangle_delta; affine_delta ]
+    |> List.filter_map (fun value -> value)
+    |> List.filter (function Tcg.Imm 0L -> false | _ -> true)
+  in
+
+  let rec combine instrs = function
+    | [] ->
+        (instrs, None)
+    | [ term ] ->
+        (instrs, Some term)
+    | lhs :: rhs :: rest ->
+        let dst = fresh_temp () in
+        combine
+          (instrs
+           @ [ simplify_simple_instr
+                 (Tcg.Bin (dst, Add, lhs, rhs)) ])
+          (Tcg.Temp dst :: rest)
+  in
+
+  let combine_instrs, total =
+    combine [] terms
+  in
+  ( choose3_instrs
+    @ triangle_instrs
+    @ affine_instrs
+    @ combine_instrs,
+    total )
+
+
+let build_quadratic_reduction_delta
+    place_carriers
+    fresh_temp
+    trip_temp
+    (iv : basic_induction_var)
+    quad
+    triangle
+    coeff
+    bias
+  =
+  let scale_sum coeff_expr sum_operand =
+    let coeff_instrs, coeff_operand =
+      emit_summary_expr_with_carriers place_carriers fresh_temp coeff_expr
+    in
+    match coeff_operand with
+    | Tcg.Imm 0L -> (coeff_instrs, None)
+    | Tcg.Imm 1L -> (coeff_instrs, Some sum_operand)
+    | _ ->
+        let dst = fresh_temp () in
+        ( coeff_instrs
+          @ [ simplify_simple_instr
+                (Tcg.Bin (dst, Mul, sum_operand, coeff_operand)) ],
+          Some (Tcg.Temp dst) )
+  in
+  let square_instrs, square_sum =
+    build_sum_squares_progression_instrs fresh_temp trip_temp iv
+  in
+  let quad_instrs, quad_delta =
+    scale_sum quad square_sum
+  in
+  let triangle_sum_instrs, triangle_sum =
+    if summary_expr_is_zero triangle then
+      ([], Some (Tcg.Imm 0L))
+    else
+      build_triangle_progression_sum_instrs fresh_temp trip_temp iv
+  in
+  let triangle_instrs, triangle_delta =
+    match triangle_sum with
+    | None -> (triangle_sum_instrs, None)
+    | Some sum ->
+        let scale_instrs, delta = scale_sum triangle sum in
+        (triangle_sum_instrs @ scale_instrs, delta)
+  in
+  let affine_instrs, affine_delta =
+    build_affine_reduction_delta
+      place_carriers fresh_temp trip_temp iv coeff bias
+  in
+  let terms =
+    [ quad_delta; triangle_delta; affine_delta ]
+    |> List.filter_map (fun value -> value)
+    |> List.filter (function Tcg.Imm 0L -> false | _ -> true)
+  in
+  let rec combine instrs = function
+    | [] -> (instrs, None)
+    | [ term ] -> (instrs, Some term)
+    | lhs :: rhs :: rest ->
+        let dst = fresh_temp () in
+        combine
+          (instrs
+           @ [ simplify_simple_instr (Tcg.Bin (dst, Add, lhs, rhs)) ])
+          (Tcg.Temp dst :: rest)
+  in
+  let combine_instrs, total =
+    combine [] terms
+  in
+  (square_instrs @ quad_instrs @ triangle_instrs @ affine_instrs @ combine_instrs, total)
+
+
 let build_carrier_progression_reduction_delta
     place_carriers
     fresh_temp
@@ -7882,6 +9597,12 @@ let build_reduction_final_update fresh_temp trip_temp place_carriers (reduction 
         build_invariant_reduction_delta place_carriers fresh_temp trip_temp step_expr
     | ReductionAffine { iv; coeff; bias } ->
         build_affine_reduction_delta place_carriers fresh_temp trip_temp iv coeff bias
+    | ReductionQuadratic { iv; quad; triangle; coeff; bias } ->
+        build_quadratic_reduction_delta
+          place_carriers fresh_temp trip_temp iv quad triangle coeff bias
+    | ReductionCubic { iv; choose3; triangle; coeff; bias } ->
+        build_cubic_reduction_delta
+          place_carriers fresh_temp trip_temp iv choose3 triangle coeff bias
     | ReductionCarrierProgression
         { carrier_temp; step_expr; carrier_subtract; include_updated } ->
         build_carrier_progression_reduction_delta
@@ -8457,6 +10178,37 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
       incr next_temp;
       temp
     in
+
+    (* A counted summary may be executed on the original loop's zero-trip
+       edge if:
+         1. its trip count is masked by the original loop condition, and
+         2. evaluating the summary with trip=0 cannot introduce a trap/call.
+
+       Loads/stores are ordinary ToyC scalar memory accesses (no pointers or
+       volatile I/O).  Arithmetic is safe except Div/Mod with a potentially
+       zero divisor; calls are conservatively rejected. *)
+    let zero_trip_safe_instr = function
+      | Tcg.Call _ ->
+          false
+      | Tcg.Bin (_, Div, _, Tcg.Imm divisor)
+      | Tcg.Bin (_, Mod, _, Tcg.Imm divisor) ->
+          divisor <> 0L
+      | Tcg.Bin (_, Div, _, Tcg.Temp _)
+      | Tcg.Bin (_, Mod, _, Tcg.Temp _) ->
+          false
+      | Tcg.Move _
+      | Tcg.Un _
+      | Tcg.Bin _
+      | Tcg.Load _
+      | Tcg.Store _ ->
+          true
+    in
+
+    let zero_trip_safe_body body =
+      List.for_all zero_trip_safe_instr body
+    in
+
+
     let summary_id = ref 0 in
     let fresh_summary_label () =
       let id = !summary_id in
@@ -9207,7 +10959,9 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                               "counted-ambiguous-iv-carrier func=%s header=%s carrier=%d include_updated=%b depends_on_iv=true"
                               f.name header carrier_temp include_updated
                         | ReductionInvariant _
-                        | ReductionAffine _ ->
+                        | ReductionAffine _
+                        | ReductionQuadratic _
+                        | ReductionCubic _ ->
                             ())
                       ambiguous_iv_carrier_reductions;
                   debugf
@@ -9255,13 +11009,13 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                       info.control_iv.step
                       info.kind
                   in
-                  let updates =
+                  let build_updates effective_trip =
                     carrier_preloads
                     @ List.concat_map
-                        (build_reduction_final_update fresh_temp trip_temp place_carriers)
+                        (build_reduction_final_update fresh_temp effective_trip place_carriers)
                         reductions
                     @ List.concat_map
-                        (build_iv_final_update fresh_temp trip_temp)
+                        (build_iv_final_update fresh_temp effective_trip)
                         live_ivs
                     @ build_live_temp_reconstruction_updates
                         fresh_temp
@@ -9272,21 +11026,46 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                         (fun (place, temp) -> Tcg.Store (place, Tcg.Temp temp))
                         place_mirrors
                   in
+                  (* First build a probe body.  If every generated instruction is
+                     safe to evaluate when the original loop executes zero
+                     iterations, we can remove the residual loop guard by
+                     masking [trip] with the original condition. *)
+                  let probe_updates = build_updates trip_temp in
+                  let probe_body = trip_instrs @ probe_updates in
                   let summary_label = fresh_summary_label () in
                   let control_block = get_block info.control_label in
-                  let term =
-                    rewrite_term_successor control_block.term
-                      ~from_label:info.inside_label ~to_label:summary_label
+                  let zero_trip_elided =
+                    zero_trip_safe_body probe_body
+                  in
+                  let body, term =
+                    if zero_trip_elided then
+                      (* [build_trip_count_instrs] is defined from the exact
+                         monotone counted-loop relation and clamps the computed
+                         trip count to zero when the initial condition is false.
+                         Therefore a safe summary already has neutral semantics
+                         on the original zero-trip edge; no extra condition mask
+                         is required. *)
+                      (probe_body, Cfg.Jump summary_label)
+                    else
+                      let term =
+                        rewrite_term_successor control_block.term
+                          ~from_label:info.inside_label ~to_label:summary_label
+                      in
+                      (probe_body, term)
                   in
                   update_block { control_block with term; succs = Cfg.successors term };
                   Hashtbl.add current_blocks summary_label
                     {
                       Cfg.label = summary_label;
-                      body = trip_instrs @ updates;
+                      body;
                       term = Cfg.Jump info.exit_label;
                       preds = [];
                       succs = [ info.exit_label ];
                     };
+                  if zero_trip_elided then
+                    debugf
+                      "counted-zero-trip-elide func=%s header=%s summary=%s masked=false"
+                      f.name header summary_label;
                   debugf "counted-apply func=%s header=%s summary=%s updates=%d" f.name header
                     summary_label (List.length all_updates);
                   new_blocks_rev := summary_label :: !new_blocks_rev;
