@@ -10175,6 +10175,72 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
     | Tcg.Imm value -> Int64.to_string value
     | Tcg.Temp temp -> Printf.sprintf "t%d" temp
   in
+  let string_of_binop = function
+    | Add -> "add"
+    | Sub -> "sub"
+    | Mul -> "mul"
+    | Div -> "div"
+    | Mod -> "mod"
+    | Lt -> "lt"
+    | Le -> "le"
+    | Gt -> "gt"
+    | Ge -> "ge"
+    | Eq -> "eq"
+    | Ne -> "ne"
+    | LAnd -> "land"
+    | LOr -> "lor"
+  in
+  let string_of_unop = function
+    | UMinus -> "uminus"
+    | UNot -> "unot"
+    | UPlus -> "uplus"
+  in
+  let string_of_simple_instr = function
+    | Tcg.Move (dst, src) ->
+        Printf.sprintf "t%d=move(%s)" dst (string_of_operand src)
+    | Tcg.Un (dst, op, src) ->
+        Printf.sprintf "t%d=%s(%s)"
+          dst (string_of_unop op) (string_of_operand src)
+    | Tcg.Bin (dst, op, lhs, rhs) ->
+        Printf.sprintf "t%d=%s(%s,%s)"
+          dst
+          (string_of_binop op)
+          (string_of_operand lhs)
+          (string_of_operand rhs)
+    | Tcg.Load (dst, place) ->
+        Printf.sprintf "t%d=load(%s)" dst (string_of_place place)
+    | Tcg.Store (place, src) ->
+        Printf.sprintf "store(%s,%s)"
+          (string_of_place place) (string_of_operand src)
+    | Tcg.Call (dst, name, args) ->
+        Printf.sprintf "%s=call(%s;%s)"
+          (match dst with
+           | None -> "_"
+           | Some temp -> Printf.sprintf "t%d" temp)
+          name
+          (String.concat "," (List.map string_of_operand args))
+  in
+  let string_of_term = function
+    | Cfg.Jump label ->
+        Printf.sprintf "jump(%s)" label
+    | Cfg.BranchZero (operand, zero_label, nonzero_label) ->
+        Printf.sprintf "branch_zero(%s,%s,%s)"
+          (string_of_operand operand) zero_label nonzero_label
+    | Cfg.BranchNonZero (operand, nonzero_label, zero_label) ->
+        Printf.sprintf "branch_nonzero(%s,%s,%s)"
+          (string_of_operand operand) nonzero_label zero_label
+    | Cfg.BranchCompare (op, lhs, rhs, yes_label, no_label) ->
+        Printf.sprintf "branch_cmp(%s,%s,%s,%s,%s)"
+          (string_of_binop op)
+          (string_of_operand lhs)
+          (string_of_operand rhs)
+          yes_label no_label
+    | Cfg.Return value ->
+        Printf.sprintf "return(%s)"
+          (match value with
+           | None -> ""
+           | Some operand -> string_of_operand operand)
+  in
   let _, loops, headers = discover_natural_loops f in
   if headers = [] then f
   else
@@ -10183,6 +10249,36 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
     let get_block = get_block_exn current_blocks in
     let update_block (block : Cfg.block) =
       Hashtbl.replace current_blocks block.label block
+    in
+    let dump_nonlinear_shape header loop (info : counted_loop_info) =
+      if debug_counted then begin
+        debugf
+          "counted-shape-dump func=%s header=%s control=%s inside=%s exit=%s iv=t%d step=%Ld loop=[%s]"
+          f.name
+          header
+          info.control_label
+          info.inside_label
+          info.exit_label
+          info.control_iv.phi_temp
+          info.control_iv.step
+          (String.concat "," (LabelSet.elements loop));
+        LabelSet.elements loop
+        |> List.iter (fun label ->
+               let block : Cfg.block = get_block label in
+               debugf
+                 "counted-shape-block label=%s preds=[%s] succs=[%s] body=%d term=%s"
+                 label
+                 (String.concat "," block.preds)
+                 (String.concat "," block.succs)
+                 (List.length block.body)
+                 (string_of_term block.term);
+               List.iteri
+                 (fun index instr ->
+                   debugf
+                     "counted-shape-instr block=%s index=%d %s"
+                     label index (string_of_simple_instr instr))
+                 block.body)
+      end
     in
     let original_block_labels =
       List.map (fun (block : Cfg.block) -> block.label) f.blocks
@@ -10301,9 +10397,17 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
         (lhs = a && rhs = b) || (lhs = b && rhs = a)
       in
 
+      let other_add_operand base lhs rhs =
+        if lhs = base then Some rhs
+        else if rhs = base then Some lhs
+        else None
+      in
+
       let match_arm label =
         let block : Cfg.block = get_block label in
         match (block.body, block.term) with
+        (* Existing simple arm:
+             acc = acc + iv + bias *)
         | ( [ Tcg.Load (loaded, (Tcg.Local _ as place));
               Tcg.Bin (mid, Add, lhs1, rhs1);
               Tcg.Bin (out_temp, Add, lhs2, rhs2);
@@ -10325,8 +10429,73 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
               | _ -> None
             in
             Option.map
-              (fun bias -> (place, bias, join_label))
+              (fun bias ->
+                (place, Tcg.Imm 0L, bias, join_label))
               bias)
+
+        (* Same-accumulator nested piecewise arm:
+             acc = acc + invariant + iv + bias
+
+           The two additions before the bias may appear as either
+             (acc + invariant) + iv
+           or
+             (acc + iv) + invariant.
+           The invariant operand must be available before the inner loop. *)
+        | ( [ Tcg.Load (loaded, (Tcg.Local _ as place));
+              Tcg.Bin (mid1, Add, lhs1, rhs1);
+              Tcg.Bin (mid2, Add, lhs2, rhs2);
+              Tcg.Bin (out_temp, Add, lhs3, rhs3);
+              Tcg.Store (stored_place, Tcg.Temp stored_temp) ],
+            Cfg.Jump join_label )
+          when stored_place = place
+               && stored_temp = out_temp
+               && loaded <> control_iv.phi_temp
+               && mid1 <> control_iv.phi_temp
+               && mid2 <> control_iv.phi_temp
+               && out_temp <> control_iv.phi_temp -> (
+            match
+              ( other_add_operand (Tcg.Temp loaded) lhs1 rhs1,
+                other_add_operand (Tcg.Temp mid1) lhs2 rhs2 )
+            with
+            | Some first_extra, Some second_extra ->
+                let invariant =
+                  if first_extra = Tcg.Temp control_iv.phi_temp then
+                    Some second_extra
+                  else if second_extra = Tcg.Temp control_iv.phi_temp then
+                    Some first_extra
+                  else
+                    None
+                in
+                let bias =
+                  match (lhs3, rhs3) with
+                  | Tcg.Temp temp, Tcg.Imm bias when temp = mid2 ->
+                      Some bias
+                  | Tcg.Imm bias, Tcg.Temp temp when temp = mid2 ->
+                      Some bias
+                  | _ ->
+                      None
+                in
+                (match (invariant, bias) with
+                 | Some invariant, Some bias -> (
+                     match
+                       resolve_operand_before_loop
+                         loop_defs multi_defs def_instrs invariant
+                     with
+                     | Some invariant
+                       when invariant <> Tcg.Temp control_iv.phi_temp ->
+                         Some
+                           (place, invariant, bias, join_label)
+                     | Some _
+                     | None ->
+                         None)
+                 | Some _, None
+                 | None, Some _
+                 | None, None ->
+                     None)
+            | Some _, None
+            | None, Some _
+            | None, None ->
+                None)
         | _ -> None
       in
 
@@ -10491,12 +10660,184 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                && LabelSet.mem then_label loop
                && LabelSet.mem else_label loop -> (
             match (match_arm then_label, match_arm else_label) with
-            | ( Some (then_place, then_bias, then_join),
-                Some (else_place, else_bias, else_join) )
+            | ( Some (then_place, then_invariant, then_bias, then_join),
+                Some (else_place, else_invariant, else_bias, else_join) )
               when then_join = else_join
                    && LabelSet.mem then_join loop
                    && exact_join_update then_join
                    && List.mem then_join control_iv.backedge_preds ->
+                (* Fast exact summary for the nested piecewise form
+
+                     if (j < K)
+                       s = s + A + j + Bt;
+                     else
+                       s = s + B + j + Be;
+
+                   where both arms update the SAME scalar place, A/B are
+                   invariant across the inner loop, j has step +1, and the
+                   inner initial value and bound are statically known.
+
+                   With:
+                     N = total iterations
+                     P = iterations taking the then arm
+                     R = N - P
+
+                   the whole loop contributes
+
+                     sum(j)
+                       + P * (A + Bt)
+                       + R * (B + Be)
+
+                   to s.  This is deliberately narrower than the generic
+                   piecewise transform: no arbitrary branch effects and no
+                   dynamic-bound algebra are admitted here. *)
+                let same_place_static_summary () =
+                  if then_place <> else_place then
+                    None
+                  else
+                    match (known_control_init (), info.kind) with
+                    | Some init_value, CountUpLt (bound_operand, 0L) -> (
+                        match
+                          operand_static_int64
+                            loop_defs multi_defs def_instrs bound_operand
+                        with
+                        | Some bound_value when init_value < bound_value ->
+                            let total_count =
+                              Int64.sub bound_value init_value
+                            in
+                            let raw_prefix =
+                              Int64.sub threshold init_value
+                            in
+                            let prefix_count =
+                              if raw_prefix <= 0L then 0L
+                              else if raw_prefix >= total_count then
+                                total_count
+                              else
+                                raw_prefix
+                            in
+                            let else_count =
+                              Int64.sub total_count prefix_count
+                            in
+
+                            (* All constant arithmetic is reduced to ToyC i32
+                               semantics as it is combined.  Int64.mul itself
+                               may wrap, but taking i32 afterwards preserves the
+                               low 32 bits required by source arithmetic. *)
+                            let mul_i32 a b =
+                              i32 (Int64.mul a b)
+                            in
+                            let add_i32 a b =
+                              i32 (Int64.add a b)
+                            in
+                            let triangle_count =
+                              Int64.div
+                                (Int64.mul
+                                   total_count
+                                   (Int64.sub total_count 1L))
+                                2L
+                            in
+                            let j_sum =
+                              add_i32
+                                (mul_i32 total_count init_value)
+                                (i32 triangle_count)
+                            in
+                            let branch_bias =
+                              add_i32
+                                (mul_i32 prefix_count then_bias)
+                                (mul_i32 else_count else_bias)
+                            in
+                            let constant_delta =
+                              add_i32 j_sum branch_bias
+                            in
+
+                            let scale_by_count count operand =
+                              let count_i32 = i32 count in
+                              if count_i32 = 0L then
+                                ([], Tcg.Imm 0L)
+                              else if count_i32 = 1L then
+                                ([], operand)
+                              else
+                                let dst = fresh_temp () in
+                                ( [ simplify_simple_instr
+                                      (Tcg.Bin
+                                         ( dst,
+                                           Mul,
+                                           operand,
+                                           Tcg.Imm count_i32 )) ],
+                                  Tcg.Temp dst )
+                            in
+                            let add_operands lhs rhs =
+                              match (lhs, rhs) with
+                              | Tcg.Imm 0L, operand
+                              | operand, Tcg.Imm 0L ->
+                                  ([], operand)
+                              | Tcg.Imm lhs, Tcg.Imm rhs ->
+                                  ([], Tcg.Imm (i32 (Int64.add lhs rhs)))
+                              | _ ->
+                                  let dst = fresh_temp () in
+                                  ( [ simplify_simple_instr
+                                        (Tcg.Bin
+                                           (dst, Add, lhs, rhs)) ],
+                                    Tcg.Temp dst )
+                            in
+
+                            let then_scale_instrs, then_scaled =
+                              scale_by_count
+                                prefix_count then_invariant
+                            in
+                            let else_scale_instrs, else_scaled =
+                              scale_by_count
+                                else_count else_invariant
+                            in
+                            let combine_branch_instrs, branch_scaled =
+                              add_operands then_scaled else_scaled
+                            in
+                            let combine_const_instrs, delta =
+                              add_operands
+                                branch_scaled
+                                (Tcg.Imm constant_delta)
+                            in
+
+                            let carrier = fresh_temp () in
+                            let updated = fresh_temp () in
+                            let updates =
+                              then_scale_instrs
+                              @ else_scale_instrs
+                              @ combine_branch_instrs
+                              @ combine_const_instrs
+                              @ [ simplify_simple_instr
+                                    (Tcg.Load (carrier, then_place));
+                                  simplify_simple_instr
+                                    (Tcg.Bin
+                                       ( updated,
+                                         Add,
+                                         Tcg.Temp carrier,
+                                         delta ));
+                                  Tcg.Store
+                                    (then_place, Tcg.Temp updated);
+                                  (* For strict step-one [j < bound], the
+                                     value observed after loop exit is exactly
+                                     [bound]. *)
+                                  simplify_simple_instr
+                                    (Tcg.Move
+                                       ( control_iv.phi_temp,
+                                         Tcg.Imm (i32 bound_value) )) ]
+                            in
+                            Some updates
+                        | Some _
+                        | None ->
+                            None)
+                    | Some _, CountUpLt (_, _)
+                    | Some _, CountUpLe _
+                    | Some _, CountDownGt _
+                    | Some _, CountDownGe _
+                    | None, CountUpLt _
+                    | None, CountUpLe _
+                    | None, CountDownGt _
+                    | None, CountDownGe _ ->
+                        None
+                in
+
                 let generic_summary () =
                   let total_trip_instrs, total_trip =
                     build_trip_count_instrs
@@ -10733,21 +11074,48 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                   (total_trip_instrs, prefix_instrs, updates, true)
                 in
 
-                let total_trip_instrs, prefix_instrs, updates, fast_piecewise =
-                  match (known_control_init (), info.kind) with
-                  | Some init_value, CountUpLt (bound, 0L)
-                    when then_place <> else_place
-                         && init_value >= 0L
-                         && threshold >= init_value ->
-                      let prefix_cap = Int64.sub threshold init_value in
-                      if prefix_cap <= 46_340L then
-                        fast_summary init_value prefix_cap bound
-                      else
-                        generic_summary ()
-                  | _ ->
-                      generic_summary ()
+                let selected_summary =
+                  match same_place_static_summary () with
+                  | Some updates ->
+                      Some ([], [], updates, true, "same-place-static")
+                  | None
+                    when then_invariant = Tcg.Imm 0L
+                         && else_invariant = Tcg.Imm 0L ->
+                      let total_trip_instrs, prefix_instrs, updates, fast_piecewise =
+                        match (known_control_init (), info.kind) with
+                        | Some init_value, CountUpLt (bound, 0L)
+                          when then_place <> else_place
+                               && init_value >= 0L
+                               && threshold >= init_value ->
+                            let prefix_cap =
+                              Int64.sub threshold init_value
+                            in
+                            if prefix_cap <= 46_340L then
+                              fast_summary init_value prefix_cap bound
+                            else
+                              generic_summary ()
+                        | _ ->
+                            generic_summary ()
+                      in
+                      Some
+                        ( total_trip_instrs,
+                          prefix_instrs,
+                          updates,
+                          fast_piecewise,
+                          "legacy" )
+                  | None ->
+                      None
                 in
 
+                (match selected_summary with
+                 | None ->
+                     false
+                 | Some
+                     ( total_trip_instrs,
+                       prefix_instrs,
+                       updates,
+                       fast_piecewise,
+                       piecewise_mode ) ->
                 let summary_label = fresh_summary_label () in
                 let rewritten_term =
                   rewrite_term_successor
@@ -10775,7 +11143,7 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                     succs = [ info.exit_label ];
                   };
                 debugf
-                  "counted-piecewise-apply func=%s header=%s summary=%s threshold=%Ld then=%s:%Ld else=%s:%Ld fast=%b"
+                  "counted-piecewise-apply func=%s header=%s summary=%s threshold=%Ld then=%s:%Ld else=%s:%Ld fast=%b mode=%s then_inv=%s else_inv=%s"
                   f.name
                   header
                   summary_label
@@ -10784,10 +11152,13 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                   then_bias
                   (string_of_place else_place)
                   else_bias
-                  fast_piecewise;
+                  fast_piecewise
+                  piecewise_mode
+                  (string_of_operand then_invariant)
+                  (string_of_operand else_invariant);
                 new_blocks_rev := summary_label :: !new_blocks_rev;
                 changed := true;
-                true
+                true)
             | _ -> false)
         | _ -> false
     in
@@ -10824,10 +11195,12 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                        loop_defs
                        multi_defs
                        def_instrs)
-                then
+                then begin
                   debugf
                     "counted-skip func=%s header=%s reason=nonlinear_path"
-                    f.name header
+                    f.name header;
+                  dump_nonlinear_shape header loop info
+                end
             | true ->
                 let live_in_t, live_in_p =
                   compute_liveness summaries globals { f with blocks = blocks_snapshot }
