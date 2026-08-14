@@ -11775,7 +11775,7 @@ let full_unroll_counted_loops_func summaries globals (f : Cfg.func) =
    loop BODY CFG for every iteration while deliberately omitting the redundant
    condition header.  Calls, stores, and internal branches are preserved.
    Original backedges enter the next cloned body directly; the last one exits. *)
-let full_unroll_effectful_counted_loops_func _summaries _globals (f : Cfg.func) =
+let full_unroll_effectful_counted_loops_func summaries globals (f : Cfg.func) =
   let max_trip = 6L in
   let max_loop_blocks = 10 in
   let max_loop_instrs = 72 in
@@ -11806,6 +11806,15 @@ let full_unroll_effectful_counted_loops_func _summaries _globals (f : Cfg.func) 
           !block_order
     in
     let next_id = ref 0 in
+    let next_temp = ref f.temp_count in
+    let fresh_temp () =
+      let temp = !next_temp in
+      incr next_temp;
+      temp
+    in
+    let original_live_in_t, _ =
+      compute_liveness summaries globals f
+    in
     let fresh_label iter index =
       let id = !next_id in
       Printf.sprintf
@@ -11825,7 +11834,7 @@ let full_unroll_effectful_counted_loops_func _summaries _globals (f : Cfg.func) 
             (loop_defs, _, def_instrs, multi_defs, _, _, control)
           =
             analyze_counted_loop
-              header loop get_block f.temp_count blocks_snapshot
+              header loop get_block !next_temp blocks_snapshot
           in
           match control with
           | None ->
@@ -11967,6 +11976,57 @@ let full_unroll_effectful_counted_loops_func _summaries _globals (f : Cfg.func) 
                         body_labels
                     in
 
+                    (* A full-unroll clone must not make one textual scratch
+                       temp look live across every cloned call.
+
+                       Rename only temps that are provably local to ONE loop
+                       iteration:
+                       - defined in the cloned body;
+                       - not multiply defined in the original loop;
+                       - not live on entry to the loop body (so not carried
+                         from the previous iteration);
+                       - not live at the loop exit;
+                       - not the control IV itself.
+
+                       This deliberately leaves accumulator/carrier/phi-like
+                       temps untouched while separating short-lived values
+                       such as load/add/call-argument preparation. *)
+                    let body_defined_temps =
+                      List.fold_left
+                        (fun defs (_, (block : Cfg.block)) ->
+                          List.fold_left
+                            (fun defs instr ->
+                              match defs_temp instr with
+                              | Some temp -> IntSet.add temp defs
+                              | None -> defs)
+                            defs block.body)
+                        IntSet.empty originals
+                    in
+                    let body_live_in =
+                      table_find_or_empty
+                        original_live_in_t
+                        info.inside_label
+                        IntSet.empty
+                    in
+                    let exit_live_in =
+                      table_find_or_empty
+                        original_live_in_t
+                        info.exit_label
+                        IntSet.empty
+                    in
+                    let iteration_local_temps =
+                      let temps =
+                        IntSet.diff body_defined_temps multi_defs
+                      in
+                      let temps =
+                        IntSet.diff temps body_live_in
+                      in
+                      let temps =
+                        IntSet.diff temps exit_live_in
+                      in
+                      IntSet.remove info.control_iv.phi_temp temps
+                    in
+
                     if
                       originals = []
                       || not
@@ -11990,6 +12050,38 @@ let full_unroll_effectful_counted_loops_func _summaries _globals (f : Cfg.func) 
                                originals))
                       in
                       incr next_id;
+
+                      let temp_maps =
+                        Array.init trip_int (fun _iter ->
+                          let map =
+                            Hashtbl.create
+                              (max 1
+                                 (IntSet.cardinal
+                                    iteration_local_temps))
+                          in
+                          IntSet.iter
+                            (fun old_temp ->
+                              Hashtbl.add
+                                map old_temp (fresh_temp ()))
+                            iteration_local_temps;
+                          map)
+                      in
+                      let rename_temp_for_iter iter temp =
+                        Option.value
+                          ~default:temp
+                          (Hashtbl.find_opt
+                             temp_maps.(iter) temp)
+                      in
+
+                      if debug then
+                        Printf.eprintf
+                          "effect-full-unroll-renaming func=%s header=%s local_temps=%d fresh_temps=%d temp_count=%d->%d\n%!"
+                          f.name header
+                          (IntSet.cardinal iteration_local_temps)
+                          (trip_int
+                           * IntSet.cardinal
+                               iteration_local_temps)
+                          f.temp_count !next_temp;
 
                       let rename_with map label =
                         Array.fold_left
@@ -12021,10 +12113,19 @@ let full_unroll_effectful_counted_loops_func _summaries _globals (f : Cfg.func) 
                                  Since the header itself is not in [map], an
                                  original backedge to [header] is still spelled
                                  [header] after this rewrite. *)
+                              let rename_temp =
+                                rename_temp_for_iter iter
+                              in
+                              let body =
+                                List.map
+                                  (rewrite_instr_temps rename_temp)
+                                  old_block.body
+                              in
                               let term =
-                                rewrite_term_labels
-                                  (rename_with map)
-                                  old_block.term
+                                old_block.term
+                                |> rewrite_term_temps rename_temp
+                                |> rewrite_term_labels
+                                     (rename_with map)
                               in
 
                               (* A proven backedge no longer re-tests the while
@@ -12052,7 +12153,7 @@ let full_unroll_effectful_counted_loops_func _summaries _globals (f : Cfg.func) 
                                 {
                                   old_block with
                                   label = new_label;
-                                  body = old_block.body;
+                                  body;
                                   term;
                                   succs = Cfg.successors term;
                                 }
@@ -12122,7 +12223,12 @@ let full_unroll_effectful_counted_loops_func _summaries _globals (f : Cfg.func) 
     if !changed then
       let blocks = List.map get_block !block_order in
       Cfg.rebuild_edges
-        { f with entry = !current_entry; blocks }
+        {
+          f with
+          entry = !current_entry;
+          temp_count = !next_temp;
+          blocks;
+        }
     else f
 
 let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
@@ -15724,6 +15830,339 @@ let constant_eval_func
     in
     run f.entry
 
+
+(* -------------------------------------------------------------------------- *)
+(* Bounded whole-program evaluation of closed ToyC programs                   *)
+(*                                                                            *)
+(* The existing [constant_eval_func] deliberately rejects global accesses and *)
+(* nested calls, which is appropriate for memoized call folding but leaves a  *)
+(* large class of completely closed programs untouched:                       *)
+(*                                                                            *)
+(*   globals have constant initial values;                                    *)
+(*   main has no runtime input;                                                *)
+(*   helper calls and loops are fully determined by source state.              *)
+(*                                                                            *)
+(* Evaluate such a [main] with one shared concrete global store.  This is NOT  *)
+(* an unbounded interpreter: every block/instruction/call consumes from one    *)
+(* global budget, recursive depth is capped, and any unsupported/failed        *)
+(* operation returns [None] and leaves the emitted CFG unchanged.              *)
+(*                                                                            *)
+(* A successful evaluation may replace [main] by a single constant return.     *)
+(* Final global contents are unobservable after main returns in ToyC's closed  *)
+(* execution model, so only the return value needs to be emitted.              *)
+(* -------------------------------------------------------------------------- *)
+
+let whole_eval_max_depth = 64
+
+let whole_eval_main
+    global_init
+    (funcs : Cfg.func list) =
+  let func_by_label =
+    Hashtbl.create (max 8 (List.length funcs))
+  in
+  List.iter
+    (fun (f : Cfg.func) ->
+      Hashtbl.replace func_by_label f.label f)
+    funcs;
+
+  let global_state : (string, int64) Hashtbl.t =
+    Hashtbl.create 16
+  in
+  PlaceMap.iter
+    (fun place value ->
+      match (place, value) with
+      | Tcg.Global label, CpConst value ->
+          Hashtbl.replace global_state label (i32 value)
+      | Tcg.Global _, CpUndef
+      | Tcg.Global _, CpNac
+      | Tcg.Local _, CpConst _
+      | Tcg.Local _, CpUndef
+      | Tcg.Local _, CpNac ->
+          ())
+    global_init;
+
+  let budget = ref constant_eval_call_budget in
+  let consume () =
+    decr budget;
+    !budget >= 0
+  in
+
+  let rec eval_func depth (f : Cfg.func) args =
+    if depth > whole_eval_max_depth
+       || List.length args <> List.length f.params
+    then
+      None
+    else
+      let blocks =
+        Hashtbl.create (max 8 (List.length f.blocks))
+      in
+      List.iter
+        (fun (block : Cfg.block) ->
+          Hashtbl.replace blocks block.label block)
+        f.blocks;
+
+      let temps : (int, int64) Hashtbl.t =
+        Hashtbl.create (max 16 f.temp_count)
+      in
+      let locals : (int, int64) Hashtbl.t =
+        Hashtbl.create
+          (max 8 (List.length f.locals + List.length f.params))
+      in
+      List.iter2
+        (fun (param : Tcg.var) value ->
+          Hashtbl.replace locals param.id (i32 value))
+        f.params args;
+
+      let eval_operand = function
+        | Tcg.Imm value ->
+            Some (i32 value)
+        | Tcg.Temp temp ->
+            Hashtbl.find_opt temps temp
+      in
+      let set_temp temp value =
+        Hashtbl.replace temps temp (i32 value)
+      in
+      let rec eval_operands acc = function
+        | [] ->
+            Some (List.rev acc)
+        | operand :: rest -> (
+            match eval_operand operand with
+            | Some value ->
+                eval_operands (i32 value :: acc) rest
+            | None ->
+                None)
+      in
+
+      let exec_instr = function
+        | Tcg.Move (dst, src) -> (
+            match eval_operand src with
+            | Some value ->
+                set_temp dst value;
+                true
+            | None ->
+                false)
+        | Tcg.Un (dst, op, src) -> (
+            match eval_operand src with
+            | Some value -> (
+                match fold_unop op value with
+                | Some result ->
+                    set_temp dst result;
+                    true
+                | None ->
+                    false)
+            | None ->
+                false)
+        | Tcg.Bin (dst, op, lhs, rhs) -> (
+            match (eval_operand lhs, eval_operand rhs) with
+            | Some lhs, Some rhs -> (
+                match fold_binop op lhs rhs with
+                | Some result ->
+                    set_temp dst result;
+                    true
+                | None ->
+                    false)
+            | Some _, None
+            | None, Some _
+            | None, None ->
+                false)
+        | Tcg.Load (dst, Tcg.Local id) -> (
+            match Hashtbl.find_opt locals id with
+            | Some value ->
+                set_temp dst value;
+                true
+            | None ->
+                false)
+        | Tcg.Load (dst, Tcg.Global label) -> (
+            match Hashtbl.find_opt global_state label with
+            | Some value ->
+                set_temp dst value;
+                true
+            | None ->
+                false)
+        | Tcg.Store (Tcg.Local id, src) -> (
+            match eval_operand src with
+            | Some value ->
+                Hashtbl.replace locals id (i32 value);
+                true
+            | None ->
+                false)
+        | Tcg.Store (Tcg.Global label, src) -> (
+            match eval_operand src with
+            | Some value ->
+                Hashtbl.replace
+                  global_state label (i32 value);
+                true
+            | None ->
+                false)
+        | Tcg.Call (dst, callee, call_args) -> (
+            match
+              ( Hashtbl.find_opt func_by_label callee,
+                eval_operands [] call_args )
+            with
+            | Some callee_func, Some call_args -> (
+                match
+                  eval_func
+                    (depth + 1)
+                    callee_func call_args
+                with
+                | Some return_value -> (
+                    match (dst, return_value) with
+                    | None, _ ->
+                        true
+                    | Some dst, Some value ->
+                        set_temp dst value;
+                        true
+                    | Some _, None ->
+                        false)
+                | None ->
+                    false)
+            | Some _, None
+            | None, Some _
+            | None, None ->
+                false)
+      in
+
+      let rec exec_body = function
+        | [] ->
+            true
+        | instr :: rest ->
+            if consume () && exec_instr instr then
+              exec_body rest
+            else
+              false
+      in
+
+      let rec run label =
+        if not (consume ()) then
+          None
+        else
+          match Hashtbl.find_opt blocks label with
+          | None ->
+              None
+          | Some (block : Cfg.block) ->
+              if not (exec_body block.body) then
+                None
+              else
+                match block.term with
+                | Cfg.Jump next ->
+                    run next
+                | Cfg.BranchZero
+                    (cond, if_zero, if_nonzero) -> (
+                    match eval_operand cond with
+                    | Some value ->
+                        run
+                          (if i32 value = 0L
+                           then if_zero
+                           else if_nonzero)
+                    | None ->
+                        None)
+                | Cfg.BranchNonZero
+                    (cond, if_nonzero, if_zero) -> (
+                    match eval_operand cond with
+                    | Some value ->
+                        run
+                          (if i32 value <> 0L
+                           then if_nonzero
+                           else if_zero)
+                    | None ->
+                        None)
+                | Cfg.BranchCompare
+                    ( op,
+                      lhs,
+                      rhs,
+                      if_true,
+                      if_false ) -> (
+                    match
+                      (eval_operand lhs, eval_operand rhs)
+                    with
+                    | Some lhs, Some rhs -> (
+                        match fold_binop op lhs rhs with
+                        | Some result ->
+                            run
+                              (if truth result
+                               then if_true
+                               else if_false)
+                        | None ->
+                            None)
+                    | Some _, None
+                    | None, Some _
+                    | None, None ->
+                        None)
+                | Cfg.Return (Some value) -> (
+                    match eval_operand value with
+                    | Some value ->
+                        Some (Some (i32 value))
+                    | None ->
+                        None)
+                | Cfg.Return None ->
+                    Some None
+      in
+      run f.entry
+  in
+
+  match
+    List.find_opt
+      (fun (f : Cfg.func) -> f.name = "main")
+      funcs
+  with
+  | Some main when main.params = [] ->
+      eval_func 0 main []
+  | Some _
+  | None ->
+      None
+
+let fold_whole_main_program
+    global_init
+    (funcs : Cfg.func list) =
+  let debug =
+    Sys.getenv_opt "TOYC_DEBUG_WHOLE_EVAL" <> None
+  in
+  match whole_eval_main global_init funcs with
+  | Some (Some value) ->
+      let changed = ref false in
+      let funcs =
+        List.map
+          (fun (f : Cfg.func) ->
+            if f.name <> "main" then
+              f
+            else begin
+              changed := true;
+              let block : Cfg.block =
+                {
+                  label = f.entry;
+                  body = [];
+                  term =
+                    Cfg.Return
+                      (Some (Tcg.Imm (i32 value)));
+                  preds = [];
+                  succs = [];
+                }
+              in
+              {
+                f with
+                temp_count = 0;
+                blocks = [ block ];
+              }
+            end)
+          funcs
+      in
+      if debug && !changed then
+        Printf.eprintf
+          "whole-eval-main-fold value=%Ld budget=%d\n%!"
+          (i32 value)
+          constant_eval_call_budget;
+      funcs
+  | Some None ->
+      if debug then
+        Printf.eprintf
+          "whole-eval-main-skip reason=void-main\n%!";
+      funcs
+  | None ->
+      if debug then
+        Printf.eprintf
+          "whole-eval-main-skip reason=unsupported-or-budget\n%!";
+      funcs
+
 let fold_constant_calls_program
     global_init summaries globals return_global_demands removable_calls
     (funcs : Cfg.func list) =
@@ -15888,5 +16327,9 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
     fold_trivial_calls_program
       global_init summaries globals return_global_demands removable_calls
       optimized_funcs
+  in
+  let optimized_funcs =
+    fold_whole_main_program
+      global_init optimized_funcs
   in
   { Cfg.funcs = optimized_funcs }
