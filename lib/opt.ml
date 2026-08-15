@@ -1363,7 +1363,10 @@ let mem2reg_func (f : Cfg.func) =
                       match all_same_operand values with
                       | Some value -> Some value
                       | None -> Some (Tcg.Temp (get_phi_temp block.label local_id)))
-                  | None -> None
+                  | None -> (
+                      match List.find_map Fun.id incoming with
+                      | Some _ -> Some (Tcg.Temp (get_phi_temp block.label local_id))
+                      | None -> None)
               in
               match keep_value with
               | Some value -> IntMap.add local_id value env
@@ -1444,11 +1447,20 @@ let mem2reg_func (f : Cfg.func) =
         let promoted_blocks = List.map rewrite_block f.blocks in
         let redirects = Hashtbl.create 16 in
         let edge_blocks_rev = ref [] in
+        let used_labels = Hashtbl.create (List.length f.blocks + 16) in
+        List.iter
+          (fun (block : Cfg.block) -> Hashtbl.add used_labels block.label ())
+          f.blocks;
         let edge_id = ref 0 in
-        let fresh_edge_label () =
+        let rec fresh_edge_label () =
           let id = !edge_id in
           incr edge_id;
-          Printf.sprintf ".L%s_mem2reg_edge_%d" f.label id
+          let label = Printf.sprintf ".L%s_mem2reg_edge_%d" f.label id in
+          if Hashtbl.mem used_labels label then fresh_edge_label ()
+          else begin
+            Hashtbl.add used_labels label ();
+            label
+          end
         in
         let build_parallel_copies copies =
           let snapshots = Hashtbl.create (List.length copies) in
@@ -2909,10 +2921,11 @@ let eliminate_counted_loops_func (f : Cfg.func) =
       temp
     in
     let summary_id = ref 0 in
-    let fresh_summary_label () =
+    let rec fresh_summary_label () =
       let id = !summary_id in
       incr summary_id;
-      Printf.sprintf ".L%s_counted_loop_%d" f.label id
+      let label = Printf.sprintf ".L%s_counted_loop_%d" f.label id in
+      if Hashtbl.mem current_blocks label then fresh_summary_label () else label
     in
     let new_blocks_rev = ref [] in
     let changed = ref false in
@@ -3333,13 +3346,6 @@ let licm_func (f : Cfg.func) =
         let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
         Hashtbl.replace loops header merged)
       backedges;
-    let loop_is_nested target =
-      Hashtbl.fold
-        (fun _ other nested ->
-          nested
-          || (LabelSet.subset target other && not (LabelSet.equal target other)))
-        loops false
-    in
     let headers =
       Hashtbl.fold (fun header loop acc -> (header, LabelSet.cardinal loop) :: acc) loops []
       |> List.sort (fun (_, a) (_, b) -> compare a b)
@@ -3359,10 +3365,11 @@ let licm_func (f : Cfg.func) =
     let current_block_list () = Hashtbl.fold (fun _ block acc -> block :: acc) current_blocks [] in
     let new_blocks_rev = ref [] in
     let preheader_id = ref 0 in
-    let fresh_preheader_label () =
+    let rec fresh_preheader_label () =
       let id = !preheader_id in
       incr preheader_id;
-      Printf.sprintf ".L%s_licm_preheader_%d" f.label id
+      let label = Printf.sprintf ".L%s_licm_preheader_%d" f.label id in
+      if Hashtbl.mem current_blocks label then fresh_preheader_label () else label
     in
     List.iter
       (fun header ->
@@ -3371,7 +3378,7 @@ let licm_func (f : Cfg.func) =
         let outside_preds =
           List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds
         in
-        if outside_preds <> [] && not (loop_is_nested loop) then begin
+        if outside_preds <> [] then begin
           let blocks_snapshot = current_block_list () in
           let def_blocks = temp_def_blocks_of_blocks f.temp_count blocks_snapshot in
           let def_instrs = temp_def_instrs_of_blocks f.temp_count blocks_snapshot in
