@@ -17829,6 +17829,243 @@ let inline_small_hot_calls_program
 
 
 
+
+(* -------------------------------------------------------------------------- *)
+(* Late small acyclic pure-CFG call expansion                                 *)
+(*                                                                            *)
+(* Step131 handles helpers that have collapsed to one straight-line block.     *)
+(* A second common case remains: after optimization a helper is still a tiny   *)
+(* branch diamond / short acyclic CFG.  The early AST inliner is already past, *)
+(* and the existing CFG inliner requires the call site to be inside a natural  *)
+(* loop.  Inline these small pure scalar CFGs at ordinary call sites too, then  *)
+(* feed the caller back through [optimize_func].                                *)
+(*                                                                            *)
+(* Keep the candidate deliberately conservative:                               *)
+(*   - TInt leaf helper, 2..6 reachable blocks, <= 32 instructions;            *)
+(*   - acyclic CFG; every return carries a value;                               *)
+(*   - Move/Un/non-trapping Bin, parameter loads, and global loads only;        *)
+(*   - no Store, nested Call, Div, or Mod;                                      *)
+(*   - at most four sites per caller per wave.                                  *)
+(*                                                                            *)
+(* We reuse [inline_one_small_hot_call], whose cloning logic already preserves *)
+(* call-by-value parameter operands and joins every callee return at a fresh    *)
+(* continuation block.                                                         *)
+(* -------------------------------------------------------------------------- *)
+
+let late_branch_inline_max_blocks = 6
+let late_branch_inline_max_instrs = 32
+let late_branch_inline_max_temps = 64
+let late_branch_inline_max_sites_per_func = 4
+
+let late_branch_inline_candidate (f : Cfg.func) : Cfg.func option =
+  if f.ret <> TInt then None
+  else
+    let view =
+      f
+      |> thread_and_prune_func
+      |> simplify_cfg_func
+      |> final_linear_merge_func
+      |> thread_and_prune_func
+    in
+    if not (cfg_targets_valid view) then None
+    else
+      let reachable = reachable_labels view.entry view.blocks in
+      let blocks =
+        List.filter
+          (fun (block : Cfg.block) -> LabelSet.mem block.label reachable)
+          view.blocks
+      in
+      let block_count = List.length blocks in
+      let instr_count =
+        List.fold_left
+          (fun acc (block : Cfg.block) -> acc + List.length block.body)
+          0 blocks
+      in
+      let param_ids =
+        List.fold_left
+          (fun acc (param : Tcg.var) -> IntSet.add param.id acc)
+          IntSet.empty view.params
+      in
+      let instr_safe = function
+        | Tcg.Move _ | Tcg.Un _ -> true
+        | Tcg.Bin (_, (Div | Mod), _, _) -> false
+        | Tcg.Bin _ -> true
+        | Tcg.Load (_, Tcg.Local id) -> IntSet.mem id param_ids
+        | Tcg.Load (_, Tcg.Global _) -> true
+        | Tcg.Store _ | Tcg.Call _ -> false
+      in
+      let term_safe = function
+        | Cfg.Return (Some _) -> true
+        | Cfg.Jump _
+        | Cfg.BranchZero _
+        | Cfg.BranchNonZero _
+        | Cfg.BranchCompare _ ->
+            true
+        | Cfg.Return None -> false
+      in
+      let all_returns_have_values =
+        List.for_all
+          (fun (block : Cfg.block) ->
+            match block.term with
+            | Cfg.Return None -> false
+            | Cfg.Return (Some _)
+            | Cfg.Jump _
+            | Cfg.BranchZero _
+            | Cfg.BranchNonZero _
+            | Cfg.BranchCompare _ ->
+                true)
+          blocks
+      in
+      let has_value_return =
+        List.exists
+          (fun (block : Cfg.block) ->
+            match block.term with
+            | Cfg.Return (Some _) -> true
+            | Cfg.Return None
+            | Cfg.Jump _
+            | Cfg.BranchZero _
+            | Cfg.BranchNonZero _
+            | Cfg.BranchCompare _ ->
+                false)
+          blocks
+      in
+      let ignored = Hashtbl.create 1 in
+      if
+        block_count >= 2
+        && block_count <= late_branch_inline_max_blocks
+        && instr_count <= late_branch_inline_max_instrs
+        && view.temp_count <= late_branch_inline_max_temps
+        && has_value_return
+        && all_returns_have_values
+        && List.for_all
+             (fun (block : Cfg.block) ->
+               List.for_all instr_safe block.body && term_safe block.term)
+             blocks
+        && cfg_acyclic_ignoring_edges view ignored
+      then Some { view with blocks }
+      else None
+
+let build_late_branch_inline_table (funcs : Cfg.func list) :
+    (string, Cfg.func) Hashtbl.t =
+  let table = Hashtbl.create (max 8 (List.length funcs)) in
+  List.iter
+    (fun (f : Cfg.func) ->
+      match late_branch_inline_candidate f with
+      | None -> ()
+      | Some candidate ->
+          Hashtbl.replace table f.label candidate;
+          if Sys.getenv_opt "TOYC_DEBUG_LATE_BRANCH_INLINE" <> None then
+            Printf.eprintf
+              "late-branch-candidate func=%s blocks=%d instrs=%d temps=%d params=%d\n%!"
+              f.name (List.length candidate.blocks)
+              (List.fold_left
+                 (fun acc (block : Cfg.block) ->
+                   acc + List.length block.body)
+                 0 candidate.blocks)
+              candidate.temp_count (List.length candidate.params))
+    funcs;
+  table
+
+let find_late_branch_inline_site
+    (table : (string, Cfg.func) Hashtbl.t)
+    (f : Cfg.func) : small_hot_inline_site option =
+  let rec find_in_body block_label rev_prefix = function
+    | [] -> None
+    | Tcg.Call (Some dst, callee, args) :: rest -> (
+        match Hashtbl.find_opt table callee with
+        | Some (candidate : Cfg.func)
+          when callee <> f.label
+               && List.length args = List.length candidate.params ->
+            Some
+              ( block_label,
+                List.rev rev_prefix,
+                dst,
+                callee,
+                args,
+                rest,
+                candidate )
+        | Some _ | None ->
+            find_in_body block_label
+              (Tcg.Call (Some dst, callee, args) :: rev_prefix)
+              rest)
+    | instr :: rest ->
+        find_in_body block_label (instr :: rev_prefix) rest
+  in
+  let rec find = function
+    | [] -> None
+    | (block : Cfg.block) :: rest -> (
+        match find_in_body block.label [] block.body with
+        | Some _ as site -> site
+        | None -> find rest)
+  in
+  find f.blocks
+
+let inline_late_branch_calls_func
+    (table : (string, Cfg.func) Hashtbl.t)
+    (f : Cfg.func) =
+  let rec apply serial fuel count current =
+    if fuel = 0 then (current, count)
+    else
+      match find_late_branch_inline_site table current with
+      | None -> (current, count)
+      | Some site -> (
+          match inline_one_small_hot_call serial current site with
+          | None -> (current, count)
+          | Some next ->
+              apply (serial + 1) (fuel - 1) (count + 1) next)
+  in
+  apply 0 late_branch_inline_max_sites_per_func 0 f
+
+let inline_late_branch_calls_program
+    global_init summaries globals return_global_demands removable_calls
+    (funcs : Cfg.func list) =
+  let rec iterate fuel current =
+    if fuel = 0 then current
+    else
+      let table = build_late_branch_inline_table current in
+      if Hashtbl.length table = 0 then current
+      else
+        let changed = ref false in
+        let next =
+          List.map
+            (fun (f : Cfg.func) ->
+              let inlined, count =
+                inline_late_branch_calls_func table f
+              in
+              if count = 0 then f
+              else begin
+                changed := true;
+                let return_globals =
+                  match Hashtbl.find_opt return_global_demands f.label with
+                  | Some return_globals -> return_globals
+                  | None -> globals
+                in
+                let before = metrics_of_func f in
+                let expanded = metrics_of_func inlined in
+                let cleaned =
+                  optimize_func
+                    global_init summaries globals return_globals removable_calls
+                    inlined
+                in
+                if cfg_targets_valid cleaned then begin
+                  if Sys.getenv_opt "TOYC_DEBUG_LATE_BRANCH_INLINE" <> None then
+                    Printf.eprintf
+                      "late-branch-inline caller=%s sites=%d %s -> expanded(%s) -> %s\n%!"
+                      f.name count (format_metrics before)
+                      (format_metrics expanded)
+                      (format_metrics (metrics_of_func cleaned));
+                  cleaned
+                end else begin
+                  debug_cfg_validation "late-branch-inline-cleanup" cleaned;
+                  f
+                end
+              end)
+            current
+        in
+        if !changed then iterate (fuel - 1) next else current
+  in
+  iterate 2 funcs
+
 (* -------------------------------------------------------------------------- *)
 (* Late straight-line pure-call expansion                                     *)
 (*                                                                            *)
@@ -18578,6 +18815,11 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   in
   let optimized_funcs =
     inline_late_scalar_calls_program
+      global_init summaries globals return_global_demands removable_calls
+      optimized_funcs
+  in
+  let optimized_funcs =
+    inline_late_branch_calls_program
       global_init summaries globals return_global_demands removable_calls
       optimized_funcs
   in
