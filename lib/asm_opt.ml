@@ -106,6 +106,8 @@ let peephole_pass asm =
       | Some (dst1, src1), Some (dst2, src2) when src2 = dst1 ->
           let acc' = emit_opt_lines acc [ move_line dst1 src1; move_line dst2 src1 ] in
           loop (i + 2) acc'
+      | Some (dst, src), _ when dst = src ->
+          loop (i + 1) acc
       | _ -> loop_tail i acc
     else if i + 1 < n && starts_with (trim lines.(i)) "j " && is_label lines.(i + 1)
     then

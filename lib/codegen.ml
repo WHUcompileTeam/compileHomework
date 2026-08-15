@@ -977,6 +977,51 @@ let emit_binop_operands ctx op dst lhs rhs =
   | Ge, lhs, Tcg.Imm 0L ->
       let lhs_reg = operand_reg ctx "t0" lhs in
       emit_compare_zero ctx op dst lhs_reg false
+  | Div, lhs, Tcg.Imm divisor when (let v = Int64.to_int divisor in v > 0 && v land (v - 1) = 0 && v > 1) -> (
+      let shift = let rec f v s = if v = 1L then s else f (Int64.shift_right_logical v 1) (s + 1) in f divisor 0 in
+      let lhs_reg = operand_reg ctx "t0" lhs in
+      if shift = 1 then begin
+        emitf ctx "    srli %s, %s, 31" dst lhs_reg;
+        emitf ctx "    add %s, %s, %s" dst lhs_reg dst;
+        emitf ctx "    srai %s, %s, 1" dst dst
+      end else begin
+        emitf ctx "    srai %s, %s, %d" dst lhs_reg (shift - 1);
+        emitf ctx "    srli %s, %s, %d" dst dst (32 - shift);
+        emitf ctx "    add %s, %s, %s" dst lhs_reg dst;
+        emitf ctx "    srai %s, %s, %d" dst dst shift
+      end)
+  | Mod, lhs, Tcg.Imm divisor when (let v = Int64.to_int divisor in v > 0 && v land (v - 1) = 0 && v > 1) -> (
+      let shift = let rec f v s = if v = 1L then s else f (Int64.shift_right_logical v 1) (s + 1) in f divisor 0 in
+      let lhs_reg = operand_reg ctx "t0" lhs in
+      let tmp = "t1" in
+      if shift = 1 then begin
+        emitf ctx "    srli %s, %s, 31" tmp lhs_reg;
+        emitf ctx "    add %s, %s, %s" tmp lhs_reg tmp;
+        emitf ctx "    srai %s, %s, 1" tmp tmp
+      end else begin
+        emitf ctx "    srai %s, %s, %d" tmp lhs_reg (shift - 1);
+        emitf ctx "    srli %s, %s, %d" tmp tmp (32 - shift);
+        emitf ctx "    add %s, %s, %s" tmp lhs_reg tmp;
+        emitf ctx "    srai %s, %s, %d" tmp tmp shift
+      end;
+      emitf ctx "    slli %s, %s, %d" tmp tmp shift;
+      emitf ctx "    sub %s, %s, %s" dst lhs_reg tmp)
+  | Mul, lhs, Tcg.Imm 3L -> (
+      let lhs_reg = operand_reg ctx "t0" lhs in
+      emitf ctx "    slli %s, %s, 1" dst lhs_reg;
+      emitf ctx "    add %s, %s, %s" dst dst lhs_reg)
+  | Mul, Tcg.Imm 3L, rhs -> (
+      let rhs_reg = operand_reg ctx "t0" rhs in
+      emitf ctx "    slli %s, %s, 1" dst rhs_reg;
+      emitf ctx "    add %s, %s, %s" dst dst rhs_reg)
+  | Mul, lhs, Tcg.Imm 5L -> (
+      let lhs_reg = operand_reg ctx "t0" lhs in
+      emitf ctx "    slli %s, %s, 2" dst lhs_reg;
+      emitf ctx "    add %s, %s, %s" dst dst lhs_reg)
+  | Mul, Tcg.Imm 5L, rhs -> (
+      let rhs_reg = operand_reg ctx "t0" rhs in
+      emitf ctx "    slli %s, %s, 2" dst rhs_reg;
+      emitf ctx "    add %s, %s, %s" dst dst rhs_reg)
   | _ ->
        let lhs_reg = operand_reg ctx "t0" lhs in
        let rhs_reg = operand_reg ctx "t1" rhs in
