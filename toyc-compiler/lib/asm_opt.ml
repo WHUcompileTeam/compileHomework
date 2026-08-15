@@ -143,7 +143,11 @@ let uses_defs line =
           | "call" ->
               (call_arg_regs, caller_saved_regs)
           | "ret" ->
-              (RegSet.singleton "ra", RegSet.empty)
+              (* Be conservative about the integer return-value register.
+                 This is required by post-regalloc dead-move elimination:
+                 [addi a0, r, 0; ret] must keep the write to [a0].  Void
+                 functions may not need [a0], but treating it as live is safe. *)
+              (regset_of_list [ "ra"; "a0" ], RegSet.empty)
           | _ ->
               (* Unknown instruction: assume every mentioned register is read.
                  This may miss optimization opportunities, but cannot make the
@@ -260,6 +264,9 @@ let addi_line dst src imm =
 let debug_addi_chain =
   Sys.getenv_opt "TOYC_DEBUG_ASM_ADDI_CHAIN" <> None
 
+let debug_dead_move =
+  Sys.getenv_opt "TOYC_DEBUG_ASM_DEAD_MOVE" <> None
+
 let can_fold_addi_chain live_out second_index mid base dst imm1 imm2 =
   let combined = Int64.add imm1 imm2 in
   value_register mid
@@ -313,11 +320,19 @@ let peephole_pass asm =
           | _ -> loop_tail i acc)
     else loop_tail i acc
   and loop_tail i acc =
-    if i + 1 < n && starts_with (trim lines.(i)) "j " && is_label lines.(i + 1) then
-      let label = label_name lines.(i + 1) in
-      if is_jump_to lines.(i) label then loop (i + 1) acc
-      else loop (i + 1) (lines.(i) :: acc)
-    else loop (i + 1) (lines.(i) :: acc)
+    match parse_move lines.(i) with
+    | Some (dst, _src)
+      when value_register dst && not (RegSet.mem dst live_out.(i)) ->
+        if debug_dead_move then
+          Printf.eprintf "asm-dead-move line=%d dst=%s instr=%s\n%!"
+            (i + 1) dst (trim lines.(i));
+        loop (i + 1) acc
+    | _ ->
+        if i + 1 < n && starts_with (trim lines.(i)) "j " && is_label lines.(i + 1) then
+          let label = label_name lines.(i + 1) in
+          if is_jump_to lines.(i) label then loop (i + 1) acc
+          else loop (i + 1) (lines.(i) :: acc)
+        else loop (i + 1) (lines.(i) :: acc)
   in
   String.concat "\n" (loop 0 []) ^ "\n"
 
