@@ -16447,11 +16447,8 @@ let optimize_func global_init summaries globals return_globals removable_calls (
           (const_propagate_func global_init summaries globals)
           after_loop_guards
       in
-      let after_copy3 =
-        run_stage round "copy3" copy_forward_func after_const3
-      in
       let after_dce3 =
-        run_stage round "dce3" (eliminate_dead_code_func ~removable_calls summaries globals return_globals) after_copy3
+        run_stage round "dce3" (eliminate_dead_code_func ~removable_calls summaries globals return_globals) after_const3
       in
       let after_fold4 =
         run_stage round "fold4" (fold_branch_tails_func summaries globals) after_dce3
@@ -16563,8 +16560,7 @@ let optimize_func global_init summaries globals return_globals removable_calls (
          chains.  [algebra_canonicalize_func] can safely follow those chains,
          but coalescing first can merge unrelated definitions onto one temp and
          make the canonicalizer reject them as multi-def/use-heavy. *)
-      let late_forwarded = copy_forward_func late_promoted in
-      let late_algebra = algebra_canonicalize_func late_forwarded in
+      let late_algebra = algebra_canonicalize_func late_promoted in
       let late_linear = general_linear_canonicalize_func late_algebra in
       let late_lve_sr = loop_evolution_strength_reduce_func late_linear in
       let late_dce =
