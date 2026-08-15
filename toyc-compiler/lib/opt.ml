@@ -17497,9 +17497,8 @@ let hot_loop_labels_of_func (f : Cfg.func) =
       LabelSet.union acc (table_find_or_empty loops header LabelSet.empty))
     LabelSet.empty headers
 
-let small_leaf_inline_candidate_with_reason
-    (f : Cfg.func) : Cfg.func option * string =
-  if f.ret <> TInt then (None, "non-int-return")
+let small_leaf_inline_candidate (f : Cfg.func) : Cfg.func option =
+  if f.ret <> TInt then None
   else
     let view =
       f
@@ -17508,7 +17507,7 @@ let small_leaf_inline_candidate_with_reason
       |> final_linear_merge_func
       |> thread_and_prune_func
     in
-    if not (cfg_targets_valid view) then (None, "invalid-cfg")
+    if not (cfg_targets_valid view) then None
     else
       let reachable = reachable_labels view.entry view.blocks in
       let blocks =
@@ -17527,29 +17526,13 @@ let small_leaf_inline_candidate_with_reason
           (fun acc (param : Tcg.var) -> IntSet.add param.id acc)
           IntSet.empty f.params
       in
-      let instr_reject_reason = function
-        | Tcg.Move _ | Tcg.Un _ -> None
-        | Tcg.Bin (_, (Div | Mod), _, _) -> Some "div-mod"
-        | Tcg.Bin _ -> None
-        | Tcg.Load (_, Tcg.Local id) ->
-            if IntSet.mem id param_ids then None else Some "nonparam-local-load"
-        | Tcg.Load (_, Tcg.Global _) -> Some "global-load"
-        | Tcg.Store _ -> Some "store"
-        | Tcg.Call _ -> Some "nested-call"
-      in
-      let unsafe_instr_reason =
-        List.fold_left
-          (fun found (block : Cfg.block) ->
-            match found with
-            | Some _ -> found
-            | None ->
-                List.fold_left
-                  (fun found instr ->
-                    match found with
-                    | Some _ -> found
-                    | None -> instr_reject_reason instr)
-                  None block.body)
-          None blocks
+      let instr_safe = function
+        | Tcg.Move _ | Tcg.Un _ -> true
+        | Tcg.Bin (_, (Div | Mod), _, _) -> false
+        | Tcg.Bin _ -> true
+        | Tcg.Load (_, Tcg.Local id) -> IntSet.mem id param_ids
+        | Tcg.Load (_, Tcg.Global _) -> false
+        | Tcg.Store _ | Tcg.Call _ -> false
       in
       let term_safe = function
         | Cfg.Return (Some _) -> true
@@ -17574,31 +17557,19 @@ let small_leaf_inline_candidate_with_reason
           blocks
       in
       let ignored = Hashtbl.create 1 in
-      let reason =
-        if block_count < 2 then Some "blocks<2"
-        else if block_count > small_hot_inline_max_blocks then Some "blocks>4"
-        else if instr_count > small_hot_inline_max_instrs then Some "instrs>20"
-        else if f.temp_count > 48 then Some "temps>48"
-        else if not has_value_return then Some "no-value-return"
-        else
-          match unsafe_instr_reason with
-          | Some reason -> Some reason
-          | None ->
-              if not (List.for_all
-                        (fun (block : Cfg.block) -> term_safe block.term)
-                        blocks)
-              then Some "unsafe-term"
-              else if not (cfg_acyclic_ignoring_edges view ignored)
-              then Some "cyclic"
-              else None
-      in
-      match reason with
-      | None -> (Some { view with blocks }, "candidate")
-      | Some reason -> (None, reason)
-
-let small_leaf_inline_candidate (f : Cfg.func) : Cfg.func option =
-  fst (small_leaf_inline_candidate_with_reason f)
-
+      if
+        block_count >= 2
+        && block_count <= small_hot_inline_max_blocks
+        && instr_count <= small_hot_inline_max_instrs
+        && f.temp_count <= 48
+        && has_value_return
+        && List.for_all
+             (fun (block : Cfg.block) ->
+               List.for_all instr_safe block.body && term_safe block.term)
+             blocks
+        && cfg_acyclic_ignoring_edges view ignored
+      then Some { view with blocks }
+      else None
 
 type small_hot_inline_site =
   Tcg.label
@@ -17616,13 +17587,8 @@ let build_small_hot_inline_table (funcs : Cfg.func list) :
   in
   List.iter
     (fun (f : Cfg.func) ->
-      let candidate, reason = small_leaf_inline_candidate_with_reason f in
-      match candidate with
-      | None ->
-          if Sys.getenv_opt "TOYC_DEBUG_CFG_INLINE_BLOCKERS" <> None then
-            Printf.eprintf
-              "cfg-inline-reject func=%s reason=%s params=%d\n%!"
-              f.name reason (List.length f.params)
+      match small_leaf_inline_candidate f with
+      | None -> ()
       | Some (candidate : Cfg.func) ->
           Hashtbl.replace table f.label candidate;
           if Sys.getenv_opt "TOYC_DEBUG_CFG_INLINE" <> None then begin
@@ -17655,30 +17621,11 @@ let find_hot_inline_site
                   args,
                   rest,
                   candidate )
-          | Some (candidate : Cfg.func) ->
-              if Sys.getenv_opt "TOYC_DEBUG_CFG_INLINE_BLOCKERS" <> None then
-                Printf.eprintf
-                  "cfg-inline-hot-miss caller=%s site=%s callee=%s reason=%s argc=%d params=%d\n%!"
-                  f.name block_label callee
-                  (if callee = f.label then "recursive"
-                   else "arity-mismatch")
-                  (List.length args) (List.length candidate.params);
-              find_in_body block_label
-                (Tcg.Call (Some dst, callee, args) :: rev_prefix)
-                rest
-          | None ->
-              if Sys.getenv_opt "TOYC_DEBUG_CFG_INLINE_BLOCKERS" <> None then
-                Printf.eprintf
-                  "cfg-inline-hot-miss caller=%s site=%s callee=%s reason=callee-not-candidate argc=%d\n%!"
-                  f.name block_label callee (List.length args);
+          | Some _ | None ->
               find_in_body block_label
                 (Tcg.Call (Some dst, callee, args) :: rev_prefix)
                 rest)
-      | (Tcg.Call (None, callee, args) as instr) :: rest ->
-          if Sys.getenv_opt "TOYC_DEBUG_CFG_INLINE_BLOCKERS" <> None then
-            Printf.eprintf
-              "cfg-inline-hot-miss caller=%s site=%s callee=%s reason=no-result argc=%d\n%!"
-              f.name block_label callee (List.length args);
+      | (Tcg.Call (None, _, _) as instr) :: rest ->
           find_in_body block_label (instr :: rev_prefix) rest
       | instr :: rest ->
           find_in_body block_label (instr :: rev_prefix) rest
@@ -17880,6 +17827,226 @@ let inline_small_hot_calls_program
       funcs
 
 
+
+
+(* -------------------------------------------------------------------------- *)
+(* Late straight-line pure-call expansion                                     *)
+(*                                                                            *)
+(* The AST inliner runs before CFG optimization, so it cannot benefit when a   *)
+(* helper only BECOMES simple after constant propagation, specialization, DCE, *)
+(* branch folding, etc.  Likewise, the hot CFG inliner only sees calls inside  *)
+(* natural loops.  Recover the remaining simple scalar cases here.              *)
+(*                                                                            *)
+(* Candidate requirements are deliberately strict:                             *)
+(*   - TInt result; exactly one reachable entry block;                          *)
+(*   - <= 32 simple instructions and <= 64 temps;                               *)
+(*   - only Move/Un/non-trapping Bin, parameter loads, and global loads;        *)
+(*   - no Store, nested Call, Div, or Mod;                                      *)
+(*   - direct value return.                                                     *)
+(*                                                                            *)
+(* Expansion happens at the exact call site, so ordinary global loads preserve *)
+(* their relative ordering.  After expansion, run the full intraprocedural      *)
+(* optimizer so algebra/GVN/LICM/LVE can exploit the newly visible expression.  *)
+(* -------------------------------------------------------------------------- *)
+
+let late_scalar_inline_max_instrs = 32
+let late_scalar_inline_max_temps = 64
+let late_scalar_inline_max_sites_per_func = 8
+
+type late_scalar_inline_candidate = {
+  scalar_func : Cfg.func;
+  scalar_block : Cfg.block;
+  scalar_return : Tcg.operand;
+}
+
+let late_scalar_inline_candidate_of_func (f : Cfg.func) =
+  if f.ret <> TInt then None
+  else
+    let view =
+      f
+      |> thread_and_prune_func
+      |> simplify_cfg_func
+      |> final_linear_merge_func
+      |> thread_and_prune_func
+    in
+    if not (cfg_targets_valid view) then None
+    else
+      let reachable = reachable_labels view.entry view.blocks in
+      let blocks =
+        List.filter
+          (fun (block : Cfg.block) -> LabelSet.mem block.label reachable)
+          view.blocks
+      in
+      match blocks with
+      | [ (block : Cfg.block) ] when block.label = view.entry ->
+          let param_ids =
+            List.fold_left
+              (fun acc (param : Tcg.var) -> IntSet.add param.id acc)
+              IntSet.empty view.params
+          in
+          let instr_safe = function
+            | Tcg.Move _ | Tcg.Un _ -> true
+            | Tcg.Bin (_, (Div | Mod), _, _) -> false
+            | Tcg.Bin _ -> true
+            | Tcg.Load (_, Tcg.Local id) -> IntSet.mem id param_ids
+            | Tcg.Load (_, Tcg.Global _) -> true
+            | Tcg.Store _ | Tcg.Call _ -> false
+          in
+          if List.length block.body > late_scalar_inline_max_instrs
+             || view.temp_count > late_scalar_inline_max_temps
+             || not (List.for_all instr_safe block.body)
+          then None
+          else
+            begin
+              match block.term with
+              | Cfg.Return (Some operand) ->
+                  Some
+                    {
+                      scalar_func = view;
+                      scalar_block = block;
+                      scalar_return = operand;
+                    }
+              | Cfg.Return None
+              | Cfg.Jump _
+              | Cfg.BranchZero _
+              | Cfg.BranchNonZero _
+              | Cfg.BranchCompare _ ->
+                  None
+            end
+      | _ -> None
+
+let build_late_scalar_inline_table funcs =
+  let table = Hashtbl.create (max 8 (List.length funcs)) in
+  List.iter
+    (fun (f : Cfg.func) ->
+      match late_scalar_inline_candidate_of_func f with
+      | None -> ()
+      | Some candidate ->
+          Hashtbl.replace table f.label candidate;
+          if Sys.getenv_opt "TOYC_DEBUG_LATE_SCALAR_INLINE" <> None then
+            Printf.eprintf
+              "late-scalar-candidate func=%s instrs=%d temps=%d params=%d\n%!"
+              f.name (List.length candidate.scalar_block.body)
+              candidate.scalar_func.temp_count
+              (List.length candidate.scalar_func.params))
+    funcs;
+  table
+
+let rewrite_late_scalar_calls_func
+    (table : (string, late_scalar_inline_candidate) Hashtbl.t)
+    (f : Cfg.func) =
+  let next_temp = ref f.temp_count in
+  let sites_left = ref late_scalar_inline_max_sites_per_func in
+  let replaced = ref 0 in
+
+  let expand_call dst args (candidate : late_scalar_inline_candidate) =
+    let callee = candidate.scalar_func in
+    if List.length args <> List.length callee.params then None
+    else
+      let temp_base = !next_temp in
+      next_temp := temp_base + callee.temp_count;
+      let rename_temp temp = temp_base + temp in
+      let rename_operand = rewrite_operand_temp rename_temp in
+      let param_args = Hashtbl.create (max 4 (List.length callee.params)) in
+      List.iter2
+        (fun (param : Tcg.var) arg -> Hashtbl.replace param_args param.id arg)
+        callee.params args;
+      let clone_instr = function
+        | Tcg.Load (temp, Tcg.Local id) -> (
+            match Hashtbl.find_opt param_args id with
+            | Some arg ->
+                simplify_simple_instr
+                  (Tcg.Move (rename_temp temp, arg))
+            | None ->
+                failwith "internal late scalar inline non-parameter local load")
+        | instr ->
+            rewrite_instr_temps rename_temp instr
+      in
+      let body = List.map clone_instr candidate.scalar_block.body in
+      let ret =
+        simplify_simple_instr
+          (Tcg.Move (dst, rename_operand candidate.scalar_return))
+      in
+      Some (body @ [ ret ])
+  in
+
+  let rewrite_body body =
+    let rec loop rev_acc = function
+      | [] -> List.rev rev_acc
+      | Tcg.Call (Some dst, callee, args) as instr :: rest
+        when !sites_left > 0 -> (
+          match Hashtbl.find_opt table callee with
+          | Some candidate when callee <> f.label -> (
+              match expand_call dst args candidate with
+              | Some expanded ->
+                  decr sites_left;
+                  incr replaced;
+                  loop (List.rev_append expanded rev_acc) rest
+              | None ->
+                  loop (instr :: rev_acc) rest)
+          | Some _ | None ->
+              loop (instr :: rev_acc) rest)
+      | instr :: rest ->
+          loop (instr :: rev_acc) rest
+    in
+    loop [] body
+  in
+
+  let blocks =
+    List.map
+      (fun (block : Cfg.block) ->
+        { block with body = rewrite_body block.body })
+      f.blocks
+  in
+  if !replaced = 0 then (f, 0)
+  else begin
+    let rewritten =
+      Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
+    in
+    if Sys.getenv_opt "TOYC_DEBUG_LATE_SCALAR_INLINE" <> None then
+      Printf.eprintf
+        "late-scalar-inline caller=%s replaced=%d temps=%d->%d\n%!"
+        f.name !replaced f.temp_count rewritten.temp_count;
+    (rewritten, !replaced)
+  end
+
+let inline_late_scalar_calls_program
+    global_init summaries globals return_global_demands removable_calls
+    (funcs : Cfg.func list) =
+  let rec iterate fuel current =
+    if fuel = 0 then current
+    else
+      let table = build_late_scalar_inline_table current in
+      if Hashtbl.length table = 0 then current
+      else
+        let changed = ref false in
+        let next =
+          List.map
+            (fun (f : Cfg.func) ->
+              let rewritten, count =
+                rewrite_late_scalar_calls_func table f
+              in
+              if count = 0 then f
+              else begin
+                changed := true;
+                let return_globals =
+                  match Hashtbl.find_opt return_global_demands f.label with
+                  | Some return_globals -> return_globals
+                  | None -> globals
+                in
+                let cleaned =
+                  optimize_func
+                    global_init summaries globals return_globals removable_calls
+                    rewritten
+                in
+                debug_cfg_validation "late-scalar-inline-cleanup" cleaned;
+                cleaned
+              end)
+            current
+        in
+        if !changed then iterate (fuel - 1) next else current
+  in
+  iterate 3 funcs
 
 (* -------------------------------------------------------------------------- *)
 (* Late trivial-call folding                                                  *)
@@ -18406,6 +18573,11 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let optimized_funcs =
     specialize_constant_params_program
       source_funcs
+      global_init summaries globals return_global_demands removable_calls
+      optimized_funcs
+  in
+  let optimized_funcs =
+    inline_late_scalar_calls_program
       global_init summaries globals return_global_demands removable_calls
       optimized_funcs
   in
