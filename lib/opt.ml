@@ -1650,7 +1650,6 @@ type loop_effects = {
 let licm_candidate_info = function
   | Tcg.Move (dst, src) -> Some (LicmPure (dst, [ src ]))
   | Tcg.Un (dst, _, src) -> Some (LicmPure (dst, [ src ]))
-  | Tcg.Bin (_, (Div | Mod), _, _) -> None
   | Tcg.Bin (dst, _, lhs, rhs) -> Some (LicmPure (dst, [ lhs; rhs ]))
   | Tcg.Load (dst, place) -> Some (LicmLoad (dst, place))
   | Tcg.Store _ | Tcg.Call _ -> None
@@ -3688,9 +3687,9 @@ let optimize_func global_init globals (f : Cfg.func) =
   in
   let fuel =
     let blocks = List.length promoted.blocks in
-    if blocks > 500 then 2 else if blocks > 200 then 4 else 12
+    if blocks > 220 then 1 else if blocks > 120 then 2 else 8
   in
-  let run_step = if List.length promoted.blocks > 500 then light_step else step in
+  let run_step = if List.length promoted.blocks > 220 then light_step else step in
   match debug_stop_after with
   | Some "mem2reg" -> promoted
   | Some _ | None ->
@@ -3710,7 +3709,7 @@ type inline_func = {
 
 let small_inline_func (f : Cfg.func) =
   match f.blocks with
-  | [ block ] when List.length f.params <= 8 && List.length block.body <= 20 ->
+  | [ block ] when List.length f.params <= 8 && List.length block.body <= 10 ->
       let param_ids =
         List.fold_left (fun ids (param : Tcg.var) -> IntSet.add param.id ids) IntSet.empty f.params
       in
@@ -3903,7 +3902,6 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let funcs = List.map tail_recursion_eliminate cfg.funcs in
   let funcs = List.map (optimize_func global_init globals) funcs in
   let funcs = inline_small_funcs funcs in
-  let funcs = List.map (optimize_func global_init globals) funcs in
   let pure_set = collect_pure_funcs funcs in
   let funcs = List.map (eliminate_pure_dead_calls pure_set) funcs in
   { Cfg.funcs = List.map (optimize_func global_init globals) funcs }
