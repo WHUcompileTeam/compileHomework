@@ -2321,6 +2321,255 @@ let rewrite_term_temps rename = function
   | Cfg.Return None -> Cfg.Return None
   | Cfg.Return (Some value) -> Cfg.Return (Some (rewrite_operand_temp rename value))
 
+
+(* Forward proven copy/value equivalences before algebraic passes.
+
+   GVN also tracks aliases, but historically it ran after algebra/linear
+   canonicalization.  That meant algebra saw the physical temporary names
+   rather than their logical values.  This pass is deliberately narrower than
+   GVN: it tracks only Move/UPlus-derived value equivalences, rewrites source
+   operands and branch/return operands, and never performs CSE.
+
+   The dataflow is a must analysis.  Missing predecessor states are treated as
+   "not computed yet" while solving, rather than as the empty fact set.  This
+   lets loop-invariant copy facts flow through a backedge and then be removed
+   if a later iteration proves that the backedge does not preserve them. *)
+let copy_forward_func (f : Cfg.func) =
+  let debug = Sys.getenv_opt "TOYC_DEBUG_COPY_FORWARD" <> None in
+
+  let transfer_instr aliases instr =
+    match instr with
+    | Tcg.Move (dst, src) ->
+        let src = resolve_alias_operand aliases IntSet.empty src in
+        let instr = simplify_simple_instr (Tcg.Move (dst, src)) in
+        let aliases = kill_temp_alias dst aliases in
+        let aliases =
+          match instr with
+          | Tcg.Move (_, value) -> set_alias_fact aliases dst value
+          | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ ->
+              aliases
+        in
+        (instr, aliases)
+    | Tcg.Un (dst, op, src) ->
+        let src = resolve_alias_operand aliases IntSet.empty src in
+        let instr = simplify_simple_instr (Tcg.Un (dst, op, src)) in
+        let aliases = kill_temp_alias dst aliases in
+        let aliases =
+          match instr with
+          | Tcg.Move (_, value) -> set_alias_fact aliases dst value
+          | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ ->
+              aliases
+        in
+        (instr, aliases)
+    | Tcg.Bin (dst, op, lhs, rhs) ->
+        let lhs = resolve_alias_operand aliases IntSet.empty lhs in
+        let rhs = resolve_alias_operand aliases IntSet.empty rhs in
+        let instr = simplify_simple_instr (Tcg.Bin (dst, op, lhs, rhs)) in
+        let aliases = kill_temp_alias dst aliases in
+        let aliases =
+          match instr with
+          | Tcg.Move (_, value) -> set_alias_fact aliases dst value
+          | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ ->
+              aliases
+        in
+        (instr, aliases)
+    | Tcg.Load (dst, place) ->
+        (Tcg.Load (dst, place), kill_temp_alias dst aliases)
+    | Tcg.Store (place, value) ->
+        let value = resolve_alias_operand aliases IntSet.empty value in
+        (Tcg.Store (place, value), aliases)
+    | Tcg.Call (dst, callee, args) ->
+        let args =
+          List.map (resolve_alias_operand aliases IntSet.empty) args
+        in
+        let aliases =
+          match dst with
+          | Some temp -> kill_temp_alias temp aliases
+          | None -> aliases
+        in
+        (Tcg.Call (dst, callee, args), aliases)
+  in
+
+  let transfer_block aliases (block : Cfg.block) =
+    List.fold_left
+      (fun aliases instr -> snd (transfer_instr aliases instr))
+      aliases block.body
+  in
+
+  let in_aliases = Hashtbl.create (List.length f.blocks) in
+  let out_aliases = Hashtbl.create (List.length f.blocks) in
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter
+    (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block)
+    f.blocks;
+
+  (* Seed only the reachable entry path.  When a successor is first reached,
+     the first predecessor contributes its whole state; later predecessor
+     states can only intersect facts away.  This is the standard monotone
+     worklist shape for a forward must analysis and, importantly, does not let
+     an as-yet-unvisited loop backedge erase entry facts prematurely. *)
+  let worklist = Queue.create () in
+  let queued = Hashtbl.create (List.length f.blocks) in
+  let enqueue label =
+    if not (Hashtbl.mem queued label) then begin
+      Hashtbl.replace queued label ();
+      Queue.add label worklist
+    end
+  in
+  Hashtbl.replace in_aliases f.entry empty_alias;
+  enqueue f.entry;
+
+  while not (Queue.is_empty worklist) do
+    let label = Queue.take worklist in
+    Hashtbl.remove queued label;
+    match Hashtbl.find_opt block_map label with
+    | None -> ()
+    | Some (block : Cfg.block) ->
+        let incoming =
+          Option.value ~default:empty_alias
+            (Hashtbl.find_opt in_aliases label)
+        in
+        let outgoing = transfer_block incoming block in
+        let out_changed =
+          match Hashtbl.find_opt out_aliases label with
+          | Some previous -> not (equal_alias_map previous outgoing)
+          | None -> true
+        in
+        if out_changed then begin
+          Hashtbl.replace out_aliases label outgoing;
+          List.iter
+            (fun succ ->
+              if succ <> f.entry then
+                let candidate =
+                  match Hashtbl.find_opt in_aliases succ with
+                  | None -> outgoing
+                  | Some previous -> meet_alias_map previous outgoing
+                in
+                let in_changed =
+                  match Hashtbl.find_opt in_aliases succ with
+                  | Some previous ->
+                      not (equal_alias_map previous candidate)
+                  | None -> true
+                in
+                if in_changed then begin
+                  Hashtbl.replace in_aliases succ candidate;
+                  enqueue succ
+                end)
+            block.succs
+        end
+  done;
+
+  let forwarded = ref 0 in
+  let removed_moves = ref 0 in
+
+  let resolve_counted aliases operand =
+    let resolved = resolve_alias_operand aliases IntSet.empty operand in
+    if resolved <> operand then incr forwarded;
+    resolved
+  in
+
+  let rewrite_instr aliases instr =
+    match instr with
+    | Tcg.Move (dst, src) ->
+        let src = resolve_counted aliases src in
+        let instr = simplify_simple_instr (Tcg.Move (dst, src)) in
+        let aliases = kill_temp_alias dst aliases in
+        let aliases =
+          match instr with
+          | Tcg.Move (_, value) -> set_alias_fact aliases dst value
+          | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ ->
+              aliases
+        in
+        (instr, aliases)
+    | Tcg.Un (dst, op, src) ->
+        let src = resolve_counted aliases src in
+        let instr = simplify_simple_instr (Tcg.Un (dst, op, src)) in
+        let aliases = kill_temp_alias dst aliases in
+        let aliases =
+          match instr with
+          | Tcg.Move (_, value) -> set_alias_fact aliases dst value
+          | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ ->
+              aliases
+        in
+        (instr, aliases)
+    | Tcg.Bin (dst, op, lhs, rhs) ->
+        let lhs = resolve_counted aliases lhs in
+        let rhs = resolve_counted aliases rhs in
+        let instr = simplify_simple_instr (Tcg.Bin (dst, op, lhs, rhs)) in
+        let aliases = kill_temp_alias dst aliases in
+        let aliases =
+          match instr with
+          | Tcg.Move (_, value) -> set_alias_fact aliases dst value
+          | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ ->
+              aliases
+        in
+        (instr, aliases)
+    | Tcg.Load (dst, place) ->
+        (Tcg.Load (dst, place), kill_temp_alias dst aliases)
+    | Tcg.Store (place, value) ->
+        let value = resolve_counted aliases value in
+        (Tcg.Store (place, value), aliases)
+    | Tcg.Call (dst, callee, args) ->
+        let args = List.map (resolve_counted aliases) args in
+        let aliases =
+          match dst with
+          | Some temp -> kill_temp_alias temp aliases
+          | None -> aliases
+        in
+        (Tcg.Call (dst, callee, args), aliases)
+  in
+
+  let rewrite_term aliases = function
+    | Cfg.Jump _ as term -> term
+    | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
+        Cfg.BranchZero
+          (resolve_counted aliases cond, if_zero, if_nonzero)
+    | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
+        Cfg.BranchNonZero
+          (resolve_counted aliases cond, if_nonzero, if_zero)
+    | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
+        Cfg.BranchCompare
+          ( op,
+            resolve_counted aliases lhs,
+            resolve_counted aliases rhs,
+            if_true,
+            if_false )
+    | Cfg.Return None -> Cfg.Return None
+    | Cfg.Return (Some value) ->
+        Cfg.Return (Some (resolve_counted aliases value))
+  in
+
+  let rewrite_block (block : Cfg.block) =
+    let aliases =
+      Option.value ~default:empty_alias
+        (Hashtbl.find_opt in_aliases block.label)
+    in
+    let body_rev, aliases =
+      List.fold_left
+        (fun (acc, aliases) instr ->
+          let instr, aliases = rewrite_instr aliases instr in
+          match instr with
+          | Tcg.Move (dst, Tcg.Temp src) when dst = src ->
+              incr removed_moves;
+              (acc, aliases)
+          | _ -> (instr :: acc, aliases))
+        ([], aliases) block.body
+    in
+    let term = rewrite_term aliases block.term in
+    { block with
+      body = List.rev body_rev;
+      term;
+      succs = Cfg.successors term }
+  in
+
+  let blocks = List.map rewrite_block f.blocks in
+  let result = Cfg.rebuild_edges { f with blocks } in
+  if debug then
+    Printf.eprintf
+      "copy-forward func=%s forwarded=%d removed-moves=%d\n%!"
+      f.name !forwarded !removed_moves;
+  result
+
 let copy_coalesce_func summaries globals (f : Cfg.func) =
   let debug_coalesce = Sys.getenv_opt "TOYC_DEBUG_COALESCE" <> None in
   if f.temp_count <= 1 then begin
@@ -16127,8 +16376,11 @@ let optimize_func global_init summaries globals return_globals removable_calls (
           (const_propagate_func global_init summaries globals)
           after_simplify0
       in
+      let after_copy1 =
+        run_stage round "copy1" copy_forward_func after_const1
+      in
       let after_algebra1 =
-        run_stage round "algebra1" algebra_canonicalize_func after_const1
+        run_stage round "algebra1" algebra_canonicalize_func after_copy1
       in
       let after_linear1 =
         run_stage round "linear1" general_linear_canonicalize_func after_algebra1
@@ -16155,8 +16407,11 @@ let optimize_func global_init summaries globals return_globals removable_calls (
           (const_propagate_func global_init summaries globals)
           after_unswitch
       in
+      let after_copy2 =
+        run_stage round "copy2" copy_forward_func after_const2
+      in
       let after_algebra2 =
-        run_stage round "algebra2" algebra_canonicalize_func after_const2
+        run_stage round "algebra2" algebra_canonicalize_func after_copy2
       in
       let after_linear2 =
         run_stage round "linear2" general_linear_canonicalize_func after_algebra2
@@ -16192,8 +16447,11 @@ let optimize_func global_init summaries globals return_globals removable_calls (
           (const_propagate_func global_init summaries globals)
           after_loop_guards
       in
+      let after_copy3 =
+        run_stage round "copy3" copy_forward_func after_const3
+      in
       let after_dce3 =
-        run_stage round "dce3" (eliminate_dead_code_func ~removable_calls summaries globals return_globals) after_const3
+        run_stage round "dce3" (eliminate_dead_code_func ~removable_calls summaries globals return_globals) after_copy3
       in
       let after_fold4 =
         run_stage round "fold4" (fold_branch_tails_func summaries globals) after_dce3
@@ -16305,7 +16563,8 @@ let optimize_func global_init summaries globals return_globals removable_calls (
          chains.  [algebra_canonicalize_func] can safely follow those chains,
          but coalescing first can merge unrelated definitions onto one temp and
          make the canonicalizer reject them as multi-def/use-heavy. *)
-      let late_algebra = algebra_canonicalize_func late_promoted in
+      let late_forwarded = copy_forward_func late_promoted in
+      let late_algebra = algebra_canonicalize_func late_forwarded in
       let late_linear = general_linear_canonicalize_func late_algebra in
       let late_lve_sr = loop_evolution_strength_reduce_func late_linear in
       let late_dce =
