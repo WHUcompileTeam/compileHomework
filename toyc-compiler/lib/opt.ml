@@ -15174,19 +15174,16 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
           None
     in
 
-    let branch_continue_lt header term =
+    let branch_continue_lt_in_loop loop term =
       match term with
       | Cfg.BranchCompare (op, lhs, rhs, yes_label, no_label) ->
-          let op, inside_label, exit_label =
-            if yes_label = header && no_label <> header then
-              (op, yes_label, no_label)
-            else if no_label = header && yes_label <> header then
-              (invert_compare op, no_label, yes_label)
-            else
-              (Eq, "", "")
-          in
-          if inside_label <> header then None
-          else Some (op, lhs, rhs, exit_label)
+          let yes_inside = LabelSet.mem yes_label loop in
+          let no_inside = LabelSet.mem no_label loop in
+          if yes_inside = no_inside then None
+          else if yes_inside then
+            Some (op, lhs, rhs, yes_label, no_label)
+          else
+            Some (invert_compare op, lhs, rhs, no_label, yes_label)
       | Cfg.BranchZero _
       | Cfg.BranchNonZero _
       | Cfg.Jump _
@@ -15194,54 +15191,194 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
           None
     in
 
+    let find_runtime_summary_shape loop =
+      let loop_blocks =
+        LabelSet.elements loop |> List.map get_block
+      in
+      let control_candidates =
+        List.filter_map
+          (fun (candidate : Cfg.block) ->
+            Option.map
+              (fun branch -> (candidate, branch))
+              (branch_continue_lt_in_loop loop candidate.term))
+          loop_blocks
+      in
+      match control_candidates with
+      | [ (control_block,
+           (branch_op, lhs, rhs, continue_label, exit_label)) ] ->
+          let rec trace_body_chain visited labels_rev instrs current_label =
+            if current_label = control_block.label then
+              Some (visited, List.rev labels_rev, instrs)
+            else if
+              not (LabelSet.mem current_label loop)
+              || LabelSet.mem current_label visited
+            then
+              None
+            else
+              let block : Cfg.block = get_block current_label in
+              match block.term with
+              | Cfg.Jump next_label ->
+                  trace_body_chain
+                    (LabelSet.add current_label visited)
+                    (current_label :: labels_rev)
+                    (instrs @ block.body)
+                    next_label
+              | Cfg.BranchZero _
+              | Cfg.BranchNonZero _
+              | Cfg.BranchCompare _
+              | Cfg.Return _ ->
+                  None
+          in
+          let traced =
+            if continue_label = control_block.label then
+              Some (LabelSet.empty, [], [])
+            else
+              trace_body_chain
+                LabelSet.empty [] [] continue_label
+          in
+          (match traced with
+           | None ->
+               Error
+                 (Printf.sprintf
+                    "body-chain-not-linear continue=%s control=%s"
+                    continue_label control_block.label)
+           | Some (visited_body, body_labels, prefix_instrs) ->
+               let covered =
+                 LabelSet.add control_block.label visited_body
+               in
+               if not (LabelSet.equal covered loop) then
+                 Error
+                   (Printf.sprintf
+                      "body-chain-does-not-cover-loop covered=%d total=%d"
+                      (LabelSet.cardinal covered)
+                      (LabelSet.cardinal loop))
+               else
+                 let body_instrs =
+                   prefix_instrs @ control_block.body
+                 in
+                 let self_add_count =
+                   List.fold_left
+                     (fun count instr ->
+                       if Option.is_some (self_add instr)
+                       then count + 1
+                       else count)
+                     0 body_instrs
+                 in
+                 if List.length body_instrs <> 3
+                    || self_add_count <> 3
+                 then
+                   Error
+                     (Printf.sprintf
+                        "affine-body-shape blocks=%d instrs=%d self-adds=%d"
+                        (List.length body_labels
+                         + if control_block.body = [] then 0 else 1)
+                        (List.length body_instrs)
+                        self_add_count)
+                 else
+                   Ok
+                     ( body_instrs,
+                       body_labels,
+                       control_block,
+                       branch_op,
+                       lhs,
+                       rhs,
+                       exit_label ))
+      | _ ->
+          Error
+            (Printf.sprintf
+               "control-candidates blocks=%d control=%d"
+               (List.length loop_blocks)
+               (List.length control_candidates))
+    in
+
     List.iter
       (fun header ->
         let loop = table_find_or_empty loops header LabelSet.empty in
-        if LabelSet.cardinal loop <> 1 then
-          reject header "loop-not-single-block"
-        else
-          let block : Cfg.block = get_block header in
-          let outside_preds =
-            List.filter (fun pred -> not (LabelSet.mem pred loop)) block.preds
-          in
-          match outside_preds with
-          | [ preheader_label ] -> (
-              let preheader : Cfg.block = get_block preheader_label in
-              let loop_defs, def_blocks, def_instrs, multi_defs =
-                analyze_temp_defs_of_blocks ~loop f.temp_count f.blocks
-              in
-              let addrecs =
-                analyze_loop_addrecs
-                  header loop get_block loop_defs multi_defs def_instrs
-              in
-              let effects = collect_loop_effects summaries globals loop f.blocks in
-              match branch_continue_lt header block.term with
-              | None -> reject header "unsupported-loop-branch"
-              | Some (branch_op, lhs, rhs, exit_label) ->
-                  if
-                    effects.has_call
-                    || not (PlaceSet.is_empty effects.modified_places)
-                    || List.length block.body <> 3
-                  then
+        match find_runtime_summary_shape loop with
+        | Error reason -> reject header reason
+        | Ok
+            ( body_instrs,
+              body_labels,
+              control_block,
+              branch_op,
+              lhs,
+              rhs,
+              exit_label ) ->
+            (if debug then
+               Printf.eprintf
+                 "lve-runtime-summary-shape func=%s header=%s blocks=%d body-blocks=%d control=%s body-instrs=%d path={%s}\n%!"
+                 f.name header
+                 (LabelSet.cardinal loop)
+                 (List.length body_labels)
+                 control_block.label
+                 (List.length body_instrs)
+                 (String.concat "," body_labels));
+            let header_block : Cfg.block = get_block header in
+            let outside_preds =
+              List.filter
+                (fun pred -> not (LabelSet.mem pred loop))
+                header_block.preds
+            in
+            match outside_preds with
+            | [ preheader_label ] -> (
+                let preheader : Cfg.block = get_block preheader_label in
+                let loop_defs, def_blocks, def_instrs, multi_defs =
+                  analyze_temp_defs_of_blocks ~loop f.temp_count f.blocks
+                in
+                let effects =
+                  collect_loop_effects summaries globals loop f.blocks
+                in
+                if
+                  effects.has_call
+                  || not (PlaceSet.is_empty effects.modified_places)
+                then
+                  reject header
+                    (Printf.sprintf
+                       "effects call=%b modified=%d"
+                       effects.has_call
+                       (PlaceSet.cardinal effects.modified_places))
+                else
+                  let self_adds =
+                    body_instrs
+                    |> List.mapi (fun index instr ->
+                           Option.map
+                             (fun (dst, other) -> (index, dst, other))
+                             (self_add instr))
+                    |> List.filter_map Fun.id
+                  in
+                  if List.length self_adds <> 3 then
                     reject header
                       (Printf.sprintf
-                         "effects-or-body-shape call=%b modified=%d body=%d"
-                         effects.has_call
-                         (PlaceSet.cardinal effects.modified_places)
-                         (List.length block.body))
+                         "self-add-count=%d"
+                         (List.length self_adds))
                   else
-                    let find_control () =
+                    let control_chain =
+                      control_block
+                      :: (body_labels
+                          |> List.rev
+                          |> List.map get_block)
+                    in
+                    let string_of_binop_debug = function
+                      | Add -> "add" | Sub -> "sub" | Mul -> "mul"
+                      | Div -> "div" | Mod -> "mod"
+                      | Lt -> "lt" | Le -> "le" | Gt -> "gt"
+                      | Ge -> "ge" | Eq -> "eq" | Ne -> "ne"
+                      | LAnd -> "land" | LOr -> "lor"
+                    in
+                    let operand_is_temp_value temp operand =
+                      resolves_to_induction_temp_on_chain
+                        control_chain multi_defs def_instrs temp operand
+                      || resolves_to_induction_temp_in_block
+                           control_block multi_defs def_instrs temp operand
+                      || resolves_to_induction_temp
+                           multi_defs def_instrs temp operand
+                    in
+                    let find_control_update () =
                       List.find_map
-                        (fun (iv : loop_addrec) ->
-                          let lhs_is_iv =
-                            resolves_to_induction_temp
-                              multi_defs def_instrs iv.addrec_phi_temp lhs
-                          in
-                          let rhs_is_iv =
-                            resolves_to_induction_temp
-                              multi_defs def_instrs iv.addrec_phi_temp rhs
-                          in
-                          let normalized_op, bound =
+                        (fun (_index, dst, step_operand) ->
+                          let lhs_is_iv = operand_is_temp_value dst lhs in
+                          let rhs_is_iv = operand_is_temp_value dst rhs in
+                          let normalized_op, bound_operand =
                             if lhs_is_iv && not rhs_is_iv then
                               (branch_op, rhs)
                             else if rhs_is_iv && not lhs_is_iv then
@@ -15249,22 +15386,33 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                             else
                               (Eq, Tcg.Imm 0L)
                           in
-                          if normalized_op <> Lt then None
-                          else
-                            match normalize_loop_inv_expr iv.addrec_step with
-                            | LveOperand step_operand ->
-                                Some (iv, step_operand, bound)
-                            | LveConst _
-                            | LveNeg _
-                            | LveAdd _
-                            | LveMul _ ->
-                                None)
-                        addrecs
+                          let step_expr =
+                            lve_invariant_expr_of_operand
+                              loop_defs multi_defs def_instrs step_operand
+                          in
+                          (if debug then
+                             Printf.eprintf
+                               "lve-runtime-control-match func=%s header=%s control=%s iv=t%d op=%s lhs=%s rhs=%s lhs-iv=%b rhs-iv=%b normalized=%s step=%s invariant=%b\n%!"
+                               f.name header control_block.label dst
+                               (string_of_binop_debug branch_op)
+                               (string_of_lve_operand lhs)
+                               (string_of_lve_operand rhs)
+                               lhs_is_iv rhs_is_iv
+                               (string_of_binop_debug normalized_op)
+                               (string_of_lve_operand step_operand)
+                               (Option.is_some step_expr));
+                          if
+                            normalized_op = Lt
+                            && Option.is_some step_expr
+                          then
+                            Some (dst, step_operand, bound_operand)
+                          else None)
+                        self_adds
                     in
-                    match find_control () with
-                    | None -> reject header "no-symbolic-lt-control-addrec"
-                    | Some (control_iv, step_operand, bound_operand) ->
-                        let iv_temp = control_iv.addrec_phi_temp in
+                    match find_control_update () with
+                    | None ->
+                        reject header "no-symbolic-lt-control-update"
+                    | Some (iv_temp, step_operand, bound_operand) ->
                         let initial_iv =
                           reaching_seed_on_edge
                             ~header ~pred_label:preheader_label iv_temp
@@ -15297,49 +15445,12 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                  "operand-unavailable step=%b bound=%b"
                                  step_available bound_available)
                           else
-                            let self_adds =
-                              block.body
-                              |> List.mapi (fun index instr ->
-                                     Option.map
-                                       (fun (dst, other) -> (index, dst, other))
-                                       (self_add instr))
-                              |> List.filter_map Fun.id
+                            let non_iv =
+                              List.filter
+                                (fun (_, dst, _) -> dst <> iv_temp)
+                                self_adds
                             in
-                            if List.length self_adds <> 3 then
-                              reject header
-                                (Printf.sprintf
-                                   "self-add-count=%d"
-                                   (List.length self_adds))
-                            else
-                              let iv_update =
-                                List.find_opt
-                                  (fun (_, dst, _) -> dst = iv_temp)
-                                  self_adds
-                              in
-                              match iv_update with
-                              | None -> reject header "missing-iv-self-update"
-                              | Some (_, _, iv_step_operand) ->
-                                  let iv_step_expr =
-                                    lve_invariant_expr_of_operand
-                                      loop_defs multi_defs def_instrs
-                                      iv_step_operand
-                                  in
-                                  if
-                                    not
-                                      (match iv_step_expr with
-                                       | Some expr ->
-                                           loop_inv_expr_equal
-                                             expr control_iv.addrec_step
-                                       | None -> false)
-                                  then
-                                    reject header "iv-update-step-mismatch"
-                                  else
-                                    let non_iv =
-                                      List.filter
-                                        (fun (_, dst, _) -> dst <> iv_temp)
-                                        self_adds
-                                    in
-                                    let match_pair () =
+                            let match_pair () =
                                       match non_iv with
                                       | [ (i1, dst1, other1);
                                           (i2, dst2, other2) ] ->
@@ -15386,7 +15497,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                  (i1, dst1, other1))
                                       | _ -> None
                                     in
-                                    match match_pair () with
+                            match match_pair () with
                                     | None -> reject header "no-acc-derived-pair"
                                     | Some (acc_temp, derived_temp, delta_operand) ->
                                         let live_exit =
@@ -15573,8 +15684,10 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                               changed := true;
                                               if debug then
                                                 Printf.eprintf
-                                                  "lve-runtime-summary func=%s header=%s iv=t%d acc=t%d derived=t%d step=%s bound=%s delta=%s fallback=%s\n%!"
-                                                  f.name header iv_temp
+                                                  "lve-runtime-summary func=%s header=%s blocks=%d iv=t%d acc=t%d derived=t%d step=%s bound=%s delta=%s fallback=%s\n%!"
+                                                  f.name header
+                                                  (LabelSet.cardinal loop)
+                                                  iv_temp
                                                   acc_temp derived_temp
                                                   (string_of_lve_operand step_operand)
                                                   (string_of_lve_operand bound_operand)
