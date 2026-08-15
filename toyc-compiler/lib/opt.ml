@@ -14061,6 +14061,346 @@ let general_linear_canonicalize_func (f : Cfg.func) =
 
 
 
+(* -------------------------------------------------------------------------- *)
+(* Generic quadratic arithmetic canonicalization                              *)
+(*                                                                            *)
+(* [general_linear_canonicalize_func] deliberately stops at products of two   *)
+(* non-constant values.  That leaves a common residual class untouched:        *)
+(*                                                                            *)
+(*     ((x + a) * b) - (x * b)     ==> a * b                                  *)
+(*     (x * y) + (z * y) - (x * y) ==> z * y                                  *)
+(*                                                                            *)
+(* Model Add/Sub/Mul expressions as a polynomial of degree <= 2 over wrapping  *)
+(* i32 arithmetic.  Unknown/non-arithmetic temps are atoms.  We only rewrite   *)
+(* when the fully normalized result can be represented by ONE simple IR        *)
+(* instruction (or by the existing one-instruction linear reifier).  This      *)
+(* makes the pass code-size monotone and leaves DCE to remove canceled producer *)
+(* chains afterwards.                                                          *)
+(* -------------------------------------------------------------------------- *)
+
+module QuadraticMonomialOrd = struct
+  type t = Tcg.temp * Tcg.temp
+  let compare = Stdlib.compare
+end
+
+module QuadraticMonomialMap = Map.Make (QuadraticMonomialOrd)
+
+type quadratic_form = {
+  quadratic_const : int64;
+  quadratic_linear : int64 IntMap.t;
+  quadratic_terms : int64 QuadraticMonomialMap.t;
+}
+
+let quadratic_zero =
+  {
+    quadratic_const = 0L;
+    quadratic_linear = IntMap.empty;
+    quadratic_terms = QuadraticMonomialMap.empty;
+  }
+
+let quadratic_const value =
+  { quadratic_zero with quadratic_const = i32 value }
+
+let quadratic_atom temp =
+  {
+    quadratic_zero with
+    quadratic_linear = IntMap.singleton temp 1L;
+  }
+
+let quadratic_add_linear terms temp coeff =
+  let coeff = i32 coeff in
+  if coeff = 0L then terms
+  else
+    let old =
+      Option.value ~default:0L (IntMap.find_opt temp terms)
+    in
+    let coeff = linear_i32_add old coeff in
+    if coeff = 0L then IntMap.remove temp terms
+    else IntMap.add temp coeff terms
+
+let quadratic_monomial temp1 temp2 =
+  if temp1 <= temp2 then (temp1, temp2) else (temp2, temp1)
+
+let quadratic_add_term terms temp1 temp2 coeff =
+  let coeff = i32 coeff in
+  if coeff = 0L then terms
+  else
+    let monomial = quadratic_monomial temp1 temp2 in
+    let old =
+      Option.value ~default:0L
+        (QuadraticMonomialMap.find_opt monomial terms)
+    in
+    let coeff = linear_i32_add old coeff in
+    if coeff = 0L then QuadraticMonomialMap.remove monomial terms
+    else QuadraticMonomialMap.add monomial coeff terms
+
+let quadratic_add lhs rhs =
+  {
+    quadratic_const =
+      linear_i32_add lhs.quadratic_const rhs.quadratic_const;
+    quadratic_linear =
+      IntMap.fold
+        (fun temp coeff terms ->
+          quadratic_add_linear terms temp coeff)
+        rhs.quadratic_linear lhs.quadratic_linear;
+    quadratic_terms =
+      QuadraticMonomialMap.fold
+        (fun (temp1, temp2) coeff terms ->
+          quadratic_add_term terms temp1 temp2 coeff)
+        rhs.quadratic_terms lhs.quadratic_terms;
+  }
+
+let quadratic_scale factor form =
+  let factor = i32 factor in
+  if factor = 0L then quadratic_zero
+  else
+    {
+      quadratic_const =
+        linear_i32_mul factor form.quadratic_const;
+      quadratic_linear =
+        IntMap.fold
+          (fun temp coeff terms ->
+            quadratic_add_linear terms temp
+              (linear_i32_mul factor coeff))
+          form.quadratic_linear IntMap.empty;
+      quadratic_terms =
+        QuadraticMonomialMap.fold
+          (fun (temp1, temp2) coeff terms ->
+            quadratic_add_term terms temp1 temp2
+              (linear_i32_mul factor coeff))
+          form.quadratic_terms QuadraticMonomialMap.empty;
+    }
+
+let quadratic_sub lhs rhs =
+  quadratic_add lhs (quadratic_scale (-1L) rhs)
+
+let quadratic_is_constant form =
+  IntMap.is_empty form.quadratic_linear
+  && QuadraticMonomialMap.is_empty form.quadratic_terms
+
+let quadratic_is_linear form =
+  QuadraticMonomialMap.is_empty form.quadratic_terms
+
+let quadratic_within_budget form =
+  IntMap.cardinal form.quadratic_linear <= 12
+  && QuadraticMonomialMap.cardinal form.quadratic_terms <= 16
+
+let quadratic_mul_linear_forms lhs rhs =
+  let result =
+    ref
+      {
+        quadratic_const =
+          linear_i32_mul lhs.quadratic_const rhs.quadratic_const;
+        quadratic_linear = IntMap.empty;
+        quadratic_terms = QuadraticMonomialMap.empty;
+      }
+  in
+  IntMap.iter
+    (fun temp coeff ->
+      result :=
+        {
+          !result with
+          quadratic_linear =
+            quadratic_add_linear
+              !result.quadratic_linear temp
+              (linear_i32_mul coeff rhs.quadratic_const);
+        })
+    lhs.quadratic_linear;
+  IntMap.iter
+    (fun temp coeff ->
+      result :=
+        {
+          !result with
+          quadratic_linear =
+            quadratic_add_linear
+              !result.quadratic_linear temp
+              (linear_i32_mul coeff lhs.quadratic_const);
+        })
+    rhs.quadratic_linear;
+  IntMap.iter
+    (fun temp1 coeff1 ->
+      IntMap.iter
+        (fun temp2 coeff2 ->
+          result :=
+            {
+              !result with
+              quadratic_terms =
+                quadratic_add_term
+                  !result.quadratic_terms temp1 temp2
+                  (linear_i32_mul coeff1 coeff2);
+            })
+        rhs.quadratic_linear)
+    lhs.quadratic_linear;
+  let result = !result in
+  if quadratic_within_budget result then Some result else None
+
+let quadratic_mul lhs rhs =
+  if quadratic_is_constant lhs then
+    let result = quadratic_scale lhs.quadratic_const rhs in
+    if quadratic_within_budget result then Some result else None
+  else if quadratic_is_constant rhs then
+    let result = quadratic_scale rhs.quadratic_const lhs in
+    if quadratic_within_budget result then Some result else None
+  else if quadratic_is_linear lhs && quadratic_is_linear rhs then
+    quadratic_mul_linear_forms lhs rhs
+  else
+    None
+
+let make_quadratic_analyzer (f : Cfg.func) =
+  let _, _, def_instrs, multi_defs =
+    analyze_temp_defs_of_blocks f.temp_count f.blocks
+  in
+  let memo = Hashtbl.create (max 16 f.temp_count) in
+  let rec analyze seen = function
+    | Tcg.Imm value -> Some (quadratic_const value)
+    | Tcg.Temp temp ->
+        if IntSet.mem temp multi_defs || IntSet.mem temp seen then
+          Some (quadratic_atom temp)
+        else
+          match Hashtbl.find_opt memo temp with
+          | Some cached -> cached
+          | None ->
+              let seen = IntSet.add temp seen in
+              let result =
+                match Hashtbl.find_opt def_instrs temp with
+                | Some (Tcg.Move (_, src))
+                | Some (Tcg.Un (_, UPlus, src)) ->
+                    analyze seen src
+                | Some (Tcg.Un (_, UMinus, src)) ->
+                    Option.map
+                      (quadratic_scale (-1L))
+                      (analyze seen src)
+                | Some (Tcg.Bin (_, Add, lhs, rhs)) -> (
+                    match (analyze seen lhs, analyze seen rhs) with
+                    | Some lhs, Some rhs ->
+                        let result = quadratic_add lhs rhs in
+                        if quadratic_within_budget result
+                        then Some result else None
+                    | Some _, None
+                    | None, Some _
+                    | None, None ->
+                        None)
+                | Some (Tcg.Bin (_, Sub, lhs, rhs)) -> (
+                    match (analyze seen lhs, analyze seen rhs) with
+                    | Some lhs, Some rhs ->
+                        let result = quadratic_sub lhs rhs in
+                        if quadratic_within_budget result
+                        then Some result else None
+                    | Some _, None
+                    | None, Some _
+                    | None, None ->
+                        None)
+                | Some (Tcg.Bin (_, Mul, lhs, rhs)) -> (
+                    match (analyze seen lhs, analyze seen rhs) with
+                    | Some lhs, Some rhs -> quadratic_mul lhs rhs
+                    | Some _, None
+                    | None, Some _
+                    | None, None ->
+                        None)
+                | Some (Tcg.Un _)
+                | Some (Tcg.Bin _)
+                | Some (Tcg.Load _)
+                | Some (Tcg.Store _)
+                | Some (Tcg.Call _)
+                | None ->
+                    Some (quadratic_atom temp)
+              in
+              Hashtbl.replace memo temp result;
+              result
+  in
+  fun operand -> analyze IntSet.empty operand
+
+let reify_quadratic_one_instr dst form =
+  match QuadraticMonomialMap.bindings form.quadratic_terms with
+  | [] ->
+      reify_linear_one_instr dst
+        {
+          linear_const = form.quadratic_const;
+          linear_terms = form.quadratic_linear;
+        }
+  | [ ((temp1, temp2), coeff) ]
+    when i32 coeff = 1L
+         && i32 form.quadratic_const = 0L
+         && IntMap.is_empty form.quadratic_linear ->
+      Some
+        (Tcg.Bin
+           (dst, Mul, Tcg.Temp temp1, Tcg.Temp temp2))
+  | _ ->
+      None
+
+let quadratic_canonicalize_func (f : Cfg.func) =
+  let analyze = make_quadratic_analyzer f in
+  let rewrites = ref 0 in
+  let quadratic_rewrites = ref 0 in
+  let simplify_rewrites = ref 0 in
+  let rewrite_instr instr =
+    let initial = simplify_simple_instr instr in
+    if initial <> instr then incr simplify_rewrites;
+    let form =
+      match initial with
+      | Tcg.Un (_, UPlus, src) ->
+          analyze src
+      | Tcg.Un (_, UMinus, src) ->
+          Option.map (quadratic_scale (-1L)) (analyze src)
+      | Tcg.Bin (_, Add, lhs, rhs) -> (
+          match (analyze lhs, analyze rhs) with
+          | Some lhs, Some rhs -> Some (quadratic_add lhs rhs)
+          | Some _, None
+          | None, Some _
+          | None, None ->
+              None)
+      | Tcg.Bin (_, Sub, lhs, rhs) -> (
+          match (analyze lhs, analyze rhs) with
+          | Some lhs, Some rhs -> Some (quadratic_sub lhs rhs)
+          | Some _, None
+          | None, Some _
+          | None, None ->
+              None)
+      | Tcg.Bin (_, Mul, lhs, rhs) -> (
+          match (analyze lhs, analyze rhs) with
+          | Some lhs, Some rhs -> quadratic_mul lhs rhs
+          | Some _, None
+          | None, Some _
+          | None, None ->
+              None)
+      | Tcg.Move _
+      | Tcg.Un _
+      | Tcg.Bin _
+      | Tcg.Load _
+      | Tcg.Store _
+      | Tcg.Call _ ->
+          None
+    in
+    let candidate =
+      match (initial, form) with
+      | Tcg.Un (dst, _, _), Some form
+      | Tcg.Bin (dst, _, _, _), Some form -> (
+          match reify_quadratic_one_instr dst form with
+          | Some rewritten -> simplify_simple_instr rewritten
+          | None -> initial)
+      | _, Some _
+      | _, None ->
+          initial
+    in
+    if candidate <> initial then incr quadratic_rewrites;
+    if candidate <> instr then incr rewrites;
+    candidate
+  in
+  let blocks =
+    List.map
+      (fun (block : Cfg.block) ->
+        { block with body = List.map rewrite_instr block.body })
+      f.blocks
+  in
+  if Sys.getenv_opt "TOYC_DEBUG_QUADRATIC" <> None then
+    Printf.eprintf
+      "quadratic-canon func=%s rewrites=%d quadratic=%d simplify=%d\n%!"
+      f.name !rewrites !quadratic_rewrites !simplify_rewrites;
+  if !rewrites = 0 then f
+  else Cfg.rebuild_edges { f with blocks }
+
+
+
 (* Factor a syntactically common multiplicative term across a single-use
    add/sub pair:
 
@@ -16291,8 +16631,11 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       let after_linear1 =
         run_stage round "linear1" general_linear_canonicalize_func after_algebra1
       in
+      let after_quadratic1 =
+        run_stage round "quadratic1" quadratic_canonicalize_func after_linear1
+      in
       let after_factor1 =
-        run_stage round "factor_mul1" factor_common_mul_func after_linear1
+        run_stage round "factor_mul1" factor_common_mul_func after_quadratic1
       in
       let after_sr = run_stage round "sr" strength_reduce_func after_factor1 in
       let after_gvn1 = run_stage round "gvn1" (gvn_func summaries globals) after_sr in
@@ -16322,9 +16665,13 @@ let optimize_func global_init summaries globals return_globals removable_calls (
         run_stage round "post_licm_linear"
           general_linear_canonicalize_func after_licm_factor
       in
+      let after_licm_quadratic =
+        run_stage round "post_licm_quadratic"
+          quadratic_canonicalize_func after_licm_linear
+      in
       let after_licm_algebra =
         run_stage round "post_licm_algebra"
-          algebra_canonicalize_func after_licm_linear
+          algebra_canonicalize_func after_licm_quadratic
       in
       let after_licm_dce =
         run_stage round "post_licm_dce"
@@ -16352,8 +16699,11 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       let after_linear2 =
         run_stage round "linear2" general_linear_canonicalize_func after_algebra2
       in
+      let after_quadratic2 =
+        run_stage round "quadratic2" quadratic_canonicalize_func after_linear2
+      in
       let after_factor2 =
-        run_stage round "factor_mul2" factor_common_mul_func after_linear2
+        run_stage round "factor_mul2" factor_common_mul_func after_quadratic2
       in
       let after_gvn2 =
         run_stage round "gvn2"
@@ -16501,7 +16851,8 @@ let optimize_func global_init summaries globals return_globals removable_calls (
          make the canonicalizer reject them as multi-def/use-heavy. *)
       let late_algebra = algebra_canonicalize_func late_promoted in
       let late_linear = general_linear_canonicalize_func late_algebra in
-      let late_factor = factor_common_mul_func late_linear in
+      let late_quadratic = quadratic_canonicalize_func late_linear in
+      let late_factor = factor_common_mul_func late_quadratic in
       let late_lve_sr = loop_evolution_strength_reduce_func late_factor in
       let late_dce =
         eliminate_dead_code_func ~removable_calls summaries globals return_globals late_lve_sr
