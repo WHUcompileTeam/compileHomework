@@ -2372,7 +2372,12 @@ let build_positive_ceil_div fresh_temp numer_temp divisor =
         simplify_simple_instr (Tcg.Bin (trip, Add, Tcg.Temp quotient, Tcg.Temp extra)) ],
       trip )
 
-let build_trip_count_instrs fresh_temp phi_temp step kind =
+let build_trip_count_instrs fresh_temp phi_temp step kind known_trip =
+  match known_trip with
+  | Some count ->
+      let trip = fresh_temp () in
+      ([ Tcg.Move (trip, Tcg.Imm (i32 count)) ], trip)
+  | None ->
   let stride = if step < 0L then Int64.neg step else step in
   let diff = fresh_temp () in
   match kind with
@@ -2396,6 +2401,49 @@ let build_trip_count_instrs fresh_temp phi_temp step kind =
           simplify_simple_instr (Tcg.Bin (trip, Div, Tcg.Temp diff, Tcg.Imm stride));
           simplify_simple_instr (Tcg.Bin (trip, Add, Tcg.Temp trip, Tcg.Imm 1L)) ],
         trip )
+
+let rec constant_operand multi_defs def_instrs seen = function
+  | Tcg.Imm value -> Some (i32 value)
+  | Tcg.Temp temp ->
+      if IntSet.mem temp seen || IntSet.mem temp multi_defs then None
+      else
+        let seen = IntSet.add temp seen in
+        match Hashtbl.find_opt def_instrs temp with
+        | Some (Tcg.Move (_, src)) -> constant_operand multi_defs def_instrs seen src
+        | Some (Tcg.Un (_, op, src)) ->
+            Option.bind (constant_operand multi_defs def_instrs seen src) (fold_unop op)
+        | Some (Tcg.Bin (_, op, lhs, rhs)) ->
+            Option.bind (constant_operand multi_defs def_instrs seen lhs) (fun lhs ->
+                Option.bind
+                  (constant_operand multi_defs def_instrs seen rhs)
+                  (fold_binop op lhs))
+        | Some (Tcg.Load _ | Tcg.Store _ | Tcg.Call _) | None -> None
+
+let known_trip_count multi_defs def_instrs (iv : basic_induction_var) kind =
+  let starts =
+    List.map
+      (fun (_, operand) -> constant_operand multi_defs def_instrs IntSet.empty operand)
+      iv.outside_inputs
+  in
+  let bound =
+    match kind with
+    | CountUpLt operand | CountUpLe operand
+    | CountDownGt operand | CountDownGe operand ->
+        constant_operand multi_defs def_instrs IntSet.empty operand
+  in
+  match (starts, bound) with
+  | Some start :: rest, Some bound
+    when List.for_all (fun value -> value = Some start) rest ->
+      let stride = Int64.abs iv.step in
+      let count =
+        match kind with
+        | CountUpLt _ -> Int64.div Int64.(add (sub bound start) (sub stride 1L)) stride
+        | CountUpLe _ -> Int64.add (Int64.div Int64.(sub bound start) stride) 1L
+        | CountDownGt _ -> Int64.div Int64.(add (sub start bound) (sub stride 1L)) stride
+        | CountDownGe _ -> Int64.add (Int64.div Int64.(sub start bound) stride) 1L
+      in
+      if count >= 0L && count <= int32_mask then Some count else None
+  | _ -> None
 
 let build_iv_final_update fresh_temp trip_temp (iv : basic_induction_var) =
   match iv.step with
@@ -2781,7 +2829,17 @@ let collect_counted_reductions
         else acc)
       live_temps []
 
-let build_triangle_number_instrs fresh_temp trip_temp =
+let build_triangle_number_instrs fresh_temp trip_temp known_trip =
+  match known_trip with
+  | Some count ->
+      let triangle = fresh_temp () in
+      let left, right =
+        if Int64.rem count 2L = 0L then (Int64.div count 2L, Int64.sub count 1L)
+        else (count, Int64.div (Int64.sub count 1L) 2L)
+      in
+      let value = i32 (Int64.mul left right) in
+      ([ Tcg.Move (triangle, Tcg.Imm value) ], triangle)
+  | None ->
   let n_minus_one = fresh_temp () in
   let half_n = fresh_temp () in
   let parity = fresh_temp () in
@@ -2831,42 +2889,49 @@ let build_invariant_reduction_delta fresh_temp trip_temp step_expr =
 let build_affine_reduction_delta
     fresh_temp
     trip_temp
+    known_trip
     (iv : basic_induction_var)
     coeff
     bias
   =
   let bias_instrs, bias_operand = emit_summary_expr fresh_temp bias in
   let base = fresh_temp () in
-  let base_instrs =
-    build_scaled_value base (Tcg.Temp iv.phi_temp) coeff
-    @ bias_instrs
-    @
+  let scaled = build_scaled_value base (Tcg.Temp iv.phi_temp) coeff in
+  let base_instrs, base_operand =
     match bias_operand with
-    | Tcg.Imm 0L -> []
-    | _ -> [ simplify_simple_instr (Tcg.Bin (base, Add, Tcg.Temp base, bias_operand)) ]
+    | Tcg.Imm 0L -> (scaled @ bias_instrs, Tcg.Temp base)
+    | _ ->
+        let sum = fresh_temp () in
+        ( scaled @ bias_instrs
+          @ [ simplify_simple_instr (Tcg.Bin (sum, Add, Tcg.Temp base, bias_operand)) ],
+          Tcg.Temp sum )
   in
   let delta = fresh_temp () in
   let delta_instrs =
-    [ simplify_simple_instr (Tcg.Bin (delta, Mul, Tcg.Temp base, Tcg.Temp trip_temp)) ]
+    [ simplify_simple_instr (Tcg.Bin (delta, Mul, base_operand, Tcg.Temp trip_temp)) ]
   in
   let series_coeff = Int64.mul coeff iv.step in
   if series_coeff = 0L then (base_instrs @ delta_instrs, Some (Tcg.Temp delta))
   else
-    let triangle_instrs, triangle = build_triangle_number_instrs fresh_temp trip_temp in
+    let triangle_instrs, triangle =
+      build_triangle_number_instrs fresh_temp trip_temp known_trip
+    in
     let series = fresh_temp () in
     let series_instrs = build_scaled_value series (Tcg.Temp triangle) series_coeff in
+    let result = fresh_temp () in
     let combine =
-      simplify_simple_instr (Tcg.Bin (delta, Add, Tcg.Temp delta, Tcg.Temp series))
+      simplify_simple_instr (Tcg.Bin (result, Add, Tcg.Temp delta, Tcg.Temp series))
     in
-    (base_instrs @ delta_instrs @ triangle_instrs @ series_instrs @ [ combine], Some (Tcg.Temp delta))
+    ( base_instrs @ delta_instrs @ triangle_instrs @ series_instrs @ [ combine ],
+      Some (Tcg.Temp result) )
 
-let build_reduction_final_update fresh_temp trip_temp (reduction : counted_reduction) =
+let build_reduction_final_update fresh_temp trip_temp known_trip (reduction : counted_reduction) =
   let delta_instrs, delta_operand =
     match reduction.step with
     | ReductionInvariant step_expr ->
         build_invariant_reduction_delta fresh_temp trip_temp step_expr
     | ReductionAffine { iv; coeff; bias } ->
-        build_affine_reduction_delta fresh_temp trip_temp iv coeff bias
+        build_affine_reduction_delta fresh_temp trip_temp known_trip iv coeff bias
   in
   match delta_operand with
   | None -> []
@@ -2970,9 +3035,8 @@ let eliminate_counted_loops_func (f : Cfg.func) =
                         iv.phi_temp = info.control_iv.phi_temp || IntSet.mem iv.phi_temp live_t_exit)
                       ivs
                   in
-                  let loop_live_defs =
-                    IntSet.inter (loop_defined_temps loop blocks_snapshot) live_t_exit
-                  in
+                  let loop_defs = loop_defined_temps loop blocks_snapshot in
+                  let loop_live_defs = IntSet.inter loop_defs live_t_exit in
                   let excluded_temps =
                     List.fold_left
                       (fun acc (iv : basic_induction_var) -> IntSet.add iv.phi_temp acc)
@@ -2985,7 +3049,7 @@ let eliminate_counted_loops_func (f : Cfg.func) =
                       get_block
                       def_blocks
                       loop_stable_phis
-                      multi_defs
+                      (IntSet.inter multi_defs loop_defs)
                       def_instrs
                       ivs
                       excluded_temps
@@ -3002,16 +3066,20 @@ let eliminate_counted_loops_func (f : Cfg.func) =
                   in
                   if not (IntSet.subset loop_live_defs supported_live) then ()
                   else
+                    let known_trip =
+                      known_trip_count multi_defs def_instrs info.control_iv info.kind
+                    in
                     let trip_instrs, trip_temp =
                       build_trip_count_instrs
                         fresh_temp
                         info.control_iv.phi_temp
                         info.control_iv.step
                         info.kind
+                        known_trip
                     in
                     let updates =
                       List.concat_map
-                        (build_reduction_final_update fresh_temp trip_temp)
+                        (build_reduction_final_update fresh_temp trip_temp known_trip)
                         reductions
                       @ List.concat_map
                           (build_iv_final_update fresh_temp trip_temp)
