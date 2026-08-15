@@ -932,6 +932,54 @@ let emit_compare_zero ctx op dst reg zero_on_left =
   | LOr, _ ->
       raise (Error "non-compare op in compare-zero lowering")
 
+let emit_mul_const ctx dst src factor _op =
+  let f = Int64.to_int factor in
+  let abs_f = abs f in
+  let neg = f < 0 in
+  let emit_abs () =
+    match abs_f with
+    | 0 ->
+        emitf ctx "    addi %s, x0, 0" dst
+    | 1 ->
+        if dst <> src then emitf ctx "    addi %s, %s, 0" dst src
+    | 3 ->
+        emitf ctx "    slli %s, %s, 1" dst src;
+        emitf ctx "    add %s, %s, %s" dst dst src
+    | 5 ->
+        emitf ctx "    slli %s, %s, 2" dst src;
+        emitf ctx "    add %s, %s, %s" dst dst src
+    | 6 ->
+        emitf ctx "    slli %s, %s, 1" dst src;
+        emitf ctx "    add %s, %s, %s" dst dst src;
+        emitf ctx "    slli %s, %s, 1" dst dst
+    | 7 ->
+        emitf ctx "    slli %s, %s, 3" dst src;
+        emitf ctx "    sub %s, %s, %s" dst dst src
+    | 9 ->
+        emitf ctx "    slli %s, %s, 3" dst src;
+        emitf ctx "    add %s, %s, %s" dst dst src
+    | 10 ->
+        emitf ctx "    slli %s, %s, 2" dst src;
+        emitf ctx "    add %s, %s, %s" dst dst src;
+        emitf ctx "    slli %s, %s, 1" dst dst
+    | 12 ->
+        emitf ctx "    slli %s, %s, 1" dst src;
+        emitf ctx "    add %s, %s, %s" dst dst src;
+        emitf ctx "    slli %s, %s, 2" dst dst
+    | 15 ->
+        emitf ctx "    slli %s, %s, 4" dst src;
+        emitf ctx "    sub %s, %s, %s" dst dst src
+    | n when n land (n - 1) = 0 && n > 0 ->
+        let shift = let rec f v s = if v = 1 then s else f (v lsr 1) (s + 1) in f n 0 in
+        emitf ctx "    slli %s, %s, %d" dst src shift
+    | _ ->
+        load_operand ctx "t1" (Tcg.Imm factor);
+        emitf ctx "    mul %s, %s, t1" dst src
+  in
+  emit_abs ();
+  if neg then
+    emitf ctx "    sub %s, x0, %s" dst dst
+
 let emit_binop_operands ctx op dst lhs rhs =
   match (op, lhs, rhs) with
   | Mul, Tcg.Imm factor, rhs -> (
@@ -941,16 +989,7 @@ let emit_binop_operands ctx op dst lhs rhs =
           emitf ctx "    slli %s, %s, %d" dst rhs_reg shift
       | None ->
           let rhs_reg = operand_reg ctx "t0" rhs in
-          if factor = 3L then begin
-            emitf ctx "    slli %s, %s, 1" dst rhs_reg;
-            emitf ctx "    add %s, %s, %s" dst dst rhs_reg
-          end else if factor = 5L then begin
-            emitf ctx "    slli %s, %s, 2" dst rhs_reg;
-            emitf ctx "    add %s, %s, %s" dst dst rhs_reg
-          end else begin
-            let lhs_reg = operand_reg ctx "t0" (Tcg.Imm factor) in
-            emit_binop ctx op dst lhs_reg rhs_reg
-          end)
+          emit_mul_const ctx dst rhs_reg factor op)
   | Mul, lhs, Tcg.Imm factor -> (
       match power_of_two_shift factor with
       | Some shift ->
@@ -958,16 +997,7 @@ let emit_binop_operands ctx op dst lhs rhs =
           emitf ctx "    slli %s, %s, %d" dst lhs_reg shift
       | None ->
           let lhs_reg = operand_reg ctx "t0" lhs in
-          if factor = 3L then begin
-            emitf ctx "    slli %s, %s, 1" dst lhs_reg;
-            emitf ctx "    add %s, %s, %s" dst dst lhs_reg
-          end else if factor = 5L then begin
-            emitf ctx "    slli %s, %s, 2" dst lhs_reg;
-            emitf ctx "    add %s, %s, %s" dst dst lhs_reg
-          end else begin
-            let rhs_reg = operand_reg ctx "t1" (Tcg.Imm factor) in
-            emit_binop ctx op dst lhs_reg rhs_reg
-          end)
+          emit_mul_const ctx dst lhs_reg factor op)
   | Add, Tcg.Imm imm, rhs when fits_simm12 imm ->
       let rhs_reg = operand_reg ctx "t0" rhs in
       emitf ctx "    addi %s, %s, %Ld" dst rhs_reg imm
@@ -977,6 +1007,16 @@ let emit_binop_operands ctx op dst lhs rhs =
   | Sub, lhs, Tcg.Imm imm when fits_simm12 Int64.(neg imm) ->
       let lhs_reg = operand_reg ctx "t0" lhs in
       emitf ctx "    addi %s, %s, %Ld" dst lhs_reg Int64.(neg imm)
+  | Sub, Tcg.Imm 0L, rhs ->
+      let rhs_reg = operand_reg ctx "t0" rhs in
+      emitf ctx "    sub %s, x0, %s" dst rhs_reg
+  | Lt, lhs, Tcg.Imm imm when fits_simm12 imm ->
+      let lhs_reg = operand_reg ctx "t0" lhs in
+      emitf ctx "    slti %s, %s, %Ld" dst lhs_reg imm
+  | Ge, lhs, Tcg.Imm imm when fits_simm12 imm ->
+      let lhs_reg = operand_reg ctx "t0" lhs in
+      emitf ctx "    slti %s, %s, %Ld" dst lhs_reg imm;
+      emitf ctx "    xori %s, %s, 1" dst dst
   | Eq, Tcg.Imm 0L, rhs
   | Ne, Tcg.Imm 0L, rhs
   | Lt, Tcg.Imm 0L, rhs
@@ -987,10 +1027,8 @@ let emit_binop_operands ctx op dst lhs rhs =
       emit_compare_zero ctx op dst rhs_reg true
   | Eq, lhs, Tcg.Imm 0L
   | Ne, lhs, Tcg.Imm 0L
-  | Lt, lhs, Tcg.Imm 0L
   | Gt, lhs, Tcg.Imm 0L
-  | Le, lhs, Tcg.Imm 0L
-  | Ge, lhs, Tcg.Imm 0L ->
+  | Le, lhs, Tcg.Imm 0L ->
       let lhs_reg = operand_reg ctx "t0" lhs in
       emit_compare_zero ctx op dst lhs_reg false
   | Div, lhs, Tcg.Imm divisor when (let v = Int64.to_int divisor in v > 0 && v land (v - 1) = 0 && v > 1) -> (
