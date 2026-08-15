@@ -733,9 +733,12 @@ let is_commutative_binop = function
   | Add | Mul | Eq | Ne -> true
   | Sub | Div | Mod | Lt | Gt | Le | Ge | LAnd | LOr -> false
 
+type linear_key = int64 * (Tcg.temp * int64) list
+
 type expr_key =
   | KeyUn of unop * Tcg.operand
   | KeyBin of binop * Tcg.operand * Tcg.operand
+  | KeyLinear of linear_key
   | KeyLoad of Tcg.place
 
 module ExprKeyOrd = struct
@@ -762,6 +765,197 @@ let normalize_bin_operands op lhs rhs =
     | Tcg.Temp _, Tcg.Imm _ -> (lhs, rhs)
     | _ when Stdlib.compare lhs rhs > 0 -> (rhs, lhs)
     | _ -> (lhs, rhs)
+
+type linear_form = {
+  linear_const : int64;
+  linear_terms : int64 IntMap.t;
+}
+
+type linear_analyzer = Tcg.operand -> linear_form
+
+let linear_i32_add a b = i32 Int64.(add (i32 a) (i32 b))
+let linear_i32_mul a b = i32 Int64.(mul (i32 a) (i32 b))
+
+let linear_zero = { linear_const = 0L; linear_terms = IntMap.empty }
+
+let linear_const value =
+  { linear_const = i32 value; linear_terms = IntMap.empty }
+
+let linear_atom temp =
+  {
+    linear_const = 0L;
+    linear_terms = IntMap.singleton temp 1L;
+  }
+
+let linear_add_term terms temp coeff =
+  let coeff = i32 coeff in
+  if coeff = 0L then terms
+  else
+    let old = Option.value ~default:0L (IntMap.find_opt temp terms) in
+    let coeff = linear_i32_add old coeff in
+    if coeff = 0L then IntMap.remove temp terms
+    else IntMap.add temp coeff terms
+
+let linear_add lhs rhs =
+  {
+    linear_const = linear_i32_add lhs.linear_const rhs.linear_const;
+    linear_terms =
+      IntMap.fold
+        (fun temp coeff terms -> linear_add_term terms temp coeff)
+        rhs.linear_terms lhs.linear_terms;
+  }
+
+let linear_scale factor form =
+  let factor = i32 factor in
+  if factor = 0L then linear_zero
+  else
+    {
+      linear_const = linear_i32_mul factor form.linear_const;
+      linear_terms =
+        IntMap.fold
+          (fun temp coeff terms ->
+            linear_add_term terms temp (linear_i32_mul factor coeff))
+          form.linear_terms IntMap.empty;
+    }
+
+let linear_sub lhs rhs =
+  linear_add lhs (linear_scale (-1L) rhs)
+
+let linear_key_of_form form =
+  (i32 form.linear_const, IntMap.bindings form.linear_terms)
+
+let make_linear_analyzer (f : Cfg.func) : linear_analyzer =
+  (* Keep the early linear/GVN layer independent of the later generic
+     temp-definition helpers.  This function is intentionally defined before
+     [defs_temp]/[analyze_temp_defs_of_blocks] in this file, so build the two
+     small tables it needs locally. *)
+  let def_instrs = Hashtbl.create (max 16 f.temp_count) in
+  let multi_defs = ref IntSet.empty in
+  let record_def temp instr =
+    if Hashtbl.mem def_instrs temp then
+      multi_defs := IntSet.add temp !multi_defs
+    else
+      Hashtbl.add def_instrs temp instr
+  in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter
+        (fun instr ->
+          match instr with
+          | Tcg.Move (dst, _)
+          | Tcg.Un (dst, _, _)
+          | Tcg.Bin (dst, _, _, _)
+          | Tcg.Load (dst, _) ->
+              record_def dst instr
+          | Tcg.Call (Some dst, _, _) ->
+              record_def dst instr
+          | Tcg.Store _
+          | Tcg.Call (None, _, _) ->
+              ())
+        block.body)
+    f.blocks;
+  let multi_defs = !multi_defs in
+  let memo = Hashtbl.create (max 16 f.temp_count) in
+  let rec of_operand seen = function
+    | Tcg.Imm value -> linear_const value
+    | Tcg.Temp temp ->
+        if IntSet.mem temp multi_defs || IntSet.mem temp seen then
+          linear_atom temp
+        else
+          match Hashtbl.find_opt memo temp with
+          | Some form -> form
+          | None ->
+              let seen = IntSet.add temp seen in
+              let form =
+                match Hashtbl.find_opt def_instrs temp with
+                | Some (Tcg.Move (_, src))
+                | Some (Tcg.Un (_, UPlus, src)) ->
+                    of_operand seen src
+                | Some (Tcg.Un (_, UMinus, src)) ->
+                    linear_scale (-1L) (of_operand seen src)
+                | Some (Tcg.Bin (_, Add, lhs, rhs)) ->
+                    linear_add (of_operand seen lhs) (of_operand seen rhs)
+                | Some (Tcg.Bin (_, Sub, lhs, rhs)) ->
+                    linear_sub (of_operand seen lhs) (of_operand seen rhs)
+                | Some (Tcg.Bin (_, Mul, lhs, Tcg.Imm factor))
+                | Some (Tcg.Bin (_, Mul, Tcg.Imm factor, lhs)) ->
+                    linear_scale factor (of_operand seen lhs)
+                | Some (Tcg.Un _)
+                | Some (Tcg.Bin _)
+                | Some (Tcg.Load _)
+                | Some (Tcg.Store _)
+                | Some (Tcg.Call _)
+                | None ->
+                    linear_atom temp
+              in
+              Hashtbl.replace memo temp form;
+              form
+  in
+  fun operand -> of_operand IntSet.empty operand
+
+let linear_form_of_un analyze op src =
+  match op with
+  | UPlus -> Some (analyze src)
+  | UMinus -> Some (linear_scale (-1L) (analyze src))
+  | UNot -> None
+
+let linear_form_of_bin analyze op lhs rhs =
+  match op with
+  | Add -> Some (linear_add (analyze lhs) (analyze rhs))
+  | Sub -> Some (linear_sub (analyze lhs) (analyze rhs))
+  | Mul -> (
+      match (lhs, rhs) with
+      | operand, Tcg.Imm factor
+      | Tcg.Imm factor, operand ->
+          Some (linear_scale factor (analyze operand))
+      | Tcg.Temp _, Tcg.Temp _ -> None)
+  | Div | Mod | Lt | Gt | Le | Ge | Eq | Ne | LAnd | LOr ->
+      None
+
+let linear_expr_key_of_un analysis op src =
+  Option.map
+    (fun form -> KeyLinear (linear_key_of_form form))
+    (linear_form_of_un analysis op src)
+
+let linear_expr_key_of_bin analysis op lhs rhs =
+  Option.map
+    (fun form -> KeyLinear (linear_key_of_form form))
+    (linear_form_of_bin analysis op lhs rhs)
+
+let reify_linear_one_instr dst form =
+  let const = i32 form.linear_const in
+  match IntMap.bindings form.linear_terms with
+  | [] ->
+      Some (Tcg.Move (dst, Tcg.Imm const))
+  | [ (temp, coeff) ] ->
+      let coeff = i32 coeff in
+      if coeff = 1L then
+        if const = 0L then
+          Some (Tcg.Move (dst, Tcg.Temp temp))
+        else
+          Some (Tcg.Bin (dst, Add, Tcg.Temp temp, Tcg.Imm const))
+      else if coeff = -1L then
+        if const = 0L then
+          Some (Tcg.Un (dst, UMinus, Tcg.Temp temp))
+        else
+          Some (Tcg.Bin (dst, Sub, Tcg.Imm const, Tcg.Temp temp))
+      else if const = 0L then
+        Some (Tcg.Bin (dst, Mul, Tcg.Temp temp, Tcg.Imm coeff))
+      else
+        None
+  | [ (temp1, coeff1); (temp2, coeff2) ] when const = 0L ->
+      let coeff1 = i32 coeff1 in
+      let coeff2 = i32 coeff2 in
+      if coeff1 = 1L && coeff2 = 1L then
+        Some (Tcg.Bin (dst, Add, Tcg.Temp temp1, Tcg.Temp temp2))
+      else if coeff1 = 1L && coeff2 = -1L then
+        Some (Tcg.Bin (dst, Sub, Tcg.Temp temp1, Tcg.Temp temp2))
+      else if coeff1 = -1L && coeff2 = 1L then
+        Some (Tcg.Bin (dst, Sub, Tcg.Temp temp2, Tcg.Temp temp1))
+      else
+        None
+  | _ ->
+      None
 
 let simplify_cfg_func (f : Cfg.func) =
   let simplify_instr instr =
@@ -801,7 +995,7 @@ let kill_place_loads killed avail =
     (fun key _ ->
       match key with
       | KeyLoad place -> not (PlaceSet.mem place killed)
-      | KeyUn _ | KeyBin _ -> true)
+      | KeyUn _ | KeyBin _ | KeyLinear _ -> true)
     avail
 
 let operand_has_temp temp = function
@@ -811,6 +1005,8 @@ let operand_has_temp temp = function
 let expr_key_has_temp temp = function
   | KeyUn (_, src) -> operand_has_temp temp src
   | KeyBin (_, lhs, rhs) -> operand_has_temp temp lhs || operand_has_temp temp rhs
+  | KeyLinear (_, terms) ->
+      List.exists (fun (term, _) -> term = temp) terms
   | KeyLoad _ -> false
 
 let avail_value_has_temp temp = function
@@ -895,7 +1091,7 @@ let equal_gvn_state a b =
 let meet_gvn_state a b =
   { avail = meet_avail a.avail b.avail; aliases = meet_alias_map a.aliases b.aliases }
 
-let transfer_gvn_instr summaries globals state instr =
+let transfer_gvn_instr ?linear summaries globals state instr =
   match instr with
   | Tcg.Move (dst, src) ->
       let src = resolve_alias_operand state.aliases IntSet.empty src in
@@ -915,7 +1111,14 @@ let transfer_gvn_instr summaries globals state instr =
         match instr with
         | Tcg.Move (_, src) -> (instr, { avail; aliases = set_alias_fact aliases dst src })
         | Tcg.Un (_, op, src) ->
-            let key = KeyUn (op, src) in
+            let key =
+              match linear with
+              | Some analysis -> (
+                  match linear_expr_key_of_un analysis op src with
+                  | Some key when not (expr_key_has_temp dst key) -> key
+                  | Some _ | None -> KeyUn (op, src))
+              | None -> KeyUn (op, src)
+            in
             begin
               match ExprKeyMap.find_opt key avail with
               | Some value ->
@@ -936,7 +1139,14 @@ let transfer_gvn_instr summaries globals state instr =
         | Tcg.Move (_, src) -> (instr, { avail; aliases = set_alias_fact aliases dst src })
         | Tcg.Bin (_, op, lhs, rhs) ->
             let lhs, rhs = normalize_bin_operands op lhs rhs in
-            let key = KeyBin (op, lhs, rhs) in
+            let key =
+              match linear with
+              | Some analysis -> (
+                  match linear_expr_key_of_bin analysis op lhs rhs with
+                  | Some key when not (expr_key_has_temp dst key) -> key
+                  | Some _ | None -> KeyBin (op, lhs, rhs))
+              | None -> KeyBin (op, lhs, rhs)
+            in
             begin
               match ExprKeyMap.find_opt key avail with
               | Some value ->
@@ -1287,11 +1497,11 @@ let const_propagate_func global_init summaries globals (f : Cfg.func) =
   in
   Cfg.rebuild_edges { f with blocks }
 
-let run_gvn_transfer summaries globals state (block : Cfg.block) =
+let run_gvn_transfer ?linear summaries globals state (block : Cfg.block) =
   let body_rev, state =
     List.fold_left
       (fun (acc, state) instr ->
-        let instr, state = transfer_gvn_instr summaries globals state instr in
+        let instr, state = transfer_gvn_instr ?linear summaries globals state instr in
         (instr :: acc, state))
       ([], state) block.body
   in
@@ -1335,7 +1545,7 @@ let run_gvn_transfer summaries globals state (block : Cfg.block) =
   in
   ({ block with body = List.rev body_rev; term; succs = Cfg.successors term }, state)
 
-let compute_gvn_states summaries globals (f : Cfg.func) =
+let compute_gvn_states ?linear summaries globals (f : Cfg.func) =
   let in_states = Hashtbl.create (List.length f.blocks) in
   let out_states = Hashtbl.create (List.length f.blocks) in
   let find_state table label =
@@ -1357,7 +1567,7 @@ let compute_gvn_states summaries globals (f : Cfg.func) =
     List.iter
       (fun (block : Cfg.block) ->
         let in_state = meet_preds block.preds in
-        let _, out_state = run_gvn_transfer summaries globals in_state block in
+        let _, out_state = run_gvn_transfer ?linear summaries globals in_state block in
         let prev_in = find_state in_states block.label in
         let prev_out = find_state out_states block.label in
         if not (equal_gvn_state in_state prev_in) then (
@@ -1371,7 +1581,8 @@ let compute_gvn_states summaries globals (f : Cfg.func) =
   in_states
 
 let gvn_func summaries globals (f : Cfg.func) =
-  let in_states = compute_gvn_states summaries globals f in
+  let linear = make_linear_analyzer f in
+  let in_states = compute_gvn_states ~linear summaries globals f in
   let blocks =
     List.map
       (fun (block : Cfg.block) ->
@@ -1380,7 +1591,7 @@ let gvn_func summaries globals (f : Cfg.func) =
           | Some state -> state
           | None -> empty_gvn_state
         in
-        fst (run_gvn_transfer summaries globals state block))
+        fst (run_gvn_transfer ~linear summaries globals state block))
       f.blocks
   in
   Cfg.rebuild_edges { f with blocks }
@@ -13803,6 +14014,52 @@ let algebra_canonicalize_func (f : Cfg.func) =
       f.name !rewrites !cancellation_rewrites;
   if !rewrites = 0 then f else Cfg.rebuild_edges { f with blocks }
 
+let general_linear_canonicalize_func (f : Cfg.func) =
+  let analyze = make_linear_analyzer f in
+  let rewrites = ref 0 in
+  let rewrite_instr instr =
+    let initial = simplify_simple_instr instr in
+    let candidate =
+      match initial with
+      | Tcg.Un (dst, ((UPlus | UMinus) as op), src) -> (
+          match linear_form_of_un analyze op src with
+          | Some form -> (
+              match reify_linear_one_instr dst form with
+              | Some rewritten -> simplify_simple_instr rewritten
+              | None -> initial)
+          | None -> initial)
+      | Tcg.Bin (dst, ((Add | Sub | Mul) as op), lhs, rhs) -> (
+          match linear_form_of_bin analyze op lhs rhs with
+          | Some form -> (
+              match reify_linear_one_instr dst form with
+              | Some rewritten -> simplify_simple_instr rewritten
+              | None -> initial)
+          | None -> initial)
+      | Tcg.Move _
+      | Tcg.Un _
+      | Tcg.Bin _
+      | Tcg.Load _
+      | Tcg.Store _
+      | Tcg.Call _ ->
+          initial
+    in
+    if candidate <> instr then incr rewrites;
+    candidate
+  in
+  let blocks =
+    List.map
+      (fun (block : Cfg.block) ->
+        { block with body = List.map rewrite_instr block.body })
+      f.blocks
+  in
+  if Sys.getenv_opt "TOYC_DEBUG_LINEAR" <> None then
+    Printf.eprintf
+      "linear-canon func=%s rewrites=%d\n%!"
+      f.name !rewrites;
+  if !rewrites = 0 then f
+  else Cfg.rebuild_edges { f with blocks }
+
+
 type reassoc_first =
   | FirstVarPlusInv of Tcg.operand * Tcg.operand
   | FirstVarMinusInv of Tcg.operand * Tcg.operand
@@ -15873,7 +16130,10 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       let after_algebra1 =
         run_stage round "algebra1" algebra_canonicalize_func after_const1
       in
-      let after_sr = run_stage round "sr" strength_reduce_func after_algebra1 in
+      let after_linear1 =
+        run_stage round "linear1" general_linear_canonicalize_func after_algebra1
+      in
+      let after_sr = run_stage round "sr" strength_reduce_func after_linear1 in
       let after_gvn1 = run_stage round "gvn1" (gvn_func summaries globals) after_sr in
       let after_dce1 =
         run_stage round "dce1" (eliminate_dead_code_func ~removable_calls summaries globals return_globals) after_gvn1
@@ -15898,10 +16158,13 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       let after_algebra2 =
         run_stage round "algebra2" algebra_canonicalize_func after_const2
       in
+      let after_linear2 =
+        run_stage round "linear2" general_linear_canonicalize_func after_algebra2
+      in
       let after_gvn2 =
         run_stage round "gvn2"
           (gvn_func summaries globals)
-          after_algebra2
+          after_linear2
       in
       let after_dce2 =
         run_stage round "dce2" (eliminate_dead_code_func ~removable_calls summaries globals return_globals) after_gvn2
@@ -16043,7 +16306,8 @@ let optimize_func global_init summaries globals return_globals removable_calls (
          but coalescing first can merge unrelated definitions onto one temp and
          make the canonicalizer reject them as multi-def/use-heavy. *)
       let late_algebra = algebra_canonicalize_func late_promoted in
-      let late_lve_sr = loop_evolution_strength_reduce_func late_algebra in
+      let late_linear = general_linear_canonicalize_func late_algebra in
+      let late_lve_sr = loop_evolution_strength_reduce_func late_linear in
       let late_dce =
         eliminate_dead_code_func ~removable_calls summaries globals return_globals late_lve_sr
       in
