@@ -7646,10 +7646,22 @@ let linear_expr_of_operand
       match (operand_def block left, operand_def block right) with
       | ( Some (Tcg.Bin (_, Mul, left_a, left_b)),
           Some (Tcg.Bin (_, Mul, right_a, right_b)) ) ->
+          let classify_n_minus_one operand =
+            match operand_def block operand with
+            | Some (Tcg.Bin (_, Sub, n, Tcg.Imm 1L)) ->
+                Some n
+            | Some (Tcg.Bin (_, Add, n, Tcg.Imm (-1L)))
+            | Some (Tcg.Bin (_, Add, Tcg.Imm (-1L), n)) ->
+                Some n
+            | _ ->
+                None
+          in
           let classify_left first second =
-            match (operand_def block first, operand_def block second) with
-            | ( Some (Tcg.Bin (_, Div, n_half, Tcg.Imm 2L)),
-                Some (Tcg.Bin (_, Sub, n_minus, Tcg.Imm 1L)) ) ->
+            match
+              (operand_def block first, classify_n_minus_one second)
+            with
+            | Some (Tcg.Bin (_, Div, n_half, Tcg.Imm 2L)),
+              Some n_minus ->
                 Some (first, second, n_half, n_minus)
             | _ -> None
           in
