@@ -6969,85 +6969,12 @@ let linear_expr_of_operand
         resolves_to_induction_temp multi_defs def_instrs iv.phi_temp operand)
       ivs
   in
-
-  (* Normalize multiple basic induction variables onto a unique unit-step
-     anchor whenever their loop-entry seeds are provably invariant.
-
-       anchor = a0 + sa*k,  |sa| = 1
-       other  = b0 + sb*k
-
-     therefore
-
-       other = (sb/sa) * anchor + (b0 - (sb/sa)*a0)
-
-     Since [sa] is +/-1 the coefficient is always integral.  This lets the
-     existing LinearAffine/Quadratic/Cubic algebra combine expressions that
-     previously failed merely because they mentioned two syntactically
-     different IVs.
-
-     Keep the proof deliberately conservative: require a unique unit-step IV,
-     require each IV to have one syntactically common outside seed, and require
-     those seeds to be loop-invariant at this analysis point. *)
-  let unit_anchor_iv =
-    match
-      List.filter
-        (fun (iv : basic_induction_var) -> Int64.abs iv.step = 1L)
-        ivs
-    with
-    | [ iv ] -> Some iv
-    | [] | _ :: _ :: _ -> None
-  in
-  let common_outside_seed (iv : basic_induction_var) =
-    match iv.outside_inputs with
-    | [] -> None
-    | (_, first) :: rest ->
-        if List.for_all (fun (_, operand) -> operand = first) rest
-        then Some first
-        else None
-  in
-  let seed_is_invariant seed =
-    operand_loop_invariant
-      loop_defs loop_stable_phis multi_defs def_instrs IntSet.empty seed
-  in
-  let normalize_iv_to_anchor (iv : basic_induction_var) =
-    match unit_anchor_iv with
-    | Some (anchor : basic_induction_var)
-      when iv.phi_temp <> anchor.phi_temp -> (
-        match (common_outside_seed iv, common_outside_seed anchor) with
-        | Some iv_seed, Some anchor_seed
-          when seed_is_invariant iv_seed && seed_is_invariant anchor_seed ->
-            let coeff_value =
-              if anchor.step = 1L then i32 iv.step
-              else i32 (Int64.neg iv.step)
-            in
-            let coeff = SummaryOperand (Tcg.Imm coeff_value) in
-            let bias =
-              summary_expr_sub
-                (SummaryOperand iv_seed)
-                (summary_expr_mul coeff (SummaryOperand anchor_seed))
-            in
-            if Sys.getenv_opt "TOYC_DEBUG_MULTI_IV" <> None then
-              Printf.eprintf
-                "multi-iv-anchor other=t%d step=%Ld anchor=t%d step=%Ld coeff=%Ld\n%!"
-                iv.phi_temp iv.step anchor.phi_temp anchor.step coeff_value;
-            Some (linear_affine anchor coeff bias)
-        | Some _, Some _
-        | Some _, None
-        | None, Some _
-        | None, None ->
-            None)
-    | Some _ | None ->
-        None
-  in
   let direct_scaled operand =
     match direct_iv operand with
-    | Some iv -> (
-        match normalize_iv_to_anchor iv with
-        | Some normalized -> Some normalized
-        | None ->
-            Some
-              (LinearAffine
-                 { iv; coeff = one_summary_expr; bias = zero_summary_expr }))
+    | Some iv ->
+        Some
+          (LinearAffine
+             { iv; coeff = one_summary_expr; bias = zero_summary_expr })
     | None -> None
   in
   let immediate_iv_init (iv : basic_induction_var) =
@@ -12342,8 +12269,7 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                   let summary_label = fresh_summary_label () in
                   let control_block = get_block info.control_label in
                   let zero_trip_state_simple =
-                    f.params = []
-                    && reconstruction_order = []
+                    reconstruction_order = []
                     && place_mirrors = []
                   in
                   let zero_trip_elided =
