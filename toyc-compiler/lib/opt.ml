@@ -15050,6 +15050,97 @@ let constant_param_simple_loop_shape (f : Cfg.func) =
    Once observed call arguments are constant, specialization is applied to
    this original CFG and optimized from scratch.  The existing transaction
    still accepts it only if the loop is completely eliminated. *)
+(* A second source-based specialization shape for the common case where
+   the loop is structurally simple but its induction step/bound is a formal
+   parameter.
+
+   The old late-simple path is kept as the first choice.  This source shape is
+   only used as a fallback when late specialization finds zero parameter Loads
+   to replace (typically because mem2reg has already converted those Loads into
+   long-lived temps).
+
+   Require one natural loop with exactly one conditional block.  That
+   conditional must be the loop guard: exactly one of its successors stays in
+   the natural loop and the other exits it.  Every other loop block must end
+   in an unconditional jump, so there is no hidden internal branch. *)
+let constant_param_source_simple_counted_loop_shape (f : Cfg.func) =
+  let block_map, loops, headers = discover_natural_loops f in
+  let find_block label =
+    Hashtbl.find_opt block_map label
+  in
+  match headers with
+  | [ header ] ->
+      let loop =
+        table_find_or_empty loops header LabelSet.empty
+      in
+      let conditional_labels =
+        LabelSet.fold
+          (fun label acc ->
+            match find_block label with
+            | Some (block : Cfg.block) ->
+                begin
+                  match branch_term_outcomes block.term with
+                  | Some _ -> label :: acc
+                  | None -> acc
+                end
+            | None ->
+                acc)
+          loop []
+      in
+      begin
+        match conditional_labels with
+        | [ guard ] ->
+            let non_guard_terms_are_jumps =
+              LabelSet.for_all
+                (fun label ->
+                  if label = guard then
+                    true
+                  else
+                    match find_block label with
+                    | Some (block : Cfg.block) ->
+                        begin
+                          match block.term with
+                          | Cfg.Jump _ -> true
+                          | Cfg.BranchZero _
+                          | Cfg.BranchNonZero _
+                          | Cfg.BranchCompare _
+                          | Cfg.Return _ ->
+                              false
+                        end
+                    | None ->
+                        false)
+                loop
+            in
+            if not non_guard_terms_are_jumps then
+              false
+            else
+              begin
+                match find_block guard with
+                | Some (block : Cfg.block) ->
+                    begin
+                      match branch_term_outcomes block.term with
+                      | Some (succ1, succ2) ->
+                          let succ1_inside =
+                            LabelSet.mem succ1 loop
+                          in
+                          let succ2_inside =
+                            LabelSet.mem succ2 loop
+                          in
+                          succ1_inside <> succ2_inside
+                      | None ->
+                          false
+                    end
+                | None ->
+                    false
+              end
+        | []
+        | _ :: _ :: _ ->
+            false
+      end
+  | []
+  | _ :: _ :: _ ->
+      false
+
 let constant_param_source_threshold_diamond_shape (f : Cfg.func) =
   let block_map, loops, headers = discover_natural_loops f in
 
@@ -15238,89 +15329,154 @@ let specialize_constant_params_program_once
   let funcs =
     List.map
       (fun (f : Cfg.func) ->
+        let had_loop =
+          function_has_natural_loop f
+        in
         let late_simple =
           constant_param_simple_loop_shape f
         in
-        let source_threshold =
-          if late_simple || not (function_has_natural_loop f) then
+        let return_globals =
+          match Hashtbl.find_opt return_global_demands f.label with
+          | Some return_globals ->
+              return_globals
+          | None ->
+              globals
+        in
+
+        let optimize_specialized_candidate mode specialized replacements =
+          if replacements = 0 then
             None
-          else
-            match Hashtbl.find_opt source_by_label f.label with
-            | Some source
-              when constant_param_source_threshold_diamond_shape source ->
-                Some source
-            | Some _
-            | None ->
-                None
-        in
-        let specialization_base, specialization_mode =
-          if late_simple then
-            (Some f, "late-simple")
-          else
-            match source_threshold with
-            | Some source ->
-                (Some source, "source-threshold-diamond")
-            | None ->
-                (None, "")
-        in
-        match specialization_base with
-        | None ->
-            if Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None then
-              Printf.eprintf
-                "const-param-skip func=%s reason=complex_loop_shape\n%!"
-                f.name;
-            f
-        | Some base ->
+          else begin
             if
-              specialization_mode = "source-threshold-diamond"
+              mode <> "late-simple"
               && Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None
             then
               Printf.eprintf
-                "const-param-respecialize func=%s base=source-threshold-diamond\n%!"
-                f.name;
-            let specialized, replacements =
-              specialize_constant_params_func observations base
+                "const-param-respecialize func=%s base=%s\n%!"
+                f.name mode;
+            let cleaned =
+              optimize_func
+                global_init summaries globals return_globals removable_calls
+                specialized
             in
-            if replacements = 0 then
-              f
-            else begin
-              let had_loop =
-                function_has_natural_loop f
-              in
-              let return_globals =
-                match Hashtbl.find_opt return_global_demands f.label with
-                | Some return_globals ->
-                    return_globals
+            debug_cfg_validation
+              "const-param-specialize-cleanup" cleaned;
+            let still_has_loop =
+              function_has_natural_loop cleaned
+            in
+            Some (mode, cleaned, still_has_loop)
+          end
+        in
+
+        (* First preserve the old late-simple route.  If it completely removes
+           the loop, keep exactly that result.  If it sees the constants but
+           leaves a loop behind, do NOT immediately roll back: the late CFG may
+           already have mem2reg loop-carried temps that hide an otherwise
+           ordinary source-level reduction. *)
+        let late_result =
+          if late_simple then
+            let specialized, replacements =
+              specialize_constant_params_func observations f
+            in
+            optimize_specialized_candidate
+              "late-simple" specialized replacements
+          else
+            None
+        in
+
+        match late_result with
+        | Some (mode, cleaned, false) ->
+            if cleaned <> f then
+              changed := true;
+            if Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None then
+              Printf.eprintf
+                "const-param-accept func=%s mode=%s had_loop=%b loop_after=false\n%!"
+                f.name mode had_loop;
+            cleaned
+
+        | Some ("late-simple", _, true)
+        | None ->
+            (* Either late specialization could not see useful parameter Loads,
+               or it did see them but the optimized late CFG still contains a
+               loop.  In both cases, retry from the pristine source CFG when it
+               has one of the exact safe shapes we know how to re-optimize. *)
+            let source_candidate =
+              if not had_loop then
+                None
+              else
+                match Hashtbl.find_opt source_by_label f.label with
+                | Some source
+                  when constant_param_source_simple_counted_loop_shape source ->
+                    Some (source, "source-simple-counted-loop")
+                | Some source
+                  when constant_param_source_threshold_diamond_shape source ->
+                    Some (source, "source-threshold-diamond")
+                | Some _
                 | None ->
-                    globals
-              in
-              let cleaned =
-                optimize_func
-                  global_init summaries globals return_globals removable_calls
-                  specialized
-              in
-              debug_cfg_validation
-                "const-param-specialize-cleanup" cleaned;
-              let still_has_loop =
-                function_has_natural_loop cleaned
-              in
-              if had_loop && still_has_loop then begin
-                if Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None then
-                  Printf.eprintf
-                    "const-param-rollback func=%s mode=%s reason=loop_remains\n%!"
-                    f.name specialization_mode;
-                f
-              end
-              else begin
-                if cleaned <> f then
-                  changed := true;
-                if Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None then
-                  Printf.eprintf
-                    "const-param-accept func=%s mode=%s had_loop=%b loop_after=%b\n%!"
-                    f.name specialization_mode had_loop still_has_loop;
-                cleaned
-              end
-            end)
+                    None
+            in
+            begin
+              match source_candidate with
+              | None ->
+                  if Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None then begin
+                    match late_result with
+                    | Some (mode, _, true) ->
+                        Printf.eprintf
+                          "const-param-rollback func=%s mode=%s reason=loop_remains-no-source-fallback\n%!"
+                          f.name mode
+                    | Some (_, _, false) ->
+                        ()
+                    | None ->
+                        Printf.eprintf
+                          "const-param-skip func=%s reason=no-specializable-source\n%!"
+                          f.name
+                  end;
+                  f
+
+              | Some (source, source_mode) ->
+                  let source_specialized, source_replacements =
+                    specialize_constant_params_func observations source
+                  in
+                  begin
+                    match
+                      optimize_specialized_candidate
+                        source_mode
+                        source_specialized
+                        source_replacements
+                    with
+                    | Some (mode, cleaned, false) ->
+                        if cleaned <> f then
+                          changed := true;
+                        if Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None then
+                          Printf.eprintf
+                            "const-param-accept func=%s mode=%s had_loop=%b loop_after=false\n%!"
+                            f.name mode had_loop;
+                        cleaned
+
+                    | Some (mode, _, true) ->
+                        if Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None then
+                          Printf.eprintf
+                            "const-param-rollback func=%s mode=%s reason=loop_remains\n%!"
+                            f.name mode;
+                        f
+
+                    | None ->
+                        if Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None then
+                          Printf.eprintf
+                            "const-param-rollback func=%s mode=%s reason=no-replacements\n%!"
+                            f.name source_mode;
+                        f
+                  end
+            end
+
+        | Some (mode, _, true) ->
+            (* Future-proofing: currently only late-simple can reach the
+               pre-source retry arm above. *)
+            if Sys.getenv_opt "TOYC_DEBUG_CONST_PARAMS" <> None then
+              Printf.eprintf
+                "const-param-rollback func=%s mode=%s reason=loop_remains\n%!"
+                f.name mode;
+            f)
       funcs
   in
   (funcs, !changed)
