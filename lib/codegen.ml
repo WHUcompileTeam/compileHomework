@@ -940,9 +940,17 @@ let emit_binop_operands ctx op dst lhs rhs =
           let rhs_reg = operand_reg ctx "t0" rhs in
           emitf ctx "    slli %s, %s, %d" dst rhs_reg shift
       | None ->
-          let lhs_reg = operand_reg ctx "t0" (Tcg.Imm factor) in
-          let rhs_reg = operand_reg ctx "t1" rhs in
-          emit_binop ctx op dst lhs_reg rhs_reg)
+          let rhs_reg = operand_reg ctx "t0" rhs in
+          if factor = 3L then begin
+            emitf ctx "    slli %s, %s, 1" dst rhs_reg;
+            emitf ctx "    add %s, %s, %s" dst dst rhs_reg
+          end else if factor = 5L then begin
+            emitf ctx "    slli %s, %s, 2" dst rhs_reg;
+            emitf ctx "    add %s, %s, %s" dst dst rhs_reg
+          end else begin
+            let lhs_reg = operand_reg ctx "t0" (Tcg.Imm factor) in
+            emit_binop ctx op dst lhs_reg rhs_reg
+          end)
   | Mul, lhs, Tcg.Imm factor -> (
       match power_of_two_shift factor with
       | Some shift ->
@@ -950,8 +958,16 @@ let emit_binop_operands ctx op dst lhs rhs =
           emitf ctx "    slli %s, %s, %d" dst lhs_reg shift
       | None ->
           let lhs_reg = operand_reg ctx "t0" lhs in
-          let rhs_reg = operand_reg ctx "t1" (Tcg.Imm factor) in
-          emit_binop ctx op dst lhs_reg rhs_reg)
+          if factor = 3L then begin
+            emitf ctx "    slli %s, %s, 1" dst lhs_reg;
+            emitf ctx "    add %s, %s, %s" dst dst lhs_reg
+          end else if factor = 5L then begin
+            emitf ctx "    slli %s, %s, 2" dst lhs_reg;
+            emitf ctx "    add %s, %s, %s" dst dst lhs_reg
+          end else begin
+            let rhs_reg = operand_reg ctx "t1" (Tcg.Imm factor) in
+            emit_binop ctx op dst lhs_reg rhs_reg
+          end)
   | Add, Tcg.Imm imm, rhs when fits_simm12 imm ->
       let rhs_reg = operand_reg ctx "t0" rhs in
       emitf ctx "    addi %s, %s, %Ld" dst rhs_reg imm
@@ -1006,22 +1022,7 @@ let emit_binop_operands ctx op dst lhs rhs =
       end;
       emitf ctx "    slli %s, %s, %d" tmp tmp shift;
       emitf ctx "    sub %s, %s, %s" dst lhs_reg tmp)
-  | Mul, lhs, Tcg.Imm 3L -> (
-      let lhs_reg = operand_reg ctx "t0" lhs in
-      emitf ctx "    slli %s, %s, 1" dst lhs_reg;
-      emitf ctx "    add %s, %s, %s" dst dst lhs_reg)
-  | Mul, Tcg.Imm 3L, rhs -> (
-      let rhs_reg = operand_reg ctx "t0" rhs in
-      emitf ctx "    slli %s, %s, 1" dst rhs_reg;
-      emitf ctx "    add %s, %s, %s" dst dst rhs_reg)
-  | Mul, lhs, Tcg.Imm 5L -> (
-      let lhs_reg = operand_reg ctx "t0" lhs in
-      emitf ctx "    slli %s, %s, 2" dst lhs_reg;
-      emitf ctx "    add %s, %s, %s" dst dst lhs_reg)
-  | Mul, Tcg.Imm 5L, rhs -> (
-      let rhs_reg = operand_reg ctx "t0" rhs in
-      emitf ctx "    slli %s, %s, 2" dst rhs_reg;
-      emitf ctx "    add %s, %s, %s" dst dst rhs_reg)
+
   | _ ->
        let lhs_reg = operand_reg ctx "t0" lhs in
        let rhs_reg = operand_reg ctx "t1" rhs in
