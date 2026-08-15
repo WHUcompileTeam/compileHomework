@@ -273,8 +273,16 @@ let simplify_simple_instr = function
           | Mod, _, Tcg.Imm 1L
           | Mod, _, Tcg.Imm (-1L) ->
               Tcg.Move (dst, Tcg.Imm 0L)
+          | Sub, a, b when a = b -> Tcg.Move (dst, Tcg.Imm 0L)
+          | Div, a, b when a = b -> Tcg.Move (dst, Tcg.Imm 1L)
+          | Mod, a, b when a = b -> Tcg.Move (dst, Tcg.Imm 0L)
+          | Div, Tcg.Imm 0L, _ -> Tcg.Move (dst, Tcg.Imm 0L)
+          | Mod, Tcg.Imm 0L, _ -> Tcg.Move (dst, Tcg.Imm 0L)
           | (Eq | Le | Ge), a, b when a = b -> Tcg.Move (dst, Tcg.Imm 1L)
           | (Ne | Lt | Gt), a, b when a = b -> Tcg.Move (dst, Tcg.Imm 0L)
+          | LAnd, Tcg.Imm 0L, _ | LAnd, _, Tcg.Imm 0L -> Tcg.Move (dst, Tcg.Imm 0L)
+          | LOr, Tcg.Imm v, _ when v <> 0L -> Tcg.Move (dst, Tcg.Imm 1L)
+          | LOr, _, Tcg.Imm v when v <> 0L -> Tcg.Move (dst, Tcg.Imm 1L)
           | _ -> Tcg.Bin (dst, op, lhs, rhs)))
   | instr -> instr
 
@@ -1642,6 +1650,7 @@ type loop_effects = {
 let licm_candidate_info = function
   | Tcg.Move (dst, src) -> Some (LicmPure (dst, [ src ]))
   | Tcg.Un (dst, _, src) -> Some (LicmPure (dst, [ src ]))
+  | Tcg.Bin (_, (Div | Mod), _, _) -> None
   | Tcg.Bin (dst, _, lhs, rhs) -> Some (LicmPure (dst, [ lhs; rhs ]))
   | Tcg.Load (dst, place) -> Some (LicmLoad (dst, place))
   | Tcg.Store _ | Tcg.Call _ -> None
@@ -3097,8 +3106,20 @@ let strength_reduce_func (f : Cfg.func) =
             List.iter
               (fun (block : Cfg.block) ->
                 if LabelSet.mem block.label loop then
+                  let current_body = (get_block block.label).body in
+                  let iv_def_index =
+                    let rec find_idx idx = function
+                      | [] -> max_int
+                      | instr :: rest ->
+                          (match defs_temp instr with
+                           | Some d when d = iv.phi_temp -> idx
+                           | _ -> find_idx (idx + 1) rest)
+                    in
+                    find_idx 0 current_body
+                  in
                   List.iteri
                     (fun index instr ->
+                      if index < iv_def_index then
                       match
                         derived_expr_of_instr
                           loop def_blocks loop_stable_phis multi_defs def_instrs iv.phi_temp instr
@@ -3107,7 +3128,7 @@ let strength_reduce_func (f : Cfg.func) =
                           let uses = Option.value ~default:[] (Hashtbl.find_opt derived_uses key) in
                           Hashtbl.replace derived_uses key ((block.label, index, dst) :: uses)
                       | Some _ | None -> ())
-                    (get_block block.label).body)
+                    current_body)
               f.blocks;
             Hashtbl.iter
               (fun key uses ->
@@ -3641,7 +3662,7 @@ let optimize_func global_init globals (f : Cfg.func) =
         const_propagate_func global_init globals after_licm |> stop_after "const2"
       in
       let after_copy3 = copy_propagate_func after_const2 |> stop_after "copy3" in
-      let after_gvn2 = after_copy3 |> stop_after "gvn2" in
+      let after_gvn2 = gvn_func globals after_copy3 |> stop_after "gvn2" in
       let after_dce2 = eliminate_dead_code_func after_gvn2 |> stop_after "dce2" in
       let after_dead_loops = eliminate_dead_loops_func after_dce2 |> stop_after "dead_loops" in
       let after_fold = fold_branch_tails_func after_dead_loops |> stop_after "fold" in
@@ -3667,9 +3688,9 @@ let optimize_func global_init globals (f : Cfg.func) =
   in
   let fuel =
     let blocks = List.length promoted.blocks in
-    if blocks > 220 then 1 else if blocks > 120 then 2 else 8
+    if blocks > 500 then 2 else if blocks > 200 then 4 else 12
   in
-  let run_step = if List.length promoted.blocks > 220 then light_step else step in
+  let run_step = if List.length promoted.blocks > 500 then light_step else step in
   match debug_stop_after with
   | Some "mem2reg" -> promoted
   | Some _ | None ->
@@ -3689,7 +3710,7 @@ type inline_func = {
 
 let small_inline_func (f : Cfg.func) =
   match f.blocks with
-  | [ block ] when List.length f.params <= 8 && List.length block.body <= 10 ->
+  | [ block ] when List.length f.params <= 8 && List.length block.body <= 20 ->
       let param_ids =
         List.fold_left (fun ids (param : Tcg.var) -> IntSet.add param.id ids) IntSet.empty f.params
       in
@@ -3784,6 +3805,93 @@ let inline_small_funcs funcs =
   in
   List.map inline_func funcs
 
+let tail_recursion_eliminate (f : Cfg.func) =
+  if f.ret = TVoid then f
+  else
+  let next_temp = ref f.temp_count in
+  let fresh_temp () =
+    let temp = !next_temp in
+    incr next_temp;
+    temp
+  in
+  let changed = ref false in
+  let blocks =
+    List.map
+      (fun (block : Cfg.block) ->
+        match block.term with
+        | Cfg.Return (Some (Tcg.Temp ret_temp)) -> (
+            match List.rev block.body with
+            | Tcg.Call (Some call_dst, callee, args) :: rest_rev
+              when call_dst = ret_temp && callee = f.label
+                   && List.length args = List.length f.params ->
+                changed := true;
+                let param_copies =
+                  List.map2
+                    (fun (param : Tcg.var) arg ->
+                      let tmp = fresh_temp () in
+                      (tmp, arg, param.id))
+                    f.params args
+                in
+                let snapshot_instrs =
+                  List.map (fun (tmp, arg, _) ->
+                    simplify_simple_instr (Tcg.Move (tmp, arg))) param_copies
+                in
+                let store_instrs =
+                  List.map (fun (tmp, _, param_id) ->
+                    Tcg.Store (Tcg.Local param_id, Tcg.Temp tmp)) param_copies
+                in
+                let body = List.rev rest_rev @ snapshot_instrs @ store_instrs in
+                { block with body; term = Cfg.Jump f.entry }
+            | _ -> block)
+        | _ -> block)
+      f.blocks
+  in
+  if !changed then
+    Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
+  else f
+
+let collect_pure_funcs (funcs : Cfg.func list) =
+  let pure_set = Hashtbl.create 8 in
+  List.iter
+    (fun (f : Cfg.func) ->
+      let has_side_effect =
+        List.exists
+          (fun (block : Cfg.block) ->
+            List.exists
+              (function
+                | Tcg.Store (Tcg.Global _, _) -> true
+                | Tcg.Call _ -> true
+                | _ -> false)
+              block.body)
+          f.blocks
+      in
+      if not has_side_effect then
+        Hashtbl.replace pure_set f.label true)
+    funcs;
+  pure_set
+
+let eliminate_pure_dead_calls pure_set (f : Cfg.func) =
+  let changed = ref false in
+  let blocks =
+    List.map
+      (fun (block : Cfg.block) ->
+        let body =
+          List.filter_map
+            (function
+              | Tcg.Call (dst, callee, _) as instr ->
+                  let unused = match dst with Some _ -> false | None -> true in
+                  if unused && Hashtbl.mem pure_set callee then begin
+                    changed := true; None
+                  end else Some instr
+              | instr -> Some instr)
+            block.body
+        in
+        { block with body })
+      f.blocks
+  in
+  if !changed then Cfg.rebuild_edges { f with blocks }
+  else f
+
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let global_init, globals =
     List.fold_left
@@ -3792,6 +3900,11 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
         (PlaceMap.add place (CpConst g.init) init, PlaceSet.add place set))
       (PlaceMap.empty, PlaceSet.empty) analysis.globals
   in
-  let funcs = List.map (optimize_func global_init globals) cfg.funcs in
+  let funcs = List.map tail_recursion_eliminate cfg.funcs in
+  let funcs = List.map (optimize_func global_init globals) funcs in
   let funcs = inline_small_funcs funcs in
+  let funcs = List.map (optimize_func global_init globals) funcs in
+  let pure_set = collect_pure_funcs funcs in
+  let funcs = List.map (eliminate_pure_dead_calls pure_set) funcs in
   { Cfg.funcs = List.map (optimize_func global_init globals) funcs }
+
