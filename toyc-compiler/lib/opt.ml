@@ -7707,7 +7707,41 @@ let linear_expr_of_operand
                               one_summary_expr
                               zero_summary_expr
                               zero_summary_expr)
-                     | LinearInvariant _
+
+                     | LinearInvariant n_expr ->
+                         (* The generated triangle form is also useful when
+                            its base is runtime-unknown but invariant with
+                            respect to the enclosing loop.  Preserve the same
+                            overflow-safe representation:
+                              (n-1)*(n/2) + (n%2)*((n-1)/2)
+                            as an invariant SummaryExpr coefficient.
+
+                            This is intentionally not applied to affine bases
+                            such as [m+i]; those remain piecewise when guarded
+                            by [m+i >= 0] and must not be treated as an
+                            ordinary polynomial recurrence. *)
+                         let n_minus_one =
+                           summary_expr_sub n_expr one_summary_expr
+                         in
+                         let half =
+                           SummaryBin
+                             (Div, n_expr, summary_expr_const 2L)
+                         in
+                         let parity =
+                           SummaryBin
+                             (Mod, n_expr, summary_expr_const 2L)
+                         in
+                         let half_minus_one =
+                           SummaryBin
+                             (Div, n_minus_one, summary_expr_const 2L)
+                         in
+                         let triangle =
+                           summary_expr_add
+                             (summary_expr_mul n_minus_one half)
+                             (summary_expr_mul parity half_minus_one)
+                         in
+                         Some (LinearInvariant triangle)
+
                      | LinearAffine _
                      | LinearQuadratic _
                      | LinearCubic _ ->
@@ -7775,7 +7809,35 @@ let linear_expr_of_operand
         match compare_constant_from_iv op lhs rhs with
         | Some true -> Some (LinearInvariant one_summary_expr)
         | Some false -> Some (LinearInvariant zero_summary_expr)
-        | None -> None)
+        | None ->
+            (* A comparison does not have to fold to a compile-time constant
+               to be invariant with respect to the loop currently being
+               summarized.  This matters after an inner counted-loop summary:
+               runtime bounds are clamped with expressions such as [m >= 0].
+               For an enclosing loop, [m] may be invariant even though its
+               value is not known at compile time.
+
+               Preserve such comparisons as invariant SummaryExpr
+               coefficients.  Comparisons that depend on the current IV
+               (for example [m + i >= 0]) still fail because at least one side
+               parses as LinearAffine/Quadratic rather than LinearInvariant. *)
+            let lhs = resolve_block_operand block lhs in
+            let rhs = resolve_block_operand block rhs in
+            Option.bind (of_operand block seen lhs) (function
+              | LinearInvariant lhs_expr ->
+                  Option.bind (of_operand block seen rhs) (function
+                    | LinearInvariant rhs_expr ->
+                        Some
+                          (LinearInvariant
+                             (SummaryBin (op, lhs_expr, rhs_expr)))
+                    | LinearAffine _
+                    | LinearQuadratic _
+                    | LinearCubic _ ->
+                        None)
+              | LinearAffine _
+              | LinearQuadratic _
+              | LinearCubic _ ->
+                  None))
     | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> None
   in
   of_operand block IntSet.empty operand
@@ -12517,24 +12579,33 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                   let probe_body = trip_instrs @ probe_updates in
                   let summary_label = fresh_summary_label () in
                   let control_block = get_block info.control_label in
+                  (* Function parameters are immutable inputs to the summary;
+                     merely having parameters does not make a zero-trip summary
+                     unsafe.  What matters is whether we need path-sensitive
+                     reconstruction/mirroring, and whether every generated
+                     instruction is itself safe to execute when trip=0.
+
+                     This lets generic helper functions use the same guard
+                     elision as parameter-free main functions. *)
                   let zero_trip_state_simple =
-                    f.params = []
-                    && reconstruction_order = []
+                    reconstruction_order = []
                     && place_mirrors = []
+                  in
+                  let zero_trip_body_safe =
+                    zero_trip_safe_body probe_body
                   in
                   let zero_trip_elided =
                     zero_trip_state_simple
-                    && zero_trip_safe_body probe_body
+                    && zero_trip_body_safe
                   in
                   if
                     Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None
-                    && zero_trip_safe_body probe_body
+                    && zero_trip_body_safe
                     && not zero_trip_state_simple
                   then
                     Printf.eprintf
-                      "counted-zero-trip-keep-guard func=%s header=%s params=%d reconstruction=%d mirrors=%d\n%!"
+                      "counted-zero-trip-keep-guard func=%s header=%s reconstruction=%d mirrors=%d\n%!"
                       f.name header
-                      (List.length f.params)
                       (List.length reconstruction_order)
                       (List.length place_mirrors);
                   let body, term =
@@ -16611,49 +16682,15 @@ let optimize_func global_init summaries globals return_globals removable_calls (
              ~removable_calls summaries globals return_globals
         |> copy_coalesce_func summaries globals
       in
-      (* A single late runtime-summary pass can expose another summarizable
-         enclosing loop.  This is especially common for nested loops: the
-         first pass summarizes the innermost recurrence, then constant/CFG
-         cleanup turns the parent into the same canonical affine shape.
-
-         Re-discover loops after each successful rewrite instead of relying on
-         the stale natural-loop snapshot from one invocation.  Keep the fuel
-         small to bound compile-time and code growth. *)
-      let rec late_runtime_summary_fixpoint iteration fuel current =
-        if fuel = 0 then current
-        else
-          let summarized =
-            summarize_runtime_symbolic_affine_loops_func
-              summaries globals current
-          in
-          if summarized = current then current
-          else
-            let cleaned =
-              summarized
-              |> const_propagate_func global_init summaries globals
-              |> fold_branch_tails_func summaries globals
-              |> thread_and_prune_func
-              |> simplify_cfg_func
-              |> algebra_canonicalize_func
-              |> general_linear_canonicalize_func
-              |> eliminate_dead_code_func
-                   ~removable_calls summaries globals return_globals
-              |> copy_coalesce_func summaries globals
-            in
-            if Sys.getenv_opt "TOYC_DEBUG_RUNTIME_SUMMARY_FIXPOINT" <> None then
-              Printf.eprintf
-                "runtime-summary-fixpoint func=%s iteration=%d before=(%s) summarized=(%s) cleaned=(%s)\n%!"
-                current.name iteration
-                (format_metrics (metrics_of_func current))
-                (format_metrics (metrics_of_func summarized))
-                (format_metrics (metrics_of_func cleaned));
-            if cleaned = current then cleaned
-            else
-              late_runtime_summary_fixpoint
-                (iteration + 1) (fuel - 1) cleaned
+      let late_runtime_summarized =
+        summarize_runtime_symbolic_affine_loops_func
+          summaries globals late_equiv_cleaned
       in
       let late_runtime_cleaned =
-        late_runtime_summary_fixpoint 1 4 late_equiv_cleaned
+        late_runtime_summarized
+        |> eliminate_dead_code_func
+             ~removable_calls summaries globals return_globals
+        |> copy_coalesce_func summaries globals
       in
       if Sys.getenv_opt "TOYC_DEBUG_LATE_ALGEBRA" <> None then begin
         let before = metrics_of_func late_promoted in
