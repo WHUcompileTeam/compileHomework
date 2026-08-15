@@ -17497,8 +17497,9 @@ let hot_loop_labels_of_func (f : Cfg.func) =
       LabelSet.union acc (table_find_or_empty loops header LabelSet.empty))
     LabelSet.empty headers
 
-let small_leaf_inline_candidate (f : Cfg.func) : Cfg.func option =
-  if f.ret <> TInt then None
+let small_leaf_inline_candidate_with_reason
+    (f : Cfg.func) : Cfg.func option * string =
+  if f.ret <> TInt then (None, "non-int-return")
   else
     let view =
       f
@@ -17507,7 +17508,7 @@ let small_leaf_inline_candidate (f : Cfg.func) : Cfg.func option =
       |> final_linear_merge_func
       |> thread_and_prune_func
     in
-    if not (cfg_targets_valid view) then None
+    if not (cfg_targets_valid view) then (None, "invalid-cfg")
     else
       let reachable = reachable_labels view.entry view.blocks in
       let blocks =
@@ -17526,13 +17527,29 @@ let small_leaf_inline_candidate (f : Cfg.func) : Cfg.func option =
           (fun acc (param : Tcg.var) -> IntSet.add param.id acc)
           IntSet.empty f.params
       in
-      let instr_safe = function
-        | Tcg.Move _ | Tcg.Un _ -> true
-        | Tcg.Bin (_, (Div | Mod), _, _) -> false
-        | Tcg.Bin _ -> true
-        | Tcg.Load (_, Tcg.Local id) -> IntSet.mem id param_ids
-        | Tcg.Load (_, Tcg.Global _) -> false
-        | Tcg.Store _ | Tcg.Call _ -> false
+      let instr_reject_reason = function
+        | Tcg.Move _ | Tcg.Un _ -> None
+        | Tcg.Bin (_, (Div | Mod), _, _) -> Some "div-mod"
+        | Tcg.Bin _ -> None
+        | Tcg.Load (_, Tcg.Local id) ->
+            if IntSet.mem id param_ids then None else Some "nonparam-local-load"
+        | Tcg.Load (_, Tcg.Global _) -> Some "global-load"
+        | Tcg.Store _ -> Some "store"
+        | Tcg.Call _ -> Some "nested-call"
+      in
+      let unsafe_instr_reason =
+        List.fold_left
+          (fun found (block : Cfg.block) ->
+            match found with
+            | Some _ -> found
+            | None ->
+                List.fold_left
+                  (fun found instr ->
+                    match found with
+                    | Some _ -> found
+                    | None -> instr_reject_reason instr)
+                  None block.body)
+          None blocks
       in
       let term_safe = function
         | Cfg.Return (Some _) -> true
@@ -17557,19 +17574,31 @@ let small_leaf_inline_candidate (f : Cfg.func) : Cfg.func option =
           blocks
       in
       let ignored = Hashtbl.create 1 in
-      if
-        block_count >= 2
-        && block_count <= small_hot_inline_max_blocks
-        && instr_count <= small_hot_inline_max_instrs
-        && f.temp_count <= 48
-        && has_value_return
-        && List.for_all
-             (fun (block : Cfg.block) ->
-               List.for_all instr_safe block.body && term_safe block.term)
-             blocks
-        && cfg_acyclic_ignoring_edges view ignored
-      then Some { view with blocks }
-      else None
+      let reason =
+        if block_count < 2 then Some "blocks<2"
+        else if block_count > small_hot_inline_max_blocks then Some "blocks>4"
+        else if instr_count > small_hot_inline_max_instrs then Some "instrs>20"
+        else if f.temp_count > 48 then Some "temps>48"
+        else if not has_value_return then Some "no-value-return"
+        else
+          match unsafe_instr_reason with
+          | Some reason -> Some reason
+          | None ->
+              if not (List.for_all
+                        (fun (block : Cfg.block) -> term_safe block.term)
+                        blocks)
+              then Some "unsafe-term"
+              else if not (cfg_acyclic_ignoring_edges view ignored)
+              then Some "cyclic"
+              else None
+      in
+      match reason with
+      | None -> (Some { view with blocks }, "candidate")
+      | Some reason -> (None, reason)
+
+let small_leaf_inline_candidate (f : Cfg.func) : Cfg.func option =
+  fst (small_leaf_inline_candidate_with_reason f)
+
 
 type small_hot_inline_site =
   Tcg.label
@@ -17587,8 +17616,13 @@ let build_small_hot_inline_table (funcs : Cfg.func list) :
   in
   List.iter
     (fun (f : Cfg.func) ->
-      match small_leaf_inline_candidate f with
-      | None -> ()
+      let candidate, reason = small_leaf_inline_candidate_with_reason f in
+      match candidate with
+      | None ->
+          if Sys.getenv_opt "TOYC_DEBUG_CFG_INLINE_BLOCKERS" <> None then
+            Printf.eprintf
+              "cfg-inline-reject func=%s reason=%s params=%d\n%!"
+              f.name reason (List.length f.params)
       | Some (candidate : Cfg.func) ->
           Hashtbl.replace table f.label candidate;
           if Sys.getenv_opt "TOYC_DEBUG_CFG_INLINE" <> None then begin
@@ -17621,11 +17655,30 @@ let find_hot_inline_site
                   args,
                   rest,
                   candidate )
-          | Some _ | None ->
+          | Some (candidate : Cfg.func) ->
+              if Sys.getenv_opt "TOYC_DEBUG_CFG_INLINE_BLOCKERS" <> None then
+                Printf.eprintf
+                  "cfg-inline-hot-miss caller=%s site=%s callee=%s reason=%s argc=%d params=%d\n%!"
+                  f.name block_label callee
+                  (if callee = f.label then "recursive"
+                   else "arity-mismatch")
+                  (List.length args) (List.length candidate.params);
+              find_in_body block_label
+                (Tcg.Call (Some dst, callee, args) :: rev_prefix)
+                rest
+          | None ->
+              if Sys.getenv_opt "TOYC_DEBUG_CFG_INLINE_BLOCKERS" <> None then
+                Printf.eprintf
+                  "cfg-inline-hot-miss caller=%s site=%s callee=%s reason=callee-not-candidate argc=%d\n%!"
+                  f.name block_label callee (List.length args);
               find_in_body block_label
                 (Tcg.Call (Some dst, callee, args) :: rev_prefix)
                 rest)
-      | (Tcg.Call (None, _, _) as instr) :: rest ->
+      | (Tcg.Call (None, callee, args) as instr) :: rest ->
+          if Sys.getenv_opt "TOYC_DEBUG_CFG_INLINE_BLOCKERS" <> None then
+            Printf.eprintf
+              "cfg-inline-hot-miss caller=%s site=%s callee=%s reason=no-result argc=%d\n%!"
+              f.name block_label callee (List.length args);
           find_in_body block_label (instr :: rev_prefix) rest
       | instr :: rest ->
           find_in_body block_label (instr :: rev_prefix) rest
