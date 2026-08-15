@@ -2321,255 +2321,6 @@ let rewrite_term_temps rename = function
   | Cfg.Return None -> Cfg.Return None
   | Cfg.Return (Some value) -> Cfg.Return (Some (rewrite_operand_temp rename value))
 
-
-(* Forward proven copy/value equivalences before algebraic passes.
-
-   GVN also tracks aliases, but historically it ran after algebra/linear
-   canonicalization.  That meant algebra saw the physical temporary names
-   rather than their logical values.  This pass is deliberately narrower than
-   GVN: it tracks only Move/UPlus-derived value equivalences, rewrites source
-   operands and branch/return operands, and never performs CSE.
-
-   The dataflow is a must analysis.  Missing predecessor states are treated as
-   "not computed yet" while solving, rather than as the empty fact set.  This
-   lets loop-invariant copy facts flow through a backedge and then be removed
-   if a later iteration proves that the backedge does not preserve them. *)
-let copy_forward_func (f : Cfg.func) =
-  let debug = Sys.getenv_opt "TOYC_DEBUG_COPY_FORWARD" <> None in
-
-  let transfer_instr aliases instr =
-    match instr with
-    | Tcg.Move (dst, src) ->
-        let src = resolve_alias_operand aliases IntSet.empty src in
-        let instr = simplify_simple_instr (Tcg.Move (dst, src)) in
-        let aliases = kill_temp_alias dst aliases in
-        let aliases =
-          match instr with
-          | Tcg.Move (_, value) -> set_alias_fact aliases dst value
-          | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ ->
-              aliases
-        in
-        (instr, aliases)
-    | Tcg.Un (dst, op, src) ->
-        let src = resolve_alias_operand aliases IntSet.empty src in
-        let instr = simplify_simple_instr (Tcg.Un (dst, op, src)) in
-        let aliases = kill_temp_alias dst aliases in
-        let aliases =
-          match instr with
-          | Tcg.Move (_, value) -> set_alias_fact aliases dst value
-          | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ ->
-              aliases
-        in
-        (instr, aliases)
-    | Tcg.Bin (dst, op, lhs, rhs) ->
-        let lhs = resolve_alias_operand aliases IntSet.empty lhs in
-        let rhs = resolve_alias_operand aliases IntSet.empty rhs in
-        let instr = simplify_simple_instr (Tcg.Bin (dst, op, lhs, rhs)) in
-        let aliases = kill_temp_alias dst aliases in
-        let aliases =
-          match instr with
-          | Tcg.Move (_, value) -> set_alias_fact aliases dst value
-          | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ ->
-              aliases
-        in
-        (instr, aliases)
-    | Tcg.Load (dst, place) ->
-        (Tcg.Load (dst, place), kill_temp_alias dst aliases)
-    | Tcg.Store (place, value) ->
-        let value = resolve_alias_operand aliases IntSet.empty value in
-        (Tcg.Store (place, value), aliases)
-    | Tcg.Call (dst, callee, args) ->
-        let args =
-          List.map (resolve_alias_operand aliases IntSet.empty) args
-        in
-        let aliases =
-          match dst with
-          | Some temp -> kill_temp_alias temp aliases
-          | None -> aliases
-        in
-        (Tcg.Call (dst, callee, args), aliases)
-  in
-
-  let transfer_block aliases (block : Cfg.block) =
-    List.fold_left
-      (fun aliases instr -> snd (transfer_instr aliases instr))
-      aliases block.body
-  in
-
-  let in_aliases = Hashtbl.create (List.length f.blocks) in
-  let out_aliases = Hashtbl.create (List.length f.blocks) in
-  let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter
-    (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block)
-    f.blocks;
-
-  (* Seed only the reachable entry path.  When a successor is first reached,
-     the first predecessor contributes its whole state; later predecessor
-     states can only intersect facts away.  This is the standard monotone
-     worklist shape for a forward must analysis and, importantly, does not let
-     an as-yet-unvisited loop backedge erase entry facts prematurely. *)
-  let worklist = Queue.create () in
-  let queued = Hashtbl.create (List.length f.blocks) in
-  let enqueue label =
-    if not (Hashtbl.mem queued label) then begin
-      Hashtbl.replace queued label ();
-      Queue.add label worklist
-    end
-  in
-  Hashtbl.replace in_aliases f.entry empty_alias;
-  enqueue f.entry;
-
-  while not (Queue.is_empty worklist) do
-    let label = Queue.take worklist in
-    Hashtbl.remove queued label;
-    match Hashtbl.find_opt block_map label with
-    | None -> ()
-    | Some (block : Cfg.block) ->
-        let incoming =
-          Option.value ~default:empty_alias
-            (Hashtbl.find_opt in_aliases label)
-        in
-        let outgoing = transfer_block incoming block in
-        let out_changed =
-          match Hashtbl.find_opt out_aliases label with
-          | Some previous -> not (equal_alias_map previous outgoing)
-          | None -> true
-        in
-        if out_changed then begin
-          Hashtbl.replace out_aliases label outgoing;
-          List.iter
-            (fun succ ->
-              if succ <> f.entry then
-                let candidate =
-                  match Hashtbl.find_opt in_aliases succ with
-                  | None -> outgoing
-                  | Some previous -> meet_alias_map previous outgoing
-                in
-                let in_changed =
-                  match Hashtbl.find_opt in_aliases succ with
-                  | Some previous ->
-                      not (equal_alias_map previous candidate)
-                  | None -> true
-                in
-                if in_changed then begin
-                  Hashtbl.replace in_aliases succ candidate;
-                  enqueue succ
-                end)
-            block.succs
-        end
-  done;
-
-  let forwarded = ref 0 in
-  let removed_moves = ref 0 in
-
-  let resolve_counted aliases operand =
-    let resolved = resolve_alias_operand aliases IntSet.empty operand in
-    if resolved <> operand then incr forwarded;
-    resolved
-  in
-
-  let rewrite_instr aliases instr =
-    match instr with
-    | Tcg.Move (dst, src) ->
-        let src = resolve_counted aliases src in
-        let instr = simplify_simple_instr (Tcg.Move (dst, src)) in
-        let aliases = kill_temp_alias dst aliases in
-        let aliases =
-          match instr with
-          | Tcg.Move (_, value) -> set_alias_fact aliases dst value
-          | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ ->
-              aliases
-        in
-        (instr, aliases)
-    | Tcg.Un (dst, op, src) ->
-        let src = resolve_counted aliases src in
-        let instr = simplify_simple_instr (Tcg.Un (dst, op, src)) in
-        let aliases = kill_temp_alias dst aliases in
-        let aliases =
-          match instr with
-          | Tcg.Move (_, value) -> set_alias_fact aliases dst value
-          | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ ->
-              aliases
-        in
-        (instr, aliases)
-    | Tcg.Bin (dst, op, lhs, rhs) ->
-        let lhs = resolve_counted aliases lhs in
-        let rhs = resolve_counted aliases rhs in
-        let instr = simplify_simple_instr (Tcg.Bin (dst, op, lhs, rhs)) in
-        let aliases = kill_temp_alias dst aliases in
-        let aliases =
-          match instr with
-          | Tcg.Move (_, value) -> set_alias_fact aliases dst value
-          | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ ->
-              aliases
-        in
-        (instr, aliases)
-    | Tcg.Load (dst, place) ->
-        (Tcg.Load (dst, place), kill_temp_alias dst aliases)
-    | Tcg.Store (place, value) ->
-        let value = resolve_counted aliases value in
-        (Tcg.Store (place, value), aliases)
-    | Tcg.Call (dst, callee, args) ->
-        let args = List.map (resolve_counted aliases) args in
-        let aliases =
-          match dst with
-          | Some temp -> kill_temp_alias temp aliases
-          | None -> aliases
-        in
-        (Tcg.Call (dst, callee, args), aliases)
-  in
-
-  let rewrite_term aliases = function
-    | Cfg.Jump _ as term -> term
-    | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
-        Cfg.BranchZero
-          (resolve_counted aliases cond, if_zero, if_nonzero)
-    | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
-        Cfg.BranchNonZero
-          (resolve_counted aliases cond, if_nonzero, if_zero)
-    | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
-        Cfg.BranchCompare
-          ( op,
-            resolve_counted aliases lhs,
-            resolve_counted aliases rhs,
-            if_true,
-            if_false )
-    | Cfg.Return None -> Cfg.Return None
-    | Cfg.Return (Some value) ->
-        Cfg.Return (Some (resolve_counted aliases value))
-  in
-
-  let rewrite_block (block : Cfg.block) =
-    let aliases =
-      Option.value ~default:empty_alias
-        (Hashtbl.find_opt in_aliases block.label)
-    in
-    let body_rev, aliases =
-      List.fold_left
-        (fun (acc, aliases) instr ->
-          let instr, aliases = rewrite_instr aliases instr in
-          match instr with
-          | Tcg.Move (dst, Tcg.Temp src) when dst = src ->
-              incr removed_moves;
-              (acc, aliases)
-          | _ -> (instr :: acc, aliases))
-        ([], aliases) block.body
-    in
-    let term = rewrite_term aliases block.term in
-    { block with
-      body = List.rev body_rev;
-      term;
-      succs = Cfg.successors term }
-  in
-
-  let blocks = List.map rewrite_block f.blocks in
-  let result = Cfg.rebuild_edges { f with blocks } in
-  if debug then
-    Printf.eprintf
-      "copy-forward func=%s forwarded=%d removed-moves=%d\n%!"
-      f.name !forwarded !removed_moves;
-  result
-
 let copy_coalesce_func summaries globals (f : Cfg.func) =
   let debug_coalesce = Sys.getenv_opt "TOYC_DEBUG_COALESCE" <> None in
   if f.temp_count <= 1 then begin
@@ -7646,22 +7397,10 @@ let linear_expr_of_operand
       match (operand_def block left, operand_def block right) with
       | ( Some (Tcg.Bin (_, Mul, left_a, left_b)),
           Some (Tcg.Bin (_, Mul, right_a, right_b)) ) ->
-          let classify_n_minus_one operand =
-            match operand_def block operand with
-            | Some (Tcg.Bin (_, Sub, n, Tcg.Imm 1L)) ->
-                Some n
-            | Some (Tcg.Bin (_, Add, n, Tcg.Imm (-1L)))
-            | Some (Tcg.Bin (_, Add, Tcg.Imm (-1L), n)) ->
-                Some n
-            | _ ->
-                None
-          in
           let classify_left first second =
-            match
-              (operand_def block first, classify_n_minus_one second)
-            with
-            | Some (Tcg.Bin (_, Div, n_half, Tcg.Imm 2L)),
-              Some n_minus ->
+            match (operand_def block first, operand_def block second) with
+            | ( Some (Tcg.Bin (_, Div, n_half, Tcg.Imm 2L)),
+                Some (Tcg.Bin (_, Sub, n_minus, Tcg.Imm 1L)) ) ->
                 Some (first, second, n_half, n_minus)
             | _ -> None
           in
@@ -7719,41 +7458,7 @@ let linear_expr_of_operand
                               one_summary_expr
                               zero_summary_expr
                               zero_summary_expr)
-
-                     | LinearInvariant n_expr ->
-                         (* The generated triangle form is also useful when
-                            its base is runtime-unknown but invariant with
-                            respect to the enclosing loop.  Preserve the same
-                            overflow-safe representation:
-                              (n-1)*(n/2) + (n%2)*((n-1)/2)
-                            as an invariant SummaryExpr coefficient.
-
-                            This is intentionally not applied to affine bases
-                            such as [m+i]; those remain piecewise when guarded
-                            by [m+i >= 0] and must not be treated as an
-                            ordinary polynomial recurrence. *)
-                         let n_minus_one =
-                           summary_expr_sub n_expr one_summary_expr
-                         in
-                         let half =
-                           SummaryBin
-                             (Div, n_expr, summary_expr_const 2L)
-                         in
-                         let parity =
-                           SummaryBin
-                             (Mod, n_expr, summary_expr_const 2L)
-                         in
-                         let half_minus_one =
-                           SummaryBin
-                             (Div, n_minus_one, summary_expr_const 2L)
-                         in
-                         let triangle =
-                           summary_expr_add
-                             (summary_expr_mul n_minus_one half)
-                             (summary_expr_mul parity half_minus_one)
-                         in
-                         Some (LinearInvariant triangle)
-
+                     | LinearInvariant _
                      | LinearAffine _
                      | LinearQuadratic _
                      | LinearCubic _ ->
@@ -7821,35 +7526,7 @@ let linear_expr_of_operand
         match compare_constant_from_iv op lhs rhs with
         | Some true -> Some (LinearInvariant one_summary_expr)
         | Some false -> Some (LinearInvariant zero_summary_expr)
-        | None ->
-            (* A comparison does not have to fold to a compile-time constant
-               to be invariant with respect to the loop currently being
-               summarized.  This matters after an inner counted-loop summary:
-               runtime bounds are clamped with expressions such as [m >= 0].
-               For an enclosing loop, [m] may be invariant even though its
-               value is not known at compile time.
-
-               Preserve such comparisons as invariant SummaryExpr
-               coefficients.  Comparisons that depend on the current IV
-               (for example [m + i >= 0]) still fail because at least one side
-               parses as LinearAffine/Quadratic rather than LinearInvariant. *)
-            let lhs = resolve_block_operand block lhs in
-            let rhs = resolve_block_operand block rhs in
-            Option.bind (of_operand block seen lhs) (function
-              | LinearInvariant lhs_expr ->
-                  Option.bind (of_operand block seen rhs) (function
-                    | LinearInvariant rhs_expr ->
-                        Some
-                          (LinearInvariant
-                             (SummaryBin (op, lhs_expr, rhs_expr)))
-                    | LinearAffine _
-                    | LinearQuadratic _
-                    | LinearCubic _ ->
-                        None)
-              | LinearAffine _
-              | LinearQuadratic _
-              | LinearCubic _ ->
-                  None))
+        | None -> None)
     | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> None
   in
   of_operand block IntSet.empty operand
@@ -12591,33 +12268,24 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                   let probe_body = trip_instrs @ probe_updates in
                   let summary_label = fresh_summary_label () in
                   let control_block = get_block info.control_label in
-                  (* Function parameters are immutable inputs to the summary;
-                     merely having parameters does not make a zero-trip summary
-                     unsafe.  What matters is whether we need path-sensitive
-                     reconstruction/mirroring, and whether every generated
-                     instruction is itself safe to execute when trip=0.
-
-                     This lets generic helper functions use the same guard
-                     elision as parameter-free main functions. *)
                   let zero_trip_state_simple =
-                    reconstruction_order = []
+                    f.params = []
+                    && reconstruction_order = []
                     && place_mirrors = []
-                  in
-                  let zero_trip_body_safe =
-                    zero_trip_safe_body probe_body
                   in
                   let zero_trip_elided =
                     zero_trip_state_simple
-                    && zero_trip_body_safe
+                    && zero_trip_safe_body probe_body
                   in
                   if
                     Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None
-                    && zero_trip_body_safe
+                    && zero_trip_safe_body probe_body
                     && not zero_trip_state_simple
                   then
                     Printf.eprintf
-                      "counted-zero-trip-keep-guard func=%s header=%s reconstruction=%d mirrors=%d\n%!"
+                      "counted-zero-trip-keep-guard func=%s header=%s params=%d reconstruction=%d mirrors=%d\n%!"
                       f.name header
+                      (List.length f.params)
                       (List.length reconstruction_order)
                       (List.length place_mirrors);
                   let body, term =
@@ -12754,13 +12422,6 @@ let full_unroll_counted_loops_func summaries globals (f : Cfg.func) =
   let full_unroll_max_trip = 8L in
   let full_unroll_max_blocks = 4 in
   let full_unroll_max_instrs = 28 in
-  (* Rescue larger pure-arithmetic loops when the constant trip count is still
-     small enough that specialization is likely to collapse the cloned body.
-     This is intentionally separate from the ordinary unroll budget so that
-     loops containing loads/stores/calls keep the conservative thresholds. *)
-  let full_unroll_large_pure_max_trip = 16L in
-  let full_unroll_large_pure_max_instrs = 64 in
-  let full_unroll_large_pure_expand_budget = 900L in
   let full_unroll_max_control_body_instrs = 4 in
   let control_body_supported body =
     List.length body <= full_unroll_max_control_body_instrs
@@ -12829,47 +12490,19 @@ let full_unroll_counted_loops_func summaries globals (f : Cfg.func) =
                       constant_trip_count_of_kind resolve_const init_value info.control_iv.step info.kind
                   | _ -> None
                 in
-                let pure_path_body =
-                  List.for_all
-                    (fun (block : Cfg.block) ->
-                      List.for_all pure_cfg_prep_instr block.body)
-                    path
-                in
                 if
                   effects.has_call
                   || not (PlaceSet.is_empty modified_globals)
                   || not (control_body_supported control_block.body)
                   || path = []
                   || List.length path > full_unroll_max_blocks
+                  || total_instrs > full_unroll_max_instrs
                   || (outside_preds = [] && header <> !current_entry)
                 then ()
                 else
                   match trip_count with
-                  | Some trip when 0L <= trip ->
-                      let ordinary_budget =
-                        trip <= full_unroll_max_trip
-                        && total_instrs <= full_unroll_max_instrs
-                      in
-                      let expanded_instrs =
-                        Int64.mul trip (Int64.of_int total_instrs)
-                      in
-                      let large_pure_budget =
-                        pure_path_body
-                        && trip <= full_unroll_large_pure_max_trip
-                        && total_instrs <= full_unroll_large_pure_max_instrs
-                        && expanded_instrs <= full_unroll_large_pure_expand_budget
-                      in
-                      if not (ordinary_budget || large_pure_budget) then ()
-                      else
+                  | Some trip when 0L <= trip && trip <= full_unroll_max_trip ->
                       let target_label =
-                        if
-                          Sys.getenv_opt "TOYC_DEBUG_FULL_UNROLL" <> None
-                          && large_pure_budget
-                          && not ordinary_budget
-                        then
-                          Printf.eprintf
-                            "full-unroll-large-pure func=%s header=%s trip=%Ld instrs=%d expanded=%Ld\n%!"
-                            f.name header trip total_instrs expanded_instrs;
                         if trip = 0L then info.exit_label
                         else
                           let trip_int = Int64.to_int trip in
@@ -14424,6 +14057,164 @@ let general_linear_canonicalize_func (f : Cfg.func) =
       "linear-canon func=%s rewrites=%d\n%!"
       f.name !rewrites;
   if !rewrites = 0 then f
+  else Cfg.rebuild_edges { f with blocks }
+
+
+
+(* Factor a syntactically common multiplicative term across a single-use
+   add/sub pair:
+
+       p = a * b
+       q = a * c
+       r = p + q       ==>       q = b + c
+                                  r = a * q
+
+   and analogously for subtraction.
+
+   The transformation is valid in ToyC's wrapping integer arithmetic because
+   multiplication distributes over addition/subtraction modulo 2^32.  Keep it
+   deliberately local and conservative:
+   - both product temps must have a unique definition and a single use;
+   - both product definitions must be in the same block before the consumer;
+   - a temp used as the common factor (and the earlier residual operand) must
+     not be redefined between the two products.
+
+   DCE removes the now-dead earlier multiplication immediately afterwards in
+   the normal pipeline. *)
+let factor_common_mul_func (f : Cfg.func) =
+  let use_counts = temp_use_counts f.blocks in
+  let _, _, _, multi_defs =
+    analyze_temp_defs_of_blocks f.temp_count f.blocks
+  in
+  let single_use temp =
+    Option.value ~default:0 (Hashtbl.find_opt use_counts temp) = 1
+  in
+  let instr_def_temp = function
+    | Tcg.Move (dst, _)
+    | Tcg.Un (dst, _, _)
+    | Tcg.Bin (dst, _, _, _)
+    | Tcg.Load (dst, _)
+    | Tcg.Call (Some dst, _, _) ->
+        Some dst
+    | Tcg.Store _
+    | Tcg.Call (None, _, _) ->
+        None
+  in
+  let changed = ref false in
+  let rewrites = ref 0 in
+
+  let rewrite_block (block : Cfg.block) =
+    let body = Array.of_list block.body in
+    let local_mul_defs = Hashtbl.create 16 in
+    Array.iteri
+      (fun index instr ->
+        match instr with
+        | Tcg.Bin (dst, Mul, lhs, rhs)
+          when not (IntSet.mem dst multi_defs) ->
+            Hashtbl.replace local_mul_defs dst (index, lhs, rhs)
+        | _ -> ())
+      body;
+
+    let operand_stable_between operand first_index second_index =
+      match operand with
+      | Tcg.Imm _ -> true
+      | Tcg.Temp temp ->
+          let stable = ref true in
+          for index = first_index + 1 to second_index - 1 do
+            match instr_def_temp body.(index) with
+            | Some dst when dst = temp -> stable := false
+            | Some _ | None -> ()
+          done;
+          !stable
+    in
+
+    let common_factors (lhs1, rhs1) (lhs2, rhs2) =
+      if lhs1 = lhs2 then Some (lhs1, rhs1, rhs2)
+      else if lhs1 = rhs2 then Some (lhs1, rhs1, lhs2)
+      else if rhs1 = lhs2 then Some (rhs1, lhs1, rhs2)
+      else if rhs1 = rhs2 then Some (rhs1, lhs1, lhs2)
+      else None
+    in
+
+    let replacements = Hashtbl.create 8 in
+    Array.iteri
+      (fun consumer_index instr ->
+        let try_factor op lhs_temp rhs_temp dst =
+          if
+            lhs_temp = rhs_temp
+            || IntSet.mem lhs_temp multi_defs
+            || IntSet.mem rhs_temp multi_defs
+            || not (single_use lhs_temp)
+            || not (single_use rhs_temp)
+          then
+            ()
+          else
+            match
+              ( Hashtbl.find_opt local_mul_defs lhs_temp,
+                Hashtbl.find_opt local_mul_defs rhs_temp )
+            with
+            | ( Some (lhs_index, lhs_a, lhs_b),
+                Some (rhs_index, rhs_a, rhs_b) )
+              when lhs_index < consumer_index
+                   && rhs_index < consumer_index
+                   && lhs_index <> rhs_index -> (
+                match common_factors (lhs_a, lhs_b) (rhs_a, rhs_b) with
+                | None -> ()
+                | Some (common, lhs_rest, rhs_rest) ->
+                    let early_index, early_rest, late_index, late_temp =
+                      if lhs_index < rhs_index then
+                        (lhs_index, lhs_rest, rhs_index, rhs_temp)
+                      else
+                        (rhs_index, rhs_rest, lhs_index, lhs_temp)
+                    in
+                    if
+                      operand_stable_between common early_index late_index
+                      && operand_stable_between
+                           early_rest early_index late_index
+                    then begin
+                      let residual =
+                        simplify_simple_instr
+                          (Tcg.Bin (late_temp, op, lhs_rest, rhs_rest))
+                      in
+                      let product =
+                        simplify_simple_instr
+                          (Tcg.Bin
+                             (dst, Mul, common, Tcg.Temp late_temp))
+                      in
+                      Hashtbl.replace replacements late_index residual;
+                      Hashtbl.replace replacements consumer_index product;
+                      changed := true;
+                      incr rewrites
+                    end)
+            | _ -> ()
+        in
+        match instr with
+        | Tcg.Bin
+            (dst, ((Add | Sub) as op), Tcg.Temp lhs_temp, Tcg.Temp rhs_temp) ->
+            try_factor op lhs_temp rhs_temp dst
+        | _ -> ())
+      body;
+
+    if Hashtbl.length replacements = 0 then block
+    else
+      let body =
+        Array.to_list
+          (Array.mapi
+             (fun index instr ->
+               match Hashtbl.find_opt replacements index with
+               | Some replacement -> replacement
+               | None -> instr)
+             body)
+      in
+      { block with body }
+  in
+
+  let blocks = List.map rewrite_block f.blocks in
+  if Sys.getenv_opt "TOYC_DEBUG_FACTOR_MUL" <> None && !rewrites > 0 then
+    Printf.eprintf
+      "factor-mul func=%s rewrites=%d\n%!"
+      f.name !rewrites;
+  if not !changed then f
   else Cfg.rebuild_edges { f with blocks }
 
 
@@ -16494,24 +16285,54 @@ let optimize_func global_init summaries globals return_globals removable_calls (
           (const_propagate_func global_init summaries globals)
           after_simplify0
       in
-      let after_copy1 =
-        run_stage round "copy1" copy_forward_func after_const1
-      in
       let after_algebra1 =
-        run_stage round "algebra1" algebra_canonicalize_func after_copy1
+        run_stage round "algebra1" algebra_canonicalize_func after_const1
       in
       let after_linear1 =
         run_stage round "linear1" general_linear_canonicalize_func after_algebra1
       in
-      let after_sr = run_stage round "sr" strength_reduce_func after_linear1 in
+      let after_factor1 =
+        run_stage round "factor_mul1" factor_common_mul_func after_linear1
+      in
+      let after_sr = run_stage round "sr" strength_reduce_func after_factor1 in
       let after_gvn1 = run_stage round "gvn1" (gvn_func summaries globals) after_sr in
       let after_dce1 =
         run_stage round "dce1" (eliminate_dead_code_func ~removable_calls summaries globals return_globals) after_gvn1
       in
       let after_reassoc = run_stage round "reassoc" reassociate_loop_adds_func after_dce1 in
       let after_licm = run_stage round "licm" (licm_func summaries globals) after_reassoc in
+
+      (* LICM can expose algebraic opportunities that were syntactically hidden
+         by repeated local loads.  In particular, after hoisting invariant
+         locals, expressions such as
+
+             ((iv + a) * b) - (iv * b)
+
+         have both products referring to the same invariant [b] temp.  Run a
+         small algebra cleanup before LVE/SR so factoring can turn this into
+
+             b * ((iv + a) - iv)  ==>  a * b
+
+         instead of letting LVE first strength-reduce [iv * b] into a
+         loop-carried recurrence, which destroys the cancellation shape. *)
+      let after_licm_factor =
+        run_stage round "post_licm_factor" factor_common_mul_func after_licm
+      in
+      let after_licm_linear =
+        run_stage round "post_licm_linear"
+          general_linear_canonicalize_func after_licm_factor
+      in
+      let after_licm_algebra =
+        run_stage round "post_licm_algebra"
+          algebra_canonicalize_func after_licm_linear
+      in
+      let after_licm_dce =
+        run_stage round "post_licm_dce"
+          (eliminate_dead_code_func ~removable_calls summaries globals return_globals)
+          after_licm_algebra
+      in
       let after_lve_sr =
-        run_stage round "lve_sr" loop_evolution_strength_reduce_func after_licm
+        run_stage round "lve_sr" loop_evolution_strength_reduce_func after_licm_dce
       in
       let after_unswitch =
         run_stage round
@@ -16525,19 +16346,19 @@ let optimize_func global_init summaries globals return_globals removable_calls (
           (const_propagate_func global_init summaries globals)
           after_unswitch
       in
-      let after_copy2 =
-        run_stage round "copy2" copy_forward_func after_const2
-      in
       let after_algebra2 =
-        run_stage round "algebra2" algebra_canonicalize_func after_copy2
+        run_stage round "algebra2" algebra_canonicalize_func after_const2
       in
       let after_linear2 =
         run_stage round "linear2" general_linear_canonicalize_func after_algebra2
       in
+      let after_factor2 =
+        run_stage round "factor_mul2" factor_common_mul_func after_linear2
+      in
       let after_gvn2 =
         run_stage round "gvn2"
           (gvn_func summaries globals)
-          after_linear2
+          after_factor2
       in
       let after_dce2 =
         run_stage round "dce2" (eliminate_dead_code_func ~removable_calls summaries globals return_globals) after_gvn2
@@ -16680,7 +16501,8 @@ let optimize_func global_init summaries globals return_globals removable_calls (
          make the canonicalizer reject them as multi-def/use-heavy. *)
       let late_algebra = algebra_canonicalize_func late_promoted in
       let late_linear = general_linear_canonicalize_func late_algebra in
-      let late_lve_sr = loop_evolution_strength_reduce_func late_linear in
+      let late_factor = factor_common_mul_func late_linear in
+      let late_lve_sr = loop_evolution_strength_reduce_func late_factor in
       let late_dce =
         eliminate_dead_code_func ~removable_calls summaries globals return_globals late_lve_sr
       in
