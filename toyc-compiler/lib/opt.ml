@@ -16611,15 +16611,49 @@ let optimize_func global_init summaries globals return_globals removable_calls (
              ~removable_calls summaries globals return_globals
         |> copy_coalesce_func summaries globals
       in
-      let late_runtime_summarized =
-        summarize_runtime_symbolic_affine_loops_func
-          summaries globals late_equiv_cleaned
+      (* A single late runtime-summary pass can expose another summarizable
+         enclosing loop.  This is especially common for nested loops: the
+         first pass summarizes the innermost recurrence, then constant/CFG
+         cleanup turns the parent into the same canonical affine shape.
+
+         Re-discover loops after each successful rewrite instead of relying on
+         the stale natural-loop snapshot from one invocation.  Keep the fuel
+         small to bound compile-time and code growth. *)
+      let rec late_runtime_summary_fixpoint iteration fuel current =
+        if fuel = 0 then current
+        else
+          let summarized =
+            summarize_runtime_symbolic_affine_loops_func
+              summaries globals current
+          in
+          if summarized = current then current
+          else
+            let cleaned =
+              summarized
+              |> const_propagate_func global_init summaries globals
+              |> fold_branch_tails_func summaries globals
+              |> thread_and_prune_func
+              |> simplify_cfg_func
+              |> algebra_canonicalize_func
+              |> general_linear_canonicalize_func
+              |> eliminate_dead_code_func
+                   ~removable_calls summaries globals return_globals
+              |> copy_coalesce_func summaries globals
+            in
+            if Sys.getenv_opt "TOYC_DEBUG_RUNTIME_SUMMARY_FIXPOINT" <> None then
+              Printf.eprintf
+                "runtime-summary-fixpoint func=%s iteration=%d before=(%s) summarized=(%s) cleaned=(%s)\n%!"
+                current.name iteration
+                (format_metrics (metrics_of_func current))
+                (format_metrics (metrics_of_func summarized))
+                (format_metrics (metrics_of_func cleaned));
+            if cleaned = current then cleaned
+            else
+              late_runtime_summary_fixpoint
+                (iteration + 1) (fuel - 1) cleaned
       in
       let late_runtime_cleaned =
-        late_runtime_summarized
-        |> eliminate_dead_code_func
-             ~removable_calls summaries globals return_globals
-        |> copy_coalesce_func summaries globals
+        late_runtime_summary_fixpoint 1 4 late_equiv_cleaned
       in
       if Sys.getenv_opt "TOYC_DEBUG_LATE_ALGEBRA" <> None then begin
         let before = metrics_of_func late_promoted in
