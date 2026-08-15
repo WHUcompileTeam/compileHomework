@@ -3540,6 +3540,40 @@ type basic_induction_var = {
   step : int64;
 }
 
+(* step112: a deliberately small symbolic loop-value language.
+
+   Keep this separate from [basic_induction_var]: counted-loop reasoning still
+   wants a statically known signed step, while strength reduction only needs
+   the recurrence identity to hold.  In particular, [i += step_parameter]
+   is useful even when the sign/value of [step_parameter] is unknown. *)
+type loop_inv_expr =
+  | LveConst of int64
+  | LveOperand of Tcg.operand
+  | LveNeg of loop_inv_expr
+  | LveAdd of loop_inv_expr * loop_inv_expr
+  | LveMul of loop_inv_expr * loop_inv_expr
+
+type logical_phi_backedge_case = {
+  logical_header_pred : Tcg.label;
+  logical_def_label : Tcg.label;
+  logical_source : Tcg.operand;
+  logical_chain : Cfg.block list;
+}
+
+type logical_loop_phi = {
+  logical_phi_temp : Tcg.temp;
+  logical_outside_inputs : (Tcg.label * Tcg.operand) list;
+  logical_backedge_preds : Tcg.label list;
+  logical_backedge_cases : logical_phi_backedge_case list;
+}
+
+type loop_addrec = {
+  addrec_phi_temp : Tcg.temp;
+  addrec_outside_inputs : (Tcg.label * Tcg.operand) list;
+  addrec_backedge_preds : Tcg.label list;
+  addrec_step : loop_inv_expr;
+}
+
 type derived_expr_key =
   | DerivedScaled of int64
   | DerivedAdd of Tcg.operand * int64
@@ -4367,6 +4401,582 @@ let collect_basic_induction_vars header loop get_block loop_defs multi_defs def_
         self_update_candidates []
     in
     phi_vars @ self_vars
+
+(* -------------------------------------------------------------------------- *)
+(* step112: Loop Value Evolution (SCEV-lite)                                  *)
+(* -------------------------------------------------------------------------- *)
+
+let rec normalize_loop_inv_expr expr =
+  let order_pair a b = if Stdlib.compare a b <= 0 then (a, b) else (b, a) in
+  match expr with
+  | LveConst value -> LveConst (i32 value)
+  | LveOperand (Tcg.Imm value) -> LveConst (i32 value)
+  | LveOperand operand -> LveOperand operand
+  | LveNeg inner -> (
+      match normalize_loop_inv_expr inner with
+      | LveConst value -> LveConst (i32 Int64.(neg value))
+      | LveNeg inner -> inner
+      | inner -> LveNeg inner)
+  | LveAdd (lhs, rhs) ->
+      let lhs = normalize_loop_inv_expr lhs in
+      let rhs = normalize_loop_inv_expr rhs in
+      begin
+        match (lhs, rhs) with
+        | LveConst 0L, other | other, LveConst 0L -> other
+        | LveConst a, LveConst b -> LveConst (i32 Int64.(add a b))
+        | _ ->
+            let lhs, rhs = order_pair lhs rhs in
+            LveAdd (lhs, rhs)
+      end
+  | LveMul (lhs, rhs) ->
+      let lhs = normalize_loop_inv_expr lhs in
+      let rhs = normalize_loop_inv_expr rhs in
+      begin
+        match (lhs, rhs) with
+        | LveConst 0L, _ | _, LveConst 0L -> LveConst 0L
+        | LveConst 1L, other | other, LveConst 1L -> other
+        | LveConst (-1L), other | other, LveConst (-1L) ->
+            normalize_loop_inv_expr (LveNeg other)
+        | LveConst a, LveConst b -> LveConst (i32 Int64.(mul a b))
+        | _ ->
+            let lhs, rhs = order_pair lhs rhs in
+            LveMul (lhs, rhs)
+      end
+
+let loop_inv_expr_equal lhs rhs =
+  normalize_loop_inv_expr lhs = normalize_loop_inv_expr rhs
+
+let rec loop_inv_expr_temps expr =
+  match normalize_loop_inv_expr expr with
+  | LveConst _ -> IntSet.empty
+  | LveOperand (Tcg.Imm _) -> IntSet.empty
+  | LveOperand (Tcg.Temp temp) -> IntSet.singleton temp
+  | LveNeg inner -> loop_inv_expr_temps inner
+  | LveAdd (lhs, rhs) | LveMul (lhs, rhs) ->
+      IntSet.union (loop_inv_expr_temps lhs) (loop_inv_expr_temps rhs)
+
+let string_of_lve_operand = function
+  | Tcg.Imm value -> Printf.sprintf "%Ld" value
+  | Tcg.Temp temp -> Printf.sprintf "t%d" temp
+
+let rec string_of_loop_inv_expr = function
+  | LveConst value -> Printf.sprintf "%Ld" value
+  | LveOperand operand -> string_of_lve_operand operand
+  | LveNeg inner -> Printf.sprintf "-(%s)" (string_of_loop_inv_expr inner)
+  | LveAdd (lhs, rhs) ->
+      Printf.sprintf "(%s+%s)" (string_of_loop_inv_expr lhs) (string_of_loop_inv_expr rhs)
+  | LveMul (lhs, rhs) ->
+      Printf.sprintf "(%s*%s)" (string_of_loop_inv_expr lhs) (string_of_loop_inv_expr rhs)
+
+(* Canonicalize a loop-invariant operand through its unique definition.
+
+   This is intentionally analysis-only: no IR is rewritten here.  The goal is
+   to give semantically identical invariant values the same symbolic identity.
+
+   Typical example after lowering/mem2reg:
+
+       t10 = step
+       ...
+       t13 = step
+
+   The old LVE represented the two path deltas as [t10] and [t13] and rejected
+   the AddRec.  Following unique Move/UPlus chains makes both become the same
+   root value.
+
+   We also fold simple expressions made entirely from invariant values.  This
+   gives the LVE layer a useful canonical form for future symbolic recurrences
+   such as [step + 4] and [step * k]. *)
+let lve_invariant_expr_of_operand
+    loop_defs multi_defs def_instrs operand =
+  let rec canonical seen operand =
+    match operand with
+    | Tcg.Imm value -> Some (LveConst value)
+    | Tcg.Temp temp ->
+        if IntSet.mem temp loop_defs then None
+        else if IntSet.mem temp seen then Some (LveOperand operand)
+        else if IntSet.mem temp multi_defs then
+          (* Multiple reaching definitions outside the current natural loop are
+             not globally interchangeable without path information. *)
+          Some (LveOperand operand)
+        else
+          let seen = IntSet.add temp seen in
+          match Hashtbl.find_opt def_instrs temp with
+          | Some (Tcg.Move (_, src))
+          | Some (Tcg.Un (_, UPlus, src)) -> (
+              match canonical seen src with
+              | Some expr -> Some expr
+              | None -> Some (LveOperand operand))
+          | Some (Tcg.Un (_, UMinus, src)) -> (
+              match canonical seen src with
+              | Some expr -> Some (normalize_loop_inv_expr (LveNeg expr))
+              | None -> Some (LveOperand operand))
+          | Some (Tcg.Bin (_, Add, lhs, rhs)) -> (
+              match (canonical seen lhs, canonical seen rhs) with
+              | Some lhs, Some rhs ->
+                  Some (normalize_loop_inv_expr (LveAdd (lhs, rhs)))
+              | _ -> Some (LveOperand operand))
+          | Some (Tcg.Bin (_, Sub, lhs, rhs)) -> (
+              match (canonical seen lhs, canonical seen rhs) with
+              | Some lhs, Some rhs ->
+                  Some
+                    (normalize_loop_inv_expr
+                       (LveAdd (lhs, LveNeg rhs)))
+              | _ -> Some (LveOperand operand))
+          | Some (Tcg.Bin (_, Mul, lhs, rhs)) -> (
+              match (canonical seen lhs, canonical seen rhs) with
+              | Some lhs, Some rhs ->
+                  Some (normalize_loop_inv_expr (LveMul (lhs, rhs)))
+              | _ -> Some (LveOperand operand))
+          | Some (Tcg.Un _)
+          | Some (Tcg.Bin _)
+          | Some (Tcg.Load _)
+          | Some (Tcg.Store _)
+          | Some (Tcg.Call _)
+          | None -> Some (LveOperand operand)
+  in
+  let result = canonical IntSet.empty operand in
+  (if Sys.getenv_opt "TOYC_DEBUG_LVE" <> None then
+     match (operand, result) with
+     | Tcg.Temp temp, Some expr
+       when expr <> LveOperand operand ->
+         Printf.eprintf
+           "lve-inv-canon t%d -> %s\n%!"
+           temp (string_of_loop_inv_expr expr)
+     | _ -> ());
+  result
+
+(* A path-sensitive reaching-value query used by the logical-PHI view.
+
+   Unlike fix2, this query does NOT require all predecessor paths to end in the
+   same source operand.  It returns one case per reaching Move definition,
+   together with the concrete backwards chain used to reach that definition.
+
+   This matters for shapes such as:
+
+       if (...) {
+         t1 = i + step;
+         phi = t1;
+       } else {
+         t2 = i + step;
+         phi = t2;
+       }
+       latch:
+         goto header
+
+   [t1] and [t2] are different operands, but both paths have the same semantic
+   delta from [i].  The AddRec analysis below compares the derived deltas, not
+   the temporary names. *)
+type lve_reaching_move_case = {
+  reaching_source : Tcg.operand;
+  reaching_def_label : Tcg.label;
+  reaching_chain : Cfg.block list;
+}
+
+let reaching_move_cases_on_edge get_block ~stop_label ~pred_label temp =
+  let rec search seen chain label =
+    if label = stop_label || LabelSet.mem label seen then None
+    else
+      let block : Cfg.block = get_block label in
+      let chain = chain @ [ block ] in
+      match last_def_of_temp block temp with
+      | Some (Tcg.Move (dst, src)) when dst = temp ->
+          Some
+            [
+              {
+                reaching_source = src;
+                reaching_def_label = label;
+                reaching_chain = chain;
+              };
+            ]
+      | Some _ ->
+          (* A non-Move nearest definition is not a mem2reg-style edge copy. *)
+          None
+      | None ->
+          let seen = LabelSet.add label seen in
+          let preds =
+            List.filter (fun pred -> pred <> stop_label) block.preds
+          in
+          begin
+            match preds with
+            | [] -> None
+            | _ ->
+                let reached = List.map (search seen chain) preds in
+                if List.exists Option.is_none reached then None
+                else
+                  let cases = List.concat_map (Option.value ~default:[]) reached in
+                  if cases = [] then None else Some cases
+          end
+  in
+  search LabelSet.empty [] pred_label
+
+let dedup_reaching_move_cases cases =
+  List.fold_left
+    (fun acc case ->
+      if
+        List.exists
+          (fun existing ->
+            existing.reaching_def_label = case.reaching_def_label
+            && existing.reaching_source = case.reaching_source)
+          acc
+      then acc
+      else case :: acc)
+    [] cases
+  |> List.rev
+
+(* Recover the PHI semantics that mem2reg lowered into edge copies.
+
+   A temp is a logical-PHI candidate when every header incoming edge can be
+   traced backwards to one or more unambiguous Move definitions of that temp.
+   Different paths are allowed to use different source temporaries.  The
+   recurrence proof, not PHI recovery, is responsible for showing that all
+   backedge paths have the same evolution. *)
+let recover_logical_loop_phis header loop get_block multi_defs =
+  let header_block : Cfg.block = get_block header in
+  let preds = header_block.preds in
+  let outside_preds =
+    List.filter (fun pred -> not (LabelSet.mem pred loop)) preds
+  in
+  let backedge_preds =
+    List.filter (fun pred -> LabelSet.mem pred loop) preds
+  in
+  if preds = [] || outside_preds = [] || backedge_preds = [] then []
+  else
+    IntSet.elements multi_defs
+    |> List.filter_map (fun phi_temp ->
+           let incoming =
+             List.filter_map
+               (fun pred ->
+                 match
+                   reaching_move_cases_on_edge
+                     get_block ~stop_label:header ~pred_label:pred phi_temp
+                 with
+                 | Some cases ->
+                     Some (pred, dedup_reaching_move_cases cases)
+                 | None -> None)
+               preds
+           in
+           if List.length incoming <> List.length preds then None
+           else
+             let all_def_labels =
+               List.fold_left
+                 (fun labels (_, cases) ->
+                   List.fold_left
+                     (fun labels case ->
+                       LabelSet.add case.reaching_def_label labels)
+                     labels cases)
+                 LabelSet.empty incoming
+             in
+             if LabelSet.cardinal all_def_labels < 2 then None
+             else
+               let outside_inputs =
+                 List.map
+                   (fun pred -> (pred, Tcg.Temp phi_temp))
+                   outside_preds
+               in
+               let backedge_cases =
+                 List.concat_map
+                   (fun (pred, cases) ->
+                     if List.mem pred backedge_preds then
+                       List.map
+                         (fun case ->
+                           {
+                             logical_header_pred = pred;
+                             logical_def_label = case.reaching_def_label;
+                             logical_source = case.reaching_source;
+                             logical_chain = case.reaching_chain;
+                           })
+                         cases
+                     else [])
+                   incoming
+               in
+               if backedge_cases = [] then None
+               else begin
+                 if Sys.getenv_opt "TOYC_DEBUG_LVE" <> None then
+                   Printf.eprintf
+                     "lve-phi header=%s phi=t%d outside=%d backedges=%d paths=%d defs=%d\n%!"
+                     header phi_temp
+                     (List.length outside_inputs)
+                     (List.length backedge_preds)
+                     (List.length backedge_cases)
+                     (LabelSet.cardinal all_def_labels);
+                 Some
+                   {
+                     logical_phi_temp = phi_temp;
+                     logical_outside_inputs = outside_inputs;
+                     logical_backedge_preds = backedge_preds;
+                     logical_backedge_cases = backedge_cases;
+                   }
+               end)
+
+(* Return the additive delta in [value = phi + delta].  The important
+   distinction from the old induction matcher is that [delta] is a symbolic
+   loop-invariant expression rather than an int64. *)
+let lve_delta_from_phi chain loop_defs multi_defs def_instrs phi_temp operand =
+  let rec delta seen operand =
+    match operand with
+    | Tcg.Imm _ -> None
+    | Tcg.Temp temp when temp = phi_temp -> Some (LveConst 0L)
+    | Tcg.Temp temp ->
+        if IntSet.mem temp seen then None
+        else
+          let seen = IntSet.add temp seen in
+          match def_instr_on_chain_or_global chain multi_defs def_instrs temp with
+          | Some (Tcg.Move (_, src))
+          | Some (Tcg.Un (_, UPlus, src)) -> delta seen src
+          | Some (Tcg.Bin (_, Add, lhs, rhs)) -> (
+              match (delta seen lhs, lve_invariant_expr_of_operand loop_defs multi_defs def_instrs rhs) with
+              | Some lhs_delta, Some rhs_inv ->
+                  Some (normalize_loop_inv_expr (LveAdd (lhs_delta, rhs_inv)))
+              | _ -> (
+                  match (lve_invariant_expr_of_operand loop_defs multi_defs def_instrs lhs, delta seen rhs) with
+                  | Some lhs_inv, Some rhs_delta ->
+                      Some (normalize_loop_inv_expr (LveAdd (lhs_inv, rhs_delta)))
+                  | _ -> None))
+          | Some (Tcg.Bin (_, Sub, lhs, rhs)) -> (
+              match (delta seen lhs, lve_invariant_expr_of_operand loop_defs multi_defs def_instrs rhs) with
+              | Some lhs_delta, Some rhs_inv ->
+                  Some
+                    (normalize_loop_inv_expr
+                       (LveAdd (lhs_delta, LveNeg rhs_inv)))
+              | _ -> None)
+          | Some (Tcg.Un _)
+          | Some (Tcg.Bin _)
+          | Some (Tcg.Load _)
+          | Some (Tcg.Store _)
+          | Some (Tcg.Call _)
+          | None -> None
+  in
+  delta IntSet.empty operand |> Option.map normalize_loop_inv_expr
+
+(* A backedge edge-copy may itself read another logical PHI.
+
+   Example after mem2reg:
+
+       then:  next_phi = i + step
+       else:  next_phi = step + i
+       join:  i_phi = next_phi
+       ... -> header
+
+   The physical reaching definition of [i_phi] is only [i_phi <- next_phi], so
+   the first level has one path.  But [next_phi] is multi-defined.  Recursively
+   expand that source at the point where [i_phi] reads it, then derive a delta
+   independently for every resulting path.
+
+   This is the missing piece that turns path-specific PHI recovery into
+   path-specific *value evolution*, rather than merely path-specific edge-copy
+   recovery. *)
+let lve_delta_cases_from_backedge
+    get_block loop_defs multi_defs def_instrs phi_temp
+    (case : logical_phi_backedge_case) =
+  let rec expand seen_merge_temps def_label chain source =
+    match
+      lve_delta_from_phi
+        chain loop_defs multi_defs def_instrs phi_temp source
+    with
+    | Some step -> Some [ normalize_loop_inv_expr step ]
+    | None -> (
+        match source with
+        | Tcg.Temp temp
+          when temp <> phi_temp
+               && IntSet.mem temp multi_defs
+               && not (IntSet.mem temp seen_merge_temps) ->
+            let block : Cfg.block = get_block def_label in
+            let preds = block.preds in
+            if preds = [] then None
+            else
+              let seen_merge_temps = IntSet.add temp seen_merge_temps in
+              let reached_per_pred =
+                List.map
+                  (fun pred ->
+                    reaching_move_cases_on_edge
+                      get_block ~stop_label:def_label ~pred_label:pred temp)
+                  preds
+              in
+              if List.exists Option.is_none reached_per_pred then None
+              else
+                let reached =
+                  reached_per_pred
+                  |> List.concat_map (Option.value ~default:[])
+                  |> dedup_reaching_move_cases
+                in
+                if reached = [] then None
+                else
+                  let expanded =
+                    List.map
+                      (fun reached_case ->
+                        expand
+                          seen_merge_temps
+                          reached_case.reaching_def_label
+                          reached_case.reaching_chain
+                          reached_case.reaching_source)
+                      reached
+                  in
+                  if List.exists Option.is_none expanded then None
+                  else
+                    Some
+                      (expanded
+                       |> List.concat_map (Option.value ~default:[])
+                       |> List.map normalize_loop_inv_expr)
+        | Tcg.Imm _ | Tcg.Temp _ -> None)
+  in
+  let result =
+    expand IntSet.empty case.logical_def_label case.logical_chain
+      case.logical_source
+  in
+  (if Sys.getenv_opt "TOYC_DEBUG_LVE" <> None then
+     match result with
+     | Some steps when List.length steps > 1 ->
+         Printf.eprintf
+           "lve-delta-expand header-pred=%s phi=t%d source=%s paths=%d deltas={%s}\n%!"
+           case.logical_header_pred phi_temp
+           (string_of_lve_operand case.logical_source)
+           (List.length steps)
+           (String.concat "," (List.map string_of_loop_inv_expr steps))
+     | Some _ | None -> ());
+  result
+
+let analyze_loop_addrecs header loop get_block loop_defs multi_defs def_instrs =
+  recover_logical_loop_phis header loop get_block multi_defs
+  |> List.filter_map (fun (phi : logical_loop_phi) ->
+         let recovered =
+           List.map
+             (fun case ->
+               ( case,
+                 lve_delta_cases_from_backedge
+                   get_block loop_defs multi_defs def_instrs
+                   phi.logical_phi_temp case ))
+             phi.logical_backedge_cases
+         in
+         let all_recovered =
+           List.for_all
+             (fun (_, steps) ->
+               match steps with
+               | Some (_ :: _) -> true
+               | Some [] | None -> false)
+             recovered
+         in
+         let steps =
+           recovered
+           |> List.concat_map (fun (case, maybe_steps) ->
+                  match maybe_steps with
+                  | None -> []
+                  | Some path_steps ->
+                      List.map
+                        (fun step ->
+                          ( case.logical_header_pred,
+                            case.logical_def_label,
+                            normalize_loop_inv_expr step ))
+                        path_steps)
+         in
+         match steps with
+         | [] -> None
+         | (_, _, step) :: rest
+           when all_recovered
+                && List.for_all
+                     (fun (_, _, other) -> loop_inv_expr_equal step other)
+                     rest ->
+             let addrec =
+               {
+                 addrec_phi_temp = phi.logical_phi_temp;
+                 addrec_outside_inputs = phi.logical_outside_inputs;
+                 addrec_backedge_preds = phi.logical_backedge_preds;
+                 addrec_step = normalize_loop_inv_expr step;
+               }
+             in
+             if Sys.getenv_opt "TOYC_DEBUG_LVE" <> None then
+               Printf.eprintf
+                 "lve-addrec header=%s phi=t%d step=%s outside=%d backedges=%d physical-paths=%d value-paths=%d\n%!"
+                 header addrec.addrec_phi_temp
+                 (string_of_loop_inv_expr addrec.addrec_step)
+                 (List.length addrec.addrec_outside_inputs)
+                 (List.length addrec.addrec_backedge_preds)
+                 (List.length phi.logical_backedge_cases)
+                 (List.length steps);
+             Some addrec
+         | _ ->
+             (if Sys.getenv_opt "TOYC_DEBUG_LVE" <> None then
+                let rendered =
+                  steps
+                  |> List.map (fun (pred, def_label, step) ->
+                         Printf.sprintf "%s/%s:%s"
+                           pred def_label (string_of_loop_inv_expr step))
+                  |> String.concat ","
+                in
+                Printf.eprintf
+                  "lve-addrec-reject header=%s phi=t%d paths={%s} recovered=%b value-paths=%d physical-paths=%d\n%!"
+                  header phi.logical_phi_temp rendered all_recovered
+                  (List.length steps)
+                  (List.length phi.logical_backedge_cases));
+             None)
+
+
+let lve_operand_available_before_preds doms def_blocks multi_defs preds = function
+  | Tcg.Imm _ -> true
+  | Tcg.Temp temp ->
+      if IntSet.mem temp multi_defs then false
+      else
+        match Hashtbl.find_opt def_blocks temp with
+        | None -> false
+        | Some def_label ->
+            List.for_all
+              (fun pred ->
+                LabelSet.mem def_label
+                  (table_find_or_empty doms pred LabelSet.empty))
+              preds
+
+let lve_expr_available_before_preds doms def_blocks multi_defs preds expr =
+  IntSet.for_all
+    (fun temp ->
+      lve_operand_available_before_preds
+        doms def_blocks multi_defs preds (Tcg.Temp temp))
+    (loop_inv_expr_temps expr)
+
+let rec emit_loop_inv_expr fresh_temp dst expr =
+  let expr = normalize_loop_inv_expr expr in
+  let as_operand expr =
+    match normalize_loop_inv_expr expr with
+    | LveConst value -> ([], Tcg.Imm value)
+    | LveOperand operand -> ([], operand)
+    | complex ->
+        let temp = fresh_temp () in
+        (emit_loop_inv_expr fresh_temp temp complex, Tcg.Temp temp)
+  in
+  match expr with
+  | LveConst value -> [ Tcg.Move (dst, Tcg.Imm value) ]
+  | LveOperand operand -> [ Tcg.Move (dst, operand) ]
+  | LveNeg inner ->
+      let prep, operand = as_operand inner in
+      prep @ [ simplify_simple_instr (Tcg.Un (dst, UMinus, operand)) ]
+  | LveAdd (lhs, rhs) ->
+      let lhs_prep, lhs = as_operand lhs in
+      let rhs_prep, rhs = as_operand rhs in
+      lhs_prep @ rhs_prep
+      @ [ simplify_simple_instr (Tcg.Bin (dst, Add, lhs, rhs)) ]
+  | LveMul (lhs, rhs) ->
+      let lhs_prep, lhs = as_operand lhs in
+      let rhs_prep, rhs = as_operand rhs in
+      lhs_prep @ rhs_prep
+      @ [ simplify_simple_instr (Tcg.Bin (dst, Mul, lhs, rhs)) ]
+
+let lve_scale_candidate loop_defs multi_defs def_instrs phi_temp instr =
+  let invariant operand =
+    lve_invariant_expr_of_operand loop_defs multi_defs def_instrs operand
+  in
+  match instr with
+  | Tcg.Bin (dst, Mul, lhs, rhs)
+    when resolves_to_induction_temp multi_defs def_instrs phi_temp lhs ->
+      Option.map (fun scale -> (dst, rhs, scale)) (invariant rhs)
+  | Tcg.Bin (dst, Mul, lhs, rhs)
+    when resolves_to_induction_temp multi_defs def_instrs phi_temp rhs ->
+      Option.map (fun scale -> (dst, lhs, scale)) (invariant lhs)
+  | _ -> None
+
+let lve_nontrivial_scale = function
+  | LveConst 0L | LveConst 1L | LveConst (-1L) -> false
+  | LveOperand (Tcg.Imm 0L)
+  | LveOperand (Tcg.Imm 1L)
+  | LveOperand (Tcg.Imm (-1L)) -> false
+  | LveConst _ | LveOperand _ | LveNeg _ | LveAdd _ | LveMul _ -> true
 
 type counted_loop_kind =
   | CountUpLt of Tcg.operand * int64
@@ -12698,6 +13308,156 @@ let loop_rotate_func (f : Cfg.func) =
   in
   apply f
 
+(* Dynamic loop strength reduction using the step112 LVE analysis.
+
+   First target:
+       p = i * k
+       i.next = i + step
+   where [step] and [k] may both be runtime loop-invariant values.
+
+   We build a second recurrence:
+       p.start = i.start * k
+       p.step  = step * k
+   and replace the per-iteration multiply with [p]. *)
+let loop_evolution_strength_reduce_func (f : Cfg.func) =
+  let _, loops, headers = discover_natural_loops f in
+  if headers = [] then f
+  else
+    let doms = compute_dominators f in
+    let _, def_blocks, def_instrs, multi_defs =
+      analyze_temp_defs_of_blocks f.temp_count f.blocks
+    in
+    let current_blocks = Hashtbl.create (List.length f.blocks) in
+    List.iter
+      (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block)
+      f.blocks;
+    let get_block = get_block_exn current_blocks in
+    let update_block (block : Cfg.block) =
+      Hashtbl.replace current_blocks block.label block
+    in
+    let next_temp = ref f.temp_count in
+    let fresh_temp () =
+      let temp = !next_temp in
+      incr next_temp;
+      temp
+    in
+    let changed = ref false in
+    List.iter
+      (fun header ->
+        let loop = table_find_or_empty loops header LabelSet.empty in
+        let loop_defs = loop_defined_temps loop get_block in
+        let addrecs =
+          analyze_loop_addrecs
+            header loop get_block loop_defs multi_defs def_instrs
+        in
+        List.iter
+          (fun (iv : loop_addrec) ->
+            let outside_preds = List.map fst iv.addrec_outside_inputs in
+            if
+              outside_preds <> []
+              && lve_expr_available_before_preds
+                   doms def_blocks multi_defs outside_preds iv.addrec_step
+            then begin
+              let derived_uses = Hashtbl.create 4 in
+              List.iter
+                (fun (block : Cfg.block) ->
+                  if LabelSet.mem block.label loop then
+                    List.iteri
+                      (fun index instr ->
+                        match
+                          lve_scale_candidate
+                            loop_defs multi_defs def_instrs iv.addrec_phi_temp instr
+                        with
+                        | Some (dst, scale_operand, scale_expr)
+                          when lve_nontrivial_scale scale_expr
+                               && lve_operand_available_before_preds
+                                    doms def_blocks multi_defs outside_preds scale_operand ->
+                            let key = normalize_loop_inv_expr scale_expr in
+                            let uses =
+                              Option.value ~default:[] (Hashtbl.find_opt derived_uses key)
+                            in
+                            Hashtbl.replace derived_uses key
+                              ((block.label, index, dst) :: uses)
+                        | Some _ | None -> ())
+                      (get_block block.label).body)
+                f.blocks;
+              Hashtbl.iter
+                (fun scale_expr uses ->
+                  if uses <> [] then begin
+                    changed := true;
+                    let derived_phi = fresh_temp () in
+                    let derived_step = fresh_temp () in
+                    let step_times_scale =
+                      normalize_loop_inv_expr (LveMul (iv.addrec_step, scale_expr))
+                    in
+                    List.iter
+                      (fun (pred, _source) ->
+                        let pred_block = get_block pred in
+                        let init_expr =
+                          normalize_loop_inv_expr
+                            (LveMul
+                               ( LveOperand (Tcg.Temp iv.addrec_phi_temp),
+                                 scale_expr ))
+                        in
+                        let body =
+                          pred_block.body
+                          @ emit_loop_inv_expr fresh_temp derived_phi init_expr
+                          @ emit_loop_inv_expr fresh_temp derived_step step_times_scale
+                        in
+                        update_block { pred_block with body })
+                      iv.addrec_outside_inputs;
+                    List.iter
+                      (fun pred ->
+                        let pred_block = get_block pred in
+                        let update =
+                          simplify_simple_instr
+                            (Tcg.Bin
+                               ( derived_phi,
+                                 Add,
+                                 Tcg.Temp derived_phi,
+                                 Tcg.Temp derived_step ))
+                        in
+                        update_block { pred_block with body = pred_block.body @ [ update ] })
+                      iv.addrec_backedge_preds;
+                    List.iter
+                      (fun (block : Cfg.block) ->
+                        if LabelSet.mem block.label loop then
+                          let current = get_block block.label in
+                          let replacements = Hashtbl.create (List.length uses) in
+                          List.iter
+                            (fun (label, index, dst) ->
+                              if label = current.label then
+                                Hashtbl.replace replacements index dst)
+                            uses;
+                          if Hashtbl.length replacements > 0 then
+                            let body =
+                              List.mapi
+                                (fun index instr ->
+                                  match Hashtbl.find_opt replacements index with
+                                  | Some dst -> Tcg.Move (dst, Tcg.Temp derived_phi)
+                                  | None -> instr)
+                                current.body
+                            in
+                            update_block { current with body })
+                      f.blocks;
+                    if Sys.getenv_opt "TOYC_DEBUG_LVE" <> None then
+                      Printf.eprintf
+                        "lve-sr func=%s header=%s base=t%d scale=%s step=%s uses=%d derived=t%d delta=t%d\n%!"
+                        f.name header iv.addrec_phi_temp
+                        (string_of_loop_inv_expr scale_expr)
+                        (string_of_loop_inv_expr iv.addrec_step)
+                        (List.length uses) derived_phi derived_step
+                  end)
+                derived_uses
+            end)
+          addrecs)
+      headers;
+    if !changed then
+      let ordered_labels = List.map (fun (block : Cfg.block) -> block.label) f.blocks in
+      let blocks = List.map get_block ordered_labels in
+      Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
+    else f
+
 let strength_reduce_func (f : Cfg.func) =
   let _, loops, headers = discover_natural_loops f in
   if headers = [] then f
@@ -14234,6 +14994,608 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
     with
     | Applied next -> next
 
+(* -------------------------------------------------------------------------- *)
+(* step112 fix6: late equivalent-diamond folding                              *)
+(* -------------------------------------------------------------------------- *)
+
+(* Strength reduction can lower operation latency without reducing the number
+   of dynamically executed TCG/RISC-V instructions.  The benchmark harness is
+   heavily instruction-count-sensitive, so remove redundant control flow when
+   both branch arms have become literally equivalent after late algebra,
+   mem2reg and copy coalescing.
+
+   This pass is intentionally conservative:
+     - only immediate two-arm diamonds;
+     - both arm blocks must have byte-for-byte equal TCG bodies;
+     - both arms must be unconditional jumps to the same join.
+
+   Because ToyC PHIs have already been lowered to edge Moves, equality of the
+   arm bodies also includes equality of any edge-copy state updates.  Choosing
+   either arm is therefore semantics-preserving. *)
+let fold_late_equivalent_diamonds_func (f : Cfg.func) =
+  let debug = Sys.getenv_opt "TOYC_DEBUG_EQUIV_BRANCH" <> None in
+  let rec iterate fuel (current : Cfg.func) =
+    if fuel = 0 then current
+    else
+      let block_map = Hashtbl.create (max 8 (List.length current.blocks)) in
+      List.iter
+        (fun (block : Cfg.block) ->
+          Hashtbl.replace block_map block.label block)
+        current.blocks;
+      let changed = ref false in
+      let blocks =
+        List.map
+          (fun (block : Cfg.block) ->
+            let targets =
+              match block.term with
+              | Cfg.BranchZero (_, a, b)
+              | Cfg.BranchNonZero (_, a, b) ->
+                  Some (a, b)
+              | Cfg.BranchCompare (_, _, _, a, b) ->
+                  Some (a, b)
+              | Cfg.Jump _ | Cfg.Return _ ->
+                  None
+            in
+            match targets with
+            | Some (a, b) when a <> b -> (
+                match
+                  (Hashtbl.find_opt block_map a, Hashtbl.find_opt block_map b)
+                with
+                | Some (arm_a : Cfg.block), Some (arm_b : Cfg.block) -> (
+                    match (arm_a.term, arm_b.term) with
+                    | Cfg.Jump join_a, Cfg.Jump join_b
+                      when join_a = join_b
+                           && arm_a.body = arm_b.body ->
+                        changed := true;
+                        if debug then
+                          Printf.eprintf
+                            "equiv-branch-fold func=%s branch=%s arms=%s,%s join=%s body-instrs=%d\n%!"
+                            current.name block.label a b join_a
+                            (List.length arm_a.body);
+                        let term = Cfg.Jump a in
+                        { block with term; succs = Cfg.successors term }
+                    | _ -> block)
+                | _ -> block)
+            | Some _ | None -> block)
+          current.blocks
+      in
+      if not !changed then current
+      else
+        let rebuilt = Cfg.rebuild_edges { current with blocks } in
+        let cleaned = thread_and_prune_func rebuilt in
+        if cleaned = current then current
+        else iterate (fuel - 1) cleaned
+  in
+  iterate 8 f
+
+(* -------------------------------------------------------------------------- *)
+(* step112 fix7: runtime symbolic affine-loop summary                         *)
+(* -------------------------------------------------------------------------- *)
+
+(* Late LVE strength reduction can leave the canonical runtime loop:
+
+       acc     = acc + derived
+       iv      = iv + step
+       derived = derived + delta
+       if (iv < bound) goto loop
+
+   where [step], [bound] and [delta] are all runtime loop-invariant values.
+
+   Replacing MUL by ADD does not reduce dynamic instruction count.  For this
+   very small side-effect-free shape, summarize the arithmetic progression at
+   runtime instead:
+
+       trip = ceil(bound / step)          (the first-entry iv is proven zero)
+       acc += trip * derived
+              + C(trip, 2) * delta
+
+   Correctness is guarded:
+     - the original zero-trip test remains in place;
+     - only step > 0 takes the summary path;
+     - require trip*step <= INT32_MAX, otherwise fall back to the original
+       loop so signed-IV wraparound behaviour is preserved.
+
+   The original loop is deliberately retained as a fallback.  This makes the
+   transform profitable for ordinary positive runtime steps without changing
+   zero/negative-step or overflow-sensitive behaviour. *)
+let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func) =
+  let debug = Sys.getenv_opt "TOYC_DEBUG_LVE_SUMMARY" <> None in
+  let _block_map, loops, headers = discover_natural_loops f in
+  if headers = [] then f
+  else
+    let current_blocks = Hashtbl.create (List.length f.blocks + (3 * List.length headers)) in
+    List.iter
+      (fun (block : Cfg.block) -> Hashtbl.replace current_blocks block.label block)
+      f.blocks;
+    let get_block = get_block_exn current_blocks in
+    let update_block (block : Cfg.block) =
+      Hashtbl.replace current_blocks block.label block
+    in
+    let doms = compute_dominators f in
+    let live_in_t, _ = compute_liveness summaries globals f in
+    let operand_available_at_preheader def_blocks multi_defs preheader_label operand =
+      lve_operand_available_before_preds
+        doms def_blocks multi_defs
+        [ preheader_label ] operand
+    in
+    let next_temp = ref f.temp_count in
+    let fresh_temp () =
+      let temp = !next_temp in
+      incr next_temp;
+      temp
+    in
+    let next_id = ref 0 in
+    let fresh_label suffix =
+      let id = !next_id in
+      incr next_id;
+      Printf.sprintf ".L%s_lve_summary_%d_%s" f.label id suffix
+    in
+    let reject header reason =
+      if debug then
+        Printf.eprintf
+          "lve-runtime-summary-reject func=%s header=%s reason=%s\n%!"
+          f.name header reason
+    in
+    let reaching_seed_on_edge ~header ~pred_label temp =
+      match
+        reaching_move_cases_on_edge
+          get_block ~stop_label:header ~pred_label temp
+      with
+      | None -> None
+      | Some cases ->
+          let values =
+            cases
+            |> dedup_reaching_move_cases
+            |> List.map (fun case ->
+                   resolve_chain_operand
+                     case.reaching_chain case.reaching_source)
+          in
+          (match values with
+           | [] -> None
+           | first :: rest
+             when List.for_all (fun value -> value = first) rest ->
+               Some first
+           | _ -> None)
+    in
+    let new_blocks_rev = ref [] in
+    let changed = ref false in
+
+    let self_add = function
+      | Tcg.Bin (dst, Add, Tcg.Temp lhs, rhs) when dst = lhs ->
+          Some (dst, rhs)
+      | Tcg.Bin (dst, Add, lhs, Tcg.Temp rhs) when dst = rhs ->
+          Some (dst, lhs)
+      | Tcg.Move _
+      | Tcg.Un _
+      | Tcg.Bin _
+      | Tcg.Load _
+      | Tcg.Store _
+      | Tcg.Call _ ->
+          None
+    in
+
+    let branch_continue_lt header term =
+      match term with
+      | Cfg.BranchCompare (op, lhs, rhs, yes_label, no_label) ->
+          let op, inside_label, exit_label =
+            if yes_label = header && no_label <> header then
+              (op, yes_label, no_label)
+            else if no_label = header && yes_label <> header then
+              (invert_compare op, no_label, yes_label)
+            else
+              (Eq, "", "")
+          in
+          if inside_label <> header then None
+          else Some (op, lhs, rhs, exit_label)
+      | Cfg.BranchZero _
+      | Cfg.BranchNonZero _
+      | Cfg.Jump _
+      | Cfg.Return _ ->
+          None
+    in
+
+    List.iter
+      (fun header ->
+        let loop = table_find_or_empty loops header LabelSet.empty in
+        if LabelSet.cardinal loop <> 1 then
+          reject header "loop-not-single-block"
+        else
+          let block : Cfg.block = get_block header in
+          let outside_preds =
+            List.filter (fun pred -> not (LabelSet.mem pred loop)) block.preds
+          in
+          match outside_preds with
+          | [ preheader_label ] -> (
+              let preheader : Cfg.block = get_block preheader_label in
+              let loop_defs, def_blocks, def_instrs, multi_defs =
+                analyze_temp_defs_of_blocks ~loop f.temp_count f.blocks
+              in
+              let addrecs =
+                analyze_loop_addrecs
+                  header loop get_block loop_defs multi_defs def_instrs
+              in
+              let effects = collect_loop_effects summaries globals loop f.blocks in
+              match branch_continue_lt header block.term with
+              | None -> reject header "unsupported-loop-branch"
+              | Some (branch_op, lhs, rhs, exit_label) ->
+                  if
+                    effects.has_call
+                    || not (PlaceSet.is_empty effects.modified_places)
+                    || List.length block.body <> 3
+                  then
+                    reject header
+                      (Printf.sprintf
+                         "effects-or-body-shape call=%b modified=%d body=%d"
+                         effects.has_call
+                         (PlaceSet.cardinal effects.modified_places)
+                         (List.length block.body))
+                  else
+                    let find_control () =
+                      List.find_map
+                        (fun (iv : loop_addrec) ->
+                          let lhs_is_iv =
+                            resolves_to_induction_temp
+                              multi_defs def_instrs iv.addrec_phi_temp lhs
+                          in
+                          let rhs_is_iv =
+                            resolves_to_induction_temp
+                              multi_defs def_instrs iv.addrec_phi_temp rhs
+                          in
+                          let normalized_op, bound =
+                            if lhs_is_iv && not rhs_is_iv then
+                              (branch_op, rhs)
+                            else if rhs_is_iv && not lhs_is_iv then
+                              (swap_compare branch_op, lhs)
+                            else
+                              (Eq, Tcg.Imm 0L)
+                          in
+                          if normalized_op <> Lt then None
+                          else
+                            match normalize_loop_inv_expr iv.addrec_step with
+                            | LveOperand step_operand ->
+                                Some (iv, step_operand, bound)
+                            | LveConst _
+                            | LveNeg _
+                            | LveAdd _
+                            | LveMul _ ->
+                                None)
+                        addrecs
+                    in
+                    match find_control () with
+                    | None -> reject header "no-symbolic-lt-control-addrec"
+                    | Some (control_iv, step_operand, bound_operand) ->
+                        let iv_temp = control_iv.addrec_phi_temp in
+                        let initial_iv =
+                          reaching_seed_on_edge
+                            ~header ~pred_label:preheader_label iv_temp
+                        in
+                        (if debug then
+                           Printf.eprintf
+                             "lve-runtime-summary-candidate func=%s header=%s iv=t%d step=%s bound=%s init=%s\n%!"
+                             f.name header iv_temp
+                             (string_of_lve_operand step_operand)
+                             (string_of_lve_operand bound_operand)
+                             (match initial_iv with
+                              | Some operand -> string_of_lve_operand operand
+                              | None -> "<unknown>"));
+                        if initial_iv <> Some (Tcg.Imm 0L) then
+                          reject header "initial-iv-not-proven-zero"
+                        else
+                          let step_available =
+                            operand_available_at_preheader
+                              def_blocks multi_defs preheader_label
+                              step_operand
+                          in
+                          let bound_available =
+                            operand_available_at_preheader
+                              def_blocks multi_defs preheader_label
+                              bound_operand
+                          in
+                          if not step_available || not bound_available then
+                            reject header
+                              (Printf.sprintf
+                                 "operand-unavailable step=%b bound=%b"
+                                 step_available bound_available)
+                          else
+                            let self_adds =
+                              block.body
+                              |> List.mapi (fun index instr ->
+                                     Option.map
+                                       (fun (dst, other) -> (index, dst, other))
+                                       (self_add instr))
+                              |> List.filter_map Fun.id
+                            in
+                            if List.length self_adds <> 3 then
+                              reject header
+                                (Printf.sprintf
+                                   "self-add-count=%d"
+                                   (List.length self_adds))
+                            else
+                              let iv_update =
+                                List.find_opt
+                                  (fun (_, dst, _) -> dst = iv_temp)
+                                  self_adds
+                              in
+                              match iv_update with
+                              | None -> reject header "missing-iv-self-update"
+                              | Some (_, _, iv_step_operand) ->
+                                  let iv_step_expr =
+                                    lve_invariant_expr_of_operand
+                                      loop_defs multi_defs def_instrs
+                                      iv_step_operand
+                                  in
+                                  if
+                                    not
+                                      (match iv_step_expr with
+                                       | Some expr ->
+                                           loop_inv_expr_equal
+                                             expr control_iv.addrec_step
+                                       | None -> false)
+                                  then
+                                    reject header "iv-update-step-mismatch"
+                                  else
+                                    let non_iv =
+                                      List.filter
+                                        (fun (_, dst, _) -> dst <> iv_temp)
+                                        self_adds
+                                    in
+                                    let match_pair () =
+                                      match non_iv with
+                                      | [ (i1, dst1, other1);
+                                          (i2, dst2, other2) ] ->
+                                          let try_pair
+                                              (acc_i, acc, acc_other)
+                                              (derived_i, derived, delta_operand)
+                                            =
+                                            match acc_other with
+                                            | Tcg.Temp used
+                                              when used = derived
+                                                   && acc <> derived
+                                                   && acc <> iv_temp
+                                                   && derived <> iv_temp
+                                                   && acc_i < derived_i ->
+                                                let delta_expr =
+                                                  lve_invariant_expr_of_operand
+                                                    loop_defs multi_defs def_instrs
+                                                    delta_operand
+                                                in
+                                                if
+                                                  Option.is_some delta_expr
+                                                  && operand_available_at_preheader
+                                                       def_blocks multi_defs
+                                                       preheader_label
+                                                       delta_operand
+                                                then
+                                                  Some
+                                                    ( acc,
+                                                      derived,
+                                                      delta_operand )
+                                                else None
+                                            | Tcg.Imm _ | Tcg.Temp _ ->
+                                                None
+                                          in
+                                          (match
+                                             try_pair
+                                               (i1, dst1, other1)
+                                               (i2, dst2, other2)
+                                           with
+                                           | Some _ as found -> found
+                                           | None ->
+                                               try_pair
+                                                 (i2, dst2, other2)
+                                                 (i1, dst1, other1))
+                                      | _ -> None
+                                    in
+                                    match match_pair () with
+                                    | None -> reject header "no-acc-derived-pair"
+                                    | Some (acc_temp, derived_temp, delta_operand) ->
+                                        let live_exit =
+                                          table_find_or_empty
+                                            live_in_t exit_label IntSet.empty
+                                        in
+                                        if
+                                          not (IntSet.mem acc_temp live_exit)
+                                          || IntSet.mem iv_temp live_exit
+                                          || IntSet.mem derived_temp live_exit
+                                        then
+                                          reject header
+                                            (Printf.sprintf
+                                               "bad-liveout acc=%b iv=%b derived=%b"
+                                               (IntSet.mem acc_temp live_exit)
+                                               (IntSet.mem iv_temp live_exit)
+                                               (IntSet.mem derived_temp live_exit))
+                                        else
+                                          let other_live_defs =
+                                            IntSet.remove acc_temp
+                                              (IntSet.inter loop_defs live_exit)
+                                          in
+                                          if not (IntSet.is_empty other_live_defs) then
+                                            reject header "other-loop-def-liveout"
+                                          else
+                                            let preheader_reaches_loop =
+                                              List.mem header preheader.succs
+                                            in
+                                            if not preheader_reaches_loop then
+                                              reject header "preheader-no-longer-reaches-loop"
+                                            else begin
+                                              let guard_label = fresh_label "guard" in
+                                              let calc_label = fresh_label "calc" in
+                                              let apply_label = fresh_label "apply" in
+
+                                              let redirected_term =
+                                                rewrite_term_successor
+                                                  preheader.term
+                                                  ~from_label:header
+                                                  ~to_label:guard_label
+                                              in
+                                              update_block
+                                                {
+                                                  preheader with
+                                                  term = redirected_term;
+                                                  succs =
+                                                    Cfg.successors redirected_term;
+                                                };
+
+                                              let guard_term =
+                                                Cfg.BranchCompare
+                                                  ( Gt,
+                                                    step_operand,
+                                                    Tcg.Imm 0L,
+                                                    calc_label,
+                                                    header )
+                                              in
+                                              let guard_block =
+                                                {
+                                                  Cfg.label = guard_label;
+                                                  body = [];
+                                                  term = guard_term;
+                                                  preds = [];
+                                                  succs =
+                                                    Cfg.successors guard_term;
+                                                }
+                                              in
+
+                                              (* The original first-entry guard
+                                                 already proved 0 < bound. *)
+                                              let quotient = fresh_temp () in
+                                              let remainder = fresh_temp () in
+                                              let has_remainder = fresh_temp () in
+                                              let trip = fresh_temp () in
+                                              let max_trip = fresh_temp () in
+                                              let calc_body =
+                                                [ simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( quotient,
+                                                         Div,
+                                                         bound_operand,
+                                                         step_operand ));
+                                                  simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( remainder,
+                                                         Mod,
+                                                         bound_operand,
+                                                         step_operand ));
+                                                  simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( has_remainder,
+                                                         Ne,
+                                                         Tcg.Temp remainder,
+                                                         Tcg.Imm 0L ));
+                                                  simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( trip,
+                                                         Add,
+                                                         Tcg.Temp quotient,
+                                                         Tcg.Temp has_remainder ));
+                                                  simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( max_trip,
+                                                         Div,
+                                                         Tcg.Imm 2147483647L,
+                                                         step_operand )) ]
+                                              in
+                                              let calc_term =
+                                                Cfg.BranchCompare
+                                                  ( Le,
+                                                    Tcg.Temp trip,
+                                                    Tcg.Temp max_trip,
+                                                    apply_label,
+                                                    header )
+                                              in
+                                              let calc_block =
+                                                {
+                                                  Cfg.label = calc_label;
+                                                  body = calc_body;
+                                                  term = calc_term;
+                                                  preds = [];
+                                                  succs =
+                                                    Cfg.successors calc_term;
+                                                }
+                                              in
+
+                                              let triangle_instrs, triangle =
+                                                build_triangle_number_instrs
+                                                  fresh_temp trip
+                                              in
+                                              let base_delta = fresh_temp () in
+                                              let series_delta = fresh_temp () in
+                                              let total_delta = fresh_temp () in
+                                              let apply_body =
+                                                triangle_instrs
+                                                @ [ simplify_simple_instr
+                                                      (Tcg.Bin
+                                                         ( base_delta,
+                                                           Mul,
+                                                           Tcg.Temp trip,
+                                                           Tcg.Temp derived_temp ));
+                                                    simplify_simple_instr
+                                                      (Tcg.Bin
+                                                         ( series_delta,
+                                                           Mul,
+                                                           Tcg.Temp triangle,
+                                                           delta_operand ));
+                                                    simplify_simple_instr
+                                                      (Tcg.Bin
+                                                         ( total_delta,
+                                                           Add,
+                                                           Tcg.Temp base_delta,
+                                                           Tcg.Temp series_delta ));
+                                                    simplify_simple_instr
+                                                      (Tcg.Bin
+                                                         ( acc_temp,
+                                                           Add,
+                                                           Tcg.Temp acc_temp,
+                                                           Tcg.Temp total_delta )) ]
+                                              in
+                                              let apply_block =
+                                                {
+                                                  Cfg.label = apply_label;
+                                                  body = apply_body;
+                                                  term = Cfg.Jump exit_label;
+                                                  preds = [];
+                                                  succs = [ exit_label ];
+                                                }
+                                              in
+
+                                              List.iter
+                                                (fun (new_block : Cfg.block) ->
+                                                  Hashtbl.replace
+                                                    current_blocks
+                                                    new_block.label
+                                                    new_block;
+                                                  new_blocks_rev :=
+                                                    new_block.label
+                                                    :: !new_blocks_rev)
+                                                [ guard_block;
+                                                  calc_block;
+                                                  apply_block ];
+
+                                              changed := true;
+                                              if debug then
+                                                Printf.eprintf
+                                                  "lve-runtime-summary func=%s header=%s iv=t%d acc=t%d derived=t%d step=%s bound=%s delta=%s fallback=%s\n%!"
+                                                  f.name header iv_temp
+                                                  acc_temp derived_temp
+                                                  (string_of_lve_operand step_operand)
+                                                  (string_of_lve_operand bound_operand)
+                                                  (string_of_lve_operand delta_operand)
+                                                  header
+                                            end)
+      | _ -> reject header "outside-predecessor-count")
+      headers;
+
+    if !changed then
+      let original_labels =
+        List.map (fun (block : Cfg.block) -> block.label) f.blocks
+      in
+      let blocks =
+        List.map get_block original_labels
+        @ List.rev_map get_block !new_blocks_rev
+      in
+      Cfg.rebuild_edges
+        { f with temp_count = !next_temp; blocks }
+    else f
+
 type func_metrics = {
   block_count : int;
   instr_count : int;
@@ -14405,12 +15767,15 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       in
       let after_reassoc = run_stage round "reassoc" reassociate_loop_adds_func after_dce1 in
       let after_licm = run_stage round "licm" (licm_func summaries globals) after_reassoc in
+      let after_lve_sr =
+        run_stage round "lve_sr" loop_evolution_strength_reduce_func after_licm
+      in
       let after_unswitch =
         run_stage round
           ~enabled:(stage_round_enabled profile round "unswitch")
           "unswitch"
           (unswitch_loops_func summaries globals)
-          after_licm
+          after_lve_sr
       in
       let after_const2 =
         run_stage round "const2"
@@ -14565,10 +15930,30 @@ let optimize_func global_init summaries globals return_globals removable_calls (
          but coalescing first can merge unrelated definitions onto one temp and
          make the canonicalizer reject them as multi-def/use-heavy. *)
       let late_algebra = algebra_canonicalize_func late_promoted in
+      let late_lve_sr = loop_evolution_strength_reduce_func late_algebra in
       let late_dce =
-        eliminate_dead_code_func ~removable_calls summaries globals return_globals late_algebra
+        eliminate_dead_code_func ~removable_calls summaries globals return_globals late_lve_sr
       in
       let late_coalesced = copy_coalesce_func summaries globals late_dce in
+      let late_equiv_branches =
+        fold_late_equivalent_diamonds_func late_coalesced
+      in
+      let late_equiv_cleaned =
+        late_equiv_branches
+        |> eliminate_dead_code_func
+             ~removable_calls summaries globals return_globals
+        |> copy_coalesce_func summaries globals
+      in
+      let late_runtime_summarized =
+        summarize_runtime_symbolic_affine_loops_func
+          summaries globals late_equiv_cleaned
+      in
+      let late_runtime_cleaned =
+        late_runtime_summarized
+        |> eliminate_dead_code_func
+             ~removable_calls summaries globals return_globals
+        |> copy_coalesce_func summaries globals
+      in
       if Sys.getenv_opt "TOYC_DEBUG_LATE_ALGEBRA" <> None then begin
         let before = metrics_of_func late_promoted in
         let after_algebra = metrics_of_func late_algebra in
@@ -14580,7 +15965,7 @@ let optimize_func global_init summaries globals return_globals removable_calls (
             after_dce.instr_count before.temp_count after_dce.temp_count
       end;
       let with_hoisted_loop_bounds =
-        hoist_unrolled_loop_branch_immediates_func summaries globals late_coalesced
+        hoist_unrolled_loop_branch_immediates_func summaries globals late_runtime_cleaned
       in
       let final_candidate =
         final_linear_merge_func with_hoisted_loop_bounds
@@ -14595,6 +15980,8 @@ let optimize_func global_init summaries globals return_globals removable_calls (
         let fallbacks =
           [
             ("pre-final-merge", with_hoisted_loop_bounds);
+            ("late-runtime-cleaned", late_runtime_cleaned);
+            ("late-equiv-cleaned", late_equiv_cleaned);
             ("late-coalesced", late_coalesced);
             ("pre-late-mem2reg", optimized);
             ("canonical", canonical);
