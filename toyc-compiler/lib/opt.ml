@@ -12671,6 +12671,13 @@ let full_unroll_counted_loops_func summaries globals (f : Cfg.func) =
   let full_unroll_max_trip = 8L in
   let full_unroll_max_blocks = 4 in
   let full_unroll_max_instrs = 28 in
+  (* Rescue larger pure-arithmetic loops when the constant trip count is still
+     small enough that specialization is likely to collapse the cloned body.
+     This is intentionally separate from the ordinary unroll budget so that
+     loops containing loads/stores/calls keep the conservative thresholds. *)
+  let full_unroll_large_pure_max_trip = 16L in
+  let full_unroll_large_pure_max_instrs = 64 in
+  let full_unroll_large_pure_expand_budget = 900L in
   let full_unroll_max_control_body_instrs = 4 in
   let control_body_supported body =
     List.length body <= full_unroll_max_control_body_instrs
@@ -12739,19 +12746,47 @@ let full_unroll_counted_loops_func summaries globals (f : Cfg.func) =
                       constant_trip_count_of_kind resolve_const init_value info.control_iv.step info.kind
                   | _ -> None
                 in
+                let pure_path_body =
+                  List.for_all
+                    (fun (block : Cfg.block) ->
+                      List.for_all pure_cfg_prep_instr block.body)
+                    path
+                in
                 if
                   effects.has_call
                   || not (PlaceSet.is_empty modified_globals)
                   || not (control_body_supported control_block.body)
                   || path = []
                   || List.length path > full_unroll_max_blocks
-                  || total_instrs > full_unroll_max_instrs
                   || (outside_preds = [] && header <> !current_entry)
                 then ()
                 else
                   match trip_count with
-                  | Some trip when 0L <= trip && trip <= full_unroll_max_trip ->
+                  | Some trip when 0L <= trip ->
+                      let ordinary_budget =
+                        trip <= full_unroll_max_trip
+                        && total_instrs <= full_unroll_max_instrs
+                      in
+                      let expanded_instrs =
+                        Int64.mul trip (Int64.of_int total_instrs)
+                      in
+                      let large_pure_budget =
+                        pure_path_body
+                        && trip <= full_unroll_large_pure_max_trip
+                        && total_instrs <= full_unroll_large_pure_max_instrs
+                        && expanded_instrs <= full_unroll_large_pure_expand_budget
+                      in
+                      if not (ordinary_budget || large_pure_budget) then ()
+                      else
                       let target_label =
+                        if
+                          Sys.getenv_opt "TOYC_DEBUG_FULL_UNROLL" <> None
+                          && large_pure_budget
+                          && not ordinary_budget
+                        then
+                          Printf.eprintf
+                            "full-unroll-large-pure func=%s header=%s trip=%Ld instrs=%d expanded=%Ld\n%!"
+                            f.name header trip total_instrs expanded_instrs;
                         if trip = 0L then info.exit_label
                         else
                           let trip_int = Int64.to_int trip in
