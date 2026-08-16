@@ -7425,64 +7425,6 @@ type recurrence_control_candidate = {
   recurrence_control_exit_label : Tcg.label;
 }
 
-type symbolic_trip_spec = {
-  symbolic_trip_start : loop_inv_expr;
-  symbolic_trip_step : loop_inv_expr;
-  symbolic_trip_scale : loop_inv_expr;
-  symbolic_trip_bias : loop_inv_expr;
-  symbolic_trip_bound : loop_inv_expr;
-  symbolic_trip_op : binop;
-}
-
-let symbolic_trip_spec_of_candidate
-    (facts : recurrence_facts)
-    (candidate : recurrence_control_candidate) =
-  Option.map
-    (fun start ->
-      {
-        symbolic_trip_start =
-          normalize_loop_inv_expr start;
-        symbolic_trip_step =
-          normalize_loop_inv_expr
-            candidate.recurrence_control_base.addrec_step;
-        symbolic_trip_scale =
-          normalize_loop_inv_expr
-            candidate.recurrence_control_scale;
-        symbolic_trip_bias =
-          normalize_loop_inv_expr
-            candidate.recurrence_control_bias;
-        symbolic_trip_bound =
-          normalize_loop_inv_expr
-            candidate.recurrence_control_bound_expr;
-        symbolic_trip_op =
-          candidate.recurrence_control_op;
-      })
-    (recurrence_addrec_start_expr
-       facts candidate.recurrence_control_base)
-
-let symbolic_trip_is_zero_start_lt
-    (spec : symbolic_trip_spec) =
-  spec.symbolic_trip_op = Lt
-  && loop_inv_expr_equal
-       spec.symbolic_trip_start
-       scalar_inv_zero
-
-let symbolic_trip_control_start
-    (spec : symbolic_trip_spec) =
-  normalize_loop_inv_expr
-    (LveAdd
-       ( LveMul
-           ( spec.symbolic_trip_scale,
-             spec.symbolic_trip_start ),
-         spec.symbolic_trip_bias ))
-
-let symbolic_trip_effective_step
-    (spec : symbolic_trip_spec) =
-  normalize_loop_inv_expr
-    (LveMul
-       ( spec.symbolic_trip_scale,
-         spec.symbolic_trip_step ))
-
 let string_of_recurrence_compare = function
   | Lt -> "lt"
   | Le -> "le"
@@ -7622,7 +7564,7 @@ let find_recurrence_loop_control_candidate
              None)
 
 let proven_counted_control_of_recurrence_candidate
-    header loop get_block facts
+    header loop get_block
     (candidate : recurrence_control_candidate) =
   let build_kind step =
     match (step, candidate.recurrence_control_op) with
@@ -7649,38 +7591,34 @@ let proven_counted_control_of_recurrence_candidate
     | _ ->
         None
   in
-  match symbolic_trip_spec_of_candidate facts candidate with
-  | None ->
+  match
+    ( loop_inv_expr_const_opt
+        candidate.recurrence_control_scale,
+      loop_inv_expr_const_opt
+        candidate.recurrence_control_bias,
+      basic_iv_of_scalar_addrec
+        header loop get_block
+        candidate.recurrence_control_base )
+  with
+  | Some 1L, Some 0L, Some control_iv ->
+      Option.map
+        (fun kind ->
+          {
+            control_iv;
+            control_label =
+              candidate.recurrence_control_label;
+            inside_label =
+              candidate.recurrence_control_inside_label;
+            exit_label =
+              candidate.recurrence_control_exit_label;
+            kind;
+          })
+        (build_kind control_iv.step)
+  | _ ->
+      (* Item #1 recognizes symbolic/scaled/biased recurrences, but does not
+         promote them into mature counted-loop proof consumers.  Item #3 will
+         own sign/range/no-wrap/trip-count proof. *)
       None
-  | Some spec -> (
-      match
-        ( loop_inv_expr_const_opt
-            spec.symbolic_trip_scale,
-          loop_inv_expr_const_opt
-            spec.symbolic_trip_bias,
-          basic_iv_of_scalar_addrec
-            header loop get_block
-            candidate.recurrence_control_base )
-      with
-      | Some 1L, Some 0L, Some control_iv ->
-          Option.map
-            (fun kind ->
-              {
-                control_iv;
-                control_label =
-                  candidate.recurrence_control_label;
-                inside_label =
-                  candidate.recurrence_control_inside_label;
-                exit_label =
-                  candidate.recurrence_control_exit_label;
-                kind;
-              })
-            (build_kind control_iv.step)
-      | _ ->
-          (* Recognition and proof are separate.  Scaled/biased/symbolic-step
-             controls are represented by [symbolic_trip_spec], but only the
-             old proven subset enters mature counted lowering here. *)
-          None)
 
 let classify_counted_loop_header
     control_label
@@ -8408,7 +8346,7 @@ let find_counted_loop_control_semantic
     (find_recurrence_loop_control_candidate
        facts multi_defs def_instrs)
     (proven_counted_control_of_recurrence_candidate
-       header loop get_block facts)
+       header loop get_block)
 
 let analyze_counted_loop_for_elimination
     header loop get_block temp_count blocks =
@@ -8762,58 +8700,6 @@ let int64_nonnegative_inclusive_div numer denom =
   else
     let floor = int64_floor_div numer denom in
     Some (if floor < 0L then 0L else Int64.succ floor)
-
-let exact_trip_count_of_symbolic_spec
-    (spec : symbolic_trip_spec) =
-  match
-    ( loop_inv_expr_const_opt spec.symbolic_trip_start,
-      loop_inv_expr_const_opt spec.symbolic_trip_step,
-      loop_inv_expr_const_opt spec.symbolic_trip_scale,
-      loop_inv_expr_const_opt spec.symbolic_trip_bias,
-      loop_inv_expr_const_opt spec.symbolic_trip_bound,
-      spec.symbolic_trip_op )
-  with
-  | Some start,
-    Some step,
-    Some scale,
-    Some bias,
-    Some bound,
-    Lt
-    when
-      start = 0L
-      && scale > 0L
-      && step > 0L
-      && bias >= 0L ->
-      let effective_step =
-        Int64.mul scale step
-      in
-      if
-        effective_step <= 0L
-        || effective_step > 2147483647L
-      then
-        None
-      else if bound <= bias then
-        Some 0L
-      else
-        Option.bind
-          (int64_nonnegative_ceil_div
-             Int64.(sub bound bias)
-             effective_step)
-          (fun trip ->
-            (* The original loop evaluates the failing comparison at k=trip.
-               Prove that this final control expression is also monotone
-               signed-i32 rather than relying on wrapped arithmetic. *)
-            let max_trip =
-              Int64.div
-                Int64.(sub 2147483647L bias)
-                effective_step
-            in
-            if trip <= max_trip then
-              Some trip
-            else
-              None)
-  | _ ->
-      None
 
 let constant_trip_count_of_kind resolve_operand init_value step = function
   | CountUpLt (bound, bias) -> (
@@ -13179,7 +13065,6 @@ let collect_counted_reductions
   let summary_expr_semantic_equal lhs rhs =
     summary_semantic_key lhs
     = summary_semantic_key rhs
-  in
 
   let basic_iv_semantic_equal
       (lhs : basic_induction_var)
@@ -20379,6 +20264,12 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                           normalize_loop_inv_expr
                             (LveAdd (invariant, LveNeg bias)) )
                     in
+                    let summary_operand_of_loop_inv_expr expr =
+                      match normalize_loop_inv_expr expr with
+                      | LveConst value -> Some (Tcg.Imm value)
+                      | LveOperand operand -> Some operand
+                      | LveNeg _ | LveAdd _ | LveMul _ -> None
+                    in
                     let scev_debug =
                       Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
                       <> None
@@ -20665,14 +20556,13 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                   (control_update_affine_of_instr
                                      dst update_index IntSet.empty instr)
                                   (fun (update_scale, update_bias) ->
-                                    if
-                                      loop_inv_expr_equal
-                                        (normalize_loop_inv_expr update_scale)
-                                        scalar_inv_one
+                                    if normalize_loop_inv_expr update_scale = LveConst 1L
                                     then
-                                      Some
-                                        (normalize_loop_inv_expr
-                                           update_bias)
+                                      Option.map
+                                        (fun step_operand ->
+                                          ( step_operand,
+                                            normalize_loop_inv_expr update_bias ))
+                                        (summary_operand_of_loop_inv_expr update_bias)
                                     else
                                       None)
                               in
@@ -20717,7 +20607,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                           | ( Some
                                 (normalized_op, bound_operand,
                                  control_scale, control_bias),
-                              Some step_expr )
+                              Some (step_operand, step_expr) )
                             when normalized_op = Lt ->
                               let control_scale =
                                 normalize_loop_inv_expr control_scale
@@ -20731,11 +20621,12 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                   f.name header control_block.label dst
                                   (string_of_loop_inv_expr control_scale)
                                   (string_of_loop_inv_expr control_bias)
-                                  (string_of_loop_inv_expr step_expr)
+                                  (string_of_lve_operand step_operand)
                                   (string_of_lve_operand bound_operand);
                               Some
                                 ( update_index,
                                   dst,
+                                  step_operand,
                                   step_expr,
                                   bound_operand,
                                   control_scale,
@@ -20756,6 +20647,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                         Some
                           ( update_index,
                             iv_temp,
+                            step_operand,
                             legacy_step,
                             bound_operand,
                             legacy_scale,
@@ -20861,6 +20753,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                             Some
                               ( update_index,
                                 iv_temp,
+                                step_operand,
                                 candidate_step,
                                 bound_operand,
                                 candidate_scale,
@@ -20924,21 +20817,11 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                     | Some
                         ( iv_update_index,
                           iv_temp,
+                          step_operand,
                           step_expr,
                           bound_operand,
                           control_scale,
                           control_bias ) ->
-                        let symbolic_trip_spec =
-                          match runtime_control_candidate with
-                          | Some candidate
-                            when unified_control_agreed ->
-                              symbolic_trip_spec_of_candidate
-                                runtime_recurrence_analysis.loop_recurrence_facts
-                                candidate
-                          | Some _
-                          | None ->
-                              None
-                        in
                         let initial_iv =
                           reaching_seed_on_edge
                             ~header ~pred_label:preheader_label iv_temp
@@ -20949,47 +20832,18 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                              f.name header iv_temp
                              (string_of_loop_inv_expr control_scale)
                              (string_of_loop_inv_expr control_bias)
-                             (string_of_loop_inv_expr step_expr)
+                             (string_of_lve_operand step_operand)
                              (string_of_lve_operand bound_operand)
                              (match initial_iv with
                               | Some operand -> string_of_lve_operand operand
                               | None -> "<unknown>"));
-                        let initial_iv_expr =
-                          Option.bind initial_iv invariant_expr
-                        in
-                        let initial_zero =
-                          match initial_iv_expr with
-                          | Some expr ->
-                              loop_inv_expr_equal
-                                (normalize_loop_inv_expr expr)
-                                scalar_inv_zero
-                          | None ->
-                              false
-                        in
-                        let semantic_start_agrees =
-                          match
-                            (symbolic_trip_spec, initial_iv_expr)
-                          with
-                          | Some spec, Some expr ->
-                              loop_inv_expr_equal
-                                spec.symbolic_trip_start
-                                (normalize_loop_inv_expr expr)
-                          | Some _, None ->
-                              false
-                          | None, _ ->
-                              true
-                        in
-                        if
-                          not initial_zero
-                          || not semantic_start_agrees
-                        then
-                          reject header
-                            "initial-iv-not-proven-zero-or-scev-start-mismatch"
+                        if initial_iv <> Some (Tcg.Imm 0L) then
+                          reject header "initial-iv-not-proven-zero"
                         else
                           let step_available =
-                            lve_expr_available_before_preds
-                              doms def_blocks multi_defs
-                              [ preheader_label ] step_expr
+                            operand_available_at_preheader
+                              def_blocks multi_defs preheader_label
+                              step_operand
                           in
                           let bound_available =
                             operand_available_at_preheader
@@ -21018,47 +20872,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                  step_available bound_available
                                  scale_available bias_available)
                           else
-                            let step_prep, step_operand =
-                              match normalize_loop_inv_expr step_expr with
-                              | LveConst value ->
-                                  ([], Tcg.Imm value)
-                              | LveOperand operand ->
-                                  ([], operand)
-                              | complex ->
-                                  let temp = fresh_temp () in
-                                  ( emit_loop_inv_expr
-                                      fresh_temp temp complex,
-                                    Tcg.Temp temp )
-                            in
-                            (if scev_debug then
-                               match symbolic_trip_spec with
-                               | Some spec ->
-                                   Printf.eprintf
-                                     "symbolic-trip-spec header=%s start=%s step=%s scale=%s bias=%s bound=%s control-start=%s effective-step=%s static-trip=%s\n%!"
-                                     header
-                                     (string_of_loop_inv_expr
-                                        spec.symbolic_trip_start)
-                                     (string_of_loop_inv_expr
-                                        spec.symbolic_trip_step)
-                                     (string_of_loop_inv_expr
-                                        spec.symbolic_trip_scale)
-                                     (string_of_loop_inv_expr
-                                        spec.symbolic_trip_bias)
-                                     (string_of_loop_inv_expr
-                                        spec.symbolic_trip_bound)
-                                     (string_of_loop_inv_expr
-                                        (symbolic_trip_control_start spec))
-                                     (string_of_loop_inv_expr
-                                        (symbolic_trip_effective_step spec))
-                                     (match
-                                        exact_trip_count_of_symbolic_spec spec
-                                      with
-                                      | Some trip ->
-                                          Int64.to_string trip
-                                      | None ->
-                                          "<runtime-proof>")
-                               | None ->
-                                   ());
                             let non_iv =
                               List.filter
                                 (fun (_, dst, _) -> dst <> iv_temp)
@@ -21766,28 +21579,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                    control_bias
                                                  <> LveConst 0L
                                             then begin
-                                              (if scev_debug then
-                                                 match symbolic_trip_spec with
-                                                 | Some spec
-                                                   when
-                                                     symbolic_trip_is_zero_start_lt
-                                                       spec ->
-                                                     Printf.eprintf
-                                                       "symbolic-trip-runtime-proof-hit header=%s family=positive-affine-lt start=%s step=%s scale=%s bias=%s bound=%s\n%!"
-                                                       header
-                                                       (string_of_loop_inv_expr
-                                                          spec.symbolic_trip_start)
-                                                       (string_of_loop_inv_expr
-                                                          spec.symbolic_trip_step)
-                                                       (string_of_loop_inv_expr
-                                                          spec.symbolic_trip_scale)
-                                                       (string_of_loop_inv_expr
-                                                          spec.symbolic_trip_bias)
-                                                       (string_of_loop_inv_expr
-                                                          spec.symbolic_trip_bound)
-                                                 | Some _
-                                                 | None ->
-                                                     ());
                                               (* Runtime invariant affine-control
                                                  extension:
 
@@ -21880,9 +21671,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                   control_bias
                                               in
                                               let values_body =
-                                                step_prep
-                                                @ scale_prep
-                                                @ bias_prep
+                                                scale_prep @ bias_prep
                                               in
                                               let values_term =
                                                 Cfg.BranchCompare
@@ -22195,7 +21984,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                               let guard_block =
                                                 {
                                                   Cfg.label = guard_label;
-                                                  body = step_prep;
+                                                  body = [];
                                                   term = guard_term;
                                                   preds = [];
                                                   succs =
