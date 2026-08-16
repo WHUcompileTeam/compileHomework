@@ -16871,7 +16871,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                               delta_bias ))
                                       else
                                         None)
-                              | [] | _ :: _ :: _ ->
+                              | _ ->
                                   None
                             in
 
