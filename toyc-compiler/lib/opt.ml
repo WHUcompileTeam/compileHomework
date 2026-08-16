@@ -5770,10 +5770,6 @@ let resolve_compare_operand_in_block block multi_defs def_instrs operand =
   loop IntSet.empty false operand
 
 let range_of_counted_iv_expr kind expr_bias =
-  let floor_div_pos numer denom =
-    if denom <= 0L then None
-    else Some (Int64.div numer denom)
-  in
   match kind with
   | CountUpLt (Tcg.Imm bound, control_bias) ->
       {
@@ -5795,31 +5791,20 @@ let range_of_counted_iv_expr kind expr_bias =
         min_value = Some Int64.(sub bound control_bias |> add expr_bias);
         max_value = None;
       }
-  | CountUpLtScaled (Tcg.Imm bound, scale, control_bias) when scale > 0L -> (
-      match floor_div_pos Int64.(sub (sub bound 1L) control_bias) scale with
-      | Some max_iv -> { min_value = None; max_value = Some Int64.(add max_iv expr_bias) }
-      | None -> { min_value = None; max_value = None })
-  | CountUpLeScaled (Tcg.Imm bound, scale, control_bias) when scale > 0L -> (
-      match floor_div_pos Int64.(sub bound control_bias) scale with
-      | Some max_iv -> { min_value = None; max_value = Some Int64.(add max_iv expr_bias) }
-      | None -> { min_value = None; max_value = None })
-  | CountDownGtScaled (Tcg.Imm bound, scale, control_bias) when scale > 0L -> (
-      match floor_div_pos Int64.(sub (sub bound control_bias) (neg 1L)) scale with
-      | Some floor_bound ->
-          { min_value = Some Int64.(add floor_bound expr_bias |> add 1L); max_value = None }
-      | None -> { min_value = None; max_value = None })
-  | CountDownGeScaled (Tcg.Imm bound, scale, control_bias) when scale > 0L -> (
-      match floor_div_pos Int64.(sub bound control_bias) scale with
-      | Some min_iv -> { min_value = Some Int64.(add min_iv expr_bias); max_value = None }
-      | None -> { min_value = None; max_value = None })
-  | CountUpLt _
-  | CountUpLe _
-  | CountDownGt _
-  | CountDownGe _
   | CountUpLtScaled _
   | CountUpLeScaled _
   | CountDownGtScaled _
   | CountDownGeScaled _ ->
+      (* Scaled controls are currently not admitted into range-based branch
+         folding.  The previous formulas were both mathematically incomplete for
+         some signed cases and, more importantly, unsound under ToyC's i32
+         wrapping semantics.  Keep the range unknown unless we later add a full
+         no-overflow proof. *)
+      { min_value = None; max_value = None }
+  | CountUpLt _
+  | CountUpLe _
+  | CountDownGt _
+  | CountDownGe _ ->
       { min_value = None; max_value = None }
 
 let compare_truth_from_range op range constant =
@@ -6371,10 +6356,13 @@ let classify_counted_loop_header
     | step, Le, 1L when step > 0L -> Some (CountUpLe (bound, bias))
     | step, Gt, 1L when step < 0L -> Some (CountDownGt (bound, bias))
     | step, Ge, 1L when step < 0L -> Some (CountDownGe (bound, bias))
-    | step, Lt, _ when step > 0L -> Some (CountUpLtScaled (bound, scale, bias))
-    | step, Le, _ when step > 0L -> Some (CountUpLeScaled (bound, scale, bias))
-    | step, Gt, _ when step < 0L -> Some (CountDownGtScaled (bound, scale, bias))
-    | step, Ge, _ when step < 0L -> Some (CountDownGeScaled (bound, scale, bias))
+    | (step, (Lt | Le | Gt | Ge), _)
+      when step <> 0L ->
+        (* Conservatively keep counted-loop control on the proven unit-scale
+           path only.  The temporary scaled variants are not safe under ToyC
+           i32 wrapping unless we can prove the controlling expression never
+           overflows for the whole loop. *)
+        None
     | _ -> None
   in
   let match_control_iv op lhs rhs =
@@ -6478,6 +6466,9 @@ let merge_basic_induction_vars
   in
   primary @ extra
 
+let proven_syntactic_induction_vars (ivs : basic_induction_var list) =
+  List.filter (fun (iv : basic_induction_var) -> iv.origin = `Syntactic) ivs
+
 let analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs =
   let syntactic =
     collect_basic_induction_vars
@@ -6521,7 +6512,10 @@ let analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs
   merged
 
 let analyze_counted_control header loop get_block loop_defs loop_stable_phis multi_defs def_instrs =
-  let ivs = analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs in
+  let ivs =
+    analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs
+    |> proven_syntactic_induction_vars
+  in
   ( ivs,
     find_counted_loop_control
       loop loop_defs loop_stable_phis multi_defs def_instrs ivs get_block )
@@ -14540,7 +14534,10 @@ let strength_reduce_func (f : Cfg.func) =
         let loop_stable_phis =
           collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
         in
-        let ivs = analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs in
+        let ivs =
+          analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs
+          |> proven_syntactic_induction_vars
+        in
         List.iter
           (fun (iv : basic_induction_var) ->
             let derived_uses = Hashtbl.create 4 in
