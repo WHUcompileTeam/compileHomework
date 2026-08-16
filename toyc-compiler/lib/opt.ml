@@ -15497,6 +15497,255 @@ let term_uses_temp temp = function
   | Cfg.BranchCompare (_, lhs, rhs, _, _) ->
       operand_has_temp temp lhs || operand_has_temp temp rhs
 
+(* -------------------------------------------------------------------------- *)
+(* item2.7a: LCSSA-lite live-out analysis (analysis only)                      *)
+(*                                                                            *)
+(* We deliberately do NOT rewrite CFG or insert carriers yet.  A temp is       *)
+(* considered a loop live-out when:                                            *)
+(*   1. it has at least one definition inside the natural loop; and             *)
+(*   2. it is live-in to at least one loop exit target.                         *)
+(*                                                                            *)
+(* This uses the compiler's existing liveness solution instead of merely        *)
+(* scanning for syntactic outside uses, so values redefined/killed before an    *)
+(* outside use are not spuriously classified as loop live-outs.                 *)
+(*                                                                            *)
+(* Dedicated-exit information comes from LoopForest/LoopSimplify metadata.      *)
+(* Multi-exit loops are analyzed and reported, but later carrier materialization *)
+(* will initially be restricted to dedicated single-exit loops.                 *)
+(* -------------------------------------------------------------------------- *)
+
+type lcssa_lite_liveout = {
+  lcssa_loop_header : Tcg.label;
+  lcssa_loop_parent : Tcg.label option;
+  lcssa_loop_depth : int;
+  lcssa_temp : int;
+  lcssa_def_blocks : Tcg.label list;
+  lcssa_live_exit_targets : Tcg.label list;
+  lcssa_outside_use_blocks : Tcg.label list;
+  lcssa_single_exit_materializable : bool;
+}
+
+type lcssa_lite_loop_info = {
+  lcssa_info_header : Tcg.label;
+  lcssa_info_parent : Tcg.label option;
+  lcssa_info_depth : int;
+  lcssa_info_exit_targets : Tcg.label list;
+  lcssa_info_dedicated_exits : bool;
+  lcssa_info_liveouts : lcssa_lite_liveout list;
+}
+
+type lcssa_lite_report = {
+  lcssa_forest : loop_forest;
+  lcssa_infos : (Tcg.label, lcssa_lite_loop_info) Hashtbl.t;
+  lcssa_total_liveouts : int;
+  lcssa_single_exit_materializable_count : int;
+}
+
+let temps_defined_in_loop loop get_block =
+  LabelSet.fold
+    (fun label acc ->
+      let block : Cfg.block = get_block label in
+      List.fold_left
+        (fun acc instr ->
+          match defs_temp instr with
+          | Some temp -> IntSet.add temp acc
+          | None -> acc)
+        acc block.body)
+    loop IntSet.empty
+
+let temp_def_blocks_in_loop temp loop get_block =
+  LabelSet.fold
+    (fun label blocks ->
+      let block : Cfg.block = get_block label in
+      if
+        List.exists
+          (fun instr -> defs_temp instr = Some temp)
+          block.body
+      then
+        label :: blocks
+      else
+        blocks)
+    loop []
+  |> List.sort_uniq String.compare
+
+let temp_outside_use_blocks temp loop (f : Cfg.func) =
+  f.blocks
+  |> List.filter_map
+       (fun (block : Cfg.block) ->
+         if LabelSet.mem block.label loop then None
+         else if
+           List.exists (instr_uses_temp temp) block.body
+           || term_uses_temp temp block.term
+         then
+           Some block.label
+         else
+           None)
+  |> List.sort_uniq String.compare
+
+let dedicated_exit_targets_for_loop
+    (forest : loop_forest)
+    (info : loop_forest_info) =
+  info.loop_info_exit_targets
+  |> List.filter
+       (fun exit_target ->
+         let exit_block =
+           get_block_exn
+             forest.loop_forest_block_map
+             exit_target
+         in
+         exit_block.preds <> []
+         && List.for_all
+              (fun pred ->
+                LabelSet.mem
+                  pred info.loop_info_blocks)
+              exit_block.preds)
+
+let build_lcssa_lite_report
+    summaries globals
+    (f : Cfg.func) =
+  let forest = build_loop_forest f in
+  let live_in_t, _ =
+    compute_liveness summaries globals f
+  in
+  let infos =
+    Hashtbl.create
+      (max 8 (List.length forest.loop_forest_headers))
+  in
+  let total_liveouts = ref 0 in
+  let materializable = ref 0 in
+  List.iter
+    (fun header ->
+      match Hashtbl.find_opt forest.loop_forest_infos header with
+      | None -> ()
+      | Some loop_info ->
+          let loop = loop_info.loop_info_blocks in
+          let get_block =
+            get_block_exn forest.loop_forest_block_map
+          in
+          let defined =
+            temps_defined_in_loop loop get_block
+          in
+          let dedicated_exits =
+            dedicated_exit_targets_for_loop forest loop_info
+          in
+          let dedicated_all =
+            List.length dedicated_exits
+            = List.length loop_info.loop_info_exit_targets
+          in
+          let single_exit =
+            match dedicated_exits with
+            | [ _ ] -> true
+            | [] | _ :: _ :: _ -> false
+          in
+          let liveouts =
+            IntSet.fold
+              (fun temp acc ->
+                let live_exit_targets =
+                  loop_info.loop_info_exit_targets
+                  |> List.filter
+                       (fun exit_target ->
+                         IntSet.mem temp
+                           (table_find_or_empty
+                              live_in_t exit_target
+                              IntSet.empty))
+                in
+                if live_exit_targets = [] then acc
+                else
+                  let item =
+                    {
+                      lcssa_loop_header = header;
+                      lcssa_loop_parent =
+                        loop_info.loop_info_parent;
+                      lcssa_loop_depth =
+                        loop_info.loop_info_depth;
+                      lcssa_temp = temp;
+                      lcssa_def_blocks =
+                        temp_def_blocks_in_loop
+                          temp loop get_block;
+                      lcssa_live_exit_targets =
+                        live_exit_targets;
+                      lcssa_outside_use_blocks =
+                        temp_outside_use_blocks
+                          temp loop f;
+                      lcssa_single_exit_materializable =
+                        dedicated_all
+                        && single_exit
+                        && List.length live_exit_targets = 1;
+                    }
+                  in
+                  incr total_liveouts;
+                  if item.lcssa_single_exit_materializable
+                  then incr materializable;
+                  item :: acc)
+              defined []
+            |> List.rev
+          in
+          Hashtbl.replace infos header
+            {
+              lcssa_info_header = header;
+              lcssa_info_parent =
+                loop_info.loop_info_parent;
+              lcssa_info_depth =
+                loop_info.loop_info_depth;
+              lcssa_info_exit_targets =
+                loop_info.loop_info_exit_targets;
+              lcssa_info_dedicated_exits =
+                dedicated_all;
+              lcssa_info_liveouts = liveouts;
+            })
+    forest.loop_forest_headers;
+  {
+    lcssa_forest = forest;
+    lcssa_infos = infos;
+    lcssa_total_liveouts = !total_liveouts;
+    lcssa_single_exit_materializable_count = !materializable;
+  }
+
+let debug_lcssa_lite_report
+    summaries globals
+    (f : Cfg.func) =
+  if Sys.getenv_opt "TOYC_DEBUG_LCSSA_LITE" <> None then begin
+    let report =
+      build_lcssa_lite_report summaries globals f
+    in
+    List.iter
+      (fun header ->
+        match Hashtbl.find_opt report.lcssa_infos header with
+        | None -> ()
+        | Some info ->
+            Printf.eprintf
+              "lcssa-lite-loop func=%s header=%s depth=%d parent=%s exits={%s} dedicated=%b liveouts=%d\n%!"
+              f.name
+              header
+              info.lcssa_info_depth
+              (match info.lcssa_info_parent with
+               | Some parent -> parent
+               | None -> "<root>")
+              (String.concat "," info.lcssa_info_exit_targets)
+              info.lcssa_info_dedicated_exits
+              (List.length info.lcssa_info_liveouts);
+            List.iter
+              (fun item ->
+                Printf.eprintf
+                  "lcssa-lite-liveout func=%s header=%s depth=%d temp=t%d defs={%s} live-exits={%s} outside-uses={%s} materializable=%b\n%!"
+                  f.name
+                  item.lcssa_loop_header
+                  item.lcssa_loop_depth
+                  item.lcssa_temp
+                  (String.concat "," item.lcssa_def_blocks)
+                  (String.concat "," item.lcssa_live_exit_targets)
+                  (String.concat "," item.lcssa_outside_use_blocks)
+                  item.lcssa_single_exit_materializable)
+              info.lcssa_info_liveouts)
+      report.lcssa_forest.loop_forest_headers;
+    Printf.eprintf
+      "lcssa-lite-summary func=%s loops=%d liveouts=%d single-exit-materializable=%d\n%!"
+      f.name
+      (List.length report.lcssa_forest.loop_forest_headers)
+      report.lcssa_total_liveouts
+      report.lcssa_single_exit_materializable_count
+  end
+
 let collect_direct_extractable_reductions loop get_block backedge_preds reductions =
   let last_def_index_for_temp temp (block : Cfg.block) =
     let last_index = ref None in
@@ -26412,4 +26661,8 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
       global_init summaries globals return_global_demands removable_calls
       optimized_funcs
   in
+  if Sys.getenv_opt "TOYC_DEBUG_LCSSA_LITE" <> None then
+    List.iter
+      (debug_lcssa_lite_report summaries globals)
+      optimized_funcs;
   { Cfg.funcs = optimized_funcs }
