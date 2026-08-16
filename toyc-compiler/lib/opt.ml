@@ -10665,6 +10665,50 @@ let collect_counted_reductions
                   Some (anchor_iv, coeff, bias)
               | Some _ | None -> None)
   in
+
+  (* A nested inner-summary may read an enclosing-loop carrier before that
+     carrier is updated later on the same backedge:
+
+       summary:  acc += carrier * inner_trip + ...
+       latch:    carrier += invariant_step
+                 iv      += 1
+
+     Program-point operand resolution must NOT look through the later latch
+     update.  However, proving the carrier's per-iteration recurrence does need
+     to inspect that full backedge.
+
+     Keep these roles separate:
+       - [block]/the current prefix supplies the *current* carrier and IV values;
+       - the full backedge chain is used only to prove
+           carrier_next = carrier + invariant_step.
+
+     Restrict this fallback to a single backedge.  Multi-backedge recurrence
+     agreement remains handled by the existing path/logical-PHI machinery. *)
+  let dependent_affine_step_from_full_backedge
+      block operand =
+    match backedge_preds with
+    | [ pred ] -> (
+        match
+          dependent_affine_step_of_operand
+            block
+            (update_chain_for_pred pred)
+            operand
+        with
+        | Some (iv, _, _) as result ->
+            if
+              Sys.getenv_opt
+                "TOYC_DEBUG_RECURRENCE_REDUCTION"
+              <> None
+            then
+              Printf.eprintf
+                "recurrence-carrier-full-backedge-hit header=%s block=%s anchor=t%d pred=%s\n%!"
+                header block.label iv.phi_temp pred;
+            result
+        | None ->
+            None)
+    | [] | _ :: _ :: _ ->
+        None
+  in
   let rec summary_expr_of_loop_inv_expr = function
     | LveConst value ->
         SummaryOperand (Tcg.Imm value)
@@ -11018,11 +11062,20 @@ let collect_counted_reductions
                   else
                     match last_def_of_temp block temp with
                     | None -> (
-                        match
-                          dependent_affine_step_of_operand
-                            block older_chain
-                            (Tcg.Temp temp)
-                        with
+                        let carrier =
+                          match
+                            dependent_affine_step_of_operand
+                              block older_chain
+                              (Tcg.Temp temp)
+                          with
+                          | Some _ as result ->
+                              result
+                          | None ->
+                              dependent_affine_step_from_full_backedge
+                                block
+                                (Tcg.Temp temp)
+                        in
+                        match carrier with
                         | Some (iv, coeff, bias) ->
                             if
                               Sys.getenv_opt
