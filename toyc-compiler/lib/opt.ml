@@ -20299,14 +20299,10 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
     in
 
     List.iter
-      (fun discovered_header ->
-        let loop =
-          table_find_or_empty
-            loops discovered_header LabelSet.empty
-        in
+      (fun header ->
+        let loop = table_find_or_empty loops header LabelSet.empty in
         match find_runtime_summary_shape loop with
-        | Error reason ->
-            reject discovered_header reason
+        | Error reason -> reject header reason
         | Ok
             ( body_instrs,
               body_labels,
@@ -20315,30 +20311,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
               lhs,
               rhs,
               exit_label ) ->
-            (* Keep CFG entry and recurrence/control program point distinct.
-
-               Rotated loops commonly look like:
-                 preheader -> body(header) -> control(latch) -> body/exit
-
-               The natural header is the only correct place for preheader,
-               reaching-seed and fallback CFG reasoning.  The unique compare
-               block is the correct program point for recovering the logical
-               AddRec/control expression. *)
-            let header =
-              discovered_header
-            in
-            let recurrence_header =
-              control_block.label
-            in
-            (if
-               Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
-               <> None
-               && header <> recurrence_header
-             then
-               Printf.eprintf
-                 "symbolic-trip-domain-control-point domain=%s control-point=%s\n%!"
-                 header recurrence_header;
-             if debug then
+             (if debug then
                 Printf.eprintf
                   "lve-runtime-summary-shape func=%s header=%s blocks=%d body-blocks=%d control=%s body-instrs=%d path={%s}\n%!"
                   f.name header
@@ -20375,12 +20348,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                     ~loop f.temp_count current_blocks_snapshot
                 in
                 let runtime_recurrence_analysis =
-                  (* Recurrence facts are rooted at the natural loop entry:
-                     that is where outside seeds and backedges define the
-                     AddRec.  The control candidate finder itself scans the
-                     whole loop and queries recurrence_at at the compare
-                     block's program point, so the latch/control label must
-                     not replace the recurrence domain header. *)
                   build_loop_recurrence_analysis
                     header loop get_block
                     loop_defs multi_defs def_instrs
@@ -20390,39 +20357,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                     runtime_recurrence_analysis.loop_recurrence_facts
                     multi_defs def_instrs
                 in
-                (if
-                   Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
-                   <> None
-                 then
-                   Printf.eprintf
-                     "symbolic-trip-recurrence-domain header=%s control-point=%s addrecs=%d\n%!"
-                     header recurrence_header
-                     (List.length
-                        runtime_recurrence_analysis
-                          .loop_recurrence_addrecs));
-                (if
-                   Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
-                   <> None
-                 then
-                   match runtime_control_candidate with
-                   | Some candidate ->
-                       Printf.eprintf
-                         "symbolic-trip-domain-control-hit domain=%s control-point=%s control=%s phi=t%d step=%s scale=%s bias=%s bound=%s\n%!"
-                         header recurrence_header
-                         candidate.recurrence_control_label
-                         candidate.recurrence_control_base.addrec_phi_temp
-                         (string_of_loop_inv_expr
-                            candidate.recurrence_control_base.addrec_step)
-                         (string_of_loop_inv_expr
-                            candidate.recurrence_control_scale)
-                         (string_of_loop_inv_expr
-                            candidate.recurrence_control_bias)
-                         (string_of_loop_inv_expr
-                            candidate.recurrence_control_bound_expr)
-                   | None ->
-                       Printf.eprintf
-                         "symbolic-trip-domain-control-miss domain=%s control-point=%s\n%!"
-                         header recurrence_header);
                 let effects =
                   collect_loop_effects summaries globals loop f.blocks
                 in
