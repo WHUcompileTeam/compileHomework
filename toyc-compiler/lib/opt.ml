@@ -4662,8 +4662,93 @@ let rec normalize_loop_inv_expr expr =
             LveMul (lhs, rhs)
       end
 
+module LoopInvAtomOrd = struct
+  type t = loop_inv_expr
+  let compare = Stdlib.compare
+end
+
+module LoopInvAtomMap = Map.Make (LoopInvAtomOrd)
+
+type loop_inv_linear_form = {
+  inv_linear_const : int64;
+  inv_linear_atoms : int64 LoopInvAtomMap.t;
+}
+
+let inv_linear_zero =
+  {
+    inv_linear_const = 0L;
+    inv_linear_atoms = LoopInvAtomMap.empty;
+  }
+
+let inv_linear_add_atom atoms atom coeff =
+  let coeff = i32 coeff in
+  if coeff = 0L then atoms
+  else
+    let old =
+      Option.value ~default:0L
+        (LoopInvAtomMap.find_opt atom atoms)
+    in
+    let coeff = linear_i32_add old coeff in
+    if coeff = 0L then LoopInvAtomMap.remove atom atoms
+    else LoopInvAtomMap.add atom coeff atoms
+
+let inv_linear_add lhs rhs =
+  {
+    inv_linear_const =
+      linear_i32_add lhs.inv_linear_const rhs.inv_linear_const;
+    inv_linear_atoms =
+      LoopInvAtomMap.fold
+        (fun atom coeff atoms ->
+          inv_linear_add_atom atoms atom coeff)
+        rhs.inv_linear_atoms lhs.inv_linear_atoms;
+  }
+
+let inv_linear_scale factor form =
+  let factor = i32 factor in
+  if factor = 0L then inv_linear_zero
+  else
+    {
+      inv_linear_const =
+        linear_i32_mul factor form.inv_linear_const;
+      inv_linear_atoms =
+        LoopInvAtomMap.fold
+          (fun atom coeff atoms ->
+            inv_linear_add_atom atoms atom
+              (linear_i32_mul factor coeff))
+          form.inv_linear_atoms LoopInvAtomMap.empty;
+    }
+
+let loop_inv_linear_form_of_expr expr =
+  let rec collect expr =
+    match normalize_loop_inv_expr expr with
+    | LveConst value ->
+        {
+          inv_linear_const = i32 value;
+          inv_linear_atoms = LoopInvAtomMap.empty;
+        }
+    | LveNeg inner ->
+        inv_linear_scale (-1L) (collect inner)
+    | LveAdd (lhs, rhs) ->
+        inv_linear_add (collect lhs) (collect rhs)
+    | LveMul (LveConst factor, rhs)
+    | LveMul (rhs, LveConst factor) ->
+        inv_linear_scale factor (collect rhs)
+    | (LveOperand _ | LveMul _) as atom ->
+        {
+          inv_linear_const = 0L;
+          inv_linear_atoms =
+            LoopInvAtomMap.singleton atom 1L;
+        }
+  in
+  collect expr
+
+let loop_inv_linear_key expr =
+  let form = loop_inv_linear_form_of_expr expr in
+  ( i32 form.inv_linear_const,
+    LoopInvAtomMap.bindings form.inv_linear_atoms )
+
 let loop_inv_expr_equal lhs rhs =
-  normalize_loop_inv_expr lhs = normalize_loop_inv_expr rhs
+  loop_inv_linear_key lhs = loop_inv_linear_key rhs
 
 let rec loop_inv_expr_temps expr =
   match normalize_loop_inv_expr expr with
@@ -19073,7 +19158,7 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       in
       let late_runtime_summarized =
         summarize_runtime_symbolic_affine_loops_func
-          summaries globals late_equiv_cleaned
+          summaries globals late_equiv_recanon
       in
       let late_runtime_cleaned =
         late_runtime_summarized
