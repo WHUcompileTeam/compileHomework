@@ -3642,6 +3642,36 @@ type loop_forest = {
   loop_forest_roots : Tcg.label list;
 }
 
+(* item2.6: a stable LoopSimplify view derived from LoopForest.
+
+   This is intentionally metadata + validation first.  We do not force a
+   single latch yet: merging latches changes program points and is exactly the
+   kind of transformation that can invalidate recurrence phase facts.  Older
+   passes may keep handling multi-latch loops, while new consumers can request
+   [loop_simplify_ready] or stronger individual invariants explicitly. *)
+type loop_simplify_info = {
+  loop_simplify_header : Tcg.label;
+  loop_simplify_preheader : Tcg.label option;
+  loop_simplify_latches : Tcg.label list;
+  loop_simplify_exit_edges : (Tcg.label * Tcg.label) list;
+  loop_simplify_exit_targets : Tcg.label list;
+  loop_simplify_exit_control_blocks : Tcg.label list;
+  loop_simplify_unique_preheader : bool;
+  loop_simplify_has_latch : bool;
+  loop_simplify_single_latch : bool;
+  loop_simplify_dedicated_exits : bool;
+  loop_simplify_single_exit_control : bool;
+  loop_simplify_control_block : Tcg.label option;
+  loop_simplify_ready : bool;
+}
+
+type loop_simplify_report = {
+  loop_simplify_forest : loop_forest;
+  loop_simplify_infos :
+    (Tcg.label, loop_simplify_info) Hashtbl.t;
+  loop_simplify_all_ready : bool;
+}
+
 let strict_labelset_subset a b =
   LabelSet.subset a b && not (LabelSet.equal a b)
 
@@ -3846,6 +3876,177 @@ let build_loop_forest (f : Cfg.func) =
     loop_forest_roots = roots;
   }
 
+let build_loop_simplify_report_from_forest
+    (forest : loop_forest) =
+  let infos =
+    Hashtbl.create
+      (max 8 (List.length forest.loop_forest_headers))
+  in
+  let all_ready = ref true in
+  List.iter
+    (fun header ->
+      match
+        Hashtbl.find_opt forest.loop_forest_infos header
+      with
+      | None ->
+          all_ready := false
+      | Some loop_info ->
+          let blocks = loop_info.loop_info_blocks in
+          let block_map = forest.loop_forest_block_map in
+          let dedicated_exits =
+            List.for_all
+              (fun exit_target ->
+                let exit_block =
+                  get_block_exn block_map exit_target
+                in
+                exit_block.preds <> []
+                && List.for_all
+                     (fun pred ->
+                       LabelSet.mem pred blocks)
+                     exit_block.preds)
+              loop_info.loop_info_exit_targets
+          in
+          let exit_control_blocks =
+            loop_info.loop_info_exit_edges
+            |> List.map fst
+            |> List.sort_uniq String.compare
+          in
+          let control_block =
+            match exit_control_blocks with
+            | [ label ] -> Some label
+            | []
+            | _ :: _ :: _ ->
+                None
+          in
+          let unique_preheader =
+            Option.is_some loop_info.loop_info_preheader
+          in
+          let has_latch =
+            loop_info.loop_info_latches <> []
+          in
+          let single_latch =
+            match loop_info.loop_info_latches with
+            | [ _ ] -> true
+            | []
+            | _ :: _ :: _ ->
+                false
+          in
+          let single_exit_control =
+            Option.is_some control_block
+          in
+          (* "ready" is deliberately the safe common denominator needed by
+             recurrence/summary clients:
+               - a unique dedicated preheader,
+               - at least one backedge/latch,
+               - dedicated exits.
+
+             A single latch and a single exiting control block are exposed as
+             stronger optional invariants, not required globally. *)
+          let ready =
+            unique_preheader
+            && has_latch
+            && dedicated_exits
+          in
+          if not ready then all_ready := false;
+          Hashtbl.replace infos header
+            {
+              loop_simplify_header = header;
+              loop_simplify_preheader =
+                loop_info.loop_info_preheader;
+              loop_simplify_latches =
+                loop_info.loop_info_latches;
+              loop_simplify_exit_edges =
+                loop_info.loop_info_exit_edges;
+              loop_simplify_exit_targets =
+                loop_info.loop_info_exit_targets;
+              loop_simplify_exit_control_blocks =
+                exit_control_blocks;
+              loop_simplify_unique_preheader =
+                unique_preheader;
+              loop_simplify_has_latch = has_latch;
+              loop_simplify_single_latch = single_latch;
+              loop_simplify_dedicated_exits =
+                dedicated_exits;
+              loop_simplify_single_exit_control =
+                single_exit_control;
+              loop_simplify_control_block = control_block;
+              loop_simplify_ready = ready;
+            })
+    forest.loop_forest_headers;
+  {
+    loop_simplify_forest = forest;
+    loop_simplify_infos = infos;
+    loop_simplify_all_ready = !all_ready;
+  }
+
+let build_loop_simplify_report (f : Cfg.func) =
+  build_loop_simplify_report_from_forest
+    (build_loop_forest f)
+
+let string_of_optional_label = function
+  | Some label -> label
+  | None -> "<none>"
+
+let debug_loop_simplify_report
+    (f : Cfg.func)
+    (report : loop_simplify_report) =
+  if
+    Sys.getenv_opt "TOYC_DEBUG_LOOP_SIMPLIFY"
+    <> None
+  then begin
+    List.iter
+      (fun header ->
+        match
+          Hashtbl.find_opt
+            report.loop_simplify_infos header
+        with
+        | None ->
+            Printf.eprintf
+              "loop-simplify func=%s header=%s status=missing-info\n%!"
+              f.name header
+        | Some info ->
+            Printf.eprintf
+              "loop-simplify func=%s header=%s ready=%b preheader=%s latches={%s} single-latch=%b dedicated-exits=%b exit-controls={%s} single-exit-control=%b control=%s exits={%s}\n%!"
+              f.name
+              header
+              info.loop_simplify_ready
+              (string_of_optional_label
+                 info.loop_simplify_preheader)
+              (String.concat ","
+                 info.loop_simplify_latches)
+              info.loop_simplify_single_latch
+              info.loop_simplify_dedicated_exits
+              (String.concat ","
+                 info.loop_simplify_exit_control_blocks)
+              info.loop_simplify_single_exit_control
+              (string_of_optional_label
+                 info.loop_simplify_control_block)
+              (info.loop_simplify_exit_edges
+               |> List.map
+                    (fun (src, dst) ->
+                      src ^ "->" ^ dst)
+               |> String.concat ","))
+      report.loop_simplify_forest.loop_forest_headers;
+    Printf.eprintf
+      "loop-simplify-summary func=%s loops=%d all-ready=%b\n%!"
+      f.name
+      (List.length
+         report.loop_simplify_forest.loop_forest_headers)
+      report.loop_simplify_all_ready
+  end
+
+let loop_simplify_info_opt
+    (report : loop_simplify_report)
+    header =
+  Hashtbl.find_opt report.loop_simplify_infos header
+
+let loop_simplify_ready
+    (report : loop_simplify_report)
+    header =
+  match loop_simplify_info_opt report header with
+  | Some info -> info.loop_simplify_ready
+  | None -> false
+
 let debug_loop_forest (f : Cfg.func) =
   if Sys.getenv_opt "TOYC_DEBUG_LOOP_FOREST" <> None then begin
     let forest = build_loop_forest f in
@@ -3884,6 +4085,7 @@ let debug_loop_forest (f : Cfg.func) =
                |> String.concat ","))
       forest.loop_forest_headers
   end
+
 
 let tailrec_elim_func (f : Cfg.func) =
   let tail_loop_label = f.entry in
@@ -3995,14 +4197,8 @@ let loop_canonicalize_func summaries globals (f : Cfg.func) =
     Printf.sprintf ".L%s_canon_cmp_%d" f.label id
   in
   let rec apply (current : Cfg.func) =
-    let live_in_t, live_in_p =
-      compute_liveness summaries globals current
-    in
-    let forest = build_loop_forest current in
-    let loops = forest.loop_forest_loops in
-    let headers = forest.loop_forest_headers in
-    if Sys.getenv_opt "TOYC_DEBUG_LOOP_FOREST" <> None then
-      debug_loop_forest current;
+    let live_in_t, live_in_p = compute_liveness summaries globals current in
+    let _, loops, headers = discover_natural_loops current in
     if headers = [] then current
     else
       let current_blocks = Hashtbl.create (List.length current.blocks + (3 * List.length headers)) in
@@ -5777,8 +5973,68 @@ let reachable_in_loop
     in
     visit [ start ] LabelSet.empty
 
+let loop_has_dedicated_preheader_from_cfg
+    header loop get_block =
+  let header_block : Cfg.block =
+    get_block header
+  in
+  match
+    List.filter
+      (fun pred ->
+        not (LabelSet.mem pred loop))
+      header_block.preds
+  with
+  | [ pred ] ->
+      let pred_block : Cfg.block =
+        get_block pred
+      in
+      pred_block.succs = [ header ]
+  | []
+  | _ :: _ :: _ ->
+      false
+
+let loop_has_dedicated_exits_from_cfg
+    loop get_block =
+  let exit_targets =
+    LabelSet.fold
+      (fun label targets ->
+        let block : Cfg.block =
+          get_block label
+        in
+        List.fold_left
+          (fun targets succ ->
+            if LabelSet.mem succ loop then targets
+            else LabelSet.add succ targets)
+          targets block.succs)
+      loop LabelSet.empty
+  in
+  LabelSet.for_all
+    (fun target ->
+      let exit_block : Cfg.block =
+        get_block target
+      in
+      exit_block.preds <> []
+      && List.for_all
+           (fun pred ->
+             LabelSet.mem pred loop)
+           exit_block.preds)
+    exit_targets
+
 let direct_update_exactly_once_proof
     header loop get_block phi_temp =
+  if
+    not
+      (loop_has_dedicated_preheader_from_cfg
+         header loop get_block)
+  then
+    Error "loop-not-simplified-preheader"
+  else if
+    not
+      (loop_has_dedicated_exits_from_cfg
+         loop get_block)
+  then
+    Error "loop-not-simplified-exits"
+  else
   let header_block : Cfg.block =
     get_block header
   in
@@ -5857,8 +6113,8 @@ let direct_update_exactly_once_proof
   | _ :: _ :: _ ->
       Error "multiple-loop-definitions"
 
+
 let analyze_direct_self_addrecs
-    ?(require_exactly_once = true)
     header loop get_block loop_defs multi_defs def_instrs
     excluded_temps =
   let header_block : Cfg.block = get_block header in
@@ -5991,55 +6247,28 @@ let analyze_direct_self_addrecs
             List.for_all
               (fun (_, step) ->
                 loop_inv_expr_equal first_step step)
-              rest -> (
-            let execution_proof =
-              if require_exactly_once then
-                direct_update_exactly_once_proof
-                  header loop get_block phi_temp
-              else
-                Ok "<experimental>"
+              rest ->
+            let addrec =
+              {
+                addrec_phi_temp = phi_temp;
+                addrec_outside_inputs = outside_inputs;
+                addrec_backedge_preds = backedge_preds;
+                addrec_step =
+                  normalize_loop_inv_expr first_step;
+              }
             in
-            match execution_proof with
-            | Error reason ->
-                if
-                  Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
-                  <> None
-                then
-                  Printf.eprintf
-                    "scev-direct-addrec-exactly-once-reject header=%s phi=t%d step=%s reason=%s\n%!"
-                    header phi_temp
-                    (string_of_loop_inv_expr
-                       (normalize_loop_inv_expr first_step))
-                    reason;
-                addrecs
-            | Ok update_label ->
-                let addrec =
-                  {
-                    addrec_phi_temp = phi_temp;
-                    addrec_outside_inputs = outside_inputs;
-                    addrec_backedge_preds = backedge_preds;
-                    addrec_step =
-                      normalize_loop_inv_expr first_step;
-                  }
-                in
-                if
-                  Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
-                  <> None
-                then begin
-                  Printf.eprintf
-                    "scev-direct-addrec-exactly-once-hit header=%s phi=t%d update=%s step=%s\n%!"
-                    header phi_temp update_label
-                    (string_of_loop_inv_expr
-                       addrec.addrec_step);
-                  Printf.eprintf
-                    "scev-direct-addrec header=%s phi=t%d step=%s outside=%d backedges=%d\n%!"
-                    header phi_temp
-                    (string_of_loop_inv_expr
-                       addrec.addrec_step)
-                    (List.length outside_inputs)
-                    (List.length backedge_preds)
-                end;
-                addrec :: addrecs)
+            if
+              Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
+              <> None
+            then
+              Printf.eprintf
+                "scev-direct-addrec header=%s phi=t%d step=%s outside=%d backedges=%d\n%!"
+                header phi_temp
+                (string_of_loop_inv_expr
+                   addrec.addrec_step)
+                (List.length outside_inputs)
+                (List.length backedge_preds);
+            addrec :: addrecs
         | _ ->
             addrecs)
       candidates
@@ -6172,44 +6401,47 @@ let analyze_loop_addrecs
       loop_defs multi_defs def_instrs
       logical_temps
   in
-  let direct_addrecs =
-    if
-      Sys.getenv_opt
-        "TOYC_EXPERIMENTAL_GLOBAL_DIRECT_ADDREC"
-      <> None
-    then begin
-      let unrestricted =
-        analyze_direct_self_addrecs
-          ~require_exactly_once:false
-          header loop get_block
-          loop_defs multi_defs def_instrs
-          logical_temps
-      in
-      if
-        Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
-        <> None
-      then
-        Printf.eprintf
-          "scev-global-direct-addrec-mode header=%s mode=experimental-unrestricted safe=%d unrestricted=%d\n%!"
-          header
-          (List.length direct_addrecs)
-          (List.length unrestricted);
-      unrestricted
-    end
-    else begin
-      if
-        Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
-        <> None
-        && direct_addrecs <> []
-      then
-        Printf.eprintf
-          "scev-global-direct-addrec-mode header=%s mode=exactly-once safe=%d\n%!"
-          header (List.length direct_addrecs);
-      direct_addrecs
-    end
-  in
-  logical_addrecs @ direct_addrecs
+  (* Global direct-self AddRec recovery is deliberately fenced off by
+     default.
 
+     Unlike recovered logical/edge-copy recurrences, a physical
+       t = t + invariant
+     instruction does not by itself prove that the update executes exactly
+     once per logical iteration of every enclosing natural loop.  In
+     particular, the same static instruction may execute repeatedly inside a
+     nested subloop.  Treating such a temp as a global AddRec can therefore
+     make the semantic step smaller than the true per-iteration delta and can
+     poison later loop summaries.
+
+     Keep the recognizer available for diagnostics/experimentation, but only
+     logical AddRecs feed the general RecurrenceFacts layer by default.
+     Runtime-summary rotated-loop recovery remains a separate, locally gated
+     mechanism. *)
+  if
+    Sys.getenv_opt "TOYC_EXPERIMENTAL_GLOBAL_DIRECT_ADDREC"
+    <> None
+  then begin
+    if
+      Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
+      <> None
+      && direct_addrecs <> []
+    then
+      Printf.eprintf
+        "scev-global-direct-addrec-mode header=%s mode=enabled candidates=%d\n%!"
+        header (List.length direct_addrecs);
+    logical_addrecs @ direct_addrecs
+  end
+  else begin
+    if
+      Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
+      <> None
+      && direct_addrecs <> []
+    then
+      Printf.eprintf
+        "scev-global-direct-addrec-mode header=%s mode=fenced candidates=%d\n%!"
+        header (List.length direct_addrecs);
+    logical_addrecs
+  end
 
 
 (* -------------------------------------------------------------------------- *)
