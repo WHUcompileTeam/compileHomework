@@ -16331,9 +16331,10 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                      (fun instr -> Option.is_none (self_add instr))
                      body_instrs
                  in
-                 if self_add_count <> 3
-                    || List.length extra_instrs > 4
-                    || not (List.for_all pure_affine_control_instr extra_instrs)
+                 if
+                   (self_add_count <> 2 && self_add_count <> 3)
+                   || List.length extra_instrs > 6
+                   || not (List.for_all pure_affine_control_instr extra_instrs)
                  then
                    Error
                      (Printf.sprintf
@@ -16604,8 +16605,10 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                    (string_of_lve_operand step_operand)
                                    (string_of_lve_operand bound_operand);
                                Some
-                                 ( dst,
+                                 ( update_index,
+                                   dst,
                                    step_operand,
+                                   Option.get step_expr,
                                    bound_operand,
                                    control_scale,
                                    control_bias )
@@ -16616,8 +16619,10 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                     | None ->
                         reject header "no-symbolic-affine-lt-control-update"
                     | Some
-                        ( iv_temp,
+                        ( iv_update_index,
+                          iv_temp,
                           step_operand,
+                          step_expr,
                           bound_operand,
                           control_scale,
                           control_bias ) ->
@@ -16676,6 +16681,200 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                 (fun (_, dst, _) -> dst <> iv_temp)
                                 self_adds
                             in
+
+                            (* Phase-aware direct affine reduction analysis.
+
+                               At the start of source iteration k:
+
+                                 iv_pre(k) = k * step
+
+                               A direct reduction operand is normalized to
+
+                                 delta(k) = scale * iv_pre(k) + bias.
+
+                               A bare use of [iv_temp] before its self-add has
+                               phase 0.  A bare use after the self-add has
+                               phase 1, represented by adding [step_expr] to
+                               the bias.  Snapshot temporaries retain the phase
+                               of their defining instruction because recursive
+                               analysis uses the definition's instruction
+                               index, not the final use index.
+
+                               Only Add/Sub/Mul-by-invariant are accepted. *)
+                            let last_body_def_before use_index temp =
+                              let found = ref None in
+                              List.iteri
+                                (fun index instr ->
+                                  if index < use_index then
+                                    match defs_temp instr with
+                                    | Some dst when dst = temp ->
+                                        found := Some (index, instr)
+                                    | Some _ | None -> ())
+                                body_instrs;
+                              !found
+                            in
+                            let affine_add
+                                (lhs_scale, lhs_bias)
+                                (rhs_scale, rhs_bias) =
+                              ( normalize_loop_inv_expr
+                                  (LveAdd (lhs_scale, rhs_scale)),
+                                normalize_loop_inv_expr
+                                  (LveAdd (lhs_bias, rhs_bias)) )
+                            in
+                            let affine_neg (scale, bias) =
+                              ( normalize_loop_inv_expr (LveNeg scale),
+                                normalize_loop_inv_expr (LveNeg bias) )
+                            in
+                            let affine_sub lhs rhs =
+                              affine_add lhs (affine_neg rhs)
+                            in
+                            let affine_mul_invariant
+                                (scale, bias) invariant =
+                              ( normalize_loop_inv_expr
+                                  (LveMul (scale, invariant)),
+                                normalize_loop_inv_expr
+                                  (LveMul (bias, invariant)) )
+                            in
+                            let affine_is_invariant (scale, _) =
+                              normalize_loop_inv_expr scale = LveConst 0L
+                            in
+                            let rec direct_delta_affine_of_operand
+                                use_index seen operand =
+                              match operand with
+                              | Tcg.Imm value ->
+                                  Some (LveConst 0L, LveConst value)
+                              | Tcg.Temp temp when temp = iv_temp ->
+                                  let phase_bias =
+                                    if use_index > iv_update_index then
+                                      step_expr
+                                    else
+                                      LveConst 0L
+                                  in
+                                  Some
+                                    ( LveConst 1L,
+                                      normalize_loop_inv_expr phase_bias )
+                              | Tcg.Temp temp as operand ->
+                                  (match
+                                     lve_invariant_expr_of_operand
+                                       loop_defs multi_defs def_instrs operand
+                                   with
+                                   | Some invariant ->
+                                       Some
+                                         ( LveConst 0L,
+                                           normalize_loop_inv_expr invariant )
+                                   | None ->
+                                       if IntSet.mem temp seen then None
+                                       else
+                                         match
+                                           last_body_def_before
+                                             use_index temp
+                                         with
+                                         | Some (def_index, instr) ->
+                                             direct_delta_affine_of_instr
+                                               def_index
+                                               (IntSet.add temp seen)
+                                               instr
+                                         | None -> None)
+                            and direct_delta_affine_of_instr
+                                def_index seen = function
+                              | Tcg.Move (_, src)
+                              | Tcg.Un (_, UPlus, src) ->
+                                  direct_delta_affine_of_operand
+                                    def_index seen src
+                              | Tcg.Un (_, UMinus, src) ->
+                                  Option.map
+                                    affine_neg
+                                    (direct_delta_affine_of_operand
+                                       def_index seen src)
+                              | Tcg.Bin (_, Add, lhs, rhs) ->
+                                  Option.bind
+                                    (direct_delta_affine_of_operand
+                                       def_index seen lhs)
+                                    (fun lhs ->
+                                      Option.map
+                                        (affine_add lhs)
+                                        (direct_delta_affine_of_operand
+                                           def_index seen rhs))
+                              | Tcg.Bin (_, Sub, lhs, rhs) ->
+                                  Option.bind
+                                    (direct_delta_affine_of_operand
+                                       def_index seen lhs)
+                                    (fun lhs ->
+                                      Option.map
+                                        (affine_sub lhs)
+                                        (direct_delta_affine_of_operand
+                                           def_index seen rhs))
+                              | Tcg.Bin (_, Mul, lhs, rhs) ->
+                                  Option.bind
+                                    (direct_delta_affine_of_operand
+                                       def_index seen lhs)
+                                    (fun lhs_affine ->
+                                      Option.bind
+                                        (direct_delta_affine_of_operand
+                                           def_index seen rhs)
+                                        (fun rhs_affine ->
+                                          if affine_is_invariant lhs_affine then
+                                            let _, invariant = lhs_affine in
+                                            Some
+                                              (affine_mul_invariant
+                                                 rhs_affine invariant)
+                                          else if
+                                            affine_is_invariant rhs_affine
+                                          then
+                                            let _, invariant = rhs_affine in
+                                            Some
+                                              (affine_mul_invariant
+                                                 lhs_affine invariant)
+                                          else
+                                            None))
+                              | Tcg.Un (_, UNot, _)
+                              | Tcg.Bin
+                                  (_,
+                                   (Div | Mod | Lt | Le | Gt | Ge | Eq | Ne
+                                   | LAnd | LOr),
+                                   _, _)
+                              | Tcg.Load _
+                              | Tcg.Store _
+                              | Tcg.Call _ ->
+                                  None
+                            in
+
+                            let match_direct_reduction () =
+                              match non_iv with
+                              | [ (acc_index, acc_temp, delta_operand) ]
+                                when acc_temp <> iv_temp ->
+                                  Option.bind
+                                    (direct_delta_affine_of_operand
+                                       acc_index IntSet.empty delta_operand)
+                                    (fun (delta_scale, delta_bias) ->
+                                      let delta_scale =
+                                        normalize_loop_inv_expr delta_scale
+                                      in
+                                      let delta_bias =
+                                        normalize_loop_inv_expr delta_bias
+                                      in
+                                      let scale_available =
+                                        lve_expr_available_before_preds
+                                          doms def_blocks multi_defs
+                                          [ preheader_label ] delta_scale
+                                      in
+                                      let bias_available =
+                                        lve_expr_available_before_preds
+                                          doms def_blocks multi_defs
+                                          [ preheader_label ] delta_bias
+                                      in
+                                      if scale_available && bias_available then
+                                        Some
+                                          (`Direct
+                                            ( acc_temp,
+                                              delta_scale,
+                                              delta_bias ))
+                                      else
+                                        None)
+                              | [] | _ :: _ :: _ ->
+                                  None
+                            in
+
                             let match_pair () =
                                       match non_iv with
                                       | [ (i1, dst1, other1);
@@ -16723,29 +16922,67 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                  (i1, dst1, other1))
                                       | _ -> None
                                     in
-                            match match_pair () with
-                                    | None -> reject header "no-acc-derived-pair"
-                                    | Some (acc_temp, derived_temp, delta_operand) ->
-                                        let live_exit =
-                                          table_find_or_empty
-                                            live_in_t exit_label IntSet.empty
-                                        in
-                                        if
-                                          not (IntSet.mem acc_temp live_exit)
-                                          || IntSet.mem iv_temp live_exit
-                                          || IntSet.mem derived_temp live_exit
-                                        then
-                                          reject header
-                                            (Printf.sprintf
-                                               "bad-liveout acc=%b iv=%b derived=%b"
-                                               (IntSet.mem acc_temp live_exit)
-                                               (IntSet.mem iv_temp live_exit)
-                                               (IntSet.mem derived_temp live_exit))
-                                        else
-                                          let other_live_defs =
-                                            IntSet.remove acc_temp
-                                              (IntSet.inter loop_defs live_exit)
-                                          in
+                            let reduction_shape =
+                              match match_pair () with
+                              | Some
+                                  (acc_temp, derived_temp, delta_operand) ->
+                                  Some
+                                    (`Carrier
+                                      ( acc_temp,
+                                        derived_temp,
+                                        delta_operand ))
+                              | None ->
+                                  match_direct_reduction ()
+                            in
+                            match reduction_shape with
+                            | None ->
+                                reject header
+                                  "no-runtime-affine-reduction"
+                            | Some reduction_shape ->
+                                (match reduction_shape with
+                                 | `Direct (acc, scale, bias) when debug ->
+                                     Printf.eprintf
+                                       "lve-runtime-direct-affine-reduction func=%s header=%s iv=t%d acc=t%d scale=%s bias=%s step=%s\n%!"
+                                       f.name header iv_temp acc
+                                       (string_of_loop_inv_expr scale)
+                                       (string_of_loop_inv_expr bias)
+                                       (string_of_lve_operand step_operand)
+                                 | `Direct _
+                                 | `Carrier _ ->
+                                     ());
+                                let acc_temp =
+                                  match reduction_shape with
+                                  | `Carrier (acc, _, _)
+                                  | `Direct (acc, _, _) ->
+                                      acc
+                                in
+                                let live_exit =
+                                  table_find_or_empty
+                                    live_in_t exit_label IntSet.empty
+                                in
+                                let derived_live_bad =
+                                  match reduction_shape with
+                                  | `Carrier (_, derived, _) ->
+                                      IntSet.mem derived live_exit
+                                  | `Direct _ ->
+                                      false
+                                in
+                                if
+                                  not (IntSet.mem acc_temp live_exit)
+                                  || IntSet.mem iv_temp live_exit
+                                  || derived_live_bad
+                                then
+                                  reject header
+                                    (Printf.sprintf
+                                       "bad-liveout acc=%b iv=%b derived=%b"
+                                       (IntSet.mem acc_temp live_exit)
+                                       (IntSet.mem iv_temp live_exit)
+                                       derived_live_bad)
+                                else
+                                  let other_live_defs =
+                                    IntSet.remove acc_temp
+                                      (IntSet.inter loop_defs live_exit)
+                                  in
                                           if not (IntSet.is_empty other_live_defs) then
                                             reject header "other-loop-def-liveout"
                                           else
@@ -16754,7 +16991,154 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                             in
                                             if not preheader_reaches_loop then
                                               reject header "preheader-no-longer-reaches-loop"
-                                            else if
+                                            else
+                                              let materialize_summary_inv_expr
+                                                  expr =
+                                                match
+                                                  normalize_loop_inv_expr expr
+                                                with
+                                                | LveConst value ->
+                                                    ([], Tcg.Imm value)
+                                                | LveOperand operand ->
+                                                    ([], operand)
+                                                | complex ->
+                                                    let temp = fresh_temp () in
+                                                    ( emit_loop_inv_expr
+                                                        fresh_temp temp complex,
+                                                      Tcg.Temp temp )
+                                              in
+                                              let build_reduction_apply_body
+                                                  trip =
+                                                match reduction_shape with
+                                                | `Carrier
+                                                    ( _,
+                                                      derived_temp,
+                                                      delta_operand ) ->
+                                                    let
+                                                      triangle_instrs,
+                                                      triangle
+                                                    =
+                                                      build_triangle_number_instrs
+                                                        fresh_temp trip
+                                                    in
+                                                    let base_delta =
+                                                      fresh_temp ()
+                                                    in
+                                                    let series_delta =
+                                                      fresh_temp ()
+                                                    in
+                                                    let total_delta =
+                                                      fresh_temp ()
+                                                    in
+                                                    triangle_instrs
+                                                    @ [ simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( base_delta,
+                                                               Mul,
+                                                               Tcg.Temp trip,
+                                                               Tcg.Temp
+                                                                 derived_temp ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( series_delta,
+                                                               Mul,
+                                                               Tcg.Temp
+                                                                 triangle,
+                                                               delta_operand ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( total_delta,
+                                                               Add,
+                                                               Tcg.Temp
+                                                                 base_delta,
+                                                               Tcg.Temp
+                                                                 series_delta ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( acc_temp,
+                                                               Add,
+                                                               Tcg.Temp
+                                                                 acc_temp,
+                                                               Tcg.Temp
+                                                                 total_delta )) ]
+                                                | `Direct
+                                                    ( _,
+                                                      delta_scale,
+                                                      delta_bias ) ->
+                                                    let
+                                                      scale_prep,
+                                                      scale_operand
+                                                    =
+                                                      materialize_summary_inv_expr
+                                                        delta_scale
+                                                    in
+                                                    let
+                                                      bias_prep,
+                                                      bias_operand
+                                                    =
+                                                      materialize_summary_inv_expr
+                                                        delta_bias
+                                                    in
+                                                    let
+                                                      triangle_instrs,
+                                                      triangle
+                                                    =
+                                                      build_triangle_number_instrs
+                                                        fresh_temp trip
+                                                    in
+                                                    let step_triangle =
+                                                      fresh_temp ()
+                                                    in
+                                                    let series_delta =
+                                                      fresh_temp ()
+                                                    in
+                                                    let base_delta =
+                                                      fresh_temp ()
+                                                    in
+                                                    let total_delta =
+                                                      fresh_temp ()
+                                                    in
+                                                    scale_prep
+                                                    @ bias_prep
+                                                    @ triangle_instrs
+                                                    @ [ simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( step_triangle,
+                                                               Mul,
+                                                               Tcg.Temp
+                                                                 triangle,
+                                                               step_operand ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( series_delta,
+                                                               Mul,
+                                                               Tcg.Temp
+                                                                 step_triangle,
+                                                               scale_operand ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( base_delta,
+                                                               Mul,
+                                                               Tcg.Temp trip,
+                                                               bias_operand ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( total_delta,
+                                                               Add,
+                                                               Tcg.Temp
+                                                                 base_delta,
+                                                               Tcg.Temp
+                                                                 series_delta ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( acc_temp,
+                                                               Add,
+                                                               Tcg.Temp
+                                                                 acc_temp,
+                                                               Tcg.Temp
+                                                                 total_delta )) ]
+                                              in
+                                              if
                                               normalize_loop_inv_expr
                                                 control_scale
                                               <> LveConst 1L
@@ -17072,49 +17456,8 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                 }
                                               in
 
-                                              let triangle_instrs, triangle =
-                                                build_triangle_number_instrs
-                                                  fresh_temp trip
-                                              in
-                                              let base_delta =
-                                                fresh_temp ()
-                                              in
-                                              let series_delta =
-                                                fresh_temp ()
-                                              in
-                                              let total_delta =
-                                                fresh_temp ()
-                                              in
                                               let apply_body =
-                                                triangle_instrs
-                                                @ [ simplify_simple_instr
-                                                      (Tcg.Bin
-                                                         ( base_delta,
-                                                           Mul,
-                                                           Tcg.Temp trip,
-                                                           Tcg.Temp
-                                                             derived_temp ));
-                                                    simplify_simple_instr
-                                                      (Tcg.Bin
-                                                         ( series_delta,
-                                                           Mul,
-                                                           Tcg.Temp triangle,
-                                                           delta_operand ));
-                                                    simplify_simple_instr
-                                                      (Tcg.Bin
-                                                         ( total_delta,
-                                                           Add,
-                                                           Tcg.Temp
-                                                             base_delta,
-                                                           Tcg.Temp
-                                                             series_delta ));
-                                                    simplify_simple_instr
-                                                      (Tcg.Bin
-                                                         ( acc_temp,
-                                                           Add,
-                                                           Tcg.Temp acc_temp,
-                                                           Tcg.Temp
-                                                             total_delta )) ]
+                                                build_reduction_apply_body trip
                                               in
                                               let apply_block =
                                                 {
@@ -17149,19 +17492,33 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                               changed := true;
                                               if debug then
                                                 Printf.eprintf
-                                                  "lve-runtime-invariant-affine-summary func=%s header=%s iv=t%d scale=%s bias=%s acc=t%d derived=t%d step=%s bound=%s delta=%s fallback=%s\n%!"
+                                                  "lve-runtime-invariant-affine-summary func=%s header=%s iv=t%d scale=%s bias=%s acc=t%d reduction=%s step=%s bound=%s fallback=%s\n%!"
                                                   f.name header iv_temp
                                                   (string_of_loop_inv_expr
                                                      control_scale)
                                                   (string_of_loop_inv_expr
                                                      control_bias)
-                                                  acc_temp derived_temp
+                                                  acc_temp
+                                                  (match reduction_shape with
+                                                   | `Carrier
+                                                       (_, derived, delta) ->
+                                                       Printf.sprintf
+                                                         "carrier:t%d+=%s"
+                                                         derived
+                                                         (string_of_lve_operand
+                                                            delta)
+                                                   | `Direct
+                                                       (_, scale, bias) ->
+                                                       Printf.sprintf
+                                                         "direct:scale=%s,bias=%s"
+                                                         (string_of_loop_inv_expr
+                                                            scale)
+                                                         (string_of_loop_inv_expr
+                                                            bias))
                                                   (string_of_lve_operand
                                                      step_operand)
                                                   (string_of_lve_operand
                                                      bound_operand)
-                                                  (string_of_lve_operand
-                                                     delta_operand)
                                                   header
                                             end else begin
                                               let guard_label = fresh_label "guard" in
@@ -17259,39 +17616,8 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                 }
                                               in
 
-                                              let triangle_instrs, triangle =
-                                                build_triangle_number_instrs
-                                                  fresh_temp trip
-                                              in
-                                              let base_delta = fresh_temp () in
-                                              let series_delta = fresh_temp () in
-                                              let total_delta = fresh_temp () in
                                               let apply_body =
-                                                triangle_instrs
-                                                @ [ simplify_simple_instr
-                                                      (Tcg.Bin
-                                                         ( base_delta,
-                                                           Mul,
-                                                           Tcg.Temp trip,
-                                                           Tcg.Temp derived_temp ));
-                                                    simplify_simple_instr
-                                                      (Tcg.Bin
-                                                         ( series_delta,
-                                                           Mul,
-                                                           Tcg.Temp triangle,
-                                                           delta_operand ));
-                                                    simplify_simple_instr
-                                                      (Tcg.Bin
-                                                         ( total_delta,
-                                                           Add,
-                                                           Tcg.Temp base_delta,
-                                                           Tcg.Temp series_delta ));
-                                                    simplify_simple_instr
-                                                      (Tcg.Bin
-                                                         ( acc_temp,
-                                                           Add,
-                                                           Tcg.Temp acc_temp,
-                                                           Tcg.Temp total_delta )) ]
+                                                build_reduction_apply_body trip
                                               in
                                               let apply_block =
                                                 {
@@ -17319,14 +17645,29 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                               changed := true;
                                               if debug then
                                                 Printf.eprintf
-                                                  "lve-runtime-summary func=%s header=%s blocks=%d iv=t%d acc=t%d derived=t%d step=%s bound=%s delta=%s fallback=%s\n%!"
+                                                  "lve-runtime-summary func=%s header=%s blocks=%d iv=t%d acc=t%d reduction=%s step=%s bound=%s fallback=%s\n%!"
                                                   f.name header
                                                   (LabelSet.cardinal loop)
                                                   iv_temp
-                                                  acc_temp derived_temp
+                                                  acc_temp
+                                                  (match reduction_shape with
+                                                   | `Carrier
+                                                       (_, derived, delta) ->
+                                                       Printf.sprintf
+                                                         "carrier:t%d+=%s"
+                                                         derived
+                                                         (string_of_lve_operand
+                                                            delta)
+                                                   | `Direct
+                                                       (_, scale, bias) ->
+                                                       Printf.sprintf
+                                                         "direct:scale=%s,bias=%s"
+                                                         (string_of_loop_inv_expr
+                                                            scale)
+                                                         (string_of_loop_inv_expr
+                                                            bias))
                                                   (string_of_lve_operand step_operand)
                                                   (string_of_lve_operand bound_operand)
-                                                  (string_of_lve_operand delta_operand)
                                                   header
                                              end)
       | _ -> reject header "outside-predecessor-count")
