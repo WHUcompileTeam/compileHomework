@@ -7531,6 +7531,182 @@ let analyze_counted_loop header loop get_block temp_count blocks =
   in
   (loop_defs, def_blocks, def_instrs, multi_defs, loop_stable_phis, ivs, control)
 
+(* Elimination-only semantic control fallback.
+
+   Mature counted-loop clients continue to use [analyze_counted_loop], whose IV
+   list is syntactic-only for control purposes.  Nested elimination sometimes
+   loses the physical edge-copy shape after an inner summary even though
+   [analyze_loop_addrecs] can still recover the logical outer IV.
+
+   For elimination only, when the mature control matcher fails:
+     - query the control operands at the actual block-exit program point;
+     - require a single AddRec/Affine with constant step;
+     - require unit scale and constant bias;
+     - require the opposite operand to be loop-invariant.
+
+   The recovered semantic IV is kept only in [counted_loop_info.control_iv].
+   It is NOT inserted into the reduction IV list. *)
+let find_counted_loop_control_semantic
+    header
+    loop
+    loop_defs
+    multi_defs
+    def_instrs
+    get_block
+    addrecs =
+  let facts =
+    build_recurrence_facts
+      header loop get_block loop_defs multi_defs def_instrs addrecs
+  in
+  let invariant_operand operand =
+    lve_invariant_expr_of_operand
+      loop_defs multi_defs def_instrs operand
+    |> Option.is_some
+  in
+  let semantic_control_of_operand label operand =
+    match
+      recurrence_at facts
+        (RecurrenceBlockExit label) operand
+    with
+    | Some ((ScalarAddRec _ | ScalarAffine _) as recurrence) -> (
+        match scalar_recurrence_scale_bias recurrence with
+        | Some (base, scale, bias) -> (
+            match
+              ( loop_inv_expr_const_opt scale,
+                loop_inv_expr_const_opt bias,
+                basic_iv_of_scalar_addrec
+                  header loop get_block base )
+            with
+            | Some 1L, Some 0L, Some iv ->
+                Some (iv, 0L)
+            | _ ->
+                None)
+        | None ->
+            None)
+    | Some (ScalarConst _)
+    | Some (ScalarInvariant _)
+    | None ->
+        None
+  in
+  let build_kind step op bound bias =
+    match (step, op) with
+    | step, Lt when step > 0L ->
+        Some (CountUpLt (bound, bias))
+    | step, Le when step > 0L ->
+        Some (CountUpLe (bound, bias))
+    | step, Gt when step < 0L ->
+        Some (CountDownGt (bound, bias))
+    | step, Ge when step < 0L ->
+        Some (CountDownGe (bound, bias))
+    | _ ->
+        None
+  in
+  LabelSet.elements loop
+  |> List.find_map (fun label ->
+         let block : Cfg.block = get_block label in
+         match
+           branch_compare_shape_in_block
+             block multi_defs def_instrs block.term
+         with
+         | Some (op, lhs, rhs, if_true, if_false)
+           when
+             LabelSet.mem if_true loop
+             <> LabelSet.mem if_false loop ->
+             (* Reuse the mature target-orientation rule directly instead of
+                inventing inverse counted kinds: classify the comparison whose
+                TRUE edge stays in-loop; otherwise invert the comparison first. *)
+             let true_in = LabelSet.mem if_true loop in
+             let op, if_true, if_false =
+               if true_in then (op, if_true, if_false)
+               else (invert_compare op, if_false, if_true)
+             in
+             let match_one op recurrence_operand bound =
+               if not (invariant_operand bound) then None
+               else
+                 match
+                   semantic_control_of_operand
+                     label recurrence_operand
+                 with
+                 | Some (iv, bias) ->
+                     Option.map
+                       (fun kind -> (iv, kind))
+                       (build_kind iv.step op bound bias)
+                 | None ->
+                     None
+             in
+             let matched =
+               match match_one op lhs rhs with
+               | Some _ as found -> found
+               | None ->
+                   match_one
+                     (swap_compare op) rhs lhs
+             in
+             Option.map
+               (fun (control_iv, kind) ->
+                 {
+                   control_iv;
+                   control_label = label;
+                   inside_label = if_true;
+                   exit_label = if_false;
+                   kind;
+                 })
+               matched
+         | Some _ | None ->
+             None)
+
+let analyze_counted_loop_for_elimination
+    header loop get_block temp_count blocks =
+  let loop_defs, def_blocks, def_instrs, multi_defs =
+    analyze_temp_defs_of_blocks
+      ~loop temp_count blocks
+  in
+  let loop_stable_phis =
+    collect_loop_stable_phis
+      header loop get_block def_blocks multi_defs def_instrs
+  in
+  let all_ivs =
+    analyze_induction_vars
+      header loop get_block loop_defs multi_defs def_instrs
+  in
+  let syntactic_ivs =
+    proven_syntactic_induction_vars all_ivs
+  in
+  let old_control =
+    find_counted_loop_control
+      loop loop_defs loop_stable_phis multi_defs def_instrs
+      syntactic_ivs get_block
+  in
+  let control =
+    match old_control with
+    | Some _ ->
+        old_control
+    | None ->
+        let addrecs =
+          analyze_loop_addrecs
+            header loop get_block loop_defs multi_defs def_instrs
+        in
+        find_counted_loop_control_semantic
+          header loop loop_defs multi_defs def_instrs
+          get_block addrecs
+  in
+  (match control with
+   | Some info
+     when info.control_iv.origin = `Semantic
+          && Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None ->
+       Printf.eprintf
+         "counted-semantic-control-hit header=%s phi=t%d step=%Ld\n%!"
+         header info.control_iv.phi_temp info.control_iv.step
+   | Some _
+   | None ->
+       ());
+  ( loop_defs,
+    def_blocks,
+    def_instrs,
+    multi_defs,
+    loop_stable_phis,
+    syntactic_ivs,
+    control )
+
 let linear_loop_path header loop get_block entry_label =
   let rec collapse_transparent_branch seen visiting label =
     if label = header || LabelSet.mem label seen then Some header
@@ -13385,7 +13561,8 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
         let header_block : Cfg.block = get_block header in
         let blocks_snapshot = current_block_list () in
         let (loop_defs, def_blocks, def_instrs, multi_defs, loop_stable_phis, ivs, control) =
-          analyze_counted_loop header loop get_block !next_temp blocks_snapshot
+          analyze_counted_loop_for_elimination
+            header loop get_block !next_temp blocks_snapshot
         in
         let effects = collect_loop_effects summaries globals loop blocks_snapshot in
         let invariant_loaded_places =
@@ -13408,10 +13585,23 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
                 let live_t_exit = table_find_or_empty live_in_t info.exit_label IntSet.empty in
                 let live_p_exit = table_find_or_empty live_in_p info.exit_label PlaceSet.empty in
                 let live_ivs =
-                  List.filter
-                    (fun (iv : basic_induction_var) ->
-                      iv.phi_temp = info.control_iv.phi_temp || IntSet.mem iv.phi_temp live_t_exit)
-                    ivs
+                  let syntactic_live =
+                    List.filter
+                      (fun (iv : basic_induction_var) ->
+                        iv.phi_temp = info.control_iv.phi_temp
+                        || IntSet.mem iv.phi_temp live_t_exit)
+                      ivs
+                  in
+                  if
+                    List.exists
+                      (fun (iv : basic_induction_var) ->
+                        iv.phi_temp
+                        = info.control_iv.phi_temp)
+                      syntactic_live
+                  then
+                    syntactic_live
+                  else
+                    info.control_iv :: syntactic_live
                 in
                 let loop_live_defs = IntSet.inter loop_defs live_t_exit in
                 let excluded_temps =
@@ -14692,7 +14882,8 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
         let header_block : Cfg.block = get_block header in
         let blocks_snapshot = current_block_list () in
         let (loop_defs, def_blocks, def_instrs, multi_defs, loop_stable_phis, ivs, control) =
-          analyze_counted_loop header loop get_block !next_temp blocks_snapshot
+          analyze_counted_loop_for_elimination
+            header loop get_block !next_temp blocks_snapshot
         in
         let effects = collect_loop_effects summaries globals loop blocks_snapshot in
         let invariant_loaded_places =
@@ -14735,10 +14926,22 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                 in
                 let live_t_exit = table_find_or_empty live_in_t info.exit_label IntSet.empty in
                 let live_ivs =
-                  List.filter
-                    (fun (iv : basic_induction_var) ->
-                      iv.phi_temp = info.control_iv.phi_temp || IntSet.mem iv.phi_temp live_t_exit)
-                    ivs
+                  let syntactic_live =
+                    List.filter
+                      (fun (iv : basic_induction_var) ->
+                        iv.phi_temp = info.control_iv.phi_temp
+                        || IntSet.mem iv.phi_temp live_t_exit)
+                      ivs
+                  in
+                  if
+                    List.exists
+                      (fun (iv : basic_induction_var) ->
+                        iv.phi_temp = info.control_iv.phi_temp)
+                      syntactic_live
+                  then
+                    syntactic_live
+                  else
+                    info.control_iv :: syntactic_live
                 in
                 let loop_live_defs =
                   IntSet.inter loop_defs live_t_exit
@@ -14970,15 +15173,83 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                   let probe_body = trip_instrs @ probe_updates in
                   let summary_label = fresh_summary_label () in
                   let control_block = get_block info.control_label in
+                  (* Parameterized loops normally keep the original zero-trip
+                     guard because computing a closed-form trip count on the
+                     false edge can itself overflow (for example [bound-init]
+                     with unrelated signed parameters).
+
+                     There is one important safe case for nested summaries:
+                       i = 0;
+                       while (i < bound) { ...; i = i + 1; }
+
+                     Here [CountUpLt(bound, 0)] with unit step and a proven
+                     outside value of exactly zero computes
+                       trip = max(bound, 0)
+                     without a signed subtraction overflow.  If the generated
+                     summary body is also zero-trip-safe, executing it on the
+                     original false edge is neutral.  This removes the residual
+
+                       guard -> counted_summary / bypass -> join
+
+                     diamond produced by an eliminated inner loop, exposing a
+                     straight-line scalar transfer to the enclosing loop.
+
+                     Keep this deliberately narrow: no biased/scaled control,
+                     no nonzero initial value, and no reconstruction/mirrors. *)
+                  let zero_trip_control_init_is_zero =
+                    match info.kind with
+                    | CountUpLt (_, 0L)
+                      when info.control_iv.step = 1L -> (
+                        match info.control_iv.outside_inputs with
+                        | [] ->
+                            false
+                        | inputs ->
+                            List.for_all
+                              (fun (pred, operand) ->
+                                let chain =
+                                  incoming_phi_chain get_block header pred
+                                  |> extend_counted_outside_seed_chain
+                                       get_block loop
+                                in
+                                match
+                                  operand_static_int64_on_chain
+                                    chain
+                                    loop_defs
+                                    multi_defs
+                                    def_instrs
+                                    operand
+                                with
+                                | Some 0L -> true
+                                | Some _ | None -> false)
+                              inputs)
+                    | CountUpLt _
+                    | CountUpLe _
+                    | CountDownGt _
+                    | CountDownGe _
+                    | CountUpLtScaled _
+                    | CountUpLeScaled _
+                    | CountDownGtScaled _
+                    | CountDownGeScaled _ ->
+                        false
+                  in
                   let zero_trip_state_simple =
-                    f.params = []
-                    && reconstruction_order = []
+                    reconstruction_order = []
                     && place_mirrors = []
+                    && (f.params = [] || zero_trip_control_init_is_zero)
                   in
                   let zero_trip_elided =
                     zero_trip_state_simple
                     && zero_trip_safe_body probe_body
                   in
+                  if
+                    debug_counted
+                    && zero_trip_elided
+                    && f.params <> []
+                    && zero_trip_control_init_is_zero
+                  then
+                    debugf
+                      "counted-zero-trip-param-zero-init-elide func=%s header=%s summary=%s"
+                      f.name header summary_label;
                   if
                     Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None
                     && zero_trip_safe_body probe_body
@@ -15060,10 +15331,38 @@ let eliminate_counted_loops_func global_init summaries globals (f : Cfg.func) =
     |> simplify_cfg_func
   in
 
-  let prepare_promoted_view current =
+  let prepare_promoted_base current =
     current
     |> mem2reg_func ~optimistic_loop_phi:true
     |> loop_canonicalize_func summaries globals
+    |> const_propagate_func global_init summaries globals
+    |> thread_and_prune_func
+    |> simplify_cfg_func
+  in
+
+  (* Bottom-up nested scalar-transfer bridge.
+
+     A successful inner counted-loop summary is emitted as ordinary scalar
+     arithmetic.  Optimistic mem2reg exposes the enclosing loop-carried locals,
+     but that alone is not enough: the freshly emitted transfer may still be a
+     temp tree such as
+
+       t1 = trip * outer_iv
+       t2 = trip * bias
+       t3 = t1 + t2
+       outer_acc = outer_acc + t3
+
+     while the outer recurrence consumers are strongest on canonical
+     Add/Sub/constant-Mul forms.
+
+     Recanonicalize only the promoted *analysis bridge*.  If it does not enable
+     another counted-loop elimination, [cascade] still returns the cleaned
+     pre-promotion CFG, so these bridge-only rewrites do not perturb the normal
+     optimizer pipeline on their own. *)
+  let recanonicalize_promoted_view current =
+    current
+    |> gvn_func summaries globals
+    |> copy_coalesce_func summaries globals
     |> const_propagate_func global_init summaries globals
     |> thread_and_prune_func
     |> simplify_cfg_func
@@ -15091,10 +15390,28 @@ let eliminate_counted_loops_func global_init summaries globals (f : Cfg.func) =
 
         if fuel <= 1 then cleaned
         else
-          let promoted = prepare_promoted_view cleaned in
+          let promoted_base =
+            prepare_promoted_base cleaned
+          in
+          let promoted =
+            recanonicalize_promoted_view promoted_base
+          in
           let second =
             eliminate_counted_loops_func_once summaries globals promoted
           in
+          if debug_enabled () && second <> promoted then begin
+            let without_recanon =
+              eliminate_counted_loops_func_once
+                summaries globals promoted_base
+            in
+            if without_recanon = promoted_base then
+              Printf.eprintf
+                "counted-nested-transfer-recanon-hit func=%s remaining=%d blocks=%d->%d\n%!"
+                f.name
+                (fuel - 2)
+                (List.length promoted_base.blocks)
+                (List.length promoted.blocks)
+          end;
           if second = promoted then begin
             if debug_enabled () then
               Printf.eprintf
