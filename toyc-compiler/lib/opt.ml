@@ -9082,6 +9082,103 @@ let linear_expr_of_operand
         | Some (Tcg.Call (_, name, _)) ->
             Printf.sprintf "t%d=call(%s)" temp name)
   in
+
+  (* Program-point-local invariant closure.
+
+     [summary_expr_of_operand] is deliberately conservative about a temp that
+     is multi-defined anywhere in the loop.  After an inner counted loop is
+     summarized, however, the enclosing loop commonly contains temps such as
+
+       outer-body:    t4 = 0
+       inner-summary: t4 = bound * (bound >= 0)
+
+     so [t4] is function/loop-wide multi-def even though, at the exact point
+     inside [inner-summary], the prefix contains one unambiguous definition.
+
+     When [allow_local_multidef] is enabled, follow only a definition visible
+     in the supplied block prefix.  This proves pure arithmetic subtrees
+     invariant at that program point without choosing an arbitrary reaching
+     definition.  A multi-def temp with no local visible definition is still
+     rejected, which keeps genuinely loop-carried values out of this closure. *)
+  let point_local_invariant_summary block operand =
+    let invariant operand =
+      operand_loop_invariant
+        loop_defs loop_stable_phis multi_defs def_instrs
+        IntSet.empty operand
+    in
+    let rec of_operand block seen operand =
+      match operand with
+      | Tcg.Imm _ ->
+          Some (SummaryOperand operand)
+      | Tcg.Temp temp ->
+          (* A real counted IV must remain affine, never become an invariant
+             just because one update happens to be visible locally. *)
+          if
+            List.exists
+              (fun (iv : basic_induction_var) ->
+                iv.phi_temp = temp)
+              ivs
+          then
+            None
+          else if invariant operand then
+            Some (SummaryOperand operand)
+          else if IntSet.mem temp seen then
+            None
+          else
+            let seen = IntSet.add temp seen in
+            match last_def_of_temp block temp with
+            | Some instr
+              when
+                allow_local_multidef
+                || not (IntSet.mem temp multi_defs) ->
+                of_instr block seen instr
+            | Some _ ->
+                None
+            | None ->
+                (* Crucial safety fence: do not use a function-wide/global
+                   definition for a multi-def temp.  Without a definition in
+                   this program-point prefix, its reaching value is ambiguous. *)
+                if IntSet.mem temp multi_defs then
+                  None
+                else
+                  match Hashtbl.find_opt def_instrs temp with
+                  | Some instr -> (
+                      match Hashtbl.find_opt def_blocks temp with
+                      | Some label ->
+                          of_instr (get_block label) seen instr
+                      | None ->
+                          None)
+                  | None ->
+                      None
+    and of_instr block seen = function
+      | Tcg.Move (_, src) ->
+          of_operand block seen
+            (resolve_block_operand block src)
+      | Tcg.Load (_, place)
+        when PlaceSet.mem place invariant_loaded_places ->
+          Some (SummaryPlace place)
+      | Tcg.Un (_, op, src) ->
+          let src = resolve_block_operand block src in
+          Option.map
+            (fun expr -> SummaryUn (op, expr))
+            (of_operand block seen src)
+      | Tcg.Bin (_, op, lhs, rhs) ->
+          let lhs = resolve_block_operand block lhs in
+          let rhs = resolve_block_operand block rhs in
+          Option.bind
+            (of_operand block seen lhs)
+            (fun lhs_expr ->
+              Option.map
+                (fun rhs_expr ->
+                  SummaryBin (op, lhs_expr, rhs_expr))
+                (of_operand block seen rhs))
+      | Tcg.Load _
+      | Tcg.Store _
+      | Tcg.Call _ ->
+          None
+    in
+    of_operand block IntSet.empty operand
+  in
   let rec of_operand block seen operand =
     match direct_scaled operand with
     | Some expr -> Some expr
@@ -9092,13 +9189,39 @@ let linear_expr_of_operand
             match generated_triangle block seen operand with
             | Some expr -> Some expr
             | None -> (
-                match
-              summary_expr_of_operand
-                invariant_loaded_places
-                loop_defs def_blocks get_block loop_stable_phis multi_defs def_instrs block operand
-            with
-            | Some expr -> Some (LinearInvariant expr)
-            | None -> (
+                let invariant_expr =
+                  match
+                    summary_expr_of_operand
+                      invariant_loaded_places
+                      loop_defs def_blocks get_block
+                      loop_stable_phis multi_defs def_instrs
+                      block operand
+                  with
+                  | Some expr ->
+                      Some expr
+                  | None when allow_local_multidef -> (
+                      match
+                        point_local_invariant_summary
+                          block operand
+                      with
+                      | Some _ as result ->
+                          if debug_triangle_enabled () then
+                            Printf.eprintf
+                              "counted-linear-local-invariant-hit block=%s operand=%s\n%!"
+                              block.label
+                              (debug_operand
+                                 (resolve_block_operand
+                                    block operand));
+                          result
+                      | None ->
+                          None)
+                  | None ->
+                      None
+                in
+                match invariant_expr with
+                | Some expr ->
+                    Some (LinearInvariant expr)
+                | None -> (
                 match operand with
                 | Tcg.Imm _ -> None
                 | Tcg.Temp temp ->
@@ -10571,7 +10694,159 @@ let collect_counted_reductions
              (LveConst iv.step))
       ivs
   in
-  let linear_expr_of_scalar_recurrence recurrence =
+  let common_addrec_seed_expr (addrec : loop_addrec) =
+    let expr_of_operand operand =
+      lve_invariant_expr_of_operand
+        loop_defs multi_defs def_instrs operand
+      |> Option.map normalize_loop_inv_expr
+    in
+    (* [recover_logical_loop_phis] deliberately records logical outside
+       inputs as [(pred, Temp phi_temp)] placeholders.  They describe the
+       logical PHI identity, not the concrete entry-edge value.
+
+       Resolve those placeholders through the actual incoming edge before
+       asking whether the seed is loop-invariant.  This is the same
+       edge-sensitive seed recovery already used when converting a semantic
+       AddRec into a basic IV. *)
+    match
+      scalar_outside_inputs
+        header loop get_block addrec
+    with
+    | None ->
+        None
+    | Some [] ->
+        None
+    | Some ((_, first_operand) :: rest) ->
+        Option.bind
+          (expr_of_operand first_operand)
+          (fun first ->
+            let rec agree = function
+              | [] ->
+                  Some first
+              | (_, operand) :: tail -> (
+                  match expr_of_operand operand with
+                  | Some other
+                    when loop_inv_expr_equal first other ->
+                      agree tail
+                  | Some _ | None ->
+                      None)
+            in
+            agree rest)
+  in
+
+  (* Rebase a semantic AddRec onto the unique mature unit-step counted IV.
+
+       anchor(k) = A0 + da*k,  da in {+1,-1}
+       base(k)   = B0 + db*k
+       value(k)  = scale*base(k) + bias
+
+     therefore
+
+       value = (scale*db*da) * anchor
+             + scale*(B0 - db*da*A0) + bias
+
+     [recurrence_at] may already have phase-shifted either recurrence; its
+     affine bias is included below.  We additionally query the anchor at the
+     same exact program point, so a phase mismatch/conflict is rejected rather
+     than guessed. *)
+  let rebase_scalar_recurrence_to_anchor point recurrence =
+    match anchor_iv with
+    | None ->
+        None
+    | Some anchor
+      when Int64.abs anchor.step = 1L -> (
+        match
+          scalar_recurrence_scale_bias
+            (normalize_scalar_recurrence recurrence),
+          recurrence_at recurrence_facts point
+            (Tcg.Temp anchor.phi_temp)
+        with
+        | Some (base, scale, bias),
+          Some anchor_recurrence -> (
+            match
+              scalar_recurrence_scale_bias
+                (normalize_scalar_recurrence anchor_recurrence)
+            with
+            | Some
+                ( anchor_base,
+                  anchor_scale,
+                  anchor_bias )
+              when
+                loop_inv_expr_equal
+                  anchor_scale scalar_inv_one
+                && (match counted_iv_of_addrec anchor_base with
+                    | Some counted ->
+                        counted.phi_temp = anchor.phi_temp
+                    | None ->
+                        false) -> (
+                match
+                  ( common_addrec_seed_expr base,
+                    common_addrec_seed_expr anchor_base )
+                with
+                | Some base_seed, Some anchor_seed ->
+                    let direction = LveConst anchor.step in
+                    let base_per_anchor =
+                      normalize_loop_inv_expr
+                        (LveMul
+                           (base.addrec_step, direction))
+                    in
+                    let coeff =
+                      normalize_loop_inv_expr
+                        (LveMul (scale, base_per_anchor))
+                    in
+                    let anchor_effective_seed =
+                      normalize_loop_inv_expr
+                        (LveAdd (anchor_seed, anchor_bias))
+                    in
+                    let rebased_base_bias =
+                      normalize_loop_inv_expr
+                        (LveAdd
+                           ( base_seed,
+                             LveNeg
+                               (LveMul
+                                  ( base_per_anchor,
+                                    anchor_effective_seed )) ))
+                    in
+                    let rebased_bias =
+                      normalize_loop_inv_expr
+                        (LveAdd
+                           ( LveMul
+                               (scale, rebased_base_bias),
+                             bias ))
+                    in
+                    if
+                      Sys.getenv_opt
+                        "TOYC_DEBUG_RECURRENCE_REDUCTION"
+                      <> None
+                    then
+                      Printf.eprintf
+                        "recurrence-rebase-hit header=%s base=t%d anchor=t%d step=%s\n%!"
+                        header
+                        base.addrec_phi_temp
+                        anchor.phi_temp
+                        (string_of_loop_inv_expr
+                           base.addrec_step);
+                    Some
+                      (LinearAffine
+                         {
+                           iv = anchor;
+                           coeff =
+                             summary_expr_of_loop_inv_expr coeff;
+                           bias =
+                             summary_expr_of_loop_inv_expr
+                               rebased_bias;
+                         })
+                | _ ->
+                    None)
+            | Some _ | None ->
+                None)
+        | _ ->
+            None)
+    | Some _ ->
+        None
+  in
+
+  let linear_expr_of_scalar_recurrence point recurrence =
     match normalize_scalar_recurrence recurrence with
     | ScalarConst value ->
         Some
@@ -10584,21 +10859,25 @@ let collect_counted_reductions
                 (normalize_loop_inv_expr expr)))
     | (ScalarAddRec _ | ScalarAffine _) as recurrence -> (
         match scalar_recurrence_scale_bias recurrence with
-        | None -> None
-        | Some (base, coeff, bias) ->
-            Option.map
-              (fun iv ->
-                LinearAffine
-                  {
-                    iv;
-                    coeff =
-                      summary_expr_of_loop_inv_expr
-                        (normalize_loop_inv_expr coeff);
-                    bias =
-                      summary_expr_of_loop_inv_expr
-                        (normalize_loop_inv_expr bias);
-                  })
-              (counted_iv_of_addrec base))
+        | None ->
+            None
+        | Some (base, coeff, bias) -> (
+            match counted_iv_of_addrec base with
+            | Some iv ->
+                Some
+                  (LinearAffine
+                     {
+                       iv;
+                       coeff =
+                         summary_expr_of_loop_inv_expr
+                           (normalize_loop_inv_expr coeff);
+                       bias =
+                         summary_expr_of_loop_inv_expr
+                           (normalize_loop_inv_expr bias);
+                     })
+            | None ->
+                rebase_scalar_recurrence_to_anchor
+                  point recurrence))
   in
   let reduction_step_of_scalar_recurrence recurrence =
     match normalize_scalar_recurrence recurrence with
@@ -10665,7 +10944,143 @@ let collect_counted_reductions
     let _, point = recurrence_point_before_prefix block in
     Option.bind
       (recurrence_at recurrence_facts point operand)
-      linear_expr_of_scalar_recurrence
+      (linear_expr_of_scalar_recurrence point)
+  in
+
+  (* Compose a freshly materialized inner-loop scalar transfer bottom-up.
+
+     First reuse the mature polynomial parser (which now understands
+     point-local invariant multi-def temps).  If one leaf is a symbolic AddRec,
+     query it through [RecurrenceFacts], rebase it to the unique unit-step
+     counted IV, then continue Add/Sub/Mul composition.
+
+     Definitions are followed only through the visible prefix of the current
+     block.  This prevents looking through a later update and changing the
+     recurrence phase. *)
+  let composed_linear_expr_at_point
+      (start_block : Cfg.block) start_older_chain start_operand =
+    let prefix_before_instr (block : Cfg.block) current_instr =
+      let rec physical acc = function
+        | [] -> None
+        | instr :: rest ->
+            if instr == current_instr then
+              Some (List.rev acc)
+            else
+              physical (instr :: acc) rest
+      in
+      let rec structural acc best = function
+        | [] -> best
+        | instr :: rest ->
+            let best =
+              if instr = current_instr then
+                Some (List.rev acc)
+              else
+                best
+            in
+            structural (instr :: acc) best rest
+      in
+      match physical [] block.body with
+      | Some prefix ->
+          prefix
+      | None ->
+          Option.value
+            (structural [] None block.body)
+            ~default:block.body
+    in
+    let rec analyze seen (block : Cfg.block) older_chain operand =
+      match
+        linear_expr_of_operand
+          ~allow_local_multidef:true
+          invariant_loaded_places
+          loop_defs
+          def_blocks
+          get_block
+          loop_stable_phis
+          multi_defs
+          def_instrs
+          ivs
+          block
+          operand
+      with
+      | Some _ as result ->
+          result
+      | None -> (
+          match semantic_linear_expr_at_point block operand with
+          | Some _ as result ->
+              result
+          | None -> (
+              match resolve_block_operand block operand with
+              | Tcg.Imm _ ->
+                  None
+              | Tcg.Temp temp ->
+                  if IntSet.mem temp seen then
+                    None
+                  else
+                    match last_def_of_temp block temp with
+                    | None -> (
+                        match
+                          dependent_affine_step_of_operand
+                            block older_chain
+                            (Tcg.Temp temp)
+                        with
+                        | Some (iv, coeff, bias) ->
+                            if
+                              Sys.getenv_opt
+                                "TOYC_DEBUG_RECURRENCE_REDUCTION"
+                              <> None
+                            then
+                              Printf.eprintf
+                                "recurrence-carrier-leaf-hit header=%s block=%s temp=t%d anchor=t%d\n%!"
+                                header block.label temp iv.phi_temp;
+                            Some
+                              (LinearAffine
+                                 { iv; coeff; bias })
+                        | None ->
+                            None)
+                    | Some instr ->
+                        let prefix =
+                          prefix_before_instr block instr
+                        in
+                        let point_block =
+                          { block with body = prefix }
+                        in
+                        let seen = IntSet.add temp seen in
+                        match instr with
+                        | Tcg.Move (_, src)
+                        | Tcg.Un (_, UPlus, src) ->
+                            analyze seen point_block older_chain src
+                        | Tcg.Un (_, UMinus, src) ->
+                            Option.map linear_expr_neg
+                              (analyze seen point_block older_chain src)
+                        | Tcg.Bin (_, Add, lhs, rhs) ->
+                            Option.bind
+                              (analyze seen point_block older_chain lhs)
+                              (fun lhs_expr ->
+                                Option.bind
+                                  (analyze seen point_block older_chain rhs)
+                                  (linear_expr_add lhs_expr))
+                        | Tcg.Bin (_, Sub, lhs, rhs) ->
+                            Option.bind
+                              (analyze seen point_block older_chain lhs)
+                              (fun lhs_expr ->
+                                Option.bind
+                                  (analyze seen point_block older_chain rhs)
+                                  (linear_expr_sub lhs_expr))
+                        | Tcg.Bin (_, Mul, lhs, rhs) ->
+                            Option.bind
+                              (analyze seen point_block older_chain lhs)
+                              (fun lhs_expr ->
+                                Option.bind
+                                  (analyze seen point_block older_chain rhs)
+                                  (linear_expr_mul lhs_expr))
+                        | Tcg.Un (_, UNot, _)
+                        | Tcg.Bin _
+                        | Tcg.Load _
+                        | Tcg.Store _
+                        | Tcg.Call _ ->
+                            None))
+    in
+    analyze IntSet.empty start_block start_older_chain start_operand
   in
   let semantic_reduction_step_at_point
       (block : Cfg.block) operand =
@@ -10850,29 +11265,6 @@ let collect_counted_reductions
                        include_updated = true;
                      }))
     in
-    let reduction_step_at_point block operand =
-      match direct_iv_progression_step operand with
-      | Some _ as step -> step
-      | None -> (
-          match
-            reduction_step_of_operand
-              ~allow_local_multidef:true
-              invariant_loaded_places
-              loop_defs
-              def_blocks
-              get_block
-              loop_stable_phis
-              multi_defs
-              def_instrs
-              ivs
-              block
-              operand
-          with
-          | Some _ as step -> step
-          | None ->
-              semantic_reduction_step_at_point
-                block operand)
-    in
     (* Recognize a reduction whose self term is buried under a
        left-/right-associated Add tree.
 
@@ -10926,6 +11318,52 @@ let collect_counted_reductions
                    })
           else
             Some (ReductionCubic { iv; choose3; triangle; coeff; bias })
+    in
+    let reduction_step_at_point block older_chain operand =
+      match direct_iv_progression_step operand with
+      | Some _ as step ->
+          step
+      | None -> (
+          match
+            reduction_step_of_operand
+              ~allow_local_multidef:true
+              invariant_loaded_places
+              loop_defs
+              def_blocks
+              get_block
+              loop_stable_phis
+              multi_defs
+              def_instrs
+              ivs
+              block
+              operand
+          with
+          | Some _ as step ->
+              step
+          | None -> (
+              match
+                composed_linear_expr_at_point
+                  block older_chain operand
+              with
+              | Some expr -> (
+                  match reduction_step_of_linear_expr expr with
+                  | Some _ as result ->
+                      if
+                        Sys.getenv_opt
+                          "TOYC_DEBUG_RECURRENCE_REDUCTION"
+                        <> None
+                      then
+                        Printf.eprintf
+                          "recurrence-reduction-hit kind=nested-addrec-compose header=%s block=%s operand=%s\n%!"
+                          header block.label
+                          (string_of_operand operand);
+                      result
+                  | None ->
+                      semantic_reduction_step_at_point
+                        block operand)
+              | None ->
+                  semantic_reduction_step_at_point
+                    block operand))
     in
     let generic_phi_delta_step_of_parts
         op block older_chain lhs rhs =
@@ -11528,7 +11966,7 @@ let collect_counted_reductions
                    (string_of_operand rhs)
                    (debug_operand_def rhs))
                 (string_of_temps self_temps);
-            match reduction_step_at_point point_block rhs with
+            match reduction_step_at_point point_block older_chain rhs with
             | Some step ->
                 Some
                   {
@@ -11609,7 +12047,7 @@ let collect_counted_reductions
                    (string_of_operand lhs)
                    (debug_operand_def lhs))
                 (string_of_temps self_temps);
-            match reduction_step_at_point point_block lhs with
+            match reduction_step_at_point point_block older_chain lhs with
             | Some step ->
                 Some
                   {
@@ -11718,7 +12156,7 @@ let collect_counted_reductions
                    (string_of_operand rhs)
                    (debug_operand_def rhs))
                 (string_of_temps self_temps);
-            match reduction_step_at_point point_block rhs with
+            match reduction_step_at_point point_block older_chain rhs with
             | Some step ->
                 Some
                   {
