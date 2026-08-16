@@ -20374,161 +20374,16 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                   analyze_temp_defs_of_blocks
                     ~loop f.temp_count current_blocks_snapshot
                 in
-                let base_runtime_recurrence_analysis =
+                let runtime_recurrence_analysis =
+                  (* Recurrence facts are rooted at the natural loop entry:
+                     that is where outside seeds and backedges define the
+                     AddRec.  The control candidate finder itself scans the
+                     whole loop and queries recurrence_at at the compare
+                     block's program point, so the latch/control label must
+                     not replace the recurrence domain header. *)
                   build_loop_recurrence_analysis
                     header loop get_block
                     loop_defs multi_defs def_instrs
-                in
-                let rotated_direct_addrecs =
-                  let existing_temps =
-                    List.fold_left
-                      (fun temps (addrec : loop_addrec) ->
-                        IntSet.add
-                          addrec.addrec_phi_temp temps)
-                      IntSet.empty
-                      base_runtime_recurrence_analysis
-                        .loop_recurrence_addrecs
-                  in
-                  let internal_preds =
-                    header_block.preds
-                    |> List.filter
-                         (fun pred ->
-                           LabelSet.mem pred loop)
-                  in
-                  let step_of_direct_update = function
-                    | Tcg.Bin
-                        ( dst,
-                          Add,
-                          Tcg.Temp lhs,
-                          rhs )
-                      when dst = lhs ->
-                        Option.map
-                          normalize_loop_inv_expr
-                          (lve_invariant_expr_of_operand
-                             loop_defs multi_defs
-                             def_instrs rhs)
-                    | Tcg.Bin
-                        ( dst,
-                          Add,
-                          lhs,
-                          Tcg.Temp rhs )
-                      when dst = rhs ->
-                        Option.map
-                          normalize_loop_inv_expr
-                          (lve_invariant_expr_of_operand
-                             loop_defs multi_defs
-                             def_instrs lhs)
-                    | Tcg.Bin
-                        ( dst,
-                          Sub,
-                          Tcg.Temp lhs,
-                          rhs )
-                      when dst = lhs ->
-                        Option.map
-                          (fun step ->
-                            normalize_loop_inv_expr
-                              (LveNeg step))
-                          (lve_invariant_expr_of_operand
-                             loop_defs multi_defs
-                             def_instrs rhs)
-                    | Tcg.Move _
-                    | Tcg.Un _
-                    | Tcg.Bin _
-                    | Tcg.Load _
-                    | Tcg.Store _
-                    | Tcg.Call _ ->
-                        None
-                  in
-                  let candidates =
-                    body_instrs
-                    |> List.filter_map
-                         (fun instr ->
-                           match defs_temp instr with
-                           | Some dst
-                             when
-                               not
-                                 (IntSet.mem
-                                    dst existing_temps) ->
-                               Option.map
-                                 (fun step ->
-                                   (dst, step))
-                                 (step_of_direct_update
-                                    instr)
-                           | Some _
-                           | None ->
-                               None)
-                  in
-                  let grouped =
-                    List.fold_left
-                      (fun table (dst, step) ->
-                        let old =
-                          Option.value
-                            ~default:[]
-                            (IntMap.find_opt dst table)
-                        in
-                        IntMap.add
-                          dst (step :: old) table)
-                      IntMap.empty
-                      candidates
-                  in
-                  IntMap.bindings grouped
-                  |> List.filter_map
-                       (fun (dst, steps) ->
-                         match steps with
-                         | [ step ]
-                           when internal_preds <> [] ->
-                             let addrec =
-                               {
-                                 addrec_phi_temp = dst;
-                                 addrec_outside_inputs =
-                                   [ ( preheader_label,
-                                       Tcg.Temp dst ) ];
-                                 addrec_backedge_preds =
-                                   internal_preds;
-                                 addrec_step = step;
-                               }
-                             in
-                             if
-                               Sys.getenv_opt
-                                 "TOYC_DEBUG_SCEV_UNIFIED"
-                               <> None
-                             then
-                               Printf.eprintf
-                                 "scev-rotated-addrec header=%s control-point=%s phi=t%d step=%s backedges=%d\n%!"
-                                 header
-                                 recurrence_header
-                                 dst
-                                 (string_of_loop_inv_expr
-                                    step)
-                                 (List.length
-                                    internal_preds);
-                             Some addrec
-                         | [ _ ]
-                         | []
-                         | _ :: _ :: _ ->
-                             None)
-                in
-                let runtime_recurrence_analysis =
-                  if rotated_direct_addrecs = [] then
-                    base_runtime_recurrence_analysis
-                  else
-                    let combined_addrecs =
-                      base_runtime_recurrence_analysis
-                        .loop_recurrence_addrecs
-                      @ rotated_direct_addrecs
-                    in
-                    {
-                      base_runtime_recurrence_analysis
-                      with
-                      loop_recurrence_addrecs =
-                        combined_addrecs;
-                      loop_recurrence_facts =
-                        build_recurrence_facts
-                          header loop get_block
-                          loop_defs multi_defs
-                          def_instrs
-                          combined_addrecs;
-                    }
                 in
                 let runtime_control_candidate =
                   find_recurrence_loop_control_candidate
@@ -20540,37 +20395,11 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                    <> None
                  then
                    Printf.eprintf
-                     "symbolic-trip-recurrence-domain header=%s control-point=%s addrecs=%d rotated=%d\n%!"
+                     "symbolic-trip-recurrence-domain header=%s control-point=%s addrecs=%d\n%!"
                      header recurrence_header
                      (List.length
                         runtime_recurrence_analysis
-                          .loop_recurrence_addrecs)
-                     (List.length rotated_direct_addrecs));
-                (if
-                   Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
-                   <> None
-                 then
-                   List.iter
-                     (fun (addrec : loop_addrec) ->
-                       Printf.eprintf
-                         "scev-rotated-phase header=%s control-point=%s phi=t%d entry=%s control-exit=%s\n%!"
-                         header recurrence_header
-                         addrec.addrec_phi_temp
-                         (string_of_recurrence_phase_state
-                            (recurrence_phase_at
-                               runtime_recurrence_analysis
-                                 .loop_recurrence_facts
-                               addrec
-                               (RecurrenceBlockEntry
-                                  header)))
-                         (string_of_recurrence_phase_state
-                            (recurrence_phase_at
-                               runtime_recurrence_analysis
-                                 .loop_recurrence_facts
-                               addrec
-                               (RecurrenceBlockExit
-                                  recurrence_header))))
-                     rotated_direct_addrecs);
+                          .loop_recurrence_addrecs));
                 (if
                    Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
                    <> None
