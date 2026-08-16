@@ -10366,6 +10366,159 @@ let collect_counted_reductions
                   Some (anchor_iv, coeff, bias)
               | Some _ | None -> None)
   in
+  let rec summary_expr_of_loop_inv_expr = function
+    | LveConst value ->
+        SummaryOperand (Tcg.Imm value)
+    | LveOperand operand ->
+        SummaryOperand operand
+    | LveNeg inner ->
+        SummaryUn
+          (UMinus, summary_expr_of_loop_inv_expr inner)
+    | LveAdd (lhs, rhs) ->
+        SummaryBin
+          ( Add,
+            summary_expr_of_loop_inv_expr lhs,
+            summary_expr_of_loop_inv_expr rhs )
+    | LveMul (lhs, rhs) ->
+        SummaryBin
+          ( Mul,
+            summary_expr_of_loop_inv_expr lhs,
+            summary_expr_of_loop_inv_expr rhs )
+  in
+  let counted_iv_of_addrec (addrec : loop_addrec) =
+    List.find_opt
+      (fun (iv : basic_induction_var) ->
+        iv.origin = `Syntactic
+        && iv.phi_temp = addrec.addrec_phi_temp
+        && loop_inv_expr_equal
+             addrec.addrec_step
+             (LveConst iv.step))
+      ivs
+  in
+  let linear_expr_of_scalar_recurrence recurrence =
+    match normalize_scalar_recurrence recurrence with
+    | ScalarConst value ->
+        Some
+          (LinearInvariant
+             (SummaryOperand (Tcg.Imm (i32 value))))
+    | ScalarInvariant expr ->
+        Some
+          (LinearInvariant
+             (summary_expr_of_loop_inv_expr
+                (normalize_loop_inv_expr expr)))
+    | (ScalarAddRec _ | ScalarAffine _) as recurrence -> (
+        match scalar_recurrence_scale_bias recurrence with
+        | None -> None
+        | Some (base, coeff, bias) ->
+            Option.map
+              (fun iv ->
+                LinearAffine
+                  {
+                    iv;
+                    coeff =
+                      summary_expr_of_loop_inv_expr
+                        (normalize_loop_inv_expr coeff);
+                    bias =
+                      summary_expr_of_loop_inv_expr
+                        (normalize_loop_inv_expr bias);
+                  })
+              (counted_iv_of_addrec base))
+  in
+  let reduction_step_of_scalar_recurrence recurrence =
+    match normalize_scalar_recurrence recurrence with
+    | ScalarConst value ->
+        if i32 value = 0L then None
+        else
+          Some
+            (ReductionInvariant
+               (SummaryOperand (Tcg.Imm (i32 value))))
+    | ScalarInvariant expr ->
+        let expr = normalize_loop_inv_expr expr in
+        begin
+          match expr with
+          | LveConst value when i32 value = 0L ->
+              None
+          | LveConst _
+          | LveOperand _
+          | LveNeg _
+          | LveAdd _
+          | LveMul _ ->
+              Some
+                (ReductionInvariant
+                   (summary_expr_of_loop_inv_expr expr))
+        end
+    | (ScalarAddRec _ | ScalarAffine _) as recurrence -> (
+        match scalar_recurrence_scale_bias recurrence with
+        | None -> None
+        | Some (base, coeff, bias) ->
+            Option.map
+              (fun iv ->
+                let coeff =
+                  summary_expr_of_loop_inv_expr
+                    (normalize_loop_inv_expr coeff)
+                in
+                let bias =
+                  summary_expr_of_loop_inv_expr
+                    (normalize_loop_inv_expr bias)
+                in
+                if
+                  summary_expr_is_zero coeff
+                  && summary_expr_is_zero bias
+                then
+                  ReductionInvariant zero_summary_expr
+                else if summary_expr_is_zero coeff then
+                  ReductionInvariant bias
+                else
+                  ReductionAffine { iv; coeff; bias })
+              (counted_iv_of_addrec base))
+  in
+  let recurrence_point_before_prefix
+      (block : Cfg.block) =
+    let full_block : Cfg.block = get_block block.label in
+    let visible_count =
+      min
+        (List.length block.body)
+        (List.length full_block.body)
+    in
+    ( visible_count,
+      RecurrenceBeforeInstr
+        (block.label, visible_count) )
+  in
+  let semantic_linear_expr_at_point
+      (block : Cfg.block) operand =
+    let _, point = recurrence_point_before_prefix block in
+    Option.bind
+      (recurrence_at recurrence_facts point operand)
+      linear_expr_of_scalar_recurrence
+  in
+  let semantic_reduction_step_at_point
+      (block : Cfg.block) operand =
+    let visible_count, point =
+      recurrence_point_before_prefix block
+    in
+    match recurrence_at recurrence_facts point operand with
+    | None -> None
+    | Some recurrence -> (
+        match
+          reduction_step_of_scalar_recurrence recurrence
+        with
+        | None -> None
+        | Some (ReductionInvariant expr)
+          when summary_expr_is_zero expr ->
+            None
+        | Some _ as result ->
+            if
+              Sys.getenv_opt
+                "TOYC_DEBUG_RECURRENCE_REDUCTION"
+              <> None
+            then
+              Printf.eprintf
+                "recurrence-reduction-hit kind=direct header=%s block=%s point=%d operand=%s recurrence=%s\n%!"
+                header block.label visible_count
+                (string_of_operand operand)
+                (string_of_scalar_recurrence recurrence);
+            result)
+  in
   let reduction_update_of_temp_on_chain temp chain =
     let self_temps = self_temps_on_chain temp chain in
     let rec resolves_to_self block older_chain seen operand =
@@ -10494,159 +10647,6 @@ let collect_counted_reductions
        [resolve_counted_carrier_order] pass compares the real instruction
        positions of the reduction and IV update and selects old-vs-updated
        semantics safely. *)
-    let rec summary_expr_of_loop_inv_expr = function
-      | LveConst value ->
-          SummaryOperand (Tcg.Imm value)
-      | LveOperand operand ->
-          SummaryOperand operand
-      | LveNeg inner ->
-          SummaryUn
-            (UMinus, summary_expr_of_loop_inv_expr inner)
-      | LveAdd (lhs, rhs) ->
-          SummaryBin
-            ( Add,
-              summary_expr_of_loop_inv_expr lhs,
-              summary_expr_of_loop_inv_expr rhs )
-      | LveMul (lhs, rhs) ->
-          SummaryBin
-            ( Mul,
-              summary_expr_of_loop_inv_expr lhs,
-              summary_expr_of_loop_inv_expr rhs )
-    in
-    let counted_iv_of_addrec (addrec : loop_addrec) =
-      List.find_opt
-        (fun (iv : basic_induction_var) ->
-          iv.origin = `Syntactic
-          && iv.phi_temp = addrec.addrec_phi_temp
-          && loop_inv_expr_equal
-               addrec.addrec_step
-               (LveConst iv.step))
-        ivs
-    in
-    let linear_expr_of_scalar_recurrence recurrence =
-      match normalize_scalar_recurrence recurrence with
-      | ScalarConst value ->
-          Some
-            (LinearInvariant
-               (SummaryOperand (Tcg.Imm (i32 value))))
-      | ScalarInvariant expr ->
-          Some
-            (LinearInvariant
-               (summary_expr_of_loop_inv_expr
-                  (normalize_loop_inv_expr expr)))
-      | (ScalarAddRec _ | ScalarAffine _) as recurrence -> (
-          match scalar_recurrence_scale_bias recurrence with
-          | None -> None
-          | Some (base, coeff, bias) ->
-              Option.map
-                (fun iv ->
-                  LinearAffine
-                    {
-                      iv;
-                      coeff =
-                        summary_expr_of_loop_inv_expr
-                          (normalize_loop_inv_expr coeff);
-                      bias =
-                        summary_expr_of_loop_inv_expr
-                          (normalize_loop_inv_expr bias);
-                    })
-                (counted_iv_of_addrec base))
-    in
-    let reduction_step_of_scalar_recurrence recurrence =
-      match normalize_scalar_recurrence recurrence with
-      | ScalarConst value ->
-          if i32 value = 0L then None
-          else
-            Some
-              (ReductionInvariant
-                 (SummaryOperand (Tcg.Imm (i32 value))))
-      | ScalarInvariant expr ->
-          let expr = normalize_loop_inv_expr expr in
-          begin
-            match expr with
-            | LveConst value when i32 value = 0L ->
-                None
-            | LveConst _
-            | LveOperand _
-            | LveNeg _
-            | LveAdd _
-            | LveMul _ ->
-                Some
-                  (ReductionInvariant
-                     (summary_expr_of_loop_inv_expr expr))
-          end
-      | (ScalarAddRec _ | ScalarAffine _) as recurrence -> (
-          match scalar_recurrence_scale_bias recurrence with
-          | None -> None
-          | Some (base, coeff, bias) ->
-              Option.map
-                (fun iv ->
-                  let coeff =
-                    summary_expr_of_loop_inv_expr
-                      (normalize_loop_inv_expr coeff)
-                  in
-                  let bias =
-                    summary_expr_of_loop_inv_expr
-                      (normalize_loop_inv_expr bias)
-                  in
-                  if
-                    summary_expr_is_zero coeff
-                    && summary_expr_is_zero bias
-                  then
-                    ReductionInvariant zero_summary_expr
-                  else if summary_expr_is_zero coeff then
-                    ReductionInvariant bias
-                  else
-                    ReductionAffine { iv; coeff; bias })
-                (counted_iv_of_addrec base))
-    in
-    let recurrence_point_before_prefix
-        (block : Cfg.block) =
-      let full_block : Cfg.block = get_block block.label in
-      let visible_count =
-        min
-          (List.length block.body)
-          (List.length full_block.body)
-      in
-      ( visible_count,
-        RecurrenceBeforeInstr
-          (block.label, visible_count) )
-    in
-    let semantic_linear_expr_at_point
-        (block : Cfg.block) operand =
-      let _, point = recurrence_point_before_prefix block in
-      Option.bind
-        (recurrence_at recurrence_facts point operand)
-        linear_expr_of_scalar_recurrence
-    in
-    let semantic_reduction_step_at_point
-        (block : Cfg.block) operand =
-      let visible_count, point =
-        recurrence_point_before_prefix block
-      in
-      match recurrence_at recurrence_facts point operand with
-      | None -> None
-      | Some recurrence -> (
-          match
-            reduction_step_of_scalar_recurrence recurrence
-          with
-          | None -> None
-          | Some (ReductionInvariant expr)
-            when summary_expr_is_zero expr ->
-              None
-          | Some _ as result ->
-              if
-                Sys.getenv_opt
-                  "TOYC_DEBUG_RECURRENCE_REDUCTION"
-                <> None
-              then
-                Printf.eprintf
-                  "recurrence-reduction-hit kind=direct header=%s block=%s point=%d operand=%s recurrence=%s\n%!"
-                  header block.label visible_count
-                  (string_of_operand operand)
-                  (string_of_scalar_recurrence recurrence);
-              result)
-    in
     let direct_iv_progression_step = function
       | Tcg.Imm _ -> None
       | Tcg.Temp temp -> (
@@ -11856,6 +11856,367 @@ let collect_counted_reductions
     in
     covered = expected
   in
+  let last_def_index_of_temp
+      (block : Cfg.block) temp =
+    let result = ref None in
+    List.iteri
+      (fun index instr ->
+        match defs_temp instr with
+        | Some dst when dst = temp ->
+            result := Some (index, instr)
+        | Some _ | None -> ())
+      block.body;
+    !result
+  in
+
+  (* Analyze one logical backedge next-value as
+
+       self_coeff * phi + delta
+
+     at the actual program point where the edge-copy reads its source.
+     [delta] is a ScalarRecurrence, so uses of another induction variable
+     retain their program-point phase through [recurrence_at].
+
+     Multiplication is accepted only when neither operand contains [phi].
+     This deliberately keeps the target recurrence additive:
+       phi + delta
+     rather than trying to solve multiplicative recurrences. *)
+  let scalar_phi_delta_case
+      phi_temp
+      consumer_temp
+      (case : logical_phi_backedge_case) =
+    let combine_add
+        (lhs_coeff, lhs_delta)
+        (rhs_coeff, rhs_delta) =
+      Option.map
+        (fun delta ->
+          (lhs_coeff + rhs_coeff, delta))
+        (scalar_recurrence_add lhs_delta rhs_delta)
+    in
+    let combine_sub
+        (lhs_coeff, lhs_delta)
+        (rhs_coeff, rhs_delta) =
+      Option.map
+        (fun delta ->
+          (lhs_coeff - rhs_coeff, delta))
+        (scalar_recurrence_sub lhs_delta rhs_delta)
+    in
+    let negate (coeff, delta) =
+      (-coeff, scalar_recurrence_neg delta)
+    in
+
+    let rec analyze_operand
+        chain point seen operand =
+      match operand with
+      | Tcg.Temp temp when temp = phi_temp ->
+          Some (1, ScalarConst 0L)
+      | Tcg.Imm value ->
+          Some (0, ScalarConst value)
+      | Tcg.Temp temp as operand ->
+          if IntSet.mem temp seen then None
+          else
+            (* First ask the phase-aware recurrence database.  This handles
+               proven IVs and their unique affine derived values without
+               recursively reinterpreting them relative to the target phi. *)
+            begin
+              match recurrence_at recurrence_facts point operand with
+              | Some recurrence ->
+                  Some (0, recurrence)
+              | None ->
+                  let seen = IntSet.add temp seen in
+                  begin
+                    match
+                      last_def_of_temp_on_chain_with_block
+                        chain temp
+                    with
+                    | Some (def_block, instr, older_chain) -> (
+                        match
+                          last_def_index_of_temp
+                            def_block temp
+                        with
+                        | Some (def_index, _)
+                          when
+                            def_block.label
+                            <> recurrence_point_label point
+                            ||
+                            (match
+                               recurrence_point_visible_count
+                                 recurrence_facts point
+                             with
+                             | Some visible_count ->
+                                 def_index < visible_count
+                             | None ->
+                                 false) ->
+                            analyze_instr
+                              (def_block :: older_chain)
+                              (RecurrenceBeforeInstr
+                                 (def_block.label,
+                                  def_index))
+                              seen instr
+                        | Some _ | None ->
+                            None)
+                    | None ->
+                        None
+                  end
+            end
+
+    and analyze_instr chain point seen = function
+      | Tcg.Move (_, src)
+      | Tcg.Un (_, UPlus, src) ->
+          analyze_operand chain point seen src
+      | Tcg.Un (_, UMinus, src) ->
+          Option.map negate
+            (analyze_operand chain point seen src)
+      | Tcg.Bin (_, Add, lhs, rhs) ->
+          Option.bind
+            (analyze_operand chain point seen lhs)
+            (fun lhs ->
+              Option.bind
+                (analyze_operand chain point seen rhs)
+                (combine_add lhs))
+      | Tcg.Bin (_, Sub, lhs, rhs) ->
+          Option.bind
+            (analyze_operand chain point seen lhs)
+            (fun lhs ->
+              Option.bind
+                (analyze_operand chain point seen rhs)
+                (combine_sub lhs))
+      | Tcg.Bin (_, Mul, lhs, rhs) ->
+          Option.bind
+            (analyze_operand chain point seen lhs)
+            (fun (lhs_coeff, lhs_delta) ->
+              Option.bind
+                (analyze_operand chain point seen rhs)
+                (fun (rhs_coeff, rhs_delta) ->
+                  if lhs_coeff <> 0 || rhs_coeff <> 0 then
+                    None
+                  else
+                    Option.map
+                      (fun delta -> (0, delta))
+                      (scalar_recurrence_mul
+                         lhs_delta rhs_delta)))
+      | Tcg.Un (_, UNot, _)
+      | Tcg.Bin
+          (_,
+           (Div | Mod | Lt | Le | Gt | Ge | Eq | Ne
+           | LAnd | LOr),
+           _, _)
+      | Tcg.Load _
+      | Tcg.Store _
+      | Tcg.Call _ ->
+          None
+    in
+
+    let def_block : Cfg.block =
+      get_block case.logical_def_label
+    in
+    match
+      last_def_index_of_temp
+        def_block consumer_temp
+    with
+    | Some
+        (copy_index,
+         Tcg.Move (dst, source))
+      when
+        dst = consumer_temp
+        && source = case.logical_source ->
+        let point =
+          RecurrenceBeforeInstr
+            (def_block.label, copy_index)
+        in
+        Option.bind
+          (analyze_operand
+             case.logical_chain
+             point IntSet.empty
+             case.logical_source)
+          (fun (self_coeff, delta) ->
+            if self_coeff = 1 then
+              Some
+                (normalize_scalar_recurrence delta)
+            else
+              None)
+    | Some _ | None ->
+        None
+  in
+
+  (* A logical edge-copy may read a merge temp whose definitions live on
+     several side paths.  If the direct scalar-delta analysis cannot resolve
+     that multi-defined source, recursively expand the reaching Move cases and
+     analyze each value path independently. *)
+  let scalar_phi_delta_cases
+      phi_temp
+      (case : logical_phi_backedge_case) =
+    let rec expand
+        seen_merge_temps
+        consumer_temp
+        def_label
+        chain
+        source =
+      let synthetic_case =
+        {
+          logical_header_pred =
+            case.logical_header_pred;
+          logical_def_label = def_label;
+          logical_source = source;
+          logical_chain = chain;
+        }
+      in
+      match
+        scalar_phi_delta_case
+          phi_temp consumer_temp
+          synthetic_case
+      with
+      | Some delta ->
+          Some [ delta ]
+      | None -> (
+          match source with
+          | Tcg.Temp temp
+            when
+              temp <> phi_temp
+              && IntSet.mem temp multi_defs
+              && not
+                   (IntSet.mem temp
+                      seen_merge_temps) ->
+              let block : Cfg.block =
+                get_block def_label
+              in
+              if block.preds = [] then None
+              else
+                let seen_merge_temps =
+                  IntSet.add temp
+                    seen_merge_temps
+                in
+                let reached_per_pred =
+                  List.map
+                    (fun pred ->
+                      reaching_move_cases_on_edge
+                        get_block
+                        ~stop_label:def_label
+                        ~pred_label:pred
+                        temp)
+                    block.preds
+                in
+                if
+                  List.exists Option.is_none
+                    reached_per_pred
+                then
+                  None
+                else
+                  let reached =
+                    reached_per_pred
+                    |> List.concat_map
+                         (Option.value
+                            ~default:[])
+                    |> dedup_reaching_move_cases
+                  in
+                  if reached = [] then None
+                  else
+                    let expanded =
+                      List.map
+                        (fun reached_case ->
+                          expand
+                            seen_merge_temps
+                            temp
+                            reached_case
+                              .reaching_def_label
+                            reached_case
+                              .reaching_chain
+                            reached_case
+                              .reaching_source)
+                        reached
+                    in
+                    if
+                      List.exists Option.is_none
+                        expanded
+                    then
+                      None
+                    else
+                      Some
+                        (expanded
+                         |> List.concat_map
+                              (Option.value
+                                 ~default:[]))
+          | Tcg.Imm _
+          | Tcg.Temp _ ->
+              None)
+    in
+    expand IntSet.empty phi_temp
+      case.logical_def_label
+      case.logical_chain
+      case.logical_source
+  in
+
+  let scalar_delta_reduction_update temp =
+    match logical_phi_for_temp temp with
+    | None -> None
+    | Some phi ->
+        if
+          not (logical_phi_covers_backedges phi)
+          || phi.logical_backedge_cases = []
+        then
+          None
+        else
+          let recovered =
+            List.map
+              (fun case ->
+                scalar_phi_delta_cases
+                  temp case)
+              phi.logical_backedge_cases
+          in
+          if
+            List.exists Option.is_none recovered
+          then
+            None
+          else
+            let deltas =
+              recovered
+              |> List.concat_map
+                   (Option.value ~default:[])
+            in
+            match deltas with
+            | [] -> None
+            | first :: rest
+              when
+                List.for_all
+                  (scalar_recurrence_equal first)
+                  rest -> (
+                match
+                  reduction_step_of_scalar_recurrence
+                    first
+                with
+                | None -> None
+                | Some
+                    (ReductionInvariant expr)
+                  when
+                    summary_expr_is_zero expr ->
+                    None
+                | Some step ->
+                    if
+                      Sys.getenv_opt
+                        "TOYC_DEBUG_RECURRENCE_REDUCTION"
+                      <> None
+                    then
+                      Printf.eprintf
+                        "recurrence-reduction-hit kind=scalar-backedge-delta header=%s temp=t%d logical-cases=%d value-paths=%d delta=%s\n%!"
+                        header temp
+                        (List.length
+                           phi.logical_backedge_cases)
+                        (List.length deltas)
+                        (string_of_scalar_recurrence
+                           first);
+                    Some
+                      {
+                        target =
+                          ReductionTempTarget temp;
+                        subtract = false;
+                        step;
+                        carrier_temp = None;
+                        alias_temps = [];
+                      })
+            | _ ->
+                None
+  in
+
   let logical_phi_reduction_update temp =
     match logical_phi_for_temp temp with
     | None -> None
@@ -11955,9 +12316,17 @@ let collect_counted_reductions
              | Some update ->
                  update :: acc
              | None -> (
-                 match logical_phi_reduction_update temp with
-                 | Some update -> update :: acc
-                 | None -> acc))
+                 match scalar_delta_reduction_update temp with
+                 | Some update ->
+                     update :: acc
+                 | None -> (
+                     match
+                       logical_phi_reduction_update temp
+                     with
+                     | Some update ->
+                         update :: acc
+                     | None ->
+                         acc)))
          live_temps []
     in
     let place_reductions =
