@@ -15525,15 +15525,25 @@ type lcssa_lite_liveout = {
   lcssa_single_exit_materializable : bool;
 }
 
+type lcssa_place_write_origin =
+  | LcssaPlaceExclusive
+  | LcssaPlaceChildOnly
+  | LcssaPlaceMixed
+
 type lcssa_lite_place_liveout = {
   lcssa_place_loop_header : Tcg.label;
   lcssa_place_loop_parent : Tcg.label option;
   lcssa_place_loop_depth : int;
   lcssa_place : Tcg.place;
   lcssa_store_blocks : Tcg.label list;
+  lcssa_exclusive_store_blocks : Tcg.label list;
+  lcssa_child_store_headers : Tcg.label list;
+  lcssa_place_write_origin : lcssa_place_write_origin;
   lcssa_place_live_exit_targets : Tcg.label list;
   lcssa_outside_load_blocks : Tcg.label list;
   lcssa_single_exit_summary_candidate : bool;
+  lcssa_direct_effect_candidate : bool;
+  lcssa_child_effect_candidate : bool;
 }
 
 type lcssa_lite_loop_info = {
@@ -15553,6 +15563,8 @@ type lcssa_lite_report = {
   lcssa_total_place_liveouts : int;
   lcssa_single_exit_temp_materializable_count : int;
   lcssa_single_exit_place_summary_count : int;
+  lcssa_direct_place_effect_count : int;
+  lcssa_child_place_effect_count : int;
 }
 
 let temps_defined_in_loop loop get_block =
@@ -15661,6 +15673,29 @@ let lcssa_string_of_place = function
   | Tcg.Global label ->
       Printf.sprintf "global:%s" label
 
+let lcssa_string_of_place_write_origin = function
+  | LcssaPlaceExclusive -> "exclusive"
+  | LcssaPlaceChildOnly -> "child-only"
+  | LcssaPlaceMixed -> "mixed"
+
+let child_loops_storing_place
+    (forest : loop_forest)
+    (info : loop_forest_info)
+    place =
+  info.loop_info_children
+  |> List.filter
+       (fun child_header ->
+         let child_loop =
+           table_find_or_empty
+             forest.loop_forest_loops
+             child_header LabelSet.empty
+         in
+         place_store_blocks_in_loop
+           place child_loop
+           (get_block_exn forest.loop_forest_block_map)
+         <> [])
+  |> List.sort_uniq String.compare
+
 let dedicated_exit_targets_for_loop
     (forest : loop_forest)
     (info : loop_forest_info) =
@@ -15694,6 +15729,8 @@ let build_lcssa_lite_report
   let total_place_liveouts = ref 0 in
   let temp_materializable = ref 0 in
   let place_summary_candidates = ref 0 in
+  let direct_place_effects = ref 0 in
+  let child_place_effects = ref 0 in
   List.iter
     (fun header ->
       match Hashtbl.find_opt forest.loop_forest_infos header with
@@ -15778,6 +15815,51 @@ let build_lcssa_lite_report
                 in
                 if live_exit_targets = [] then acc
                 else
+                  let all_store_blocks =
+                    place_store_blocks_in_loop
+                      place loop get_block
+                  in
+                  let exclusive_store_blocks =
+                    place_store_blocks_in_loop
+                      place
+                      loop_info.loop_info_exclusive_blocks
+                      get_block
+                  in
+                  let child_store_headers =
+                    child_loops_storing_place
+                      forest loop_info place
+                  in
+                  let write_origin =
+                    match
+                      exclusive_store_blocks,
+                      child_store_headers
+                    with
+                    | _ :: _, [] ->
+                        LcssaPlaceExclusive
+                    | [], _ :: _ ->
+                        LcssaPlaceChildOnly
+                    | _ :: _, _ :: _ ->
+                        LcssaPlaceMixed
+                    | [], [] ->
+                        (* [place] came from [stored_places], so this should
+                           only be reachable if loop metadata is stale.
+                           Treat it conservatively as mixed/unknown rather
+                           than enabling any direct summary. *)
+                        LcssaPlaceMixed
+                  in
+                  let structural_summary_candidate =
+                    dedicated_all
+                    && single_exit
+                    && List.length live_exit_targets = 1
+                  in
+                  let direct_effect_candidate =
+                    structural_summary_candidate
+                    && write_origin = LcssaPlaceExclusive
+                  in
+                  let child_effect_candidate =
+                    structural_summary_candidate
+                    && write_origin = LcssaPlaceChildOnly
+                  in
                   let item =
                     {
                       lcssa_place_loop_header = header;
@@ -15786,23 +15868,33 @@ let build_lcssa_lite_report
                       lcssa_place_loop_depth =
                         loop_info.loop_info_depth;
                       lcssa_place = place;
-                      lcssa_store_blocks =
-                        place_store_blocks_in_loop
-                          place loop get_block;
+                      lcssa_store_blocks = all_store_blocks;
+                      lcssa_exclusive_store_blocks =
+                        exclusive_store_blocks;
+                      lcssa_child_store_headers =
+                        child_store_headers;
+                      lcssa_place_write_origin =
+                        write_origin;
                       lcssa_place_live_exit_targets =
                         live_exit_targets;
                       lcssa_outside_load_blocks =
                         place_outside_load_blocks
                           place loop f;
                       lcssa_single_exit_summary_candidate =
-                        dedicated_all
-                        && single_exit
-                        && List.length live_exit_targets = 1;
+                        structural_summary_candidate;
+                      lcssa_direct_effect_candidate =
+                        direct_effect_candidate;
+                      lcssa_child_effect_candidate =
+                        child_effect_candidate;
                     }
                   in
                   incr total_place_liveouts;
                   if item.lcssa_single_exit_summary_candidate
                   then incr place_summary_candidates;
+                  if item.lcssa_direct_effect_candidate
+                  then incr direct_place_effects;
+                  if item.lcssa_child_effect_candidate
+                  then incr child_place_effects;
                   item :: acc)
               stored_places []
             |> List.rev
@@ -15831,6 +15923,10 @@ let build_lcssa_lite_report
       !temp_materializable;
     lcssa_single_exit_place_summary_count =
       !place_summary_candidates;
+    lcssa_direct_place_effect_count =
+      !direct_place_effects;
+    lcssa_child_place_effect_count =
+      !child_place_effects;
   }
 
 let debug_lcssa_lite_report
@@ -15873,25 +15969,35 @@ let debug_lcssa_lite_report
             List.iter
               (fun item ->
                 Printf.eprintf
-                  "lcssa-lite-place-liveout func=%s header=%s depth=%d place=%s stores={%s} live-exits={%s} outside-loads={%s} summary-candidate=%b\n%!"
+                  "lcssa-lite-place-liveout func=%s header=%s depth=%d place=%s origin=%s stores={%s} exclusive-stores={%s} child-writers={%s} live-exits={%s} outside-loads={%s} summary-candidate=%b direct-effect=%b child-effect=%b\n%!"
                   f.name
                   item.lcssa_place_loop_header
                   item.lcssa_place_loop_depth
                   (lcssa_string_of_place item.lcssa_place)
+                  (lcssa_string_of_place_write_origin
+                     item.lcssa_place_write_origin)
                   (String.concat "," item.lcssa_store_blocks)
+                  (String.concat ","
+                     item.lcssa_exclusive_store_blocks)
+                  (String.concat ","
+                     item.lcssa_child_store_headers)
                   (String.concat "," item.lcssa_place_live_exit_targets)
                   (String.concat "," item.lcssa_outside_load_blocks)
-                  item.lcssa_single_exit_summary_candidate)
+                  item.lcssa_single_exit_summary_candidate
+                  item.lcssa_direct_effect_candidate
+                  item.lcssa_child_effect_candidate)
               info.lcssa_info_place_liveouts)
       report.lcssa_forest.loop_forest_headers;
     Printf.eprintf
-      "lcssa-lite-summary func=%s loops=%d temp-liveouts=%d place-liveouts=%d temp-materializable=%d place-summary-candidates=%d\n%!"
+      "lcssa-lite-summary func=%s loops=%d temp-liveouts=%d place-liveouts=%d temp-materializable=%d place-summary-candidates=%d direct-place-effects=%d child-place-effects=%d\n%!"
       f.name
       (List.length report.lcssa_forest.loop_forest_headers)
       report.lcssa_total_temp_liveouts
       report.lcssa_total_place_liveouts
       report.lcssa_single_exit_temp_materializable_count
       report.lcssa_single_exit_place_summary_count
+      report.lcssa_direct_place_effect_count
+      report.lcssa_child_place_effect_count
   end
 
 let collect_direct_extractable_reductions loop get_block backedge_preds reductions =
