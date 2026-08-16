@@ -20574,6 +20574,9 @@ let fold_constant_calls_program
   in
   iterate 4 funcs
 
+let late_whole_program_constantization_enabled () =
+  Sys.getenv_opt "TOYC_ENABLE_LATE_CONST_WHOLE_PROGRAM" <> None
+
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
   last_liveness_cache := None;
@@ -20610,14 +20613,20 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   in
   let optimized_funcs = List.rev funcs_rev in
   let optimized_funcs =
-    fold_constant_calls_program
-      global_init summaries globals return_global_demands removable_calls
+    if late_whole_program_constantization_enabled () then
+      fold_constant_calls_program
+        global_init summaries globals return_global_demands removable_calls
+        optimized_funcs
+    else
       optimized_funcs
   in
   let optimized_funcs =
-    specialize_constant_params_program
-      source_funcs
-      global_init summaries globals return_global_demands removable_calls
+    if late_whole_program_constantization_enabled () then
+      specialize_constant_params_program
+        source_funcs
+        global_init summaries globals return_global_demands removable_calls
+        optimized_funcs
+    else
       optimized_funcs
   in
   let optimized_funcs =
