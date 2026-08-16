@@ -6579,6 +6579,72 @@ type summary_expr =
   | SummaryUn of unop * summary_expr
   | SummaryBin of binop * summary_expr * summary_expr
 
+type summary_semantic_atom =
+  | SummarySemanticLoopAtom of loop_inv_expr
+  | SummarySemanticPlaceAtom of Tcg.place
+  | SummarySemanticOpaqueAtom of summary_expr
+
+module SummarySemanticAtomOrd = struct
+  type t = summary_semantic_atom
+  let compare = Stdlib.compare
+end
+
+module SummarySemanticAtomMap = Map.Make (SummarySemanticAtomOrd)
+
+type summary_semantic_linear_form = {
+  summary_semantic_const : int64;
+  summary_semantic_atoms : int64 SummarySemanticAtomMap.t;
+}
+
+let summary_semantic_zero =
+  {
+    summary_semantic_const = 0L;
+    summary_semantic_atoms = SummarySemanticAtomMap.empty;
+  }
+
+let summary_semantic_add_atom atoms atom coeff =
+  let coeff = i32 coeff in
+  if coeff = 0L then atoms
+  else
+    let old =
+      Option.value ~default:0L
+        (SummarySemanticAtomMap.find_opt atom atoms)
+    in
+    let coeff = linear_i32_add old coeff in
+    if coeff = 0L then SummarySemanticAtomMap.remove atom atoms
+    else SummarySemanticAtomMap.add atom coeff atoms
+
+let summary_semantic_add lhs rhs =
+  {
+    summary_semantic_const =
+      linear_i32_add
+        lhs.summary_semantic_const
+        rhs.summary_semantic_const;
+    summary_semantic_atoms =
+      SummarySemanticAtomMap.fold
+        (fun atom coeff atoms ->
+          summary_semantic_add_atom atoms atom coeff)
+        rhs.summary_semantic_atoms
+        lhs.summary_semantic_atoms;
+  }
+
+let summary_semantic_scale factor form =
+  let factor = i32 factor in
+  if factor = 0L then summary_semantic_zero
+  else
+    {
+      summary_semantic_const =
+        linear_i32_mul factor form.summary_semantic_const;
+      summary_semantic_atoms =
+        SummarySemanticAtomMap.fold
+          (fun atom coeff atoms ->
+            summary_semantic_add_atom
+              atoms atom
+              (linear_i32_mul factor coeff))
+          form.summary_semantic_atoms
+          SummarySemanticAtomMap.empty;
+    }
+
 type counted_reduction_step =
   | ReductionInvariant of summary_expr
   | ReductionAffine of {
@@ -9929,6 +9995,19 @@ let collect_counted_reductions
         | Some (Tcg.Call _) -> "call"
         | None -> "none")
   in
+  let logical_phis =
+    recover_logical_loop_phis
+      header loop get_block multi_defs
+  in
+  let recurrence_addrecs =
+    analyze_loop_addrecs
+      header loop get_block loop_defs multi_defs def_instrs
+  in
+  let recurrence_facts =
+    build_recurrence_facts
+      header loop get_block loop_defs multi_defs def_instrs
+      recurrence_addrecs
+  in
   let header_block : Cfg.block = get_block header in
   let outside_preds = List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds in
   let backedge_preds = List.filter (fun pred -> LabelSet.mem pred loop) header_block.preds in
@@ -10415,6 +10494,159 @@ let collect_counted_reductions
        [resolve_counted_carrier_order] pass compares the real instruction
        positions of the reduction and IV update and selects old-vs-updated
        semantics safely. *)
+    let rec summary_expr_of_loop_inv_expr = function
+      | LveConst value ->
+          SummaryOperand (Tcg.Imm value)
+      | LveOperand operand ->
+          SummaryOperand operand
+      | LveNeg inner ->
+          SummaryUn
+            (UMinus, summary_expr_of_loop_inv_expr inner)
+      | LveAdd (lhs, rhs) ->
+          SummaryBin
+            ( Add,
+              summary_expr_of_loop_inv_expr lhs,
+              summary_expr_of_loop_inv_expr rhs )
+      | LveMul (lhs, rhs) ->
+          SummaryBin
+            ( Mul,
+              summary_expr_of_loop_inv_expr lhs,
+              summary_expr_of_loop_inv_expr rhs )
+    in
+    let counted_iv_of_addrec (addrec : loop_addrec) =
+      List.find_opt
+        (fun (iv : basic_induction_var) ->
+          iv.origin = `Syntactic
+          && iv.phi_temp = addrec.addrec_phi_temp
+          && loop_inv_expr_equal
+               addrec.addrec_step
+               (LveConst iv.step))
+        ivs
+    in
+    let linear_expr_of_scalar_recurrence recurrence =
+      match normalize_scalar_recurrence recurrence with
+      | ScalarConst value ->
+          Some
+            (LinearInvariant
+               (SummaryOperand (Tcg.Imm (i32 value))))
+      | ScalarInvariant expr ->
+          Some
+            (LinearInvariant
+               (summary_expr_of_loop_inv_expr
+                  (normalize_loop_inv_expr expr)))
+      | (ScalarAddRec _ | ScalarAffine _) as recurrence -> (
+          match scalar_recurrence_scale_bias recurrence with
+          | None -> None
+          | Some (base, coeff, bias) ->
+              Option.map
+                (fun iv ->
+                  LinearAffine
+                    {
+                      iv;
+                      coeff =
+                        summary_expr_of_loop_inv_expr
+                          (normalize_loop_inv_expr coeff);
+                      bias =
+                        summary_expr_of_loop_inv_expr
+                          (normalize_loop_inv_expr bias);
+                    })
+                (counted_iv_of_addrec base))
+    in
+    let reduction_step_of_scalar_recurrence recurrence =
+      match normalize_scalar_recurrence recurrence with
+      | ScalarConst value ->
+          if i32 value = 0L then None
+          else
+            Some
+              (ReductionInvariant
+                 (SummaryOperand (Tcg.Imm (i32 value))))
+      | ScalarInvariant expr ->
+          let expr = normalize_loop_inv_expr expr in
+          begin
+            match expr with
+            | LveConst value when i32 value = 0L ->
+                None
+            | LveConst _
+            | LveOperand _
+            | LveNeg _
+            | LveAdd _
+            | LveMul _ ->
+                Some
+                  (ReductionInvariant
+                     (summary_expr_of_loop_inv_expr expr))
+          end
+      | (ScalarAddRec _ | ScalarAffine _) as recurrence -> (
+          match scalar_recurrence_scale_bias recurrence with
+          | None -> None
+          | Some (base, coeff, bias) ->
+              Option.map
+                (fun iv ->
+                  let coeff =
+                    summary_expr_of_loop_inv_expr
+                      (normalize_loop_inv_expr coeff)
+                  in
+                  let bias =
+                    summary_expr_of_loop_inv_expr
+                      (normalize_loop_inv_expr bias)
+                  in
+                  if
+                    summary_expr_is_zero coeff
+                    && summary_expr_is_zero bias
+                  then
+                    ReductionInvariant zero_summary_expr
+                  else if summary_expr_is_zero coeff then
+                    ReductionInvariant bias
+                  else
+                    ReductionAffine { iv; coeff; bias })
+                (counted_iv_of_addrec base))
+    in
+    let recurrence_point_before_prefix
+        (block : Cfg.block) =
+      let full_block : Cfg.block = get_block block.label in
+      let visible_count =
+        min
+          (List.length block.body)
+          (List.length full_block.body)
+      in
+      ( visible_count,
+        RecurrenceBeforeInstr
+          (block.label, visible_count) )
+    in
+    let semantic_linear_expr_at_point
+        (block : Cfg.block) operand =
+      let _, point = recurrence_point_before_prefix block in
+      Option.bind
+        (recurrence_at recurrence_facts point operand)
+        linear_expr_of_scalar_recurrence
+    in
+    let semantic_reduction_step_at_point
+        (block : Cfg.block) operand =
+      let visible_count, point =
+        recurrence_point_before_prefix block
+      in
+      match recurrence_at recurrence_facts point operand with
+      | None -> None
+      | Some recurrence -> (
+          match
+            reduction_step_of_scalar_recurrence recurrence
+          with
+          | None -> None
+          | Some (ReductionInvariant expr)
+            when summary_expr_is_zero expr ->
+              None
+          | Some _ as result ->
+              if
+                Sys.getenv_opt
+                  "TOYC_DEBUG_RECURRENCE_REDUCTION"
+                <> None
+              then
+                Printf.eprintf
+                  "recurrence-reduction-hit kind=direct header=%s block=%s point=%d operand=%s recurrence=%s\n%!"
+                  header block.label visible_count
+                  (string_of_operand operand)
+                  (string_of_scalar_recurrence recurrence);
+              result)
+    in
     let direct_iv_progression_step = function
       | Tcg.Imm _ -> None
       | Tcg.Temp temp -> (
@@ -10445,19 +10677,25 @@ let collect_counted_reductions
     let reduction_step_at_point block operand =
       match direct_iv_progression_step operand with
       | Some _ as step -> step
-      | None ->
-          reduction_step_of_operand
-            ~allow_local_multidef:true
-            invariant_loaded_places
-            loop_defs
-            def_blocks
-            get_block
-            loop_stable_phis
-            multi_defs
-            def_instrs
-            ivs
-            block
-            operand
+      | None -> (
+          match
+            reduction_step_of_operand
+              ~allow_local_multidef:true
+              invariant_loaded_places
+              loop_defs
+              def_blocks
+              get_block
+              loop_stable_phis
+              multi_defs
+              def_instrs
+              ivs
+              block
+              operand
+          with
+          | Some _ as step -> step
+          | None ->
+              semantic_reduction_step_at_point
+                block operand)
     in
     (* Recognize a reduction whose self term is buried under a
        left-/right-associated Add tree.
@@ -10513,7 +10751,8 @@ let collect_counted_reductions
           else
             Some (ReductionCubic { iv; choose3; triangle; coeff; bias })
     in
-    let nested_additive_reduction_step block older_chain lhs rhs =
+    let generic_phi_delta_step_of_parts
+        op block older_chain lhs rhs =
       let prefix_before_instr (block : Cfg.block) current_instr =
         let rec physical acc = function
           | [] -> None
@@ -10548,7 +10787,10 @@ let collect_counted_reductions
               (fun expr -> Some expr)
               (linear_expr_add lhs rhs)
       in
-      let combine_parts lhs rhs =
+      let sub_deltas lhs rhs =
+        add_deltas lhs (Option.map linear_expr_neg rhs)
+      in
+      let combine_add lhs rhs =
         Option.bind lhs (fun (lhs_self, lhs_delta) ->
           Option.bind rhs (fun (rhs_self, rhs_delta) ->
             if lhs_self && rhs_self then None
@@ -10556,6 +10798,19 @@ let collect_counted_reductions
               Option.map
                 (fun delta -> (lhs_self || rhs_self, delta))
                 (add_deltas lhs_delta rhs_delta)))
+      in
+      let combine_sub lhs rhs =
+        Option.bind lhs (fun (lhs_self, lhs_delta) ->
+          Option.bind rhs (fun (rhs_self, rhs_delta) ->
+            (* [lhs - rhs] is a reduction only when the self term is on
+               the lhs with coefficient +1.  A self term on the rhs would
+               give coefficient -1 (or cancel another self), which is not
+               [next = self + delta]. *)
+            if rhs_self then None
+            else
+              Option.map
+                (fun delta -> (lhs_self, delta))
+                (sub_deltas lhs_delta rhs_delta)))
       in
       let rec split block older_chain seen operand =
         if resolves_to_self block older_chain IntSet.empty operand then
@@ -10576,53 +10831,119 @@ let collect_counted_reductions
           with
           | Some expr -> Some (false, Some expr)
           | None -> (
-              match operand with
-              | Tcg.Imm _ -> None
-              | Tcg.Temp current ->
-                  if IntSet.mem current seen then None
-                  else
-                    let continue def_block def_instr older_rest =
-                      let prefix =
-                        prefix_before_instr def_block def_instr
-                      in
-                      let point_block =
-                        { def_block with body = prefix }
-                      in
-                      let seen = IntSet.add current seen in
-                      match def_instr with
-                      | Tcg.Move (_, src)
-                      | Tcg.Un (_, UPlus, src) ->
-                          split point_block older_rest seen src
-                      | Tcg.Bin (_, Add, def_lhs, def_rhs) ->
-                          combine_parts
-                            (split point_block older_rest seen def_lhs)
-                            (split point_block older_rest seen def_rhs)
-                      | Tcg.Un _
-                      | Tcg.Bin _
-                      | Tcg.Load _
-                      | Tcg.Store _
-                      | Tcg.Call _ ->
-                          None
-                    in
-                    match last_def_of_temp block current with
-                    | Some def_instr ->
-                        continue block def_instr older_chain
-                    | None -> (
-                        match
-                          last_def_of_temp_on_chain_with_block
-                            older_chain current
-                        with
-                        | Some (older_block, def_instr, older_rest) ->
-                            continue older_block def_instr older_rest
-                        | None -> None))
+              match
+                semantic_linear_expr_at_point
+                  block operand
+              with
+              | Some expr ->
+                  if
+                    Sys.getenv_opt
+                      "TOYC_DEBUG_RECURRENCE_REDUCTION"
+                    <> None
+                  then
+                    Printf.eprintf
+                      "recurrence-reduction-hit kind=phi-delta-leaf header=%s block=%s operand=%s\n%!"
+                      header block.label
+                      (string_of_operand operand);
+                  Some (false, Some expr)
+              | None -> (
+                  match operand with
+                  | Tcg.Imm _ -> None
+                  | Tcg.Temp current ->
+                      if IntSet.mem current seen then None
+                      else
+                        let continue def_block def_instr older_rest =
+                          let prefix =
+                            prefix_before_instr def_block def_instr
+                          in
+                          let point_block =
+                            { def_block with body = prefix }
+                          in
+                          let seen = IntSet.add current seen in
+                          match def_instr with
+                          | Tcg.Move (_, src)
+                          | Tcg.Un (_, UPlus, src) ->
+                              split point_block older_rest seen src
+                          | Tcg.Un (_, UMinus, src) -> (
+                              match
+                                split point_block older_rest seen src
+                              with
+                              | Some (false, delta) ->
+                                  Some
+                                    ( false,
+                                      Option.map
+                                        linear_expr_neg delta )
+                              | Some (true, _)
+                              | None ->
+                                  None)
+                          | Tcg.Bin (_, Add, def_lhs, def_rhs) ->
+                              combine_add
+                                (split
+                                   point_block older_rest seen
+                                   def_lhs)
+                                (split
+                                   point_block older_rest seen
+                                   def_rhs)
+                          | Tcg.Bin (_, Sub, def_lhs, def_rhs) ->
+                              combine_sub
+                                (split
+                                   point_block older_rest seen
+                                   def_lhs)
+                                (split
+                                   point_block older_rest seen
+                                   def_rhs)
+                          | Tcg.Un (_, UNot, _)
+                          | Tcg.Bin _
+                          | Tcg.Load _
+                          | Tcg.Store _
+                          | Tcg.Call _ ->
+                              None
+                        in
+                        match last_def_of_temp block current with
+                        | Some def_instr ->
+                            continue block def_instr older_chain
+                        | None -> (
+                            match
+                              last_def_of_temp_on_chain_with_block
+                                older_chain current
+                            with
+                            | Some
+                                ( older_block,
+                                  def_instr,
+                                  older_rest ) ->
+                                continue
+                                  older_block def_instr older_rest
+                            | None -> None)))
       in
-      match
-        combine_parts
-          (split block older_chain IntSet.empty lhs)
-          (split block older_chain IntSet.empty rhs)
-      with
-      | Some (true, Some delta) ->
-          reduction_step_of_linear_expr delta
+      let combined =
+        match op with
+        | Add ->
+            combine_add
+              (split block older_chain IntSet.empty lhs)
+              (split block older_chain IntSet.empty rhs)
+        | Sub ->
+            combine_sub
+              (split block older_chain IntSet.empty lhs)
+              (split block older_chain IntSet.empty rhs)
+        | Mul | Div | Mod
+        | Lt | Le | Gt | Ge | Eq | Ne | LAnd | LOr ->
+            None
+      in
+      match combined with
+      | Some (true, Some delta) -> (
+          match reduction_step_of_linear_expr delta with
+          | Some _ as result ->
+              if
+                Sys.getenv_opt
+                  "TOYC_DEBUG_RECURRENCE_REDUCTION"
+                <> None
+              then
+                Printf.eprintf
+                  "recurrence-reduction-hit kind=phi-delta header=%s block=%s op=%s\n%!"
+                  header block.label
+                  (string_of_binop op);
+              result
+          | None -> None)
       | Some (true, None)
       | Some (false, _)
       | None ->
@@ -11184,13 +11505,13 @@ let collect_counted_reductions
                              point_block older_chain lhs))))
           else (
             match
-              nested_additive_reduction_step
-                point_block older_chain lhs rhs
+              generic_phi_delta_step_of_parts
+                Add point_block older_chain lhs rhs
             with
             | Some step ->
                 if debug_counted_local then
                   Printf.eprintf
-                    "counted-nested-add header=%s temp=%d recognized=true\n%!"
+                    "counted-phi-delta header=%s temp=%d op=add recognized=true\n%!"
                     header temp;
                 Some
                   {
@@ -11280,7 +11601,25 @@ let collect_counted_reductions
                         })
                       (carrier_progression_of_operand
                          point_block older_chain rhs)))
-          else None
+          else (
+            match
+              generic_phi_delta_step_of_parts
+                Sub point_block older_chain lhs rhs
+            with
+            | Some step ->
+                if debug_counted_local then
+                  Printf.eprintf
+                    "counted-phi-delta header=%s temp=%d op=sub recognized=true\n%!"
+                    header temp;
+                Some
+                  {
+                    target = ReductionTempTarget temp;
+                    subtract = false;
+                    step;
+                    carrier_temp = None;
+                    alias_temps = [];
+                  }
+            | None -> None)
       | Tcg.Un _
       | Tcg.Load _
       | Tcg.Store _
@@ -11324,6 +11663,237 @@ let collect_counted_reductions
         resolve_chain_operand chain (Tcg.Temp temp) = stored_value
     | None -> false
   in
+
+  let summary_semantic_atom_form atom =
+    {
+      summary_semantic_const = 0L;
+      summary_semantic_atoms =
+        SummarySemanticAtomMap.singleton atom 1L;
+    }
+  in
+  let summary_semantic_form_of_loop_inv_expr expr =
+    let form =
+      loop_inv_linear_form_of_expr
+        (normalize_loop_inv_expr expr)
+    in
+    {
+      summary_semantic_const = form.inv_linear_const;
+      summary_semantic_atoms =
+        LoopInvAtomMap.fold
+          (fun atom coeff atoms ->
+            summary_semantic_add_atom atoms
+              (SummarySemanticLoopAtom atom)
+              coeff)
+          form.inv_linear_atoms
+          SummarySemanticAtomMap.empty;
+    }
+  in
+  let rec summary_semantic_form_of_expr expr =
+    let opaque expr =
+      summary_semantic_atom_form
+        (SummarySemanticOpaqueAtom expr)
+    in
+    match expr with
+    | SummaryOperand (Tcg.Imm value) ->
+        {
+          summary_semantic_const = i32 value;
+          summary_semantic_atoms =
+            SummarySemanticAtomMap.empty;
+        }
+    | SummaryOperand operand -> (
+        match
+          lve_invariant_expr_of_operand
+            loop_defs multi_defs def_instrs operand
+        with
+        | Some invariant ->
+            summary_semantic_form_of_loop_inv_expr invariant
+        | None ->
+            opaque expr)
+    | SummaryPlace place ->
+        summary_semantic_atom_form
+          (SummarySemanticPlaceAtom place)
+    | SummaryUn (UPlus, inner) ->
+        summary_semantic_form_of_expr inner
+    | SummaryUn (UMinus, inner) ->
+        summary_semantic_scale (-1L)
+          (summary_semantic_form_of_expr inner)
+    | SummaryUn (UNot, _) ->
+        opaque expr
+    | SummaryBin (Add, lhs, rhs) ->
+        summary_semantic_add
+          (summary_semantic_form_of_expr lhs)
+          (summary_semantic_form_of_expr rhs)
+    | SummaryBin (Sub, lhs, rhs) ->
+        summary_semantic_add
+          (summary_semantic_form_of_expr lhs)
+          (summary_semantic_scale (-1L)
+             (summary_semantic_form_of_expr rhs))
+    | SummaryBin (Mul, lhs, rhs) ->
+        let lhs_form = summary_semantic_form_of_expr lhs in
+        let rhs_form = summary_semantic_form_of_expr rhs in
+        if
+          SummarySemanticAtomMap.is_empty
+            lhs_form.summary_semantic_atoms
+        then
+          summary_semantic_scale
+            lhs_form.summary_semantic_const rhs_form
+        else if
+          SummarySemanticAtomMap.is_empty
+            rhs_form.summary_semantic_atoms
+        then
+          summary_semantic_scale
+            rhs_form.summary_semantic_const lhs_form
+        else
+          let lhs, rhs =
+            if Stdlib.compare lhs rhs <= 0
+            then (lhs, rhs)
+            else (rhs, lhs)
+          in
+          opaque (SummaryBin (Mul, lhs, rhs))
+    | SummaryBin
+        ((Div | Mod | Lt | Le | Gt | Ge | Eq | Ne | LAnd | LOr),
+         _, _) ->
+        opaque expr
+  in
+  let summary_semantic_key expr =
+    let form = summary_semantic_form_of_expr expr in
+    ( i32 form.summary_semantic_const,
+      SummarySemanticAtomMap.bindings
+        form.summary_semantic_atoms )
+  in
+  let summary_expr_semantic_equal lhs rhs =
+    summary_semantic_key lhs = summary_semantic_key rhs
+  in
+  let basic_iv_semantic_equal
+      (lhs : basic_induction_var)
+      (rhs : basic_induction_var) =
+    lhs.phi_temp = rhs.phi_temp
+    && i32 lhs.step = i32 rhs.step
+  in
+  let counted_reduction_step_semantic_equal lhs rhs =
+    match (lhs, rhs) with
+    | ReductionInvariant lhs, ReductionInvariant rhs ->
+        summary_expr_semantic_equal lhs rhs
+    | ReductionAffine lhs, ReductionAffine rhs ->
+        basic_iv_semantic_equal lhs.iv rhs.iv
+        && summary_expr_semantic_equal lhs.coeff rhs.coeff
+        && summary_expr_semantic_equal lhs.bias rhs.bias
+    | ReductionQuadratic lhs, ReductionQuadratic rhs ->
+        basic_iv_semantic_equal lhs.iv rhs.iv
+        && summary_expr_semantic_equal lhs.quad rhs.quad
+        && summary_expr_semantic_equal lhs.triangle rhs.triangle
+        && summary_expr_semantic_equal lhs.coeff rhs.coeff
+        && summary_expr_semantic_equal lhs.bias rhs.bias
+    | ReductionCubic lhs, ReductionCubic rhs ->
+        basic_iv_semantic_equal lhs.iv rhs.iv
+        && summary_expr_semantic_equal lhs.choose3 rhs.choose3
+        && summary_expr_semantic_equal lhs.triangle rhs.triangle
+        && summary_expr_semantic_equal lhs.coeff rhs.coeff
+        && summary_expr_semantic_equal lhs.bias rhs.bias
+    | ReductionCarrierProgression lhs,
+      ReductionCarrierProgression rhs ->
+        lhs.carrier_temp = rhs.carrier_temp
+        && lhs.carrier_subtract = rhs.carrier_subtract
+        && lhs.include_updated = rhs.include_updated
+        && summary_expr_semantic_equal
+             lhs.step_expr rhs.step_expr
+    | ReductionInvariant _, _
+    | ReductionAffine _, _
+    | ReductionQuadratic _, _
+    | ReductionCubic _, _
+    | ReductionCarrierProgression _, _ ->
+        false
+  in
+  let counted_reduction_semantic_equal
+      (lhs : counted_reduction)
+      (rhs : counted_reduction) =
+    lhs.target = rhs.target
+    && lhs.subtract = rhs.subtract
+    && counted_reduction_step_semantic_equal
+         lhs.step rhs.step
+    && lhs.carrier_temp = rhs.carrier_temp
+    && List.sort_uniq compare lhs.alias_temps
+       = List.sort_uniq compare rhs.alias_temps
+  in
+  let path_updates_agree updates =
+    match updates with
+    | [] -> None
+    | first :: rest ->
+        if
+          List.for_all
+            (counted_reduction_semantic_equal first)
+            rest
+        then begin
+          if
+            Sys.getenv_opt
+              "TOYC_DEBUG_RECURRENCE_REDUCTION"
+            <> None
+            && List.exists (( <> ) first) rest
+          then
+            Printf.eprintf
+              "recurrence-reduction-hit kind=path-effect-merge header=%s paths=%d\n%!"
+              header (List.length updates);
+          Some first
+        end
+        else
+          None
+  in
+  let logical_phi_for_temp temp =
+    List.find_opt
+      (fun (phi : logical_loop_phi) ->
+        phi.logical_phi_temp = temp)
+      logical_phis
+  in
+  let logical_phi_covers_backedges (phi : logical_loop_phi) =
+    let covered =
+      phi.logical_backedge_cases
+      |> List.map
+           (fun case -> case.logical_header_pred)
+      |> List.sort_uniq String.compare
+    in
+    let expected =
+      backedge_preds |> List.sort_uniq String.compare
+    in
+    covered = expected
+  in
+  let logical_phi_reduction_update temp =
+    match logical_phi_for_temp temp with
+    | None -> None
+    | Some phi ->
+        if
+          not (logical_phi_covers_backedges phi)
+          || phi.logical_backedge_cases = []
+        then
+          None
+        else
+          let updates =
+            List.filter_map
+              (fun (case : logical_phi_backedge_case) ->
+                reduction_update_of_temp_on_chain
+                  temp case.logical_chain)
+              phi.logical_backedge_cases
+          in
+          if
+            List.length updates
+            <> List.length phi.logical_backedge_cases
+          then
+            None
+          else
+            match path_updates_agree updates with
+            | None -> None
+            | Some update ->
+                if
+                  Sys.getenv_opt
+                    "TOYC_DEBUG_RECURRENCE_REDUCTION"
+                  <> None
+                then
+                  Printf.eprintf
+                    "recurrence-reduction-hit kind=logical-phi-backedge header=%s temp=t%d header-preds=%d value-paths=%d\\n%!"
+                    header temp
+                    (List.length phi.logical_backedge_preds)
+                    (List.length phi.logical_backedge_cases);
+                Some update
+  in
   if backedge_preds = [] then []
   else
       let temp_reductions =
@@ -11357,25 +11927,37 @@ let collect_counted_reductions
                Printf.eprintf
                  "counted-temp-gate header=%s temp=%d seeds={%s} pass=%b\n%!"
                  header temp (string_of_temps common_self_temps) has_outside_seed;
-             if has_outside_seed
-             then
-             let updates =
-               List.filter_map
-                 (fun pred -> reduction_update_of_temp_on_chain temp (update_chain_for_pred pred))
-                 backedge_preds
+             let old_update =
+               if not has_outside_seed then None
+               else
+                 let updates =
+                   List.filter_map
+                     (fun pred ->
+                       reduction_update_of_temp_on_chain
+                         temp (update_chain_for_pred pred))
+                     backedge_preds
+                 in
+                 if debug_counted_local then
+                   Printf.eprintf
+                     "counted-temp-updates header=%s temp=%d count=%d preds=%d\n%!"
+                     header temp
+                     (List.length updates)
+                     (List.length backedge_preds);
+                 if
+                   List.length updates
+                   <> List.length backedge_preds
+                 then
+                   None
+                 else
+                   path_updates_agree updates
              in
-             if debug_counted_local then
-               Printf.eprintf
-                 "counted-temp-updates header=%s temp=%d count=%d preds=%d\n%!"
-                 header temp (List.length updates) (List.length backedge_preds);
-             match updates with
-             | [] -> acc
-             | first :: rest
-               when List.length updates = List.length backedge_preds
-                    && List.for_all (fun update -> update = first) rest ->
-                 first :: acc
-             | _ -> acc
-             else acc)
+             match old_update with
+             | Some update ->
+                 update :: acc
+             | None -> (
+                 match logical_phi_reduction_update temp with
+                 | Some update -> update :: acc
+                 | None -> acc))
          live_temps []
     in
     let place_reductions =
@@ -11398,13 +11980,12 @@ let collect_counted_reductions
                    | Tcg.Global name -> Printf.sprintf "global:%s" name)
                   (List.length updates)
                   (List.length backedge_preds);
-              match updates with
-              | [] -> acc
-              | first :: rest
-                when List.length updates = List.length backedge_preds
-                     && List.for_all (fun update -> update = first) rest ->
-                  first :: acc
-              | _ -> acc)
+              if List.length updates <> List.length backedge_preds then
+                acc
+              else
+                match path_updates_agree updates with
+                | Some update -> update :: acc
+                | None -> acc)
         live_places []
       |> List.map (fun reduction ->
              match reduction.target with
