@@ -5412,6 +5412,87 @@ let scalar_recurrence_of_operand
   analyze IntSet.empty operand
   |> Option.map normalize_scalar_recurrence
 
+let scalar_recurrence_of_instr
+    loop_defs
+    multi_defs
+    def_instrs
+    addrecs
+    (block : Cfg.block)
+    instr
+  =
+  let analyze =
+    scalar_recurrence_of_operand
+      loop_defs multi_defs def_instrs addrecs block
+  in
+  let with_dst dst recurrence =
+    Option.map (fun recurrence -> (dst, normalize_scalar_recurrence recurrence)) recurrence
+  in
+  match instr with
+  | Tcg.Move (dst, src)
+  | Tcg.Un (dst, UPlus, src) ->
+      with_dst dst (analyze src)
+  | Tcg.Un (dst, UMinus, src) ->
+      with_dst dst (Option.map scalar_recurrence_neg (analyze src))
+  | Tcg.Bin (dst, Add, lhs, rhs) ->
+      with_dst dst
+        (Option.bind (analyze lhs) (fun lhs ->
+             Option.bind (analyze rhs) (scalar_recurrence_add lhs)))
+  | Tcg.Bin (dst, Sub, lhs, rhs) ->
+      with_dst dst
+        (Option.bind (analyze lhs) (fun lhs ->
+             Option.bind (analyze rhs) (scalar_recurrence_sub lhs)))
+  | Tcg.Bin (dst, Mul, lhs, rhs) ->
+      with_dst dst
+        (Option.bind (analyze lhs) (fun lhs ->
+             Option.bind (analyze rhs) (scalar_recurrence_mul lhs)))
+  | Tcg.Un (_, UNot, _)
+  | Tcg.Bin (_, (Div | Mod | Lt | Le | Gt | Ge | Eq | Ne | LAnd | LOr), _, _)
+  | Tcg.Load _
+  | Tcg.Store _
+  | Tcg.Call _ ->
+      None
+
+let rec lve_runtime_scale_of_operand
+    loop_defs multi_defs def_instrs phi_temp operand =
+  let invariant operand =
+    lve_invariant_expr_of_operand loop_defs multi_defs def_instrs operand
+  in
+  match operand with
+  | Tcg.Imm _ -> None
+  | Tcg.Temp temp ->
+      if temp = phi_temp then Some scalar_inv_one
+      else if IntSet.mem temp multi_defs then None
+      else
+        match Hashtbl.find_opt def_instrs temp with
+        | Some (Tcg.Move (_, src))
+        | Some (Tcg.Un (_, UPlus, src)) ->
+            lve_runtime_scale_of_operand
+              loop_defs multi_defs def_instrs phi_temp src
+        | Some (Tcg.Un (_, UMinus, src)) ->
+            Option.map
+              (fun scale -> normalize_loop_inv_expr (LveNeg scale))
+              (lve_runtime_scale_of_operand
+                 loop_defs multi_defs def_instrs phi_temp src)
+        | Some (Tcg.Bin (_, Mul, lhs, rhs)) -> (
+            match
+              ( lve_runtime_scale_of_operand
+                  loop_defs multi_defs def_instrs phi_temp lhs,
+                invariant rhs )
+            with
+            | Some scale, Some factor ->
+                Some (normalize_loop_inv_expr (LveMul (scale, factor)))
+            | _ -> (
+                match
+                  ( invariant lhs,
+                    lve_runtime_scale_of_operand
+                      loop_defs multi_defs def_instrs phi_temp rhs )
+                with
+                | Some factor, Some scale ->
+                    Some (normalize_loop_inv_expr (LveMul (factor, scale)))
+                | _ -> None))
+        | Some _ | None ->
+            None
+
 let scalar_outside_inputs
     header loop get_block (addrec : loop_addrec) =
   let header_block : Cfg.block = get_block header in
@@ -5491,11 +5572,20 @@ let debug_scalar_recurrence_loop
           (fun instr ->
             match defs_temp instr with
             | Some dst -> (
-                match
-                  scalar_recurrence_of_operand
-                    loop_defs multi_defs def_instrs addrecs block
-                    (Tcg.Temp dst)
-                with
+                let recurrence =
+                  match
+                    scalar_recurrence_of_operand
+                      loop_defs multi_defs def_instrs addrecs block
+                      (Tcg.Temp dst)
+                  with
+                  | Some recurrence -> Some recurrence
+                  | None ->
+                      Option.map snd
+                        (scalar_recurrence_of_instr
+                           loop_defs multi_defs def_instrs addrecs block
+                           instr)
+                in
+                match recurrence with
                 | Some (ScalarAddRec _ as recurrence)
                 | Some (ScalarAffine _ as recurrence) ->
                     Printf.eprintf
@@ -5518,7 +5608,11 @@ let lve_operand_available_before_preds doms def_blocks multi_defs preds = functi
       if IntSet.mem temp multi_defs then false
       else
         match Hashtbl.find_opt def_blocks temp with
-        | None -> false
+        | None ->
+            (* Temps without an explicit defining block are incoming values
+               (for example function parameters).  They are available on every
+               edge leading into the loop header. *)
+            true
         | Some def_label ->
             List.for_all
               (fun pred ->
@@ -5560,25 +5654,156 @@ let rec emit_loop_inv_expr fresh_temp dst expr =
       lhs_prep @ rhs_prep
       @ [ simplify_simple_instr (Tcg.Bin (dst, Mul, lhs, rhs)) ]
 
-let lve_scale_candidate loop_defs multi_defs def_instrs phi_temp instr =
+let lve_affine_candidate
+    loop_defs multi_defs def_instrs addrecs (block : Cfg.block)
+    (iv : loop_addrec) instr =
   let invariant operand =
     lve_invariant_expr_of_operand loop_defs multi_defs def_instrs operand
   in
-  match instr with
-  | Tcg.Bin (dst, Mul, lhs, rhs)
-    when resolves_to_induction_temp multi_defs def_instrs phi_temp lhs ->
-      Option.map (fun scale -> (dst, rhs, scale)) (invariant rhs)
-  | Tcg.Bin (dst, Mul, lhs, rhs)
-    when resolves_to_induction_temp multi_defs def_instrs phi_temp rhs ->
-      Option.map (fun scale -> (dst, lhs, scale)) (invariant lhs)
-  | _ -> None
+  let direct =
+    match instr with
+    | Tcg.Move (dst, src)
+    | Tcg.Un (dst, UPlus, src) -> (
+        match
+          lve_runtime_scale_of_operand
+            loop_defs multi_defs def_instrs iv.addrec_phi_temp src
+        with
+        | Some scale -> Some (dst, scale, scalar_inv_zero)
+        | None -> None)
+    | Tcg.Un (dst, UMinus, src) -> (
+        match
+          lve_runtime_scale_of_operand
+            loop_defs multi_defs def_instrs iv.addrec_phi_temp src
+        with
+        | Some scale ->
+            Some
+              ( dst,
+                normalize_loop_inv_expr (LveNeg scale),
+                scalar_inv_zero )
+        | None -> None)
+    | Tcg.Bin (dst, Mul, lhs, rhs) -> (
+        match
+          ( lve_runtime_scale_of_operand
+              loop_defs multi_defs def_instrs iv.addrec_phi_temp lhs,
+            invariant rhs )
+        with
+        | Some scale, Some factor ->
+            Some
+              ( dst,
+                normalize_loop_inv_expr (LveMul (scale, factor)),
+                scalar_inv_zero )
+        | _ -> (
+            match
+              ( invariant lhs,
+                lve_runtime_scale_of_operand
+                  loop_defs multi_defs def_instrs iv.addrec_phi_temp rhs )
+            with
+            | Some factor, Some scale ->
+                Some
+                  ( dst,
+                    normalize_loop_inv_expr (LveMul (factor, scale)),
+                    scalar_inv_zero )
+            | _ -> None))
+    | Tcg.Bin (dst, Add, lhs, rhs) -> (
+        match
+          ( lve_runtime_scale_of_operand
+              loop_defs multi_defs def_instrs iv.addrec_phi_temp lhs,
+            invariant rhs )
+        with
+        | Some scale, Some bias ->
+            Some (dst, normalize_loop_inv_expr scale, normalize_loop_inv_expr bias)
+        | _ -> (
+            match
+              ( invariant lhs,
+                lve_runtime_scale_of_operand
+                  loop_defs multi_defs def_instrs iv.addrec_phi_temp rhs )
+            with
+            | Some bias, Some scale ->
+                Some (dst, normalize_loop_inv_expr scale, normalize_loop_inv_expr bias)
+            | _ -> None))
+    | Tcg.Bin (dst, Sub, lhs, rhs) -> (
+        match
+          ( lve_runtime_scale_of_operand
+              loop_defs multi_defs def_instrs iv.addrec_phi_temp lhs,
+            invariant rhs )
+        with
+        | Some scale, Some bias ->
+            Some
+              ( dst,
+                normalize_loop_inv_expr scale,
+                normalize_loop_inv_expr (LveNeg bias) )
+        | _ -> (
+            match
+              ( invariant lhs,
+                lve_runtime_scale_of_operand
+                  loop_defs multi_defs def_instrs iv.addrec_phi_temp rhs )
+            with
+            | Some bias, Some scale ->
+                Some
+                  ( dst,
+                    normalize_loop_inv_expr (LveNeg scale),
+                    normalize_loop_inv_expr bias )
+            | _ -> None))
+    | Tcg.Load _
+    | Tcg.Store _
+    | Tcg.Call _
+    | Tcg.Bin (_, (Div | Mod | Lt | Le | Gt | Ge | Eq | Ne | LAnd | LOr), _, _)
+    | Tcg.Un (_, UNot, _) ->
+        None
+  in
+  let recurrence =
+    match direct with
+    | Some (dst, scale, bias) ->
+        Some (dst, scalar_recurrence_affine iv scale bias)
+    | None ->
+        begin
+          match
+            scalar_recurrence_of_instr
+              loop_defs multi_defs def_instrs addrecs block instr
+          with
+          | Some (dst, recurrence) -> Some (dst, recurrence)
+          | None ->
+              begin
+                match defs_temp instr with
+                | None -> None
+                | Some dst ->
+                    Option.map
+                      (fun recurrence -> (dst, recurrence))
+                      (scalar_recurrence_of_operand
+                         loop_defs multi_defs def_instrs addrecs block
+                         (Tcg.Temp dst))
+              end
+        end
+  in
+  match recurrence with
+  | Some (dst, recurrence) -> (
+      match scalar_recurrence_scale_bias recurrence with
+      | Some (base, scale, bias) when scalar_same_base base iv ->
+          Some
+            ( dst,
+              normalize_loop_inv_expr scale,
+              normalize_loop_inv_expr bias )
+      | Some _ | None -> None)
+  | None -> None
 
-let lve_nontrivial_scale = function
-  | LveConst 0L | LveConst 1L | LveConst (-1L) -> false
-  | LveOperand (Tcg.Imm 0L)
-  | LveOperand (Tcg.Imm 1L)
-  | LveOperand (Tcg.Imm (-1L)) -> false
-  | LveConst _ | LveOperand _ | LveNeg _ | LveAdd _ | LveMul _ -> true
+let lve_nontrivial_affine scale bias =
+  let scale = normalize_loop_inv_expr scale in
+  let bias = normalize_loop_inv_expr bias in
+  not
+    (loop_inv_expr_equal scale scalar_inv_one
+    && loop_inv_expr_equal bias scalar_inv_zero)
+
+let lve_useful_affine (iv : loop_addrec) scale bias =
+  let scale = normalize_loop_inv_expr scale in
+  let bias = normalize_loop_inv_expr bias in
+  lve_nontrivial_affine scale bias
+  &&
+  (* Do not build a separate carrier for the trivial "next IV" mirror
+     [i + step].  In practice this mostly duplicates the control update and
+     can add pressure without removing the real hotspot expression. *)
+  not
+    (loop_inv_expr_equal scale scalar_inv_one
+    && loop_inv_expr_equal bias iv.addrec_step)
 
 type counted_loop_kind =
   | CountUpLt of Tcg.operand * int64
@@ -14414,14 +14639,19 @@ let loop_evolution_strength_reduce_func (f : Cfg.func) =
                     List.iteri
                       (fun index instr ->
                         match
-                          lve_scale_candidate
-                            loop_defs multi_defs def_instrs iv.addrec_phi_temp instr
+                          lve_affine_candidate
+                            loop_defs multi_defs def_instrs addrecs block iv instr
                         with
-                        | Some (dst, scale_operand, scale_expr)
-                          when lve_nontrivial_scale scale_expr
-                               && lve_operand_available_before_preds
-                                    doms def_blocks multi_defs outside_preds scale_operand ->
-                            let key = normalize_loop_inv_expr scale_expr in
+                        | Some (dst, scale_expr, bias_expr)
+                          when lve_useful_affine iv scale_expr bias_expr
+                               && lve_expr_available_before_preds
+                                    doms def_blocks multi_defs outside_preds scale_expr
+                               && lve_expr_available_before_preds
+                                    doms def_blocks multi_defs outside_preds bias_expr ->
+                            let key =
+                              ( normalize_loop_inv_expr scale_expr,
+                                normalize_loop_inv_expr bias_expr )
+                            in
                             let uses =
                               Option.value ~default:[] (Hashtbl.find_opt derived_uses key)
                             in
@@ -14431,7 +14661,7 @@ let loop_evolution_strength_reduce_func (f : Cfg.func) =
                       (get_block block.label).body)
                 f.blocks;
               Hashtbl.iter
-                (fun scale_expr uses ->
+                (fun (scale_expr, bias_expr) uses ->
                   if uses <> [] then begin
                     changed := true;
                     let derived_phi = fresh_temp () in
@@ -14444,9 +14674,11 @@ let loop_evolution_strength_reduce_func (f : Cfg.func) =
                         let pred_block = get_block pred in
                         let init_expr =
                           normalize_loop_inv_expr
-                            (LveMul
-                               ( LveOperand (Tcg.Temp iv.addrec_phi_temp),
-                                 scale_expr ))
+                            (LveAdd
+                               ( LveMul
+                                   ( LveOperand (Tcg.Temp iv.addrec_phi_temp),
+                                     scale_expr ),
+                                 bias_expr ))
                         in
                         let body =
                           pred_block.body
@@ -14491,9 +14723,10 @@ let loop_evolution_strength_reduce_func (f : Cfg.func) =
                       f.blocks;
                     if Sys.getenv_opt "TOYC_DEBUG_LVE" <> None then
                       Printf.eprintf
-                        "lve-sr func=%s header=%s base=t%d scale=%s step=%s uses=%d derived=t%d delta=t%d\n%!"
+                        "lve-sr func=%s header=%s base=t%d scale=%s bias=%s step=%s uses=%d derived=t%d delta=t%d\n%!"
                         f.name header iv.addrec_phi_temp
                         (string_of_loop_inv_expr scale_expr)
+                        (string_of_loop_inv_expr bias_expr)
                         (string_of_loop_inv_expr iv.addrec_step)
                         (List.length uses) derived_phi derived_step
                   end)
