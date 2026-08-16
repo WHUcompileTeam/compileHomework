@@ -13892,6 +13892,7 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
   let unroll_single_block_max_defs = 12 in
   let unroll_multi_block_max_defs = 8 in
   let unroll_max_control_body_instrs = 4 in
+  let unroll_max_extra_loop_carried_defs = 2 in
   let control_body_supported body =
     List.length body <= unroll_max_control_body_instrs
     && List.for_all pure_cfg_prep_instr body
@@ -13925,6 +13926,9 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
         if is_unroll2_label header || LabelSet.exists is_unroll2_label loop then ()
         else
           let blocks_snapshot = current_block_list () in
+          let live_in_t, _ =
+            compute_liveness summaries globals { f with blocks = blocks_snapshot }
+          in
           let (loop_defs, _, def_instrs, multi_defs, _, _, control) =
             analyze_counted_loop header loop get_block f.temp_count blocks_snapshot
           in
@@ -13953,6 +13957,14 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
                     if one_block_path then unroll_single_block_max_memory_ops
                     else if path_blocks <= 2 then unroll_small_path_max_memory_ops
                     else unroll_large_path_max_memory_ops
+                  in
+                  let body_live_in =
+                    table_find_or_empty live_in_t info.inside_label IntSet.empty
+                  in
+                  let extra_loop_carried_defs =
+                    IntSet.diff
+                      (IntSet.inter loop_defs body_live_in)
+                      (IntSet.singleton info.control_iv.phi_temp)
                   in
                   let has_redefined_candidate_temp =
                     let counts = Hashtbl.create 16 in
@@ -14053,7 +14065,13 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
                       control_block.body
                   in
                   let can_pair_without_mid_guard =
-                    control_body_defs_are_guard_private
+                    (* The "pair two iterations without the mid-guard" fast path is
+                       currently unsound: hot_local_loop_mix proves that we can still
+                       lose loop-carried latch updates and generate wrong-code.  Keep
+                       x2 unrolling itself, but disable this shortcut until it is
+                       rebuilt with explicit parallel-copy/latch-state handling. *)
+                    false
+                    && control_body_defs_are_guard_private
                     && control_body_nontrapping
                     &&
                     match exact_trip_count with
@@ -14072,6 +14090,7 @@ let unroll_counted_loops_x2_func summaries globals (f : Cfg.func) =
                     || total_instrs > max_instrs
                     || memory_ops > max_memory_ops
                     || unique_defs > (if one_block_path then unroll_single_block_max_defs else unroll_multi_block_max_defs)
+                    || IntSet.cardinal extra_loop_carried_defs > unroll_max_extra_loop_carried_defs
                     || (PlaceSet.is_empty effects.modified_places && not enough_benefit)
                     || has_redefined_candidate_temp
                   then ()
