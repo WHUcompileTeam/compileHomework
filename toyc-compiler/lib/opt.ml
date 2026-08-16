@@ -734,7 +734,258 @@ let is_commutative_binop = function
   | Add | Mul | Eq | Ne -> true
   | Sub | Div | Mod | Lt | Gt | Le | Ge | LAnd | LOr -> false
 
-type linear_key = int64 * (Tcg.temp * int64) list
+let linear_i32_add a b =
+  i32 Int64.(add (i32 a) (i32 b))
+
+let linear_i32_mul a b =
+  i32 Int64.(mul (i32 a) (i32 b))
+
+(* -------------------------------------------------------------------------- *)
+(* item6: one canonical scalar identity shared by GVN, algebra and loop/SCEV  *)
+(* -------------------------------------------------------------------------- *)
+
+type canonical_scalar_key =
+  int64 * (canonical_scalar_atom * int64) list
+
+and canonical_scalar_atom =
+  | CanonicalOperandAtom of Tcg.operand
+  | CanonicalPlaceAtom of Tcg.place
+  | CanonicalUnaryAtom of unop * canonical_scalar_key
+  | CanonicalBinaryAtom of
+      binop * canonical_scalar_key * canonical_scalar_key
+
+module CanonicalScalarAtomOrd = struct
+  type t = canonical_scalar_atom
+  let compare = Stdlib.compare
+end
+
+module CanonicalScalarAtomMap =
+  Map.Make (CanonicalScalarAtomOrd)
+
+type canonical_scalar_form = {
+  canonical_scalar_const : int64;
+  canonical_scalar_atoms :
+    int64 CanonicalScalarAtomMap.t;
+}
+
+let canonical_scalar_zero =
+  {
+    canonical_scalar_const = 0L;
+    canonical_scalar_atoms =
+      CanonicalScalarAtomMap.empty;
+  }
+
+let canonical_scalar_const value =
+  {
+    canonical_scalar_const = i32 value;
+    canonical_scalar_atoms =
+      CanonicalScalarAtomMap.empty;
+  }
+
+let canonical_scalar_add_atom atoms atom coeff =
+  let coeff = i32 coeff in
+  if coeff = 0L then
+    atoms
+  else
+    let old =
+      Option.value
+        ~default:0L
+        (CanonicalScalarAtomMap.find_opt atom atoms)
+    in
+    let coeff = linear_i32_add old coeff in
+    if coeff = 0L then
+      CanonicalScalarAtomMap.remove atom atoms
+    else
+      CanonicalScalarAtomMap.add atom coeff atoms
+
+let canonical_scalar_atom_form atom =
+  {
+    canonical_scalar_const = 0L;
+    canonical_scalar_atoms =
+      CanonicalScalarAtomMap.singleton atom 1L;
+  }
+
+let canonical_scalar_operand operand =
+  match operand with
+  | Tcg.Imm value ->
+      canonical_scalar_const value
+  | Tcg.Temp _ ->
+      canonical_scalar_atom_form
+        (CanonicalOperandAtom operand)
+
+let canonical_scalar_place place =
+  canonical_scalar_atom_form
+    (CanonicalPlaceAtom place)
+
+let canonical_scalar_add lhs rhs =
+  {
+    canonical_scalar_const =
+      linear_i32_add
+        lhs.canonical_scalar_const
+        rhs.canonical_scalar_const;
+    canonical_scalar_atoms =
+      CanonicalScalarAtomMap.fold
+        (fun atom coeff atoms ->
+          canonical_scalar_add_atom
+            atoms atom coeff)
+        rhs.canonical_scalar_atoms
+        lhs.canonical_scalar_atoms;
+  }
+
+let canonical_scalar_scale factor form =
+  let factor = i32 factor in
+  if factor = 0L then
+    canonical_scalar_zero
+  else
+    {
+      canonical_scalar_const =
+        linear_i32_mul
+          factor form.canonical_scalar_const;
+      canonical_scalar_atoms =
+        CanonicalScalarAtomMap.fold
+          (fun atom coeff atoms ->
+            canonical_scalar_add_atom
+              atoms atom
+              (linear_i32_mul factor coeff))
+          form.canonical_scalar_atoms
+          CanonicalScalarAtomMap.empty;
+    }
+
+let canonical_scalar_sub lhs rhs =
+  canonical_scalar_add
+    lhs
+    (canonical_scalar_scale (-1L) rhs)
+
+let canonical_scalar_key_of_form form =
+  ( i32 form.canonical_scalar_const,
+    CanonicalScalarAtomMap.bindings
+      form.canonical_scalar_atoms )
+
+let canonical_scalar_is_constant form =
+  CanonicalScalarAtomMap.is_empty
+    form.canonical_scalar_atoms
+
+let canonical_scalar_order_pair lhs rhs =
+  let lhs_key = canonical_scalar_key_of_form lhs in
+  let rhs_key = canonical_scalar_key_of_form rhs in
+  if Stdlib.compare lhs_key rhs_key <= 0 then
+    (lhs_key, rhs_key)
+  else
+    (rhs_key, lhs_key)
+
+let canonical_scalar_mul lhs rhs =
+  if canonical_scalar_is_constant lhs then
+    canonical_scalar_scale
+      lhs.canonical_scalar_const rhs
+  else if canonical_scalar_is_constant rhs then
+    canonical_scalar_scale
+      rhs.canonical_scalar_const lhs
+  else
+    let lhs_key, rhs_key =
+      canonical_scalar_order_pair lhs rhs
+    in
+    canonical_scalar_atom_form
+      (CanonicalBinaryAtom
+         (Mul, lhs_key, rhs_key))
+
+let canonical_scalar_un op inner =
+  match op with
+  | UPlus ->
+      inner
+  | UMinus ->
+      canonical_scalar_scale (-1L) inner
+  | UNot ->
+      canonical_scalar_atom_form
+        (CanonicalUnaryAtom
+           (op, canonical_scalar_key_of_form inner))
+
+let canonical_scalar_opaque_bin op lhs rhs =
+  let lhs_key = canonical_scalar_key_of_form lhs in
+  let rhs_key = canonical_scalar_key_of_form rhs in
+  let lhs_key, rhs_key =
+    if is_commutative_binop op
+       && Stdlib.compare lhs_key rhs_key > 0
+    then
+      (rhs_key, lhs_key)
+    else
+      (lhs_key, rhs_key)
+  in
+  canonical_scalar_atom_form
+    (CanonicalBinaryAtom
+       (op, lhs_key, rhs_key))
+
+let canonical_scalar_bin op lhs rhs =
+  match op with
+  | Add ->
+      canonical_scalar_add lhs rhs
+  | Sub ->
+      canonical_scalar_sub lhs rhs
+  | Mul ->
+      canonical_scalar_mul lhs rhs
+  | Div | Mod | Lt | Gt | Le | Ge
+  | Eq | Ne | LAnd | LOr ->
+      canonical_scalar_opaque_bin op lhs rhs
+
+let canonical_scalar_key_equal lhs rhs =
+  canonical_scalar_key_of_form lhs
+  = canonical_scalar_key_of_form rhs
+
+let rec string_of_canonical_scalar_key
+    (const, terms) =
+  let string_of_atom = function
+    | CanonicalOperandAtom (Tcg.Imm value) ->
+        Printf.sprintf "imm:%Ld" value
+    | CanonicalOperandAtom (Tcg.Temp temp) ->
+        Printf.sprintf "t%d" temp
+    | CanonicalPlaceAtom place ->
+        Printf.sprintf "place:%s"
+          (match place with
+           | Tcg.Local id ->
+               Printf.sprintf "local:%d" id
+           | Tcg.Global name ->
+               Printf.sprintf "global:%s" name)
+    | CanonicalUnaryAtom (op, inner) ->
+        Printf.sprintf "un:%d[%s]"
+          (Hashtbl.hash op)
+          (string_of_canonical_scalar_key inner)
+    | CanonicalBinaryAtom (op, lhs, rhs) ->
+        Printf.sprintf "bin:%d[%s][%s]"
+          (Hashtbl.hash op)
+          (string_of_canonical_scalar_key lhs)
+          (string_of_canonical_scalar_key rhs)
+  in
+  let rendered_terms =
+    terms
+    |> List.map
+         (fun (atom, coeff) ->
+           Printf.sprintf "%Ld*%s"
+             coeff (string_of_atom atom))
+    |> String.concat ","
+  in
+  Printf.sprintf "{c=%Ld;%s}"
+    const rendered_terms
+
+let rec canonical_scalar_key_has_temp
+    temp (_const, terms) =
+  List.exists
+    (fun (atom, _) ->
+      canonical_scalar_atom_has_temp temp atom)
+    terms
+
+and canonical_scalar_atom_has_temp temp = function
+  | CanonicalOperandAtom (Tcg.Temp other) ->
+      temp = other
+  | CanonicalOperandAtom (Tcg.Imm _) ->
+      false
+  | CanonicalPlaceAtom _ ->
+      false
+  | CanonicalUnaryAtom (_, inner) ->
+      canonical_scalar_key_has_temp temp inner
+  | CanonicalBinaryAtom (_, lhs, rhs) ->
+      canonical_scalar_key_has_temp temp lhs
+      || canonical_scalar_key_has_temp temp rhs
+
+type linear_key = canonical_scalar_key
 
 type expr_key =
   | KeyUn of unop * Tcg.operand
@@ -744,7 +995,6 @@ type expr_key =
 
 module ExprKeyOrd = struct
   type t = expr_key
-
   let compare = Stdlib.compare
 end
 
@@ -759,78 +1009,41 @@ type alias_map = Tcg.operand IntMap.t
 let empty_alias = IntMap.empty
 
 let normalize_bin_operands op lhs rhs =
-  if not (is_commutative_binop op) then (lhs, rhs)
+  if not (is_commutative_binop op) then
+    (lhs, rhs)
   else
     match (lhs, rhs) with
-    | Tcg.Imm _, Tcg.Temp _ -> (rhs, lhs)
-    | Tcg.Temp _, Tcg.Imm _ -> (lhs, rhs)
-    | _ when Stdlib.compare lhs rhs > 0 -> (rhs, lhs)
-    | _ -> (lhs, rhs)
+    | Tcg.Imm _, Tcg.Temp _ ->
+        (rhs, lhs)
+    | Tcg.Temp _, Tcg.Imm _ ->
+        (lhs, rhs)
+    | _ when Stdlib.compare lhs rhs > 0 ->
+        (rhs, lhs)
+    | _ ->
+        (lhs, rhs)
 
-type linear_form = {
-  linear_const : int64;
-  linear_terms : int64 IntMap.t;
-}
+type linear_form = canonical_scalar_form
 
-type linear_analyzer = Tcg.operand -> linear_form
-
-let linear_i32_add a b = i32 Int64.(add (i32 a) (i32 b))
-let linear_i32_mul a b = i32 Int64.(mul (i32 a) (i32 b))
-
-let linear_zero = { linear_const = 0L; linear_terms = IntMap.empty }
-
-let linear_const value =
-  { linear_const = i32 value; linear_terms = IntMap.empty }
+type linear_analyzer =
+  Tcg.operand -> linear_form
 
 let linear_atom temp =
-  {
-    linear_const = 0L;
-    linear_terms = IntMap.singleton temp 1L;
-  }
+  canonical_scalar_operand
+    (Tcg.Temp temp)
 
-let linear_add_term terms temp coeff =
-  let coeff = i32 coeff in
-  if coeff = 0L then terms
-  else
-    let old = Option.value ~default:0L (IntMap.find_opt temp terms) in
-    let coeff = linear_i32_add old coeff in
-    if coeff = 0L then IntMap.remove temp terms
-    else IntMap.add temp coeff terms
+let linear_key_of_form =
+  canonical_scalar_key_of_form
 
-let linear_add lhs rhs =
-  {
-    linear_const = linear_i32_add lhs.linear_const rhs.linear_const;
-    linear_terms =
-      IntMap.fold
-        (fun temp coeff terms -> linear_add_term terms temp coeff)
-        rhs.linear_terms lhs.linear_terms;
-  }
+let make_linear_analyzer
+    (f : Cfg.func) : linear_analyzer =
+  (* The analyzer follows only unique definitions.  A multi-def temp is a
+     program-point-sensitive value, so it remains an opaque scalar atom.
 
-let linear_scale factor form =
-  let factor = i32 factor in
-  if factor = 0L then linear_zero
-  else
-    {
-      linear_const = linear_i32_mul factor form.linear_const;
-      linear_terms =
-        IntMap.fold
-          (fun temp coeff terms ->
-            linear_add_term terms temp (linear_i32_mul factor coeff))
-          form.linear_terms IntMap.empty;
-    }
-
-let linear_sub lhs rhs =
-  linear_add lhs (linear_scale (-1L) rhs)
-
-let linear_key_of_form form =
-  (i32 form.linear_const, IntMap.bindings form.linear_terms)
-
-let make_linear_analyzer (f : Cfg.func) : linear_analyzer =
-  (* Keep the early linear/GVN layer independent of the later generic
-     temp-definition helpers.  This function is intentionally defined before
-     [defs_temp]/[analyze_temp_defs_of_blocks] in this file, so build the two
-     small tables it needs locally. *)
-  let def_instrs = Hashtbl.create (max 16 f.temp_count) in
+     All arithmetic identity is now represented by [canonical_scalar_form],
+     the same key later used by loop/SCEV and counted-summary semantics. *)
+  let def_instrs =
+    Hashtbl.create (max 16 f.temp_count)
+  in
   let multi_defs = ref IntSet.empty in
   let record_def temp instr =
     if Hashtbl.mem def_instrs temp then
@@ -856,31 +1069,45 @@ let make_linear_analyzer (f : Cfg.func) : linear_analyzer =
         block.body)
     f.blocks;
   let multi_defs = !multi_defs in
-  let memo = Hashtbl.create (max 16 f.temp_count) in
+  let memo =
+    Hashtbl.create (max 16 f.temp_count)
+  in
   let rec of_operand seen = function
-    | Tcg.Imm value -> linear_const value
+    | Tcg.Imm value ->
+        canonical_scalar_const value
     | Tcg.Temp temp ->
-        if IntSet.mem temp multi_defs || IntSet.mem temp seen then
+        if
+          IntSet.mem temp multi_defs
+          || IntSet.mem temp seen
+        then
           linear_atom temp
         else
           match Hashtbl.find_opt memo temp with
-          | Some form -> form
+          | Some form ->
+              form
           | None ->
-              let seen = IntSet.add temp seen in
+              let seen =
+                IntSet.add temp seen
+              in
               let form =
-                match Hashtbl.find_opt def_instrs temp with
+                match Hashtbl.find_opt
+                        def_instrs temp
+                with
                 | Some (Tcg.Move (_, src))
                 | Some (Tcg.Un (_, UPlus, src)) ->
                     of_operand seen src
                 | Some (Tcg.Un (_, UMinus, src)) ->
-                    linear_scale (-1L) (of_operand seen src)
-                | Some (Tcg.Bin (_, Add, lhs, rhs)) ->
-                    linear_add (of_operand seen lhs) (of_operand seen rhs)
-                | Some (Tcg.Bin (_, Sub, lhs, rhs)) ->
-                    linear_sub (of_operand seen lhs) (of_operand seen rhs)
-                | Some (Tcg.Bin (_, Mul, lhs, Tcg.Imm factor))
-                | Some (Tcg.Bin (_, Mul, Tcg.Imm factor, lhs)) ->
-                    linear_scale factor (of_operand seen lhs)
+                    canonical_scalar_un
+                      UMinus
+                      (of_operand seen src)
+                | Some
+                    (Tcg.Bin
+                       (_, ((Add | Sub | Mul) as op),
+                        lhs, rhs)) ->
+                    canonical_scalar_bin
+                      op
+                      (of_operand seen lhs)
+                      (of_operand seen rhs)
                 | Some (Tcg.Un _)
                 | Some (Tcg.Bin _)
                 | Some (Tcg.Load _)
@@ -892,71 +1119,157 @@ let make_linear_analyzer (f : Cfg.func) : linear_analyzer =
               Hashtbl.replace memo temp form;
               form
   in
-  fun operand -> of_operand IntSet.empty operand
+  fun operand ->
+    of_operand IntSet.empty operand
 
 let linear_form_of_un analyze op src =
   match op with
-  | UPlus -> Some (analyze src)
-  | UMinus -> Some (linear_scale (-1L) (analyze src))
-  | UNot -> None
+  | UPlus | UMinus ->
+      Some
+        (canonical_scalar_un
+           op (analyze src))
+  | UNot ->
+      None
 
-let linear_form_of_bin analyze op lhs rhs =
+let linear_form_of_bin
+    analyze op lhs rhs =
   match op with
-  | Add -> Some (linear_add (analyze lhs) (analyze rhs))
-  | Sub -> Some (linear_sub (analyze lhs) (analyze rhs))
-  | Mul -> (
-      match (lhs, rhs) with
-      | operand, Tcg.Imm factor
-      | Tcg.Imm factor, operand ->
-          Some (linear_scale factor (analyze operand))
-      | Tcg.Temp _, Tcg.Temp _ -> None)
-  | Div | Mod | Lt | Gt | Le | Ge | Eq | Ne | LAnd | LOr ->
+  | Add | Sub | Mul ->
+      Some
+        (canonical_scalar_bin
+           op
+           (analyze lhs)
+           (analyze rhs))
+  | Div | Mod | Lt | Gt | Le | Ge
+  | Eq | Ne | LAnd | LOr ->
       None
 
 let linear_expr_key_of_un analysis op src =
   Option.map
-    (fun form -> KeyLinear (linear_key_of_form form))
+    (fun form ->
+      KeyLinear
+        (linear_key_of_form form))
     (linear_form_of_un analysis op src)
 
-let linear_expr_key_of_bin analysis op lhs rhs =
+let linear_expr_key_of_bin
+    analysis op lhs rhs =
   Option.map
-    (fun form -> KeyLinear (linear_key_of_form form))
-    (linear_form_of_bin analysis op lhs rhs)
+    (fun form ->
+      KeyLinear
+        (linear_key_of_form form))
+    (linear_form_of_bin
+       analysis op lhs rhs)
 
 let reify_linear_one_instr dst form =
-  let const = i32 form.linear_const in
-  match IntMap.bindings form.linear_terms with
-  | [] ->
-      Some (Tcg.Move (dst, Tcg.Imm const))
-  | [ (temp, coeff) ] ->
-      let coeff = i32 coeff in
-      if coeff = 1L then
-        if const = 0L then
-          Some (Tcg.Move (dst, Tcg.Temp temp))
-        else
-          Some (Tcg.Bin (dst, Add, Tcg.Temp temp, Tcg.Imm const))
-      else if coeff = -1L then
-        if const = 0L then
-          Some (Tcg.Un (dst, UMinus, Tcg.Temp temp))
-        else
-          Some (Tcg.Bin (dst, Sub, Tcg.Imm const, Tcg.Temp temp))
-      else if const = 0L then
-        Some (Tcg.Bin (dst, Mul, Tcg.Temp temp, Tcg.Imm coeff))
-      else
-        None
-  | [ (temp1, coeff1); (temp2, coeff2) ] when const = 0L ->
-      let coeff1 = i32 coeff1 in
-      let coeff2 = i32 coeff2 in
-      if coeff1 = 1L && coeff2 = 1L then
-        Some (Tcg.Bin (dst, Add, Tcg.Temp temp1, Tcg.Temp temp2))
-      else if coeff1 = 1L && coeff2 = -1L then
-        Some (Tcg.Bin (dst, Sub, Tcg.Temp temp1, Tcg.Temp temp2))
-      else if coeff1 = -1L && coeff2 = 1L then
-        Some (Tcg.Bin (dst, Sub, Tcg.Temp temp2, Tcg.Temp temp1))
-      else
-        None
-  | _ ->
+  let const =
+    i32 form.canonical_scalar_const
+  in
+  let temp_terms =
+    List.fold_right
+      (fun (atom, coeff) acc ->
+        match (atom, acc) with
+        | CanonicalOperandAtom
+            (Tcg.Temp temp),
+          Some terms ->
+            Some ((temp, coeff) :: terms)
+        | CanonicalOperandAtom
+            (Tcg.Imm _),
+          _
+        | CanonicalPlaceAtom _, _
+        | CanonicalUnaryAtom _, _
+        | CanonicalBinaryAtom _, _
+        | _, None ->
+            None)
+      (CanonicalScalarAtomMap.bindings
+         form.canonical_scalar_atoms)
+      (Some [])
+  in
+  match temp_terms with
+  | None ->
       None
+  | Some terms -> (
+      match terms with
+      | [] ->
+          Some
+            (Tcg.Move
+               (dst, Tcg.Imm const))
+      | [ (temp, coeff) ] ->
+          let coeff = i32 coeff in
+          if coeff = 1L then
+            if const = 0L then
+              Some
+                (Tcg.Move
+                   (dst, Tcg.Temp temp))
+            else
+              Some
+                (Tcg.Bin
+                   ( dst,
+                     Add,
+                     Tcg.Temp temp,
+                     Tcg.Imm const ))
+          else if coeff = -1L then
+            if const = 0L then
+              Some
+                (Tcg.Un
+                   ( dst,
+                     UMinus,
+                     Tcg.Temp temp ))
+            else
+              Some
+                (Tcg.Bin
+                   ( dst,
+                     Sub,
+                     Tcg.Imm const,
+                     Tcg.Temp temp ))
+          else if const = 0L then
+            Some
+              (Tcg.Bin
+                 ( dst,
+                   Mul,
+                   Tcg.Temp temp,
+                   Tcg.Imm coeff ))
+          else
+            None
+      | [ (temp1, coeff1);
+          (temp2, coeff2) ]
+        when const = 0L ->
+          let coeff1 = i32 coeff1 in
+          let coeff2 = i32 coeff2 in
+          if
+            coeff1 = 1L
+            && coeff2 = 1L
+          then
+            Some
+              (Tcg.Bin
+                 ( dst,
+                   Add,
+                   Tcg.Temp temp1,
+                   Tcg.Temp temp2 ))
+          else if
+            coeff1 = 1L
+            && coeff2 = -1L
+          then
+            Some
+              (Tcg.Bin
+                 ( dst,
+                   Sub,
+                   Tcg.Temp temp1,
+                   Tcg.Temp temp2 ))
+          else if
+            coeff1 = -1L
+            && coeff2 = 1L
+          then
+            Some
+              (Tcg.Bin
+                 ( dst,
+                   Sub,
+                   Tcg.Temp temp2,
+                   Tcg.Temp temp1 ))
+          else
+            None
+      | _ ->
+          None)
+
 
 let simplify_cfg_func (f : Cfg.func) =
   let simplify_instr instr =
@@ -1004,11 +1317,15 @@ let operand_has_temp temp = function
   | Tcg.Imm _ -> false
 
 let expr_key_has_temp temp = function
-  | KeyUn (_, src) -> operand_has_temp temp src
-  | KeyBin (_, lhs, rhs) -> operand_has_temp temp lhs || operand_has_temp temp rhs
-  | KeyLinear (_, terms) ->
-      List.exists (fun (term, _) -> term = temp) terms
-  | KeyLoad _ -> false
+  | KeyUn (_, src) ->
+      operand_has_temp temp src
+  | KeyBin (_, lhs, rhs) ->
+      operand_has_temp temp lhs
+      || operand_has_temp temp rhs
+  | KeyLinear key ->
+      canonical_scalar_key_has_temp temp key
+  | KeyLoad _ ->
+      false
 
 let avail_value_has_temp temp = function
   | Tcg.Temp other -> other = temp
@@ -4662,93 +4979,39 @@ let rec normalize_loop_inv_expr expr =
             LveMul (lhs, rhs)
       end
 
-module LoopInvAtomOrd = struct
-  type t = loop_inv_expr
-  let compare = Stdlib.compare
-end
-
-module LoopInvAtomMap = Map.Make (LoopInvAtomOrd)
-
-type loop_inv_linear_form = {
-  inv_linear_const : int64;
-  inv_linear_atoms : int64 LoopInvAtomMap.t;
-}
-
-let inv_linear_zero =
-  {
-    inv_linear_const = 0L;
-    inv_linear_atoms = LoopInvAtomMap.empty;
-  }
-
-let inv_linear_add_atom atoms atom coeff =
-  let coeff = i32 coeff in
-  if coeff = 0L then atoms
-  else
-    let old =
-      Option.value ~default:0L
-        (LoopInvAtomMap.find_opt atom atoms)
-    in
-    let coeff = linear_i32_add old coeff in
-    if coeff = 0L then LoopInvAtomMap.remove atom atoms
-    else LoopInvAtomMap.add atom coeff atoms
-
-let inv_linear_add lhs rhs =
-  {
-    inv_linear_const =
-      linear_i32_add lhs.inv_linear_const rhs.inv_linear_const;
-    inv_linear_atoms =
-      LoopInvAtomMap.fold
-        (fun atom coeff atoms ->
-          inv_linear_add_atom atoms atom coeff)
-        rhs.inv_linear_atoms lhs.inv_linear_atoms;
-  }
-
-let inv_linear_scale factor form =
-  let factor = i32 factor in
-  if factor = 0L then inv_linear_zero
-  else
-    {
-      inv_linear_const =
-        linear_i32_mul factor form.inv_linear_const;
-      inv_linear_atoms =
-        LoopInvAtomMap.fold
-          (fun atom coeff atoms ->
-            inv_linear_add_atom atoms atom
-              (linear_i32_mul factor coeff))
-          form.inv_linear_atoms LoopInvAtomMap.empty;
-    }
-
-let loop_inv_linear_form_of_expr expr =
-  let rec collect expr =
-    match normalize_loop_inv_expr expr with
-    | LveConst value ->
-        {
-          inv_linear_const = i32 value;
-          inv_linear_atoms = LoopInvAtomMap.empty;
-        }
-    | LveNeg inner ->
-        inv_linear_scale (-1L) (collect inner)
-    | LveAdd (lhs, rhs) ->
-        inv_linear_add (collect lhs) (collect rhs)
-    | LveMul (LveConst factor, rhs)
-    | LveMul (rhs, LveConst factor) ->
-        inv_linear_scale factor (collect rhs)
-    | (LveOperand _ | LveMul _) as atom ->
-        {
-          inv_linear_const = 0L;
-          inv_linear_atoms =
-            LoopInvAtomMap.singleton atom 1L;
-        }
-  in
-  collect expr
+let rec canonical_scalar_form_of_loop_inv_expr expr =
+  match normalize_loop_inv_expr expr with
+  | LveConst value ->
+      canonical_scalar_const value
+  | LveOperand operand ->
+      canonical_scalar_operand operand
+  | LveNeg inner ->
+      canonical_scalar_un
+        UMinus
+        (canonical_scalar_form_of_loop_inv_expr
+           inner)
+  | LveAdd (lhs, rhs) ->
+      canonical_scalar_add
+        (canonical_scalar_form_of_loop_inv_expr
+           lhs)
+        (canonical_scalar_form_of_loop_inv_expr
+           rhs)
+  | LveMul (lhs, rhs) ->
+      canonical_scalar_mul
+        (canonical_scalar_form_of_loop_inv_expr
+           lhs)
+        (canonical_scalar_form_of_loop_inv_expr
+           rhs)
 
 let loop_inv_linear_key expr =
-  let form = loop_inv_linear_form_of_expr expr in
-  ( i32 form.inv_linear_const,
-    LoopInvAtomMap.bindings form.inv_linear_atoms )
+  canonical_scalar_key_of_form
+    (canonical_scalar_form_of_loop_inv_expr
+       expr)
 
 let loop_inv_expr_equal lhs rhs =
-  loop_inv_linear_key lhs = loop_inv_linear_key rhs
+  canonical_scalar_key_equal
+    (canonical_scalar_form_of_loop_inv_expr lhs)
+    (canonical_scalar_form_of_loop_inv_expr rhs)
 
 let rec loop_inv_expr_temps expr =
   match normalize_loop_inv_expr expr with
@@ -5139,79 +5402,326 @@ let lve_delta_cases_from_backedge
      | Some _ | None -> ());
   result
 
-let analyze_loop_addrecs header loop get_block loop_defs multi_defs def_instrs =
-  recover_logical_loop_phis header loop get_block multi_defs
-  |> List.filter_map (fun (phi : logical_loop_phi) ->
-         let recovered =
-           List.map
-             (fun case ->
-               ( case,
-                 lve_delta_cases_from_backedge
-                   get_block loop_defs multi_defs def_instrs
-                   phi.logical_phi_temp case ))
-             phi.logical_backedge_cases
-         in
-         let all_recovered =
-           List.for_all
-             (fun (_, steps) ->
-               match steps with
-               | Some (_ :: _) -> true
-               | Some [] | None -> false)
+let symbolic_induction_step_of_instr_on_chain
+    chain loop_defs multi_defs def_instrs phi_temp = function
+  | Tcg.Bin (_, Add, lhs, rhs)
+    when
+      resolves_to_induction_temp_on_chain
+        chain multi_defs def_instrs phi_temp lhs ->
+      lve_invariant_expr_of_operand
+        loop_defs multi_defs def_instrs rhs
+      |> Option.map normalize_loop_inv_expr
+  | Tcg.Bin (_, Add, lhs, rhs)
+    when
+      resolves_to_induction_temp_on_chain
+        chain multi_defs def_instrs phi_temp rhs ->
+      lve_invariant_expr_of_operand
+        loop_defs multi_defs def_instrs lhs
+      |> Option.map normalize_loop_inv_expr
+  | Tcg.Bin (_, Sub, lhs, rhs)
+    when
+      resolves_to_induction_temp_on_chain
+        chain multi_defs def_instrs phi_temp lhs ->
+      lve_invariant_expr_of_operand
+        loop_defs multi_defs def_instrs rhs
+      |> Option.map (fun step ->
+             normalize_loop_inv_expr (LveNeg step))
+  | Tcg.Move _
+  | Tcg.Un _
+  | Tcg.Bin _
+  | Tcg.Load _
+  | Tcg.Store _
+  | Tcg.Call _ ->
+      None
+
+let analyze_direct_self_addrecs
+    header loop get_block loop_defs multi_defs def_instrs
+    excluded_temps =
+  let header_block : Cfg.block = get_block header in
+  let outside_preds =
+    List.filter
+      (fun pred -> not (LabelSet.mem pred loop))
+      header_block.preds
+  in
+  let backedge_preds =
+    List.filter
+      (fun pred -> LabelSet.mem pred loop)
+      header_block.preds
+  in
+  if outside_preds = [] || backedge_preds = [] then []
+  else
+    let backedge_chains =
+      List.map
+        (fun pred ->
+          ( pred,
+            incoming_update_chain
+              get_block header pred ))
+        backedge_preds
+    in
+    let chain_for_backedge pred =
+      match List.assoc_opt pred backedge_chains with
+      | Some chain ->
+          chain
+      | None ->
+          [ get_block pred ]
+    in
+    let outside_seed_chain pred =
+      incoming_phi_chain get_block header pred
+      |> extend_counted_outside_seed_chain
+           get_block loop
+    in
+    let step_of_chain_source phi_temp chain src =
+      let resolved =
+        resolve_chain_operand chain src
+      in
+      match resolved with
+      | Tcg.Imm _ ->
+          None
+      | Tcg.Temp temp -> (
+          match
+            def_instr_on_chain_or_global
+              chain multi_defs def_instrs temp
+          with
+          | Some instr ->
+              symbolic_induction_step_of_instr_on_chain
+                chain loop_defs multi_defs def_instrs
+                phi_temp instr
+          | None ->
+              None)
+    in
+    let step_of_chain_def phi_temp chain =
+      match
+        last_def_of_temp_on_chain chain phi_temp
+      with
+      | Some (Tcg.Move (_, src)) ->
+          step_of_chain_source phi_temp chain src
+      | Some instr ->
+          symbolic_induction_step_of_instr_on_chain
+            chain loop_defs multi_defs def_instrs
+            phi_temp instr
+      | None ->
+          None
+    in
+    let candidates =
+      List.fold_left
+        (fun candidates (_, chain) ->
+          List.fold_left
+            (fun candidates (block : Cfg.block) ->
+              List.fold_left
+                (fun candidates instr ->
+                  match defs_temp instr with
+                  | Some dst
+                    when
+                      not (IntSet.mem dst excluded_temps)
+                      &&
+                      Option.is_some
+                        (symbolic_induction_step_of_instr_on_chain
+                           chain loop_defs multi_defs
+                           def_instrs dst instr) ->
+                      IntSet.add dst candidates
+                  | Some _
+                  | None ->
+                      candidates)
+                candidates
+                block.body)
+            candidates
+            chain)
+        IntSet.empty
+        backedge_chains
+    in
+    IntSet.fold
+      (fun phi_temp addrecs ->
+        let outside_inputs =
+          List.filter_map
+            (fun pred ->
+              let chain = outside_seed_chain pred in
+              match
+                last_def_of_temp_on_chain
+                  chain phi_temp
+              with
+              | Some _ ->
+                  Some (pred, Tcg.Temp phi_temp)
+              | None ->
+                  None)
+            outside_preds
+        in
+        let steps =
+          List.filter_map
+            (fun pred ->
+              let chain = chain_for_backedge pred in
+              Option.map
+                (fun step -> (pred, step))
+                (step_of_chain_def phi_temp chain))
+            backedge_preds
+        in
+        match steps with
+        | []
+        | _ when
+            List.length outside_inputs
+            <> List.length outside_preds
+            || List.length steps
+               <> List.length backedge_preds ->
+            addrecs
+        | (_, first_step) :: rest
+          when
+            List.for_all
+              (fun (_, step) ->
+                loop_inv_expr_equal first_step step)
+              rest ->
+            let addrec =
+              {
+                addrec_phi_temp = phi_temp;
+                addrec_outside_inputs = outside_inputs;
+                addrec_backedge_preds = backedge_preds;
+                addrec_step =
+                  normalize_loop_inv_expr first_step;
+              }
+            in
+            if
+              Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
+              <> None
+            then
+              Printf.eprintf
+                "scev-direct-addrec header=%s phi=t%d step=%s outside=%d backedges=%d\n%!"
+                header phi_temp
+                (string_of_loop_inv_expr
+                   addrec.addrec_step)
+                (List.length outside_inputs)
+                (List.length backedge_preds);
+            addrec :: addrecs
+        | _ ->
+            addrecs)
+      candidates
+      []
+
+let analyze_loop_addrecs
+    header loop get_block loop_defs multi_defs def_instrs =
+  let logical_addrecs =
+    recover_logical_loop_phis
+      header loop get_block multi_defs
+    |> List.filter_map
+         (fun (phi : logical_loop_phi) ->
+           let recovered =
+             List.map
+               (fun case ->
+                 ( case,
+                   lve_delta_cases_from_backedge
+                     get_block loop_defs multi_defs
+                     def_instrs
+                     phi.logical_phi_temp case ))
+               phi.logical_backedge_cases
+           in
+           let all_recovered =
+             List.for_all
+               (fun (_, steps) ->
+                 match steps with
+                 | Some (_ :: _) ->
+                     true
+                 | Some []
+                 | None ->
+                     false)
+               recovered
+           in
+           let steps =
              recovered
-         in
-         let steps =
-           recovered
-           |> List.concat_map (fun (case, maybe_steps) ->
-                  match maybe_steps with
-                  | None -> []
-                  | Some path_steps ->
-                      List.map
-                        (fun step ->
-                          ( case.logical_header_pred,
-                            case.logical_def_label,
-                            normalize_loop_inv_expr step ))
-                        path_steps)
-         in
-         match steps with
-         | [] -> None
-         | (_, _, step) :: rest
-           when all_recovered
-                && List.for_all
-                     (fun (_, _, other) -> loop_inv_expr_equal step other)
-                     rest ->
-             let addrec =
-               {
-                 addrec_phi_temp = phi.logical_phi_temp;
-                 addrec_outside_inputs = phi.logical_outside_inputs;
-                 addrec_backedge_preds = phi.logical_backedge_preds;
-                 addrec_step = normalize_loop_inv_expr step;
-               }
-             in
-             if Sys.getenv_opt "TOYC_DEBUG_LVE" <> None then
-               Printf.eprintf
-                 "lve-addrec header=%s phi=t%d step=%s outside=%d backedges=%d physical-paths=%d value-paths=%d\n%!"
-                 header addrec.addrec_phi_temp
-                 (string_of_loop_inv_expr addrec.addrec_step)
-                 (List.length addrec.addrec_outside_inputs)
-                 (List.length addrec.addrec_backedge_preds)
-                 (List.length phi.logical_backedge_cases)
-                 (List.length steps);
-             Some addrec
-         | _ ->
-             (if Sys.getenv_opt "TOYC_DEBUG_LVE" <> None then
-                let rendered =
-                  steps
-                  |> List.map (fun (pred, def_label, step) ->
-                         Printf.sprintf "%s/%s:%s"
-                           pred def_label (string_of_loop_inv_expr step))
-                  |> String.concat ","
-                in
-                Printf.eprintf
-                  "lve-addrec-reject header=%s phi=t%d paths={%s} recovered=%b value-paths=%d physical-paths=%d\n%!"
-                  header phi.logical_phi_temp rendered all_recovered
-                  (List.length steps)
-                  (List.length phi.logical_backedge_cases));
-             None)
+             |> List.concat_map
+                  (fun (case, maybe_steps) ->
+                    match maybe_steps with
+                    | None ->
+                        []
+                    | Some path_steps ->
+                        List.map
+                          (fun step ->
+                            ( case.logical_header_pred,
+                              case.logical_def_label,
+                              normalize_loop_inv_expr
+                                step ))
+                          path_steps)
+           in
+           match steps with
+           | [] ->
+               None
+           | (_, _, step) :: rest
+             when
+               all_recovered
+               && List.for_all
+                    (fun (_, _, other) ->
+                      loop_inv_expr_equal step other)
+                    rest ->
+               let addrec =
+                 {
+                   addrec_phi_temp =
+                     phi.logical_phi_temp;
+                   addrec_outside_inputs =
+                     phi.logical_outside_inputs;
+                   addrec_backedge_preds =
+                     phi.logical_backedge_preds;
+                   addrec_step =
+                     normalize_loop_inv_expr step;
+                 }
+               in
+               if
+                 Sys.getenv_opt "TOYC_DEBUG_LVE"
+                 <> None
+               then
+                 Printf.eprintf
+                   "lve-addrec header=%s phi=t%d step=%s outside=%d backedges=%d physical-paths=%d value-paths=%d\n%!"
+                   header
+                   addrec.addrec_phi_temp
+                   (string_of_loop_inv_expr
+                      addrec.addrec_step)
+                   (List.length
+                      addrec.addrec_outside_inputs)
+                   (List.length
+                      addrec.addrec_backedge_preds)
+                   (List.length
+                      phi.logical_backedge_cases)
+                   (List.length steps);
+               Some addrec
+           | _ ->
+               (if
+                  Sys.getenv_opt "TOYC_DEBUG_LVE"
+                  <> None
+                then
+                  let rendered =
+                    steps
+                    |> List.map
+                         (fun
+                           ( pred,
+                             def_label,
+                             step ) ->
+                           Printf.sprintf
+                             "%s/%s:%s"
+                             pred def_label
+                             (string_of_loop_inv_expr
+                                step))
+                    |> String.concat ","
+                  in
+                  Printf.eprintf
+                    "lve-addrec-reject header=%s phi=t%d paths={%s} recovered=%b value-paths=%d physical-paths=%d\n%!"
+                    header
+                    phi.logical_phi_temp
+                    rendered
+                    all_recovered
+                    (List.length steps)
+                    (List.length
+                       phi.logical_backedge_cases));
+               None)
+  in
+  let logical_temps =
+    List.fold_left
+      (fun temps (addrec : loop_addrec) ->
+        IntSet.add addrec.addrec_phi_temp temps)
+      IntSet.empty
+      logical_addrecs
+  in
+  let direct_addrecs =
+    analyze_direct_self_addrecs
+      header loop get_block
+      loop_defs multi_defs def_instrs
+      logical_temps
+  in
+  logical_addrecs @ direct_addrecs
 
 
 (* -------------------------------------------------------------------------- *)
@@ -6065,6 +6575,11 @@ let recurrence_at facts point operand =
   analyze IntSet.empty point operand
   |> Option.map normalize_scalar_recurrence
 
+let recurrence_invariant_at facts point operand =
+  Option.bind
+    (recurrence_at facts point operand)
+    scalar_recurrence_invariant_expr
+
 let string_of_recurrence_phase_state = function
   | RecurrencePhaseUnseen -> "unseen"
   | RecurrencePhaseKnown phase ->
@@ -6227,6 +6742,43 @@ let scalar_outside_inputs
   let inputs = List.filter_map seed_for_pred outside_preds in
   if List.length inputs = List.length outside_preds then Some inputs
   else None
+
+let recurrence_addrec_start_expr
+    (facts : recurrence_facts)
+    (addrec : loop_addrec) =
+  let expr_of_operand = function
+    | Tcg.Imm value ->
+        Some (LveConst value)
+    | Tcg.Temp _ as operand ->
+        facts.recurrence_invariant_of_operand operand
+        |> Option.map normalize_loop_inv_expr
+  in
+  match
+    scalar_outside_inputs
+      facts.recurrence_header
+      facts.recurrence_loop
+      facts.recurrence_get_block
+      addrec
+  with
+  | Some ((_, first_operand) :: rest) ->
+      Option.bind
+        (expr_of_operand first_operand)
+        (fun first ->
+          let rec agree = function
+            | [] ->
+                Some first
+            | (_, operand) :: tail -> (
+                match expr_of_operand operand with
+                | Some other
+                  when loop_inv_expr_equal first other ->
+                    agree tail
+                | Some _ | None ->
+                    None)
+          in
+          agree rest)
+  | Some []
+  | None ->
+      None
 
 let basic_iv_of_scalar_addrec
     header loop get_block (addrec : loop_addrec) =
@@ -6579,71 +7131,7 @@ type summary_expr =
   | SummaryUn of unop * summary_expr
   | SummaryBin of binop * summary_expr * summary_expr
 
-type summary_semantic_atom =
-  | SummarySemanticLoopAtom of loop_inv_expr
-  | SummarySemanticPlaceAtom of Tcg.place
-  | SummarySemanticOpaqueAtom of summary_expr
-
-module SummarySemanticAtomOrd = struct
-  type t = summary_semantic_atom
-  let compare = Stdlib.compare
-end
-
-module SummarySemanticAtomMap = Map.Make (SummarySemanticAtomOrd)
-
-type summary_semantic_linear_form = {
-  summary_semantic_const : int64;
-  summary_semantic_atoms : int64 SummarySemanticAtomMap.t;
-}
-
-let summary_semantic_zero =
-  {
-    summary_semantic_const = 0L;
-    summary_semantic_atoms = SummarySemanticAtomMap.empty;
-  }
-
-let summary_semantic_add_atom atoms atom coeff =
-  let coeff = i32 coeff in
-  if coeff = 0L then atoms
-  else
-    let old =
-      Option.value ~default:0L
-        (SummarySemanticAtomMap.find_opt atom atoms)
-    in
-    let coeff = linear_i32_add old coeff in
-    if coeff = 0L then SummarySemanticAtomMap.remove atom atoms
-    else SummarySemanticAtomMap.add atom coeff atoms
-
-let summary_semantic_add lhs rhs =
-  {
-    summary_semantic_const =
-      linear_i32_add
-        lhs.summary_semantic_const
-        rhs.summary_semantic_const;
-    summary_semantic_atoms =
-      SummarySemanticAtomMap.fold
-        (fun atom coeff atoms ->
-          summary_semantic_add_atom atoms atom coeff)
-        rhs.summary_semantic_atoms
-        lhs.summary_semantic_atoms;
-  }
-
-let summary_semantic_scale factor form =
-  let factor = i32 factor in
-  if factor = 0L then summary_semantic_zero
-  else
-    {
-      summary_semantic_const =
-        linear_i32_mul factor form.summary_semantic_const;
-      summary_semantic_atoms =
-        SummarySemanticAtomMap.fold
-          (fun atom coeff atoms ->
-            summary_semantic_add_atom
-              atoms atom
-              (linear_i32_mul factor coeff))
-          form.summary_semantic_atoms
-          SummarySemanticAtomMap.empty;
-    }
+(* Counted-summary semantic equality uses the shared canonical scalar key. *)
 
 type counted_reduction_step =
   | ReductionInvariant of summary_expr
@@ -6924,6 +7412,213 @@ let normalize_limit_operand loop_defs multi_defs def_instrs operand delta =
       match resolve_operand_before_loop loop_defs multi_defs def_instrs operand with
       | Some resolved -> Some (LimitOperand (resolved, delta))
       | None -> None)
+
+type recurrence_control_candidate = {
+  recurrence_control_base : loop_addrec;
+  recurrence_control_scale : loop_inv_expr;
+  recurrence_control_bias : loop_inv_expr;
+  recurrence_control_bound_operand : Tcg.operand;
+  recurrence_control_bound_expr : loop_inv_expr;
+  recurrence_control_op : binop;
+  recurrence_control_label : Tcg.label;
+  recurrence_control_inside_label : Tcg.label;
+  recurrence_control_exit_label : Tcg.label;
+}
+
+let string_of_recurrence_compare = function
+  | Lt -> "lt"
+  | Le -> "le"
+  | Gt -> "gt"
+  | Ge -> "ge"
+  | Eq -> "eq"
+  | Ne -> "ne"
+  | Add -> "add"
+  | Sub -> "sub"
+  | Mul -> "mul"
+  | Div -> "div"
+  | Mod -> "mod"
+  | LAnd -> "land"
+  | LOr -> "lor"
+
+let find_recurrence_loop_control_candidate
+    (facts : recurrence_facts)
+    multi_defs
+    def_instrs =
+  let loop = facts.recurrence_loop in
+  let match_one label varying bound =
+    let point = RecurrenceBlockExit label in
+    match
+      ( recurrence_at facts point varying,
+        recurrence_invariant_at facts point bound )
+    with
+    | Some
+        ((ScalarAddRec _ | ScalarAffine _) as recurrence),
+      Some bound_expr -> (
+        match scalar_recurrence_scale_bias recurrence with
+        | Some (base, scale, bias) ->
+            Some
+              ( base,
+                normalize_loop_inv_expr scale,
+                normalize_loop_inv_expr bias,
+                normalize_loop_inv_expr bound_expr )
+        | None ->
+            None)
+    | _ ->
+        None
+  in
+  LabelSet.elements loop
+  |> List.find_map (fun label ->
+         let block : Cfg.block =
+           facts.recurrence_get_block label
+         in
+         match
+           branch_compare_shape_in_block
+             block multi_defs def_instrs block.term
+         with
+         | Some (op, lhs, rhs, if_true, if_false)
+           when
+             LabelSet.mem if_true loop
+             <> LabelSet.mem if_false loop ->
+             let true_in = LabelSet.mem if_true loop in
+             let continue_op, inside_label, exit_label =
+               if true_in then
+                 (op, if_true, if_false)
+               else
+                 (invert_compare op, if_false, if_true)
+             in
+             let matched =
+               match match_one label lhs rhs with
+               | Some (base, scale, bias, bound_expr) ->
+                   Some
+                     ( base,
+                       scale,
+                       bias,
+                       rhs,
+                       bound_expr,
+                       continue_op )
+               | None -> (
+                   match match_one label rhs lhs with
+                   | Some (base, scale, bias, bound_expr) ->
+                       Some
+                         ( base,
+                           scale,
+                           bias,
+                           lhs,
+                           bound_expr,
+                           swap_compare continue_op )
+                   | None ->
+                       None)
+             in
+             Option.map
+               (fun
+                 ( base,
+                   scale,
+                   bias,
+                   bound_operand,
+                   bound_expr,
+                   normalized_op ) ->
+                 let candidate =
+                   {
+                     recurrence_control_base = base;
+                     recurrence_control_scale = scale;
+                     recurrence_control_bias = bias;
+                     recurrence_control_bound_operand =
+                       bound_operand;
+                     recurrence_control_bound_expr =
+                       bound_expr;
+                     recurrence_control_op = normalized_op;
+                     recurrence_control_label = label;
+                     recurrence_control_inside_label =
+                       inside_label;
+                     recurrence_control_exit_label =
+                       exit_label;
+                   }
+                 in
+                 if
+                   Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
+                   <> None
+                 then
+                   Printf.eprintf
+                     "scev-control-candidate header=%s control=%s phi=t%d start=%s step=%s scale=%s bias=%s op=%s bound=%s\n%!"
+                     facts.recurrence_header
+                     label
+                     base.addrec_phi_temp
+                     (match
+                        recurrence_addrec_start_expr facts base
+                      with
+                      | Some start ->
+                          string_of_loop_inv_expr start
+                      | None ->
+                          "<path-dependent>")
+                     (string_of_loop_inv_expr
+                        base.addrec_step)
+                     (string_of_loop_inv_expr scale)
+                     (string_of_loop_inv_expr bias)
+                     (string_of_recurrence_compare
+                        normalized_op)
+                     (string_of_loop_inv_expr
+                        bound_expr);
+                 candidate)
+               matched
+         | Some _ | None ->
+             None)
+
+let proven_counted_control_of_recurrence_candidate
+    header loop get_block
+    (candidate : recurrence_control_candidate) =
+  let build_kind step =
+    match (step, candidate.recurrence_control_op) with
+    | step, Lt when step > 0L ->
+        Some
+          (CountUpLt
+             ( candidate.recurrence_control_bound_operand,
+               0L ))
+    | step, Le when step > 0L ->
+        Some
+          (CountUpLe
+             ( candidate.recurrence_control_bound_operand,
+               0L ))
+    | step, Gt when step < 0L ->
+        Some
+          (CountDownGt
+             ( candidate.recurrence_control_bound_operand,
+               0L ))
+    | step, Ge when step < 0L ->
+        Some
+          (CountDownGe
+             ( candidate.recurrence_control_bound_operand,
+               0L ))
+    | _ ->
+        None
+  in
+  match
+    ( loop_inv_expr_const_opt
+        candidate.recurrence_control_scale,
+      loop_inv_expr_const_opt
+        candidate.recurrence_control_bias,
+      basic_iv_of_scalar_addrec
+        header loop get_block
+        candidate.recurrence_control_base )
+  with
+  | Some 1L, Some 0L, Some control_iv ->
+      Option.map
+        (fun kind ->
+          {
+            control_iv;
+            control_label =
+              candidate.recurrence_control_label;
+            inside_label =
+              candidate.recurrence_control_inside_label;
+            exit_label =
+              candidate.recurrence_control_exit_label;
+            kind;
+          })
+        (build_kind control_iv.step)
+  | _ ->
+      (* Item #1 recognizes symbolic/scaled/biased recurrences, but does not
+         promote them into mature counted-loop proof consumers.  Item #3 will
+         own sign/range/no-wrap/trip-count proof. *)
+      None
 
 let classify_counted_loop_header
     control_label
@@ -7468,7 +8163,16 @@ let merge_basic_induction_vars
 let proven_syntactic_induction_vars (ivs : basic_induction_var list) =
   List.filter (fun (iv : basic_induction_var) -> iv.origin = `Syntactic) ivs
 
-let analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs =
+type loop_recurrence_analysis = {
+  loop_recurrence_syntactic_ivs : basic_induction_var list;
+  loop_recurrence_semantic_ivs : basic_induction_var list;
+  loop_recurrence_all_ivs : basic_induction_var list;
+  loop_recurrence_addrecs : loop_addrec list;
+  loop_recurrence_facts : recurrence_facts;
+}
+
+let induction_recurrence_views
+    header loop get_block loop_defs multi_defs def_instrs =
   let syntactic =
     collect_basic_induction_vars
       header loop get_block loop_defs multi_defs def_instrs
@@ -7478,20 +8182,34 @@ let analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs
       header loop get_block loop_defs multi_defs def_instrs
   in
   debug_scalar_recurrence_loop
-    header loop get_block loop_defs multi_defs def_instrs addrecs;
+    header loop get_block
+    loop_defs multi_defs def_instrs addrecs;
   let semantic =
     addrecs
     |> List.filter_map
-         (basic_iv_of_scalar_addrec header loop get_block)
+         (basic_iv_of_scalar_addrec
+            header loop get_block)
   in
-  let merged = merge_basic_induction_vars syntactic semantic in
-  let semantic_new =
-    List.filter (fun (iv : basic_induction_var) -> iv.origin = `Semantic) merged
+  let merged =
+    merge_basic_induction_vars syntactic semantic
   in
-  if Sys.getenv_opt "TOYC_DEBUG_SCALAR_RECURRENCE" <> None then begin
+  if
+    Sys.getenv_opt "TOYC_DEBUG_SCALAR_RECURRENCE"
+    <> None
+  then begin
+    let semantic_new =
+      List.filter
+        (fun (iv : basic_induction_var) ->
+          iv.origin = `Semantic
+          && not
+               (List.exists
+                  (fun (old : basic_induction_var) ->
+                    old.phi_temp = iv.phi_temp)
+                  syntactic))
+        merged
+    in
     Printf.eprintf
-      "scalar-iv-compare header=%s old=%d semantic=%d merged=%d new=%d
-%!"
+      "scalar-iv-compare header=%s old=%d semantic=%d merged=%d new=%d\n%!"
       header
       (List.length syntactic)
       (List.length semantic)
@@ -7500,15 +8218,69 @@ let analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs
     List.iter
       (fun (iv : basic_induction_var) ->
         Printf.eprintf
-          "scalar-iv-new header=%s phi=t%d step=%Ld outside=%d backedges=%d origin=%s
-%!"
-          header iv.phi_temp iv.step
+          "scalar-iv-new header=%s phi=t%d step=%Ld outside=%d backedges=%d origin=%s\n%!"
+          header
+          iv.phi_temp
+          iv.step
           (List.length iv.outside_inputs)
           (List.length iv.backedge_preds)
           (string_of_basic_iv_origin iv.origin))
       semantic_new
   end;
-  merged
+  (syntactic, semantic, merged, addrecs)
+
+let build_loop_recurrence_analysis
+    header loop get_block
+    loop_defs multi_defs def_instrs =
+  let syntactic, semantic, merged, addrecs =
+    induction_recurrence_views
+      header loop get_block
+      loop_defs multi_defs def_instrs
+  in
+  let facts =
+    build_recurrence_facts
+      header loop get_block
+      loop_defs multi_defs def_instrs addrecs
+  in
+  if Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED" <> None then begin
+    Printf.eprintf
+      "scev-loop-analysis header=%s syntactic=%d semantic=%d addrecs=%d defs=%d multidefs=%d\n%!"
+      header
+      (List.length syntactic)
+      (List.length semantic)
+      (List.length addrecs)
+      (IntSet.cardinal loop_defs)
+      (IntSet.cardinal multi_defs);
+    List.iter
+      (fun (addrec : loop_addrec) ->
+        Printf.eprintf
+          "scev-addrec header=%s phi=t%d start=%s step=%s\n%!"
+          header
+          addrec.addrec_phi_temp
+          (match recurrence_addrec_start_expr facts addrec with
+           | Some start ->
+               string_of_loop_inv_expr start
+           | None ->
+               "<path-dependent>")
+          (string_of_loop_inv_expr addrec.addrec_step))
+      addrecs
+  end;
+  {
+    loop_recurrence_syntactic_ivs = syntactic;
+    loop_recurrence_semantic_ivs = semantic;
+    loop_recurrence_all_ivs = merged;
+    loop_recurrence_addrecs = addrecs;
+    loop_recurrence_facts = facts;
+  }
+
+let analyze_induction_vars
+    header loop get_block loop_defs multi_defs def_instrs =
+  let analysis =
+    build_loop_recurrence_analysis
+      header loop get_block
+      loop_defs multi_defs def_instrs
+  in
+  analysis.loop_recurrence_all_ivs
 
 let analyze_counted_control header loop get_block loop_defs loop_stable_phis multi_defs def_instrs =
   let ivs =
@@ -7519,17 +8291,37 @@ let analyze_counted_control header loop get_block loop_defs loop_stable_phis mul
     find_counted_loop_control
       loop loop_defs loop_stable_phis multi_defs def_instrs ivs get_block )
 
-let analyze_counted_loop header loop get_block temp_count blocks =
+let analyze_counted_loop
+    header loop get_block temp_count blocks =
   let loop_defs, def_blocks, def_instrs, multi_defs =
-    analyze_temp_defs_of_blocks ~loop temp_count blocks
+    analyze_temp_defs_of_blocks
+      ~loop temp_count blocks
   in
   let loop_stable_phis =
-    collect_loop_stable_phis header loop get_block def_blocks multi_defs def_instrs
+    collect_loop_stable_phis
+      header loop get_block
+      def_blocks multi_defs def_instrs
   in
-  let ivs, control =
-    analyze_counted_control header loop get_block loop_defs loop_stable_phis multi_defs def_instrs
+  let recurrence_analysis =
+    build_loop_recurrence_analysis
+      header loop get_block
+      loop_defs multi_defs def_instrs
   in
-  (loop_defs, def_blocks, def_instrs, multi_defs, loop_stable_phis, ivs, control)
+  let ivs =
+    recurrence_analysis.loop_recurrence_syntactic_ivs
+  in
+  let control =
+    find_counted_loop_control
+      loop loop_defs loop_stable_phis
+      multi_defs def_instrs ivs get_block
+  in
+  ( loop_defs,
+    def_blocks,
+    def_instrs,
+    multi_defs,
+    loop_stable_phis,
+    ivs,
+    control )
 
 (* Elimination-only semantic control fallback.
 
@@ -7547,112 +8339,14 @@ let analyze_counted_loop header loop get_block temp_count blocks =
    The recovered semantic IV is kept only in [counted_loop_info.control_iv].
    It is NOT inserted into the reduction IV list. *)
 let find_counted_loop_control_semantic
-    header
-    loop
-    loop_defs
-    multi_defs
-    def_instrs
-    get_block
-    addrecs =
-  let facts =
-    build_recurrence_facts
-      header loop get_block loop_defs multi_defs def_instrs addrecs
-  in
-  let invariant_operand operand =
-    lve_invariant_expr_of_operand
-      loop_defs multi_defs def_instrs operand
-    |> Option.is_some
-  in
-  let semantic_control_of_operand label operand =
-    match
-      recurrence_at facts
-        (RecurrenceBlockExit label) operand
-    with
-    | Some ((ScalarAddRec _ | ScalarAffine _) as recurrence) -> (
-        match scalar_recurrence_scale_bias recurrence with
-        | Some (base, scale, bias) -> (
-            match
-              ( loop_inv_expr_const_opt scale,
-                loop_inv_expr_const_opt bias,
-                basic_iv_of_scalar_addrec
-                  header loop get_block base )
-            with
-            | Some 1L, Some 0L, Some iv ->
-                Some (iv, 0L)
-            | _ ->
-                None)
-        | None ->
-            None)
-    | Some (ScalarConst _)
-    | Some (ScalarInvariant _)
-    | None ->
-        None
-  in
-  let build_kind step op bound bias =
-    match (step, op) with
-    | step, Lt when step > 0L ->
-        Some (CountUpLt (bound, bias))
-    | step, Le when step > 0L ->
-        Some (CountUpLe (bound, bias))
-    | step, Gt when step < 0L ->
-        Some (CountDownGt (bound, bias))
-    | step, Ge when step < 0L ->
-        Some (CountDownGe (bound, bias))
-    | _ ->
-        None
-  in
-  LabelSet.elements loop
-  |> List.find_map (fun label ->
-         let block : Cfg.block = get_block label in
-         match
-           branch_compare_shape_in_block
-             block multi_defs def_instrs block.term
-         with
-         | Some (op, lhs, rhs, if_true, if_false)
-           when
-             LabelSet.mem if_true loop
-             <> LabelSet.mem if_false loop ->
-             (* Reuse the mature target-orientation rule directly instead of
-                inventing inverse counted kinds: classify the comparison whose
-                TRUE edge stays in-loop; otherwise invert the comparison first. *)
-             let true_in = LabelSet.mem if_true loop in
-             let op, if_true, if_false =
-               if true_in then (op, if_true, if_false)
-               else (invert_compare op, if_false, if_true)
-             in
-             let match_one op recurrence_operand bound =
-               if not (invariant_operand bound) then None
-               else
-                 match
-                   semantic_control_of_operand
-                     label recurrence_operand
-                 with
-                 | Some (iv, bias) ->
-                     Option.map
-                       (fun kind -> (iv, kind))
-                       (build_kind iv.step op bound bias)
-                 | None ->
-                     None
-             in
-             let matched =
-               match match_one op lhs rhs with
-               | Some _ as found -> found
-               | None ->
-                   match_one
-                     (swap_compare op) rhs lhs
-             in
-             Option.map
-               (fun (control_iv, kind) ->
-                 {
-                   control_iv;
-                   control_label = label;
-                   inside_label = if_true;
-                   exit_label = if_false;
-                   kind;
-                 })
-               matched
-         | Some _ | None ->
-             None)
+    header loop get_block
+    multi_defs def_instrs
+    facts =
+  Option.bind
+    (find_recurrence_loop_control_candidate
+       facts multi_defs def_instrs)
+    (proven_counted_control_of_recurrence_candidate
+       header loop get_block)
 
 let analyze_counted_loop_for_elimination
     header loop get_block temp_count blocks =
@@ -7662,18 +8356,21 @@ let analyze_counted_loop_for_elimination
   in
   let loop_stable_phis =
     collect_loop_stable_phis
-      header loop get_block def_blocks multi_defs def_instrs
+      header loop get_block
+      def_blocks multi_defs def_instrs
   in
-  let all_ivs =
-    analyze_induction_vars
-      header loop get_block loop_defs multi_defs def_instrs
+  let recurrence_analysis =
+    build_loop_recurrence_analysis
+      header loop get_block
+      loop_defs multi_defs def_instrs
   in
   let syntactic_ivs =
-    proven_syntactic_induction_vars all_ivs
+    recurrence_analysis.loop_recurrence_syntactic_ivs
   in
   let old_control =
     find_counted_loop_control
-      loop loop_defs loop_stable_phis multi_defs def_instrs
+      loop loop_defs loop_stable_phis
+      multi_defs def_instrs
       syntactic_ivs get_block
   in
   let control =
@@ -7681,13 +8378,10 @@ let analyze_counted_loop_for_elimination
     | Some _ ->
         old_control
     | None ->
-        let addrecs =
-          analyze_loop_addrecs
-            header loop get_block loop_defs multi_defs def_instrs
-        in
         find_counted_loop_control_semantic
-          header loop loop_defs multi_defs def_instrs
-          get_block addrecs
+          header loop get_block
+          multi_defs def_instrs
+          recurrence_analysis.loop_recurrence_facts
   in
   (match control with
    | Some info
@@ -7705,7 +8399,8 @@ let analyze_counted_loop_for_elimination
     multi_defs,
     loop_stable_phis,
     syntactic_ivs,
-    control )
+    control,
+    recurrence_analysis.loop_recurrence_facts )
 
 let linear_loop_path header loop get_block entry_label =
   let rec collapse_transparent_branch seen visiting label =
@@ -10203,6 +10898,7 @@ let reduction_update_of_place
   | None -> None
 
 let collect_counted_reductions
+    ?recurrence_facts
     header
     loop
     invariant_loaded_places
@@ -10298,14 +10994,19 @@ let collect_counted_reductions
     recover_logical_loop_phis
       header loop get_block multi_defs
   in
-  let recurrence_addrecs =
-    analyze_loop_addrecs
-      header loop get_block loop_defs multi_defs def_instrs
-  in
   let recurrence_facts =
-    build_recurrence_facts
-      header loop get_block loop_defs multi_defs def_instrs
-      recurrence_addrecs
+    match recurrence_facts with
+    | Some facts ->
+        facts
+    | None ->
+        let addrecs =
+          analyze_loop_addrecs
+            header loop get_block
+            loop_defs multi_defs def_instrs
+        in
+        build_recurrence_facts
+          header loop get_block
+          loop_defs multi_defs def_instrs addrecs
   in
   let header_block : Cfg.block = get_block header in
   let outside_preds = List.filter (fun pred -> not (LabelSet.mem pred loop)) header_block.preds in
@@ -12331,106 +13032,41 @@ let collect_counted_reductions
     | None -> false
   in
 
-  let summary_semantic_atom_form atom =
-    {
-      summary_semantic_const = 0L;
-      summary_semantic_atoms =
-        SummarySemanticAtomMap.singleton atom 1L;
-    }
-  in
-  let summary_semantic_form_of_loop_inv_expr expr =
-    let form =
-      loop_inv_linear_form_of_expr
-        (normalize_loop_inv_expr expr)
-    in
-    {
-      summary_semantic_const = form.inv_linear_const;
-      summary_semantic_atoms =
-        LoopInvAtomMap.fold
-          (fun atom coeff atoms ->
-            summary_semantic_add_atom atoms
-              (SummarySemanticLoopAtom atom)
-              coeff)
-          form.inv_linear_atoms
-          SummarySemanticAtomMap.empty;
-    }
-  in
   let rec summary_semantic_form_of_expr expr =
-    let opaque expr =
-      summary_semantic_atom_form
-        (SummarySemanticOpaqueAtom expr)
-    in
     match expr with
     | SummaryOperand (Tcg.Imm value) ->
-        {
-          summary_semantic_const = i32 value;
-          summary_semantic_atoms =
-            SummarySemanticAtomMap.empty;
-        }
+        canonical_scalar_const value
     | SummaryOperand operand -> (
         match
           lve_invariant_expr_of_operand
             loop_defs multi_defs def_instrs operand
         with
         | Some invariant ->
-            summary_semantic_form_of_loop_inv_expr invariant
+            canonical_scalar_form_of_loop_inv_expr
+              invariant
         | None ->
-            opaque expr)
+            canonical_scalar_operand operand)
     | SummaryPlace place ->
-        summary_semantic_atom_form
-          (SummarySemanticPlaceAtom place)
-    | SummaryUn (UPlus, inner) ->
-        summary_semantic_form_of_expr inner
-    | SummaryUn (UMinus, inner) ->
-        summary_semantic_scale (-1L)
+        canonical_scalar_place place
+    | SummaryUn (op, inner) ->
+        canonical_scalar_un
+          op
           (summary_semantic_form_of_expr inner)
-    | SummaryUn (UNot, _) ->
-        opaque expr
-    | SummaryBin (Add, lhs, rhs) ->
-        summary_semantic_add
+    | SummaryBin (op, lhs, rhs) ->
+        canonical_scalar_bin
+          op
           (summary_semantic_form_of_expr lhs)
           (summary_semantic_form_of_expr rhs)
-    | SummaryBin (Sub, lhs, rhs) ->
-        summary_semantic_add
-          (summary_semantic_form_of_expr lhs)
-          (summary_semantic_scale (-1L)
-             (summary_semantic_form_of_expr rhs))
-    | SummaryBin (Mul, lhs, rhs) ->
-        let lhs_form = summary_semantic_form_of_expr lhs in
-        let rhs_form = summary_semantic_form_of_expr rhs in
-        if
-          SummarySemanticAtomMap.is_empty
-            lhs_form.summary_semantic_atoms
-        then
-          summary_semantic_scale
-            lhs_form.summary_semantic_const rhs_form
-        else if
-          SummarySemanticAtomMap.is_empty
-            rhs_form.summary_semantic_atoms
-        then
-          summary_semantic_scale
-            rhs_form.summary_semantic_const lhs_form
-        else
-          let lhs, rhs =
-            if Stdlib.compare lhs rhs <= 0
-            then (lhs, rhs)
-            else (rhs, lhs)
-          in
-          opaque (SummaryBin (Mul, lhs, rhs))
-    | SummaryBin
-        ((Div | Mod | Lt | Le | Gt | Ge | Eq | Ne | LAnd | LOr),
-         _, _) ->
-        opaque expr
   in
   let summary_semantic_key expr =
-    let form = summary_semantic_form_of_expr expr in
-    ( i32 form.summary_semantic_const,
-      SummarySemanticAtomMap.bindings
-        form.summary_semantic_atoms )
+    canonical_scalar_key_of_form
+      (summary_semantic_form_of_expr expr)
   in
   let summary_expr_semantic_equal lhs rhs =
-    summary_semantic_key lhs = summary_semantic_key rhs
+    summary_semantic_key lhs
+    = summary_semantic_key rhs
   in
+
   let basic_iv_semantic_equal
       (lhs : basic_induction_var)
       (rhs : basic_induction_var) =
@@ -14051,7 +14687,15 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
         let loop = table_find_or_empty loops header LabelSet.empty in
         let header_block : Cfg.block = get_block header in
         let blocks_snapshot = current_block_list () in
-        let (loop_defs, def_blocks, def_instrs, multi_defs, loop_stable_phis, ivs, control) =
+        let
+          ( loop_defs,
+            def_blocks,
+            def_instrs,
+            multi_defs,
+            loop_stable_phis,
+            ivs,
+            control,
+            recurrence_facts ) =
           analyze_counted_loop_for_elimination
             header loop get_block !next_temp blocks_snapshot
         in
@@ -14102,6 +14746,7 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
                 in
                 let reductions =
                   collect_counted_reductions
+                    ~recurrence_facts
                     header
                     loop
                     invariant_loaded_places
@@ -15372,7 +16017,15 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
         let loop = table_find_or_empty loops header LabelSet.empty in
         let header_block : Cfg.block = get_block header in
         let blocks_snapshot = current_block_list () in
-        let (loop_defs, def_blocks, def_instrs, multi_defs, loop_stable_phis, ivs, control) =
+        let
+          ( loop_defs,
+            def_blocks,
+            def_instrs,
+            multi_defs,
+            loop_stable_phis,
+            ivs,
+            control,
+            recurrence_facts ) =
           analyze_counted_loop_for_elimination
             header loop get_block !next_temp blocks_snapshot
         in
@@ -15444,6 +16097,7 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                 in
                 let reductions =
                   collect_counted_reductions
+                    ~recurrence_facts
                     header
                     loop
                     invariant_loaded_places
@@ -17622,6 +18276,12 @@ let general_linear_canonicalize_func (f : Cfg.func) =
    DCE removes the now-dead earlier multiplication immediately afterwards in
    the normal pipeline. *)
 let factor_common_mul_func (f : Cfg.func) =
+  let canonical_scalar = make_linear_analyzer f in
+  let canonical_operand_equal lhs rhs =
+    canonical_scalar_key_equal
+      (canonical_scalar lhs)
+      (canonical_scalar rhs)
+  in
   let use_counts = temp_use_counts f.blocks in
   let _, _, _, multi_defs =
     analyze_temp_defs_of_blocks f.temp_count f.blocks
@@ -17642,6 +18302,7 @@ let factor_common_mul_func (f : Cfg.func) =
   in
   let changed = ref false in
   let rewrites = ref 0 in
+  let semantic_common_rewrites = ref 0 in
 
   let rewrite_block (block : Cfg.block) =
     let body = Array.of_list block.body in
@@ -17669,11 +18330,16 @@ let factor_common_mul_func (f : Cfg.func) =
     in
 
     let common_factors (lhs1, rhs1) (lhs2, rhs2) =
-      if lhs1 = lhs2 then Some (lhs1, rhs1, rhs2)
-      else if lhs1 = rhs2 then Some (lhs1, rhs1, lhs2)
-      else if rhs1 = lhs2 then Some (rhs1, lhs1, rhs2)
-      else if rhs1 = rhs2 then Some (rhs1, lhs1, lhs2)
-      else None
+      if canonical_operand_equal lhs1 lhs2 then
+        Some (lhs1, rhs1, rhs2)
+      else if canonical_operand_equal lhs1 rhs2 then
+        Some (lhs1, rhs1, lhs2)
+      else if canonical_operand_equal rhs1 lhs2 then
+        Some (rhs1, lhs1, rhs2)
+      else if canonical_operand_equal rhs1 rhs2 then
+        Some (rhs1, lhs1, lhs2)
+      else
+        None
     in
 
     let replacements = Hashtbl.create 8 in
@@ -17712,6 +18378,14 @@ let factor_common_mul_func (f : Cfg.func) =
                       && operand_stable_between
                            early_rest early_index late_index
                     then begin
+                      let raw_cross_common =
+                        lhs_a = rhs_a
+                        || lhs_a = rhs_b
+                        || lhs_b = rhs_a
+                        || lhs_b = rhs_b
+                      in
+                      if not raw_cross_common then
+                        incr semantic_common_rewrites;
                       let residual =
                         simplify_simple_instr
                           (Tcg.Bin (late_temp, op, lhs_rest, rhs_rest))
@@ -17750,10 +18424,13 @@ let factor_common_mul_func (f : Cfg.func) =
   in
 
   let blocks = List.map rewrite_block f.blocks in
-  if Sys.getenv_opt "TOYC_DEBUG_FACTOR_MUL" <> None && !rewrites > 0 then
+  if
+    Sys.getenv_opt "TOYC_DEBUG_FACTOR_MUL" <> None
+    && !rewrites > 0
+  then
     Printf.eprintf
-      "factor-mul func=%s rewrites=%d\n%!"
-      f.name !rewrites;
+      "factor-mul func=%s rewrites=%d semantic-common=%d\n%!"
+      f.name !rewrites !semantic_common_rewrites;
   if not !changed then f
   else Cfg.rebuild_edges { f with blocks }
 
@@ -19450,8 +20127,26 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
             match outside_preds with
             | [ preheader_label ] -> (
                 let preheader : Cfg.block = get_block preheader_label in
+                let current_blocks_snapshot =
+                  Hashtbl.fold
+                    (fun _ (block : Cfg.block) acc ->
+                      block :: acc)
+                    current_blocks
+                    []
+                in
                 let loop_defs, def_blocks, def_instrs, multi_defs =
-                  analyze_temp_defs_of_blocks ~loop f.temp_count f.blocks
+                  analyze_temp_defs_of_blocks
+                    ~loop f.temp_count current_blocks_snapshot
+                in
+                let runtime_recurrence_analysis =
+                  build_loop_recurrence_analysis
+                    header loop get_block
+                    loop_defs multi_defs def_instrs
+                in
+                let runtime_control_candidate =
+                  find_recurrence_loop_control_candidate
+                    runtime_recurrence_analysis.loop_recurrence_facts
+                    multi_defs def_instrs
                 in
                 let effects =
                   collect_loop_effects summaries globals loop f.blocks
@@ -19486,6 +20181,39 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                     let body_indexed =
                       List.mapi (fun index instr -> (index, instr)) body_instrs
                     in
+                    let body_program_points =
+                      let points_of_label label =
+                        let block : Cfg.block =
+                          get_block label
+                        in
+                        List.mapi
+                          (fun index _ ->
+                            RecurrenceBeforeInstr
+                              (label, index))
+                          block.body
+                      in
+                      (body_labels
+                       |> List.concat_map points_of_label)
+                      @
+                      (List.mapi
+                         (fun index _ ->
+                           RecurrenceBeforeInstr
+                             (control_block.label, index))
+                         control_block.body)
+                    in
+                    let recurrence_point_of_body_index index =
+                      List.nth_opt body_program_points index
+                    in
+                    if
+                      debug
+                      && List.length body_program_points
+                         <> List.length body_instrs
+                    then
+                      Printf.eprintf
+                        "lve-runtime-point-map-mismatch func=%s header=%s points=%d instrs=%d\n%!"
+                        f.name header
+                        (List.length body_program_points)
+                        (List.length body_instrs);
                     let last_body_def_before use_index temp =
                       let found = ref None in
                       List.iteri
@@ -19542,6 +20270,10 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                       | LveConst value -> Some (Tcg.Imm value)
                       | LveOperand operand -> Some operand
                       | LveNeg _ | LveAdd _ | LveMul _ -> None
+                    in
+                    let scev_debug =
+                      Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
+                      <> None
                     in
                     let rec preupdate_affine_of_operand
                         iv_temp use_index seen operand =
@@ -19904,7 +20636,183 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                               None)
                         body_indexed
                     in
-                    match find_control_update () with
+                    let legacy_control_update =
+                      find_control_update ()
+                    in
+                    let unified_control_update =
+                      match
+                        ( runtime_control_candidate,
+                          legacy_control_update )
+                      with
+                      | Some candidate,
+                        Some
+                          ( update_index,
+                            iv_temp,
+                            step_operand,
+                            legacy_step,
+                            bound_operand,
+                            legacy_scale,
+                            legacy_bias )
+                        when
+                          candidate.recurrence_control_op = Lt ->
+                          let candidate_step =
+                            normalize_loop_inv_expr
+                              candidate
+                                .recurrence_control_base
+                                .addrec_step
+                          in
+                          let candidate_scale =
+                            normalize_loop_inv_expr
+                              candidate
+                                .recurrence_control_scale
+                          in
+                          let candidate_bias =
+                            normalize_loop_inv_expr
+                              candidate
+                                .recurrence_control_bias
+                          in
+                          let legacy_step =
+                            normalize_loop_inv_expr
+                              legacy_step
+                          in
+                          let legacy_scale =
+                            normalize_loop_inv_expr
+                              legacy_scale
+                          in
+                          let legacy_bias =
+                            normalize_loop_inv_expr
+                              legacy_bias
+                          in
+                          let bound_expr =
+                            invariant_expr bound_operand
+                          in
+                          let step_agree =
+                            loop_inv_expr_equal
+                              candidate_step legacy_step
+                          in
+                          let scale_agree =
+                            loop_inv_expr_equal
+                              candidate_scale legacy_scale
+                          in
+                          let bias_agree =
+                            loop_inv_expr_equal
+                              candidate_bias legacy_bias
+                          in
+                          if
+                            scev_debug
+                            && not bias_agree
+                          then
+                            Printf.eprintf
+                              "canonical-scalar-bias-disagree header=%s candidate=%s legacy=%s candidate-key=%s legacy-key=%s\n%!"
+                              header
+                              (string_of_loop_inv_expr
+                                 candidate_bias)
+                              (string_of_loop_inv_expr
+                                 legacy_bias)
+                              (string_of_canonical_scalar_key
+                                 (loop_inv_linear_key
+                                    candidate_bias))
+                              (string_of_canonical_scalar_key
+                                 (loop_inv_linear_key
+                                    legacy_bias));
+                          let bound_agree =
+                            match bound_expr with
+                            | Some expr ->
+                                loop_inv_expr_equal
+                                  (normalize_loop_inv_expr expr)
+                                  (normalize_loop_inv_expr
+                                     candidate
+                                       .recurrence_control_bound_expr)
+                            | None ->
+                                false
+                          in
+                          if
+                            step_agree
+                            && scale_agree
+                            && bias_agree
+                            && bound_agree
+                          then begin
+                            if scev_debug || debug then
+                              Printf.eprintf
+                                "scev-runtime-control-hit func=%s header=%s control=%s iv=t%d phi=t%d step=%s scale=%s bias=%s bound=%s\n%!"
+                                f.name
+                                header
+                                control_block.label
+                                iv_temp
+                                candidate
+                                  .recurrence_control_base
+                                  .addrec_phi_temp
+                                (string_of_loop_inv_expr
+                                   candidate_step)
+                                (string_of_loop_inv_expr
+                                   candidate_scale)
+                                (string_of_loop_inv_expr
+                                   candidate_bias)
+                                (string_of_loop_inv_expr
+                                   candidate
+                                     .recurrence_control_bound_expr);
+                            Some
+                              ( update_index,
+                                iv_temp,
+                                step_operand,
+                                candidate_step,
+                                bound_operand,
+                                candidate_scale,
+                                candidate_bias )
+                          end
+                          else begin
+                            if scev_debug then
+                              Printf.eprintf
+                                "scev-runtime-control-disagree header=%s iv=t%d phi=t%d step=%b scale=%b bias=%b bound=%b\n%!"
+                                header
+                                iv_temp
+                                candidate
+                                  .recurrence_control_base
+                                  .addrec_phi_temp
+                                step_agree
+                                scale_agree
+                                bias_agree
+                                bound_agree;
+                            None
+                          end
+                      | Some candidate, None ->
+                          if scev_debug then
+                            Printf.eprintf
+                              "scev-runtime-control-miss header=%s reason=no-physical-update phi=t%d\n%!"
+                              header
+                              candidate
+                                .recurrence_control_base
+                                .addrec_phi_temp;
+                          None
+                      | None, Some _ ->
+                          if scev_debug then
+                            Printf.eprintf
+                              "scev-runtime-control-miss header=%s reason=no-candidate\n%!"
+                              header;
+                          None
+                      | None, None ->
+                          if scev_debug then
+                            Printf.eprintf
+                              "scev-runtime-control-miss header=%s reason=no-candidate-or-physical-update\n%!"
+                              header;
+                          None
+                      | Some candidate, Some _ ->
+                          if scev_debug then
+                            Printf.eprintf
+                              "scev-runtime-control-miss header=%s reason=unsupported-op op=%s\n%!"
+                              header
+                              (string_of_recurrence_compare
+                                 candidate.recurrence_control_op);
+                          None
+                    in
+                    let control_update, unified_control_agreed =
+                      match unified_control_update with
+                      | Some _ as result ->
+                          (result, true)
+                      | None ->
+                          (legacy_control_update, false)
+                    in
+                    match control_update with
                     | None ->
                         reject header "no-symbolic-affine-lt-control-update"
                     | Some
@@ -20015,7 +20923,107 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                             let affine_is_invariant (scale, _) =
                               normalize_loop_inv_expr scale = LveConst 0L
                             in
+                            let semantic_delta_affine_at
+                                use_index operand =
+                              match
+                                ( runtime_control_candidate,
+                                  recurrence_point_of_body_index
+                                    use_index )
+                              with
+                              | Some candidate, Some point
+                                when unified_control_agreed -> (
+                                  match
+                                    recurrence_at
+                                      runtime_recurrence_analysis.loop_recurrence_facts
+                                      point operand
+                                  with
+                                  | Some (ScalarConst value) ->
+                                      Some
+                                        ( LveConst 0L,
+                                          LveConst value )
+                                  | Some (ScalarInvariant expr) ->
+                                      Some
+                                        ( LveConst 0L,
+                                          normalize_loop_inv_expr
+                                            expr )
+                                  | Some
+                                      ((ScalarAddRec _
+                                       | ScalarAffine _)
+                                        as recurrence) -> (
+                                      match
+                                        scalar_recurrence_scale_bias
+                                          recurrence
+                                      with
+                                      | Some
+                                          (base, scale, bias)
+                                        when
+                                          scalar_same_base
+                                            base
+                                            candidate.recurrence_control_base ->
+                                          Some
+                                            ( normalize_loop_inv_expr
+                                                scale,
+                                              normalize_loop_inv_expr
+                                                bias )
+                                      | Some _ | None ->
+                                          None)
+                                  | None ->
+                                      None)
+                              | Some _, None ->
+                                  if scev_debug then
+                                    Printf.eprintf
+                                      "scev-runtime-delta-miss header=%s index=%d operand=%s reason=no-program-point\n%!"
+                                      header
+                                      use_index
+                                      (string_of_lve_operand operand);
+                                  None
+                              | None, _ ->
+                                  if scev_debug then
+                                    Printf.eprintf
+                                      "scev-runtime-delta-miss header=%s index=%d operand=%s reason=no-control-candidate\n%!"
+                                      header
+                                      use_index
+                                      (string_of_lve_operand operand);
+                                  None
+                              | Some _, Some _
+                                when not unified_control_agreed ->
+                                  if scev_debug then
+                                    Printf.eprintf
+                                      "scev-runtime-delta-miss header=%s index=%d operand=%s reason=control-not-unified\n%!"
+                                      header
+                                      use_index
+                                      (string_of_lve_operand operand);
+                                  None
+                              | Some _, Some _ ->
+                                  None
+                            in
                             let rec direct_delta_affine_of_operand
+                                use_index seen operand =
+                              match
+                                semantic_delta_affine_at
+                                  use_index operand
+                              with
+                              | Some (scale, bias) ->
+                                  if
+                                    Sys.getenv_opt
+                                      "TOYC_DEBUG_SCEV_UNIFIED"
+                                    <> None
+                                  then
+                                    Printf.eprintf
+                                      "scev-runtime-delta-hit header=%s index=%d operand=%s scale=%s bias=%s\n%!"
+                                      header
+                                      use_index
+                                      (string_of_lve_operand
+                                         operand)
+                                      (string_of_loop_inv_expr
+                                         scale)
+                                      (string_of_loop_inv_expr
+                                         bias);
+                                  Some (scale, bias)
+                              | None ->
+                                  direct_delta_affine_of_operand_legacy
+                                    use_index seen operand
+                            and direct_delta_affine_of_operand_legacy
                                 use_index seen operand =
                               match operand with
                               | Tcg.Imm value ->
