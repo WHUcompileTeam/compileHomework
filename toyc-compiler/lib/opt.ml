@@ -5537,6 +5537,622 @@ let scalar_recurrence_of_instr
   | Tcg.Call _ ->
       None
 
+
+(* -------------------------------------------------------------------------- *)
+(* Phase-aware recurrence facts                                                *)
+(*                                                                            *)
+(* [ScalarAddRec] denotes the value at logical loop-iteration entry.  A bare   *)
+(* recurrence is therefore not sufficient to describe a value at an arbitrary *)
+(* program point: after the physical update, the same IV temp denotes the next *)
+(* AddRec value.  The old optimizer handled this independently in several      *)
+(* control/reduction matchers.  Keep the semantic layer analysis-only for now, *)
+(* but make program point part of the query itself.                             *)
+(* -------------------------------------------------------------------------- *)
+
+type recurrence_program_point =
+  | RecurrenceBlockEntry of Tcg.label
+  | RecurrenceBeforeInstr of Tcg.label * int
+  | RecurrenceAfterInstr of Tcg.label * int
+  | RecurrenceBlockExit of Tcg.label
+
+type recurrence_phase_state =
+  | RecurrencePhaseUnseen
+  | RecurrencePhaseKnown of int
+  | RecurrencePhaseConflict
+
+type recurrence_def_site = {
+  recurrence_def_label : Tcg.label;
+  recurrence_def_index : int;
+}
+
+type recurrence_facts = {
+  recurrence_header : Tcg.label;
+  recurrence_loop : LabelSet.t;
+  recurrence_get_block : Tcg.label -> Cfg.block;
+  recurrence_loop_defs : IntSet.t;
+  recurrence_multi_defs : IntSet.t;
+  recurrence_invariant_of_operand :
+    Tcg.operand -> loop_inv_expr option;
+  recurrence_phase_transfer :
+    loop_addrec ->
+    Cfg.block ->
+    recurrence_phase_state ->
+    int ->
+    recurrence_phase_state;
+  recurrence_addrecs : loop_addrec list;
+  recurrence_addrec_by_temp : (Tcg.temp, loop_addrec) Hashtbl.t;
+  recurrence_unique_def_sites :
+    (Tcg.temp, recurrence_def_site) Hashtbl.t;
+  recurrence_loop_doms :
+    (Tcg.label, LabelSet.t) Hashtbl.t;
+  recurrence_entry_phases :
+    ((Tcg.temp * Tcg.label), recurrence_phase_state) Hashtbl.t;
+}
+
+let scalar_recurrence_equal lhs rhs =
+  let lhs = normalize_scalar_recurrence lhs in
+  let rhs = normalize_scalar_recurrence rhs in
+  match (lhs, rhs) with
+  | ScalarConst lhs, ScalarConst rhs ->
+      i32 lhs = i32 rhs
+  | ScalarInvariant lhs, ScalarInvariant rhs ->
+      loop_inv_expr_equal lhs rhs
+  | (ScalarAddRec _ | ScalarAffine _),
+    (ScalarAddRec _ | ScalarAffine _) -> (
+      match
+        ( scalar_recurrence_scale_bias lhs,
+          scalar_recurrence_scale_bias rhs )
+      with
+      | Some (lhs_base, lhs_scale, lhs_bias),
+        Some (rhs_base, rhs_scale, rhs_bias) ->
+          scalar_same_base lhs_base rhs_base
+          && loop_inv_expr_equal lhs_scale rhs_scale
+          && loop_inv_expr_equal lhs_bias rhs_bias
+      | _ -> false)
+  | ScalarConst _, ScalarInvariant invariant
+  | ScalarInvariant invariant, ScalarConst _ -> (
+      match normalize_loop_inv_expr invariant with
+      | LveConst _ ->
+          normalize_scalar_recurrence lhs =
+          normalize_scalar_recurrence rhs
+      | LveOperand _
+      | LveNeg _
+      | LveAdd _
+      | LveMul _ ->
+          false)
+  | (ScalarConst _ | ScalarInvariant _),
+    (ScalarAddRec _ | ScalarAffine _)
+  | (ScalarAddRec _ | ScalarAffine _),
+    (ScalarConst _ | ScalarInvariant _) ->
+      false
+
+let scalar_recurrence_shift_addrec (base : loop_addrec) phase =
+  if phase = 0 then ScalarAddRec base
+  else
+    let phase_expr = LveConst (Int64.of_int phase) in
+    scalar_recurrence_affine
+      base scalar_inv_one
+      (normalize_loop_inv_expr
+         (LveMul (base.addrec_step, phase_expr)))
+
+let recurrence_phase_state_equal lhs rhs =
+  match (lhs, rhs) with
+  | RecurrencePhaseUnseen, RecurrencePhaseUnseen
+  | RecurrencePhaseConflict, RecurrencePhaseConflict ->
+      true
+  | RecurrencePhaseKnown lhs, RecurrencePhaseKnown rhs ->
+      lhs = rhs
+  | RecurrencePhaseUnseen, _
+  | RecurrencePhaseConflict, _
+  | RecurrencePhaseKnown _, _ ->
+      false
+
+let merge_recurrence_phase_state lhs rhs =
+  match (lhs, rhs) with
+  | RecurrencePhaseConflict, _
+  | _, RecurrencePhaseConflict ->
+      RecurrencePhaseConflict
+  | RecurrencePhaseUnseen, state
+  | state, RecurrencePhaseUnseen ->
+      state
+  | RecurrencePhaseKnown lhs, RecurrencePhaseKnown rhs ->
+      if lhs = rhs then RecurrencePhaseKnown lhs
+      else RecurrencePhaseConflict
+
+let recurrence_loop_dominators header loop get_block =
+  let labels = LabelSet.elements loop in
+  let all_labels =
+    List.fold_left
+      (fun labels label -> LabelSet.add label labels)
+      LabelSet.empty labels
+  in
+  let doms = Hashtbl.create (max 8 (List.length labels)) in
+  List.iter
+    (fun label ->
+      Hashtbl.replace doms label
+        (if label = header then LabelSet.singleton header
+         else all_labels))
+    labels;
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter
+      (fun label ->
+        if label <> header then
+          let block : Cfg.block = get_block label in
+          let preds =
+            List.filter (fun pred -> LabelSet.mem pred loop) block.preds
+          in
+          let merged =
+            match preds with
+            | [] -> LabelSet.empty
+            | pred :: rest ->
+                List.fold_left
+                  (fun acc pred ->
+                    LabelSet.inter acc
+                      (table_find_or_empty doms pred all_labels))
+                  (table_find_or_empty doms pred all_labels)
+                  rest
+          in
+          let next = LabelSet.add label merged in
+          let old =
+            table_find_or_empty doms label all_labels
+          in
+          if not (LabelSet.equal old next) then begin
+            Hashtbl.replace doms label next;
+            changed := true
+          end)
+      labels
+  done;
+  doms
+
+let recurrence_unique_def_sites loop get_block multi_defs =
+  let sites = Hashtbl.create 32 in
+  LabelSet.iter
+    (fun label ->
+      let block : Cfg.block = get_block label in
+      List.iteri
+        (fun index instr ->
+          match defs_temp instr with
+          | Some temp when not (IntSet.mem temp multi_defs) ->
+              Hashtbl.replace sites temp
+                {
+                  recurrence_def_label = label;
+                  recurrence_def_index = index;
+                }
+          | Some _ | None -> ())
+        block.body)
+    loop;
+  sites
+
+let recurrence_local_instr
+    loop_defs
+    multi_defs
+    def_instrs
+    addrec
+    phase
+    env
+    instr =
+  let analyze_operand = function
+    | Tcg.Imm value ->
+        Some (ScalarConst value)
+    | Tcg.Temp temp ->
+        if temp = addrec.addrec_phi_temp then
+          Some (scalar_recurrence_shift_addrec addrec phase)
+        else
+          match Hashtbl.find_opt env temp with
+          | Some recurrence -> Some recurrence
+          | None ->
+              if not (IntSet.mem temp loop_defs) then
+                Option.map
+                  (fun expr ->
+                    normalize_scalar_recurrence
+                      (ScalarInvariant expr))
+                  (lve_invariant_expr_of_operand
+                     loop_defs multi_defs def_instrs
+                     (Tcg.Temp temp))
+              else
+                None
+  in
+  let with_unary f operand =
+    Option.map f (analyze_operand operand)
+  in
+  let with_binary f lhs rhs =
+    Option.bind (analyze_operand lhs) (fun lhs ->
+      Option.bind (analyze_operand rhs) (f lhs))
+  in
+  match instr with
+  | Tcg.Move (_, src)
+  | Tcg.Un (_, UPlus, src) ->
+      analyze_operand src
+  | Tcg.Un (_, UMinus, src) ->
+      with_unary scalar_recurrence_neg src
+  | Tcg.Bin (_, Add, lhs, rhs) ->
+      with_binary scalar_recurrence_add lhs rhs
+  | Tcg.Bin (_, Sub, lhs, rhs) ->
+      with_binary scalar_recurrence_sub lhs rhs
+  | Tcg.Bin (_, Mul, lhs, rhs) ->
+      with_binary scalar_recurrence_mul lhs rhs
+  | Tcg.Un (_, UNot, _)
+  | Tcg.Bin
+      (_, (Div | Mod | Lt | Le | Gt | Ge | Eq | Ne | LAnd | LOr), _, _)
+  | Tcg.Load _
+  | Tcg.Store _
+  | Tcg.Call _ ->
+      None
+
+let recurrence_transfer_phase
+    loop_defs multi_defs def_instrs addrec
+    (block : Cfg.block) entry_state stop_count =
+  match entry_state with
+  | RecurrencePhaseUnseen ->
+      RecurrencePhaseUnseen
+  | RecurrencePhaseConflict ->
+      RecurrencePhaseConflict
+  | RecurrencePhaseKnown entry_phase ->
+      let phase = ref entry_phase in
+      let conflict = ref false in
+      let env = Hashtbl.create (max 8 (List.length block.body)) in
+      let limit =
+        min (max 0 stop_count) (List.length block.body)
+      in
+      block.body
+      |> List.iteri (fun index instr ->
+             if index < limit && not !conflict then begin
+               let recurrence =
+                 recurrence_local_instr
+                   loop_defs multi_defs def_instrs
+                   addrec !phase env instr
+               in
+               match defs_temp instr with
+               | None -> ()
+               | Some dst when dst = addrec.addrec_phi_temp -> (
+                   let current =
+                     scalar_recurrence_shift_addrec addrec !phase
+                   in
+                   let next =
+                     scalar_recurrence_shift_addrec addrec (!phase + 1)
+                   in
+                   match recurrence with
+                   | Some recurrence
+                     when scalar_recurrence_equal recurrence current ->
+                       ()
+                   | Some recurrence
+                     when scalar_recurrence_equal recurrence next ->
+                       incr phase
+                   | Some _ | None ->
+                       conflict := true;
+                   Hashtbl.remove env dst)
+               | Some dst ->
+                   begin
+                     match recurrence with
+                     | Some recurrence ->
+                         Hashtbl.replace env dst recurrence
+                     | None ->
+                         Hashtbl.remove env dst
+                   end
+             end);
+      if !conflict then RecurrencePhaseConflict
+      else RecurrencePhaseKnown !phase
+
+let recurrence_build_entry_phases
+    header loop get_block loop_defs multi_defs def_instrs addrecs =
+  let phases = Hashtbl.create 64 in
+  let labels = LabelSet.elements loop in
+  List.iter
+    (fun (addrec : loop_addrec) ->
+      List.iter
+        (fun label ->
+          Hashtbl.replace phases
+            (addrec.addrec_phi_temp, label)
+            (if label = header then RecurrencePhaseKnown 0
+             else RecurrencePhaseUnseen))
+        labels;
+      let changed = ref true in
+      while !changed do
+        changed := false;
+        List.iter
+          (fun label ->
+            if label <> header then begin
+              let block : Cfg.block = get_block label in
+              let preds =
+                List.filter
+                  (fun pred -> LabelSet.mem pred loop)
+                  block.preds
+              in
+              let next =
+                List.fold_left
+                  (fun merged pred ->
+                    let pred_block : Cfg.block = get_block pred in
+                    let pred_entry =
+                      Option.value
+                        ~default:RecurrencePhaseUnseen
+                        (Hashtbl.find_opt phases
+                           (addrec.addrec_phi_temp, pred))
+                    in
+                    let pred_exit =
+                      recurrence_transfer_phase
+                        loop_defs multi_defs def_instrs
+                        addrec pred_block pred_entry
+                        (List.length pred_block.body)
+                    in
+                    merge_recurrence_phase_state
+                      merged pred_exit)
+                  RecurrencePhaseUnseen preds
+              in
+              let key = (addrec.addrec_phi_temp, label) in
+              let old =
+                Option.value
+                  ~default:RecurrencePhaseUnseen
+                  (Hashtbl.find_opt phases key)
+              in
+              if not (recurrence_phase_state_equal old next) then begin
+                Hashtbl.replace phases key next;
+                changed := true
+              end
+            end)
+          labels
+      done)
+    addrecs;
+  phases
+
+let build_recurrence_facts
+    header loop get_block loop_defs multi_defs def_instrs addrecs =
+  {
+    recurrence_header = header;
+    recurrence_loop = loop;
+    recurrence_get_block = get_block;
+    recurrence_loop_defs = loop_defs;
+    recurrence_multi_defs = multi_defs;
+    recurrence_invariant_of_operand =
+      lve_invariant_expr_of_operand
+        loop_defs multi_defs def_instrs;
+    recurrence_phase_transfer =
+      recurrence_transfer_phase
+        loop_defs multi_defs def_instrs;
+    recurrence_addrecs = addrecs;
+    recurrence_addrec_by_temp = scalar_addrec_table addrecs;
+    recurrence_unique_def_sites =
+      recurrence_unique_def_sites loop get_block multi_defs;
+    recurrence_loop_doms =
+      recurrence_loop_dominators header loop get_block;
+    recurrence_entry_phases =
+      recurrence_build_entry_phases
+        header loop get_block loop_defs multi_defs
+        def_instrs addrecs;
+  }
+
+let recurrence_point_label = function
+  | RecurrenceBlockEntry label
+  | RecurrenceBeforeInstr (label, _)
+  | RecurrenceAfterInstr (label, _)
+  | RecurrenceBlockExit label ->
+      label
+
+let recurrence_point_visible_count facts = function
+  | RecurrenceBlockEntry _ ->
+      Some 0
+  | RecurrenceBeforeInstr (label, index) ->
+      let block : Cfg.block = facts.recurrence_get_block label in
+      if index < 0 || index > List.length block.body then None
+      else Some index
+  | RecurrenceAfterInstr (label, index) ->
+      let block : Cfg.block = facts.recurrence_get_block label in
+      if index < 0 || index >= List.length block.body then None
+      else Some (index + 1)
+  | RecurrenceBlockExit label ->
+      let block : Cfg.block = facts.recurrence_get_block label in
+      Some (List.length block.body)
+
+let recurrence_phase_at facts (addrec : loop_addrec) point =
+  let label = recurrence_point_label point in
+  match recurrence_point_visible_count facts point with
+  | None ->
+      RecurrencePhaseConflict
+  | Some visible_count ->
+      let block : Cfg.block =
+        facts.recurrence_get_block label
+      in
+      let entry =
+        Option.value
+          ~default:RecurrencePhaseUnseen
+          (Hashtbl.find_opt facts.recurrence_entry_phases
+             (addrec.addrec_phi_temp, label))
+      in
+      facts.recurrence_phase_transfer
+        addrec block entry visible_count
+
+let recurrence_def_visible_at facts point site =
+  let use_label = recurrence_point_label point in
+  match recurrence_point_visible_count facts point with
+  | None -> false
+  | Some visible_count ->
+      if site.recurrence_def_label = use_label then
+        site.recurrence_def_index < visible_count
+      else
+        LabelSet.mem site.recurrence_def_label
+          (table_find_or_empty
+             facts.recurrence_loop_doms
+             use_label LabelSet.empty)
+
+let recurrence_at facts point operand =
+  let rec analyze seen point operand =
+    match operand with
+    | Tcg.Imm value ->
+        Some (ScalarConst value)
+    | Tcg.Temp temp as operand -> (
+        match Hashtbl.find_opt facts.recurrence_addrec_by_temp temp with
+        | Some addrec -> (
+            match recurrence_phase_at facts addrec point with
+            | RecurrencePhaseKnown phase ->
+                Some
+                  (scalar_recurrence_shift_addrec
+                     addrec phase)
+            | RecurrencePhaseUnseen
+            | RecurrencePhaseConflict ->
+                None)
+        | None ->
+            if not (IntSet.mem temp facts.recurrence_loop_defs) then
+              Option.map
+                (fun expr ->
+                  normalize_scalar_recurrence
+                    (ScalarInvariant expr))
+                (facts.recurrence_invariant_of_operand operand)
+            else if
+              IntSet.mem temp seen
+              || IntSet.mem temp facts.recurrence_multi_defs
+            then
+              None
+            else
+              match
+                Hashtbl.find_opt
+                  facts.recurrence_unique_def_sites temp
+              with
+              | Some site
+                when recurrence_def_visible_at
+                       facts point site ->
+                  let def_block : Cfg.block =
+                    facts.recurrence_get_block
+                      site.recurrence_def_label
+                  in
+                  begin
+                    match
+                      List.nth_opt def_block.body
+                        site.recurrence_def_index
+                    with
+                    | Some instr ->
+                        analyze_instr
+                          (IntSet.add temp seen)
+                          (RecurrenceBeforeInstr
+                             ( site.recurrence_def_label,
+                               site.recurrence_def_index ))
+                          instr
+                    | None ->
+                        None
+                  end
+              | Some _ | None ->
+                  None)
+  and analyze_instr seen point = function
+    | Tcg.Move (_, src)
+    | Tcg.Un (_, UPlus, src) ->
+        analyze seen point src
+    | Tcg.Un (_, UMinus, src) ->
+        Option.map scalar_recurrence_neg
+          (analyze seen point src)
+    | Tcg.Bin (_, Add, lhs, rhs) ->
+        Option.bind (analyze seen point lhs) (fun lhs ->
+          Option.bind
+            (analyze seen point rhs)
+            (scalar_recurrence_add lhs))
+    | Tcg.Bin (_, Sub, lhs, rhs) ->
+        Option.bind (analyze seen point lhs) (fun lhs ->
+          Option.bind
+            (analyze seen point rhs)
+            (scalar_recurrence_sub lhs))
+    | Tcg.Bin (_, Mul, lhs, rhs) ->
+        Option.bind (analyze seen point lhs) (fun lhs ->
+          Option.bind
+            (analyze seen point rhs)
+            (scalar_recurrence_mul lhs))
+    | Tcg.Un (_, UNot, _)
+    | Tcg.Bin
+        (_, (Div | Mod | Lt | Le | Gt | Ge | Eq | Ne | LAnd | LOr), _, _)
+    | Tcg.Load _
+    | Tcg.Store _
+    | Tcg.Call _ ->
+        None
+  in
+  analyze IntSet.empty point operand
+  |> Option.map normalize_scalar_recurrence
+
+let string_of_recurrence_phase_state = function
+  | RecurrencePhaseUnseen -> "unseen"
+  | RecurrencePhaseKnown phase ->
+      Printf.sprintf "%d" phase
+  | RecurrencePhaseConflict -> "conflict"
+
+let debug_recurrence_facts facts =
+  if Sys.getenv_opt "TOYC_DEBUG_RECURRENCE_AT" <> None then begin
+    List.iter
+      (fun (addrec : loop_addrec) ->
+        LabelSet.iter
+          (fun label ->
+            let entry =
+              recurrence_phase_at facts addrec
+                (RecurrenceBlockEntry label)
+            in
+            let exit =
+              recurrence_phase_at facts addrec
+                (RecurrenceBlockExit label)
+            in
+            if
+              entry <> RecurrencePhaseUnseen
+              || exit <> RecurrencePhaseUnseen
+            then
+              Printf.eprintf
+                "recurrence-phase header=%s phi=t%d block=%s entry=%s exit=%s\n%!"
+                facts.recurrence_header
+                addrec.addrec_phi_temp label
+                (string_of_recurrence_phase_state entry)
+                (string_of_recurrence_phase_state exit))
+          facts.recurrence_loop)
+      facts.recurrence_addrecs;
+
+    LabelSet.iter
+      (fun label ->
+        let block : Cfg.block =
+          facts.recurrence_get_block label
+        in
+        List.iteri
+          (fun index instr ->
+            match defs_temp instr with
+            | None -> ()
+            | Some dst -> (
+                match
+                  recurrence_at facts
+                    (RecurrenceAfterInstr (label, index))
+                    (Tcg.Temp dst)
+                with
+                | Some (ScalarAddRec _ as recurrence)
+                | Some (ScalarAffine _ as recurrence) ->
+                    Printf.eprintf
+                      "recurrence-at-expr header=%s block=%s index=%d temp=t%d recurrence=%s\n%!"
+                      facts.recurrence_header label index dst
+                      (string_of_scalar_recurrence recurrence)
+                | Some (ScalarConst _)
+                | Some (ScalarInvariant _)
+                | None ->
+                    ()))
+          block.body;
+        let debug_term side operand =
+          match
+            recurrence_at facts
+              (RecurrenceBlockExit label) operand
+          with
+          | Some (ScalarAddRec _ as recurrence)
+          | Some (ScalarAffine _ as recurrence) ->
+              Printf.eprintf
+                "recurrence-at-control header=%s block=%s side=%s recurrence=%s\n%!"
+                facts.recurrence_header label side
+                (string_of_scalar_recurrence recurrence)
+          | Some (ScalarConst _)
+          | Some (ScalarInvariant _)
+          | None ->
+              ()
+        in
+        match block.term with
+        | Cfg.BranchZero (operand, _, _)
+        | Cfg.BranchNonZero (operand, _, _) ->
+            debug_term "cond" operand
+        | Cfg.BranchCompare (_, lhs, rhs, _, _) ->
+            debug_term "lhs" lhs;
+            debug_term "rhs" rhs
+        | Cfg.Jump _
+        | Cfg.Return _ ->
+            ())
+      facts.recurrence_loop
+  end
+
 let rec lve_runtime_scale_of_operand
     loop_defs multi_defs def_instrs phi_temp operand =
   let invariant operand =
@@ -5632,6 +6248,13 @@ let basic_iv_of_scalar_addrec
 
 let debug_scalar_recurrence_loop
     header loop get_block loop_defs multi_defs def_instrs addrecs =
+  let recurrence_debug =
+    Sys.getenv_opt "TOYC_DEBUG_RECURRENCE_AT" <> None
+  in
+  if recurrence_debug then
+    build_recurrence_facts
+      header loop get_block loop_defs multi_defs def_instrs addrecs
+    |> debug_recurrence_facts;
   if Sys.getenv_opt "TOYC_DEBUG_SCALAR_RECURRENCE" <> None then begin
     List.iter
       (fun (addrec : loop_addrec) ->
