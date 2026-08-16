@@ -16647,6 +16647,54 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
           "lve-runtime-summary-reject func=%s header=%s reason=%s\n%!"
           f.name header reason
     in
+    let string_of_binop = function
+      | Add -> "add"
+      | Sub -> "sub"
+      | Mul -> "mul"
+      | Div -> "div"
+      | Mod -> "mod"
+      | Lt -> "lt"
+      | Le -> "le"
+      | Gt -> "gt"
+      | Ge -> "ge"
+      | Eq -> "eq"
+      | Ne -> "ne"
+      | LAnd -> "land"
+      | LOr -> "lor"
+    in
+    let string_of_unop = function
+      | UMinus -> "uminus"
+      | UNot -> "unot"
+      | UPlus -> "uplus"
+    in
+    let string_of_place = function
+      | Tcg.Local id -> Printf.sprintf "local:%d" id
+      | Tcg.Global label -> Printf.sprintf "global:%s" label
+    in
+    let string_of_simple_instr = function
+      | Tcg.Move (dst, src) ->
+          Printf.sprintf "t%d=move(%s)" dst (string_of_lve_operand src)
+      | Tcg.Un (dst, op, src) ->
+          Printf.sprintf "t%d=%s(%s)" dst (string_of_unop op) (string_of_lve_operand src)
+      | Tcg.Bin (dst, op, lhs, rhs) ->
+          Printf.sprintf
+            "t%d=%s(%s,%s)" dst (string_of_binop op)
+            (string_of_lve_operand lhs)
+            (string_of_lve_operand rhs)
+      | Tcg.Load (dst, place) ->
+          Printf.sprintf "t%d=load(%s)" dst (string_of_place place)
+      | Tcg.Store (place, value) ->
+          Printf.sprintf "store(%s,%s)"
+            (string_of_place place)
+            (string_of_lve_operand value)
+      | Tcg.Call (dst, name, args) ->
+          Printf.sprintf "%s=call(%s;%s)"
+            (match dst with
+             | None -> "_"
+             | Some temp -> Printf.sprintf "t%d" temp)
+            name
+            (String.concat "," (List.map string_of_lve_operand args))
+    in
     let reaching_seed_on_edge ~header ~pred_label temp =
       match
         reaching_move_cases_on_edge
@@ -16846,15 +16894,22 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
               lhs,
               rhs,
               exit_label ) ->
-            (if debug then
-               Printf.eprintf
-                 "lve-runtime-summary-shape func=%s header=%s blocks=%d body-blocks=%d control=%s body-instrs=%d path={%s}\n%!"
-                 f.name header
-                 (LabelSet.cardinal loop)
-                 (List.length body_labels)
-                 control_block.label
-                 (List.length body_instrs)
-                 (String.concat "," body_labels));
+             (if debug then
+                Printf.eprintf
+                  "lve-runtime-summary-shape func=%s header=%s blocks=%d body-blocks=%d control=%s body-instrs=%d path={%s}\n%!"
+                  f.name header
+                  (LabelSet.cardinal loop)
+                  (List.length body_labels)
+                  control_block.label
+                  (List.length body_instrs)
+                  (String.concat "," body_labels);
+              if debug then
+                List.iteri
+                  (fun index instr ->
+                    Printf.eprintf
+                      "lve-runtime-summary-body func=%s header=%s index=%d instr=%s\n%!"
+                      f.name header index (string_of_simple_instr instr))
+                  body_instrs);
             let header_block : Cfg.block = get_block header in
             let outside_preds =
               List.filter
@@ -16957,6 +17012,97 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                       | LveOperand operand -> Some operand
                       | LveNeg _ | LveAdd _ | LveMul _ -> None
                     in
+                    let rec preupdate_affine_of_operand
+                        iv_temp use_index seen operand =
+                      match operand with
+                      | Tcg.Temp temp when temp = iv_temp ->
+                          Some (LveConst 1L, LveConst 0L)
+                      | Tcg.Imm value ->
+                          Some (LveConst 0L, LveConst value)
+                      | Tcg.Temp temp as operand -> (
+                          match invariant_expr operand with
+                          | Some invariant ->
+                              Some (LveConst 0L, invariant)
+                          | None ->
+                              if IntSet.mem temp seen then None
+                              else
+                                match last_body_def_before use_index temp with
+                                | Some (def_index, instr) ->
+                                    preupdate_affine_of_instr
+                                      iv_temp def_index
+                                      (IntSet.add temp seen) instr
+                                | None -> None)
+                    and preupdate_affine_of_instr
+                        iv_temp def_index seen = function
+                      | Tcg.Move (_, src)
+                      | Tcg.Un (_, UPlus, src) ->
+                          preupdate_affine_of_operand
+                            iv_temp def_index seen src
+                      | Tcg.Un (_, UMinus, src) ->
+                          Option.map
+                            (fun (scale, bias) ->
+                              ( normalize_loop_inv_expr (LveNeg scale),
+                                normalize_loop_inv_expr (LveNeg bias) ))
+                            (preupdate_affine_of_operand
+                               iv_temp def_index seen src)
+                      | Tcg.Bin (_, Add, lhs, rhs) -> (
+                          match
+                            ( preupdate_affine_of_operand
+                                iv_temp def_index seen lhs,
+                              preupdate_affine_of_operand
+                                iv_temp def_index seen rhs )
+                          with
+                          | Some (lhs_scale, lhs_bias), Some (rhs_scale, rhs_bias) ->
+                              Some
+                                ( normalize_loop_inv_expr
+                                    (LveAdd (lhs_scale, rhs_scale)),
+                                  normalize_loop_inv_expr
+                                    (LveAdd (lhs_bias, rhs_bias)) )
+                          | _ -> None)
+                      | Tcg.Bin (_, Sub, lhs, rhs) -> (
+                          match
+                            ( preupdate_affine_of_operand
+                                iv_temp def_index seen lhs,
+                              preupdate_affine_of_operand
+                                iv_temp def_index seen rhs )
+                          with
+                          | Some (lhs_scale, lhs_bias), Some (rhs_scale, rhs_bias) ->
+                              Some
+                                ( normalize_loop_inv_expr
+                                    (LveAdd (lhs_scale, LveNeg rhs_scale)),
+                                  normalize_loop_inv_expr
+                                    (LveAdd (lhs_bias, LveNeg rhs_bias)) )
+                          | _ -> None)
+                      | Tcg.Bin (_, Mul, lhs, rhs) -> (
+                          match
+                            ( preupdate_affine_of_operand
+                                iv_temp def_index seen lhs,
+                              preupdate_affine_of_operand
+                                iv_temp def_index seen rhs )
+                          with
+                          | Some (lhs_scale, lhs_bias), Some (rhs_scale, rhs_bias)
+                            when normalize_loop_inv_expr lhs_scale = LveConst 0L ->
+                              Some
+                                ( normalize_loop_inv_expr
+                                    (LveMul (rhs_scale, lhs_bias)),
+                                  normalize_loop_inv_expr
+                                    (LveMul (rhs_bias, lhs_bias)) )
+                          | Some (lhs_scale, lhs_bias), Some (rhs_scale, rhs_bias)
+                            when normalize_loop_inv_expr rhs_scale = LveConst 0L ->
+                              Some
+                                ( normalize_loop_inv_expr
+                                    (LveMul (lhs_scale, rhs_bias)),
+                                  normalize_loop_inv_expr
+                                    (LveMul (lhs_bias, rhs_bias)) )
+                          | _ -> None)
+                      | Tcg.Un (_, UNot, _)
+                      | Tcg.Bin
+                          (_, (Div | Mod | Lt | Le | Gt | Ge | Eq | Ne | LAnd | LOr), _, _)
+                      | Tcg.Load _
+                      | Tcg.Store _
+                      | Tcg.Call _ ->
+                          None
+                    in
                     let rec control_affine_of_operand
                         iv_temp iv_update_index seen operand =
                       match operand with
@@ -16973,7 +17119,11 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                 control_affine_of_instr
                                   iv_temp iv_update_index
                                   (IntSet.add temp seen) instr
-                            | Some _ | None ->
+                            | Some (def_index, instr) ->
+                                preupdate_affine_of_instr
+                                  iv_temp def_index
+                                  (IntSet.add temp seen) instr
+                            | None ->
                                 None
                     and control_affine_of_instr
                         iv_temp iv_update_index seen = function
@@ -17185,6 +17335,12 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                    lhs, scale, bias)
                             | _ -> None
                           in
+                          if debug then
+                            Printf.eprintf
+                              "lve-runtime-control-update-candidate func=%s header=%s dst=t%d index=%d update-step=%b normalized=%b\n%!"
+                              f.name header dst update_index
+                              (Option.is_some update_step)
+                              (Option.is_some normalized);
                           match (normalized, update_step) with
                           | ( Some
                                 (normalized_op, bound_operand,
@@ -17303,18 +17459,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                index, not the final use index.
 
                                Only Add/Sub/Mul-by-invariant are accepted. *)
-                            let last_body_def_before use_index temp =
-                              let found = ref None in
-                              List.iteri
-                                (fun index instr ->
-                                  if index < use_index then
-                                    match defs_temp instr with
-                                    | Some dst when dst = temp ->
-                                        found := Some (index, instr)
-                                    | Some _ | None -> ())
-                                body_instrs;
-                              !found
-                            in
                             let affine_add
                                 (lhs_scale, lhs_bias)
                                 (rhs_scale, rhs_bias) =
@@ -17494,6 +17638,77 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                   None
                             in
 
+                            let match_move_accumulator_carrier () =
+                              match non_iv with
+                              | [ (_, derived_temp, delta_operand) ]
+                                when derived_temp <> iv_temp -> (
+                                  let delta_expr =
+                                    lve_invariant_expr_of_operand
+                                      loop_defs multi_defs def_instrs
+                                      delta_operand
+                                  in
+                                  if
+                                    Option.is_none delta_expr
+                                    || not
+                                         (operand_available_at_preheader
+                                            def_blocks multi_defs
+                                            preheader_label delta_operand)
+                                  then
+                                    None
+                                  else
+                                    body_indexed
+                                    |> List.find_map (fun (acc_index, instr) ->
+                                           match instr with
+                                           | Tcg.Bin (sum_temp, Add, Tcg.Temp lhs, Tcg.Temp rhs) ->
+                                               let acc_live =
+                                                 if lhs = derived_temp
+                                                    && rhs <> derived_temp
+                                                    && rhs <> iv_temp
+                                                 then
+                                                   Some rhs
+                                                 else if
+                                                   rhs = derived_temp
+                                                   && lhs <> derived_temp
+                                                   && lhs <> iv_temp
+                                                 then
+                                                   Some lhs
+                                                 else
+                                                   None
+                                               in
+                                               Option.bind acc_live (fun acc_live ->
+                                                 body_indexed
+                                                 |> List.find_map
+                                                      (fun (move_index, move_instr) ->
+                                                        if move_index <= acc_index then
+                                                          None
+                                                        else
+                                                          match move_instr with
+                                                          | Tcg.Move (dst, Tcg.Temp src)
+                                                          | Tcg.Un (dst, UPlus, Tcg.Temp src)
+                                                            when src = sum_temp
+                                                                 && dst = acc_live ->
+                                                              Some
+                                                                ( acc_live,
+                                                                  derived_temp,
+                                                                  delta_operand )
+                                                          | Tcg.Move _
+                                                          | Tcg.Un _
+                                                          | Tcg.Bin _
+                                                          | Tcg.Load _
+                                                          | Tcg.Store _
+                                                          | Tcg.Call _ ->
+                                                              None))
+                                           | Tcg.Move _
+                                           | Tcg.Un _
+                                           | Tcg.Bin _
+                                           | Tcg.Load _
+                                           | Tcg.Store _
+                                           | Tcg.Call _ ->
+                                               None))
+                              | _ ->
+                                  None
+                            in
+
                             let match_pair () =
                                       match non_iv with
                                       | [ (i1, dst1, other1);
@@ -17542,20 +17757,28 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                       | _ -> None
                                     in
                             let reduction_shape =
-                              match match_direct_reduction () with
-                              | Some _ as direct ->
-                                  direct
+                              match match_move_accumulator_carrier () with
+                              | Some (acc_temp, derived_temp, delta_operand) ->
+                                  Some
+                                    (`Carrier
+                                      ( acc_temp,
+                                        derived_temp,
+                                        delta_operand ))
                               | None ->
-                                  (match match_pair () with
-                                   | Some
-                                       (acc_temp, derived_temp, delta_operand) ->
-                                       Some
-                                         (`Carrier
-                                           ( acc_temp,
-                                             derived_temp,
-                                             delta_operand ))
+                                  (match match_direct_reduction () with
+                                   | Some _ as direct ->
+                                       direct
                                    | None ->
-                                       None)
+                                       (match match_pair () with
+                                        | Some
+                                            (acc_temp, derived_temp, delta_operand) ->
+                                            Some
+                                              (`Carrier
+                                                ( acc_temp,
+                                                  derived_temp,
+                                                  delta_operand ))
+                                        | None ->
+                                            None))
                             in
                             match reduction_shape with
                             | None ->
@@ -17583,32 +17806,38 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                   table_find_or_empty
                                     live_in_t exit_label IntSet.empty
                                 in
-                                let derived_live_bad =
-                                  match reduction_shape with
-                                  | `Carrier (_, derived, _) ->
-                                      IntSet.mem derived live_exit
-                                  | `Direct _ ->
-                                      false
+                                let loop_live_defs =
+                                  IntSet.inter loop_defs live_exit
                                 in
-                                if
-                                  not (IntSet.mem acc_temp live_exit)
-                                  || IntSet.mem iv_temp live_exit
-                                  || derived_live_bad
-                                then
+                                let supported_live_temps =
+                                  IntSet.add iv_temp (IntSet.singleton acc_temp)
+                                in
+                                let supported_live_temps,
+                                    reconstruction_order,
+                                    reconstruction_exprs
+                                  =
+                                  collect_reconstructible_live_temps
+                                    PlaceSet.empty
+                                    loop_defs
+                                    get_block
+                                    def_blocks
+                                    IntSet.empty
+                                    multi_defs
+                                    def_instrs
+                                    supported_live_temps
+                                    loop_live_defs
+                                in
+                                if not (IntSet.subset loop_live_defs supported_live_temps) then
+                                  let missing =
+                                    IntSet.diff loop_live_defs supported_live_temps
+                                  in
                                   reject header
                                     (Printf.sprintf
-                                       "bad-liveout acc=%b iv=%b derived=%b"
-                                       (IntSet.mem acc_temp live_exit)
-                                       (IntSet.mem iv_temp live_exit)
-                                       derived_live_bad)
+                                       "bad-liveout missing={%s}"
+                                       (String.concat ","
+                                          (List.map string_of_int
+                                             (IntSet.elements missing))))
                                 else
-                                  let other_live_defs =
-                                    IntSet.remove acc_temp
-                                      (IntSet.inter loop_defs live_exit)
-                                  in
-                                          if not (IntSet.is_empty other_live_defs) then
-                                            reject header "other-loop-def-liveout"
-                                          else
                                             let preheader_reaches_loop =
                                               List.mem header preheader.succs
                                             in
@@ -17632,6 +17861,45 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                               in
                                               let build_reduction_apply_body
                                                   trip =
+                                                let summary_trip, trip_prep =
+                                                  if
+                                                    loop_inv_expr_equal
+                                                      control_scale (LveConst 1L)
+                                                    && loop_inv_expr_equal
+                                                         control_bias step_expr
+                                                  then
+                                                    let trip_plus_one =
+                                                      fresh_temp ()
+                                                    in
+                                                    ( trip_plus_one,
+                                                      [ simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( trip_plus_one,
+                                                               Add,
+                                                               Tcg.Temp trip,
+                                                               Tcg.Imm 1L )) ] )
+                                                  else
+                                                    (trip, [])
+                                                in
+                                                let final_iv = fresh_temp () in
+                                                let iv_update_instrs =
+                                                  trip_prep
+                                                  @ [ simplify_simple_instr
+                                                      (Tcg.Bin
+                                                         ( final_iv,
+                                                           Mul,
+                                                           Tcg.Temp summary_trip,
+                                                           step_operand ));
+                                                    simplify_simple_instr
+                                                      (Tcg.Move
+                                                         (iv_temp, Tcg.Temp final_iv)) ]
+                                                in
+                                                let reconstruction_instrs =
+                                                  build_live_temp_reconstruction_updates
+                                                    fresh_temp PlaceMap.empty
+                                                    reconstruction_order
+                                                    reconstruction_exprs
+                                                in
                                                 match reduction_shape with
                                                 | `Carrier
                                                     ( _,
@@ -17642,7 +17910,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                       triangle
                                                     =
                                                       build_triangle_number_instrs
-                                                        fresh_temp trip
+                                                        fresh_temp summary_trip
                                                     in
                                                     let base_delta =
                                                       fresh_temp ()
@@ -17653,12 +17921,13 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                     let total_delta =
                                                       fresh_temp ()
                                                     in
-                                                    triangle_instrs
+                                                    iv_update_instrs
+                                                    @ triangle_instrs
                                                     @ [ simplify_simple_instr
                                                           (Tcg.Bin
                                                              ( base_delta,
                                                                Mul,
-                                                               Tcg.Temp trip,
+                                                               Tcg.Temp summary_trip,
                                                                Tcg.Temp
                                                                  derived_temp ));
                                                         simplify_simple_instr
@@ -17676,14 +17945,15 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                                  base_delta,
                                                                Tcg.Temp
                                                                  series_delta ));
-                                                        simplify_simple_instr
-                                                          (Tcg.Bin
-                                                             ( acc_temp,
-                                                               Add,
-                                                               Tcg.Temp
-                                                                 acc_temp,
-                                                               Tcg.Temp
-                                                                 total_delta )) ]
+                                                         simplify_simple_instr
+                                                           (Tcg.Bin
+                                                              ( acc_temp,
+                                                                Add,
+                                                                Tcg.Temp
+                                                                  acc_temp,
+                                                                Tcg.Temp
+                                                                  total_delta )) ]
+                                                    @ reconstruction_instrs
                                                 | `Direct
                                                     ( _,
                                                       delta_scale,
@@ -17707,7 +17977,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                       triangle
                                                     =
                                                       build_triangle_number_instrs
-                                                        fresh_temp trip
+                                                        fresh_temp summary_trip
                                                     in
                                                     let step_triangle =
                                                       fresh_temp ()
@@ -17721,7 +17991,8 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                     let total_delta =
                                                       fresh_temp ()
                                                     in
-                                                    scale_prep
+                                                    iv_update_instrs
+                                                    @ scale_prep
                                                     @ bias_prep
                                                     @ triangle_instrs
                                                     @ [ simplify_simple_instr
@@ -17740,10 +18011,10 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                                scale_operand ));
                                                         simplify_simple_instr
                                                           (Tcg.Bin
-                                                             ( base_delta,
-                                                               Mul,
-                                                               Tcg.Temp trip,
-                                                               bias_operand ));
+                                                              ( base_delta,
+                                                                Mul,
+                                                                Tcg.Temp summary_trip,
+                                                                bias_operand ));
                                                         simplify_simple_instr
                                                           (Tcg.Bin
                                                              ( total_delta,
@@ -17752,14 +18023,15 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                                  base_delta,
                                                                Tcg.Temp
                                                                  series_delta ));
-                                                        simplify_simple_instr
-                                                          (Tcg.Bin
-                                                             ( acc_temp,
-                                                               Add,
-                                                               Tcg.Temp
-                                                                 acc_temp,
-                                                               Tcg.Temp
-                                                                 total_delta )) ]
+                                                         simplify_simple_instr
+                                                           (Tcg.Bin
+                                                              ( acc_temp,
+                                                                Add,
+                                                                Tcg.Temp
+                                                                  acc_temp,
+                                                                Tcg.Temp
+                                                                  total_delta )) ]
+                                                    @ reconstruction_instrs
                                               in
                                               if
                                               normalize_loop_inv_expr
