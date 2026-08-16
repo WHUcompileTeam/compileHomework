@@ -15525,20 +15525,34 @@ type lcssa_lite_liveout = {
   lcssa_single_exit_materializable : bool;
 }
 
+type lcssa_lite_place_liveout = {
+  lcssa_place_loop_header : Tcg.label;
+  lcssa_place_loop_parent : Tcg.label option;
+  lcssa_place_loop_depth : int;
+  lcssa_place : Tcg.place;
+  lcssa_store_blocks : Tcg.label list;
+  lcssa_place_live_exit_targets : Tcg.label list;
+  lcssa_outside_load_blocks : Tcg.label list;
+  lcssa_single_exit_summary_candidate : bool;
+}
+
 type lcssa_lite_loop_info = {
   lcssa_info_header : Tcg.label;
   lcssa_info_parent : Tcg.label option;
   lcssa_info_depth : int;
   lcssa_info_exit_targets : Tcg.label list;
   lcssa_info_dedicated_exits : bool;
-  lcssa_info_liveouts : lcssa_lite_liveout list;
+  lcssa_info_temp_liveouts : lcssa_lite_liveout list;
+  lcssa_info_place_liveouts : lcssa_lite_place_liveout list;
 }
 
 type lcssa_lite_report = {
   lcssa_forest : loop_forest;
   lcssa_infos : (Tcg.label, lcssa_lite_loop_info) Hashtbl.t;
-  lcssa_total_liveouts : int;
-  lcssa_single_exit_materializable_count : int;
+  lcssa_total_temp_liveouts : int;
+  lcssa_total_place_liveouts : int;
+  lcssa_single_exit_temp_materializable_count : int;
+  lcssa_single_exit_place_summary_count : int;
 }
 
 let temps_defined_in_loop loop get_block =
@@ -15582,6 +15596,71 @@ let temp_outside_use_blocks temp loop (f : Cfg.func) =
            None)
   |> List.sort_uniq String.compare
 
+let local_places_stored_in_loop loop get_block =
+  LabelSet.fold
+    (fun label acc ->
+      let block : Cfg.block = get_block label in
+      List.fold_left
+        (fun acc instr ->
+          match instr with
+          | Tcg.Store ((Tcg.Local _) as place, _) ->
+              PlaceSet.add place acc
+          | Tcg.Store (Tcg.Global _, _)
+          | Tcg.Move _
+          | Tcg.Un _
+          | Tcg.Bin _
+          | Tcg.Load _
+          | Tcg.Call _ ->
+              acc)
+        acc block.body)
+    loop PlaceSet.empty
+
+let place_store_blocks_in_loop place loop get_block =
+  LabelSet.fold
+    (fun label blocks ->
+      let block : Cfg.block = get_block label in
+      if
+        List.exists
+          (function
+            | Tcg.Store (stored, _) -> stored = place
+            | Tcg.Move _
+            | Tcg.Un _
+            | Tcg.Bin _
+            | Tcg.Load _
+            | Tcg.Call _ ->
+                false)
+          block.body
+      then label :: blocks
+      else blocks)
+    loop []
+  |> List.sort_uniq String.compare
+
+let place_outside_load_blocks place loop (f : Cfg.func) =
+  f.blocks
+  |> List.filter_map
+       (fun (block : Cfg.block) ->
+         if LabelSet.mem block.label loop then None
+         else if
+           List.exists
+             (function
+               | Tcg.Load (_, loaded) -> loaded = place
+               | Tcg.Move _
+               | Tcg.Un _
+               | Tcg.Bin _
+               | Tcg.Store _
+               | Tcg.Call _ ->
+                   false)
+             block.body
+         then Some block.label
+         else None)
+  |> List.sort_uniq String.compare
+
+let lcssa_string_of_place = function
+  | Tcg.Local id ->
+      Printf.sprintf "local:%d" id
+  | Tcg.Global label ->
+      Printf.sprintf "global:%s" label
+
 let dedicated_exit_targets_for_loop
     (forest : loop_forest)
     (info : loop_forest_info) =
@@ -15604,15 +15683,17 @@ let build_lcssa_lite_report
     summaries globals
     (f : Cfg.func) =
   let forest = build_loop_forest f in
-  let live_in_t, _ =
+  let live_in_t, live_in_p =
     compute_liveness summaries globals f
   in
   let infos =
     Hashtbl.create
       (max 8 (List.length forest.loop_forest_headers))
   in
-  let total_liveouts = ref 0 in
-  let materializable = ref 0 in
+  let total_temp_liveouts = ref 0 in
+  let total_place_liveouts = ref 0 in
+  let temp_materializable = ref 0 in
+  let place_summary_candidates = ref 0 in
   List.iter
     (fun header ->
       match Hashtbl.find_opt forest.loop_forest_infos header with
@@ -15637,7 +15718,7 @@ let build_lcssa_lite_report
             | [ _ ] -> true
             | [] | _ :: _ :: _ -> false
           in
-          let liveouts =
+          let temp_liveouts =
             IntSet.fold
               (fun temp acc ->
                 let live_exit_targets =
@@ -15673,11 +15754,57 @@ let build_lcssa_lite_report
                         && List.length live_exit_targets = 1;
                     }
                   in
-                  incr total_liveouts;
+                  incr total_temp_liveouts;
                   if item.lcssa_single_exit_materializable
-                  then incr materializable;
+                  then incr temp_materializable;
                   item :: acc)
               defined []
+            |> List.rev
+          in
+          let stored_places =
+            local_places_stored_in_loop loop get_block
+          in
+          let place_liveouts =
+            PlaceSet.fold
+              (fun place acc ->
+                let live_exit_targets =
+                  loop_info.loop_info_exit_targets
+                  |> List.filter
+                       (fun exit_target ->
+                         PlaceSet.mem place
+                           (table_find_or_empty
+                              live_in_p exit_target
+                              PlaceSet.empty))
+                in
+                if live_exit_targets = [] then acc
+                else
+                  let item =
+                    {
+                      lcssa_place_loop_header = header;
+                      lcssa_place_loop_parent =
+                        loop_info.loop_info_parent;
+                      lcssa_place_loop_depth =
+                        loop_info.loop_info_depth;
+                      lcssa_place = place;
+                      lcssa_store_blocks =
+                        place_store_blocks_in_loop
+                          place loop get_block;
+                      lcssa_place_live_exit_targets =
+                        live_exit_targets;
+                      lcssa_outside_load_blocks =
+                        place_outside_load_blocks
+                          place loop f;
+                      lcssa_single_exit_summary_candidate =
+                        dedicated_all
+                        && single_exit
+                        && List.length live_exit_targets = 1;
+                    }
+                  in
+                  incr total_place_liveouts;
+                  if item.lcssa_single_exit_summary_candidate
+                  then incr place_summary_candidates;
+                  item :: acc)
+              stored_places []
             |> List.rev
           in
           Hashtbl.replace infos header
@@ -15691,14 +15818,19 @@ let build_lcssa_lite_report
                 loop_info.loop_info_exit_targets;
               lcssa_info_dedicated_exits =
                 dedicated_all;
-              lcssa_info_liveouts = liveouts;
+              lcssa_info_temp_liveouts = temp_liveouts;
+              lcssa_info_place_liveouts = place_liveouts;
             })
     forest.loop_forest_headers;
   {
     lcssa_forest = forest;
     lcssa_infos = infos;
-    lcssa_total_liveouts = !total_liveouts;
-    lcssa_single_exit_materializable_count = !materializable;
+    lcssa_total_temp_liveouts = !total_temp_liveouts;
+    lcssa_total_place_liveouts = !total_place_liveouts;
+    lcssa_single_exit_temp_materializable_count =
+      !temp_materializable;
+    lcssa_single_exit_place_summary_count =
+      !place_summary_candidates;
   }
 
 let debug_lcssa_lite_report
@@ -15714,7 +15846,7 @@ let debug_lcssa_lite_report
         | None -> ()
         | Some info ->
             Printf.eprintf
-              "lcssa-lite-loop func=%s header=%s depth=%d parent=%s exits={%s} dedicated=%b liveouts=%d\n%!"
+              "lcssa-lite-loop func=%s header=%s depth=%d parent=%s exits={%s} dedicated=%b temp-liveouts=%d place-liveouts=%d\n%!"
               f.name
               header
               info.lcssa_info_depth
@@ -15723,11 +15855,12 @@ let debug_lcssa_lite_report
                | None -> "<root>")
               (String.concat "," info.lcssa_info_exit_targets)
               info.lcssa_info_dedicated_exits
-              (List.length info.lcssa_info_liveouts);
+              (List.length info.lcssa_info_temp_liveouts)
+              (List.length info.lcssa_info_place_liveouts);
             List.iter
               (fun item ->
                 Printf.eprintf
-                  "lcssa-lite-liveout func=%s header=%s depth=%d temp=t%d defs={%s} live-exits={%s} outside-uses={%s} materializable=%b\n%!"
+                  "lcssa-lite-temp-liveout func=%s header=%s depth=%d temp=t%d defs={%s} live-exits={%s} outside-uses={%s} materializable=%b\n%!"
                   f.name
                   item.lcssa_loop_header
                   item.lcssa_loop_depth
@@ -15736,14 +15869,29 @@ let debug_lcssa_lite_report
                   (String.concat "," item.lcssa_live_exit_targets)
                   (String.concat "," item.lcssa_outside_use_blocks)
                   item.lcssa_single_exit_materializable)
-              info.lcssa_info_liveouts)
+              info.lcssa_info_temp_liveouts;
+            List.iter
+              (fun item ->
+                Printf.eprintf
+                  "lcssa-lite-place-liveout func=%s header=%s depth=%d place=%s stores={%s} live-exits={%s} outside-loads={%s} summary-candidate=%b\n%!"
+                  f.name
+                  item.lcssa_place_loop_header
+                  item.lcssa_place_loop_depth
+                  (lcssa_string_of_place item.lcssa_place)
+                  (String.concat "," item.lcssa_store_blocks)
+                  (String.concat "," item.lcssa_place_live_exit_targets)
+                  (String.concat "," item.lcssa_outside_load_blocks)
+                  item.lcssa_single_exit_summary_candidate)
+              info.lcssa_info_place_liveouts)
       report.lcssa_forest.loop_forest_headers;
     Printf.eprintf
-      "lcssa-lite-summary func=%s loops=%d liveouts=%d single-exit-materializable=%d\n%!"
+      "lcssa-lite-summary func=%s loops=%d temp-liveouts=%d place-liveouts=%d temp-materializable=%d place-summary-candidates=%d\n%!"
       f.name
       (List.length report.lcssa_forest.loop_forest_headers)
-      report.lcssa_total_liveouts
-      report.lcssa_single_exit_materializable_count
+      report.lcssa_total_temp_liveouts
+      report.lcssa_total_place_liveouts
+      report.lcssa_single_exit_temp_materializable_count
+      report.lcssa_single_exit_place_summary_count
   end
 
 let collect_direct_extractable_reductions loop get_block backedge_preds reductions =
@@ -23984,8 +24132,24 @@ let stage_round_enabled profile round stage =
       | _ -> true)
 
 let optimize_func global_init summaries globals return_globals removable_calls (f : Cfg.func) =
-  let promoted = f |> mem2reg_func |> promote_globals_func summaries globals in
-  let canonical = loop_canonicalize_func summaries globals promoted in
+  let debug_lcssa_stage stage (current : Cfg.func) =
+    if Sys.getenv_opt "TOYC_DEBUG_LCSSA_LITE" <> None then begin
+      Printf.eprintf
+        "lcssa-lite-stage func=%s stage=%s blocks=%d temps=%d\n%!"
+        current.name stage
+        (List.length current.blocks)
+        current.temp_count;
+      debug_lcssa_lite_report summaries globals current
+    end
+  in
+  let promoted =
+    f |> mem2reg_func |> promote_globals_func summaries globals
+  in
+  let () = debug_lcssa_stage "promoted" promoted in
+  let canonical =
+    loop_canonicalize_func summaries globals promoted
+  in
+  let () = debug_lcssa_stage "canonical" canonical in
   let base_metrics = metrics_of_func f in
   let promoted_metrics = metrics_of_func promoted in
   let profile = choose_opt_profile base_metrics in
@@ -24253,7 +24417,12 @@ let optimize_func global_init summaries globals return_globals removable_calls (
   | Some "mem2reg" -> promoted
   | Some _ -> loop 1 profile.max_rounds canonical
   | None ->
-      let optimized = loop 1 profile.max_rounds canonical in
+      let optimized =
+        loop 1 profile.max_rounds canonical
+      in
+      let () =
+        debug_lcssa_stage "post-rounds" optimized
+      in
       (* Keep the early mem2reg conservative so downstream CFG/loop transforms
          see the same stable shape as step24.  After all iterative transforms
          have settled, run a final optimistic loop-phi mem2reg: provisional
@@ -24280,6 +24449,9 @@ let optimize_func global_init summaries globals return_globals removable_calls (
             optimized.name before_locals after_locals optimized.temp_count
             late_promoted.temp_count
       end;
+      let () =
+        debug_lcssa_stage "late-mem2reg" late_promoted
+      in
       (* IMPORTANT: run late algebra BEFORE copy coalescing.  Late mem2reg
          deliberately creates fresh, mostly single-definition/single-use temp
          chains.  [algebra_canonicalize_func] can safely follow those chains,
@@ -24294,9 +24466,19 @@ let optimize_func global_init summaries globals return_globals removable_calls (
              ~removable_calls summaries globals return_globals
         |> copy_coalesce_func summaries globals
       in
+      let () =
+        debug_lcssa_stage
+          "pre-runtime-summary"
+          late_pre_summary_input
+      in
       let late_pre_runtime_summarized =
         summarize_runtime_symbolic_affine_loops_func
           summaries globals late_pre_summary_input
+      in
+      let () =
+        debug_lcssa_stage
+          "post-runtime-summary"
+          late_pre_runtime_summarized
       in
       let late_pre_runtime_cleaned =
         late_pre_runtime_summarized
@@ -24349,6 +24531,11 @@ let optimize_func global_init summaries globals return_globals removable_calls (
             late_promoted.name before.instr_count after_algebra.instr_count
             after_dce.instr_count before.temp_count after_dce.temp_count
       end;
+      let () =
+        debug_lcssa_stage
+          "late-runtime-cleaned"
+          late_runtime_cleaned
+      in
       let with_hoisted_loop_bounds =
         hoist_unrolled_loop_branch_immediates_func summaries globals late_runtime_cleaned
       in
@@ -26661,8 +26848,4 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
       global_init summaries globals return_global_demands removable_calls
       optimized_funcs
   in
-  if Sys.getenv_opt "TOYC_DEBUG_LCSSA_LITE" <> None then
-    List.iter
-      (debug_lcssa_lite_report summaries globals)
-      optimized_funcs;
   { Cfg.funcs = optimized_funcs }
