@@ -5139,79 +5139,326 @@ let lve_delta_cases_from_backedge
      | Some _ | None -> ());
   result
 
-let analyze_loop_addrecs header loop get_block loop_defs multi_defs def_instrs =
-  recover_logical_loop_phis header loop get_block multi_defs
-  |> List.filter_map (fun (phi : logical_loop_phi) ->
-         let recovered =
-           List.map
-             (fun case ->
-               ( case,
-                 lve_delta_cases_from_backedge
-                   get_block loop_defs multi_defs def_instrs
-                   phi.logical_phi_temp case ))
-             phi.logical_backedge_cases
-         in
-         let all_recovered =
-           List.for_all
-             (fun (_, steps) ->
-               match steps with
-               | Some (_ :: _) -> true
-               | Some [] | None -> false)
+let symbolic_induction_step_of_instr_on_chain
+    chain loop_defs multi_defs def_instrs phi_temp = function
+  | Tcg.Bin (_, Add, lhs, rhs)
+    when
+      resolves_to_induction_temp_on_chain
+        chain multi_defs def_instrs phi_temp lhs ->
+      lve_invariant_expr_of_operand
+        loop_defs multi_defs def_instrs rhs
+      |> Option.map normalize_loop_inv_expr
+  | Tcg.Bin (_, Add, lhs, rhs)
+    when
+      resolves_to_induction_temp_on_chain
+        chain multi_defs def_instrs phi_temp rhs ->
+      lve_invariant_expr_of_operand
+        loop_defs multi_defs def_instrs lhs
+      |> Option.map normalize_loop_inv_expr
+  | Tcg.Bin (_, Sub, lhs, rhs)
+    when
+      resolves_to_induction_temp_on_chain
+        chain multi_defs def_instrs phi_temp lhs ->
+      lve_invariant_expr_of_operand
+        loop_defs multi_defs def_instrs rhs
+      |> Option.map (fun step ->
+             normalize_loop_inv_expr (LveNeg step))
+  | Tcg.Move _
+  | Tcg.Un _
+  | Tcg.Bin _
+  | Tcg.Load _
+  | Tcg.Store _
+  | Tcg.Call _ ->
+      None
+
+let analyze_direct_self_addrecs
+    header loop get_block loop_defs multi_defs def_instrs
+    excluded_temps =
+  let header_block : Cfg.block = get_block header in
+  let outside_preds =
+    List.filter
+      (fun pred -> not (LabelSet.mem pred loop))
+      header_block.preds
+  in
+  let backedge_preds =
+    List.filter
+      (fun pred -> LabelSet.mem pred loop)
+      header_block.preds
+  in
+  if outside_preds = [] || backedge_preds = [] then []
+  else
+    let backedge_chains =
+      List.map
+        (fun pred ->
+          ( pred,
+            incoming_update_chain
+              get_block header pred ))
+        backedge_preds
+    in
+    let chain_for_backedge pred =
+      match List.assoc_opt pred backedge_chains with
+      | Some chain ->
+          chain
+      | None ->
+          [ get_block pred ]
+    in
+    let outside_seed_chain pred =
+      incoming_phi_chain get_block header pred
+      |> extend_counted_outside_seed_chain
+           get_block loop
+    in
+    let step_of_chain_source phi_temp chain src =
+      let resolved =
+        resolve_chain_operand chain src
+      in
+      match resolved with
+      | Tcg.Imm _ ->
+          None
+      | Tcg.Temp temp -> (
+          match
+            def_instr_on_chain_or_global
+              chain multi_defs def_instrs temp
+          with
+          | Some instr ->
+              symbolic_induction_step_of_instr_on_chain
+                chain loop_defs multi_defs def_instrs
+                phi_temp instr
+          | None ->
+              None)
+    in
+    let step_of_chain_def phi_temp chain =
+      match
+        last_def_of_temp_on_chain chain phi_temp
+      with
+      | Some (Tcg.Move (_, src)) ->
+          step_of_chain_source phi_temp chain src
+      | Some instr ->
+          symbolic_induction_step_of_instr_on_chain
+            chain loop_defs multi_defs def_instrs
+            phi_temp instr
+      | None ->
+          None
+    in
+    let candidates =
+      List.fold_left
+        (fun candidates (_, chain) ->
+          List.fold_left
+            (fun candidates (block : Cfg.block) ->
+              List.fold_left
+                (fun candidates instr ->
+                  match defs_temp instr with
+                  | Some dst
+                    when
+                      not (IntSet.mem dst excluded_temps)
+                      &&
+                      Option.is_some
+                        (symbolic_induction_step_of_instr_on_chain
+                           chain loop_defs multi_defs
+                           def_instrs dst instr) ->
+                      IntSet.add dst candidates
+                  | Some _
+                  | None ->
+                      candidates)
+                candidates
+                block.body)
+            candidates
+            chain)
+        IntSet.empty
+        backedge_chains
+    in
+    IntSet.fold
+      (fun phi_temp addrecs ->
+        let outside_inputs =
+          List.filter_map
+            (fun pred ->
+              let chain = outside_seed_chain pred in
+              match
+                last_def_of_temp_on_chain
+                  chain phi_temp
+              with
+              | Some _ ->
+                  Some (pred, Tcg.Temp phi_temp)
+              | None ->
+                  None)
+            outside_preds
+        in
+        let steps =
+          List.filter_map
+            (fun pred ->
+              let chain = chain_for_backedge pred in
+              Option.map
+                (fun step -> (pred, step))
+                (step_of_chain_def phi_temp chain))
+            backedge_preds
+        in
+        match steps with
+        | []
+        | _ when
+            List.length outside_inputs
+            <> List.length outside_preds
+            || List.length steps
+               <> List.length backedge_preds ->
+            addrecs
+        | (_, first_step) :: rest
+          when
+            List.for_all
+              (fun (_, step) ->
+                loop_inv_expr_equal first_step step)
+              rest ->
+            let addrec =
+              {
+                addrec_phi_temp = phi_temp;
+                addrec_outside_inputs = outside_inputs;
+                addrec_backedge_preds = backedge_preds;
+                addrec_step =
+                  normalize_loop_inv_expr first_step;
+              }
+            in
+            if
+              Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
+              <> None
+            then
+              Printf.eprintf
+                "scev-direct-addrec header=%s phi=t%d step=%s outside=%d backedges=%d\n%!"
+                header phi_temp
+                (string_of_loop_inv_expr
+                   addrec.addrec_step)
+                (List.length outside_inputs)
+                (List.length backedge_preds);
+            addrec :: addrecs
+        | _ ->
+            addrecs)
+      candidates
+      []
+
+let analyze_loop_addrecs
+    header loop get_block loop_defs multi_defs def_instrs =
+  let logical_addrecs =
+    recover_logical_loop_phis
+      header loop get_block multi_defs
+    |> List.filter_map
+         (fun (phi : logical_loop_phi) ->
+           let recovered =
+             List.map
+               (fun case ->
+                 ( case,
+                   lve_delta_cases_from_backedge
+                     get_block loop_defs multi_defs
+                     def_instrs
+                     phi.logical_phi_temp case ))
+               phi.logical_backedge_cases
+           in
+           let all_recovered =
+             List.for_all
+               (fun (_, steps) ->
+                 match steps with
+                 | Some (_ :: _) ->
+                     true
+                 | Some []
+                 | None ->
+                     false)
+               recovered
+           in
+           let steps =
              recovered
-         in
-         let steps =
-           recovered
-           |> List.concat_map (fun (case, maybe_steps) ->
-                  match maybe_steps with
-                  | None -> []
-                  | Some path_steps ->
-                      List.map
-                        (fun step ->
-                          ( case.logical_header_pred,
-                            case.logical_def_label,
-                            normalize_loop_inv_expr step ))
-                        path_steps)
-         in
-         match steps with
-         | [] -> None
-         | (_, _, step) :: rest
-           when all_recovered
-                && List.for_all
-                     (fun (_, _, other) -> loop_inv_expr_equal step other)
-                     rest ->
-             let addrec =
-               {
-                 addrec_phi_temp = phi.logical_phi_temp;
-                 addrec_outside_inputs = phi.logical_outside_inputs;
-                 addrec_backedge_preds = phi.logical_backedge_preds;
-                 addrec_step = normalize_loop_inv_expr step;
-               }
-             in
-             if Sys.getenv_opt "TOYC_DEBUG_LVE" <> None then
-               Printf.eprintf
-                 "lve-addrec header=%s phi=t%d step=%s outside=%d backedges=%d physical-paths=%d value-paths=%d\n%!"
-                 header addrec.addrec_phi_temp
-                 (string_of_loop_inv_expr addrec.addrec_step)
-                 (List.length addrec.addrec_outside_inputs)
-                 (List.length addrec.addrec_backedge_preds)
-                 (List.length phi.logical_backedge_cases)
-                 (List.length steps);
-             Some addrec
-         | _ ->
-             (if Sys.getenv_opt "TOYC_DEBUG_LVE" <> None then
-                let rendered =
-                  steps
-                  |> List.map (fun (pred, def_label, step) ->
-                         Printf.sprintf "%s/%s:%s"
-                           pred def_label (string_of_loop_inv_expr step))
-                  |> String.concat ","
-                in
-                Printf.eprintf
-                  "lve-addrec-reject header=%s phi=t%d paths={%s} recovered=%b value-paths=%d physical-paths=%d\n%!"
-                  header phi.logical_phi_temp rendered all_recovered
-                  (List.length steps)
-                  (List.length phi.logical_backedge_cases));
-             None)
+             |> List.concat_map
+                  (fun (case, maybe_steps) ->
+                    match maybe_steps with
+                    | None ->
+                        []
+                    | Some path_steps ->
+                        List.map
+                          (fun step ->
+                            ( case.logical_header_pred,
+                              case.logical_def_label,
+                              normalize_loop_inv_expr
+                                step ))
+                          path_steps)
+           in
+           match steps with
+           | [] ->
+               None
+           | (_, _, step) :: rest
+             when
+               all_recovered
+               && List.for_all
+                    (fun (_, _, other) ->
+                      loop_inv_expr_equal step other)
+                    rest ->
+               let addrec =
+                 {
+                   addrec_phi_temp =
+                     phi.logical_phi_temp;
+                   addrec_outside_inputs =
+                     phi.logical_outside_inputs;
+                   addrec_backedge_preds =
+                     phi.logical_backedge_preds;
+                   addrec_step =
+                     normalize_loop_inv_expr step;
+                 }
+               in
+               if
+                 Sys.getenv_opt "TOYC_DEBUG_LVE"
+                 <> None
+               then
+                 Printf.eprintf
+                   "lve-addrec header=%s phi=t%d step=%s outside=%d backedges=%d physical-paths=%d value-paths=%d\n%!"
+                   header
+                   addrec.addrec_phi_temp
+                   (string_of_loop_inv_expr
+                      addrec.addrec_step)
+                   (List.length
+                      addrec.addrec_outside_inputs)
+                   (List.length
+                      addrec.addrec_backedge_preds)
+                   (List.length
+                      phi.logical_backedge_cases)
+                   (List.length steps);
+               Some addrec
+           | _ ->
+               (if
+                  Sys.getenv_opt "TOYC_DEBUG_LVE"
+                  <> None
+                then
+                  let rendered =
+                    steps
+                    |> List.map
+                         (fun
+                           ( pred,
+                             def_label,
+                             step ) ->
+                           Printf.sprintf
+                             "%s/%s:%s"
+                             pred def_label
+                             (string_of_loop_inv_expr
+                                step))
+                    |> String.concat ","
+                  in
+                  Printf.eprintf
+                    "lve-addrec-reject header=%s phi=t%d paths={%s} recovered=%b value-paths=%d physical-paths=%d\n%!"
+                    header
+                    phi.logical_phi_temp
+                    rendered
+                    all_recovered
+                    (List.length steps)
+                    (List.length
+                       phi.logical_backedge_cases));
+               None)
+  in
+  let logical_temps =
+    List.fold_left
+      (fun temps (addrec : loop_addrec) ->
+        IntSet.add addrec.addrec_phi_temp temps)
+      IntSet.empty
+      logical_addrecs
+  in
+  let direct_addrecs =
+    analyze_direct_self_addrecs
+      header loop get_block
+      loop_defs multi_defs def_instrs
+      logical_temps
+  in
+  logical_addrecs @ direct_addrecs
 
 
 (* -------------------------------------------------------------------------- *)
@@ -19871,150 +20118,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                       Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
                       <> None
                     in
-                    let same_candidate_recurrence point operand candidate =
-                      match
-                        recurrence_at
-                          runtime_recurrence_analysis.loop_recurrence_facts
-                          point operand
-                      with
-                      | Some
-                          ((ScalarAddRec _ | ScalarAffine _)
-                            as recurrence) -> (
-                          match
-                            scalar_recurrence_scale_bias recurrence
-                          with
-                          | Some (base, scale, _bias) ->
-                              scalar_same_base
-                                base
-                                candidate.recurrence_control_base
-                              && loop_inv_expr_equal
-                                   (normalize_loop_inv_expr scale)
-                                   scalar_inv_one
-                          | None ->
-                              false)
-                      | Some (ScalarConst _)
-                      | Some (ScalarInvariant _)
-                      | None ->
-                          false
-                    in
-                    let find_unified_control_update () =
-                      match runtime_control_candidate with
-                      | Some candidate
-                        when candidate.recurrence_control_op = Lt ->
-                          let base =
-                            candidate.recurrence_control_base
-                          in
-                          let semantic_matches =
-                            self_adds
-                            |> List.filter_map
-                                 (fun
-                                   ( update_index,
-                                     dst,
-                                     step_operand ) ->
-                                   match
-                                     recurrence_point_of_body_index
-                                       update_index
-                                   with
-                                   | None ->
-                                       None
-                                   | Some point ->
-                                       let dst_matches =
-                                         same_candidate_recurrence
-                                           point
-                                           (Tcg.Temp dst)
-                                           candidate
-                                       in
-                                       let step_matches =
-                                         match
-                                           recurrence_invariant_at
-                                             runtime_recurrence_analysis.loop_recurrence_facts
-                                             point
-                                             step_operand
-                                         with
-                                         | Some step_expr ->
-                                             loop_inv_expr_equal
-                                               (normalize_loop_inv_expr
-                                                  step_expr)
-                                               (normalize_loop_inv_expr
-                                                  base.addrec_step)
-                                         | None ->
-                                             false
-                                       in
-                                       if dst_matches
-                                          && step_matches
-                                       then
-                                         Some
-                                           ( update_index,
-                                             dst,
-                                             step_operand )
-                                       else
-                                         None)
-                          in
-                          (match semantic_matches with
-                           | [ ( update_index,
-                                 dst,
-                                 step_operand ) ] ->
-                               if scev_debug || debug then
-                                 Printf.eprintf
-                                   "lve-runtime-unified-control-hit func=%s header=%s iv=t%d phi=t%d step=%s scale=%s bias=%s bound=%s\n%!"
-                                   f.name
-                                   header
-                                   dst
-                                   base.addrec_phi_temp
-                                   (string_of_loop_inv_expr
-                                      base.addrec_step)
-                                   (string_of_loop_inv_expr
-                                      candidate
-                                        .recurrence_control_scale)
-                                   (string_of_loop_inv_expr
-                                      candidate
-                                        .recurrence_control_bias)
-                                   (string_of_loop_inv_expr
-                                      candidate
-                                        .recurrence_control_bound_expr);
-                               Some
-                                 ( update_index,
-                                   dst,
-                                   step_operand,
-                                   base.addrec_step,
-                                   candidate
-                                     .recurrence_control_bound_operand,
-                                   candidate
-                                     .recurrence_control_scale,
-                                   candidate
-                                     .recurrence_control_bias )
-                           | [] ->
-                               if scev_debug then
-                                 Printf.eprintf
-                                   "scev-runtime-control-miss header=%s reason=no-semantic-update phi=t%d self-adds=%d\n%!"
-                                   header
-                                   base.addrec_phi_temp
-                                   (List.length self_adds);
-                               None
-                           | matches ->
-                               if scev_debug then
-                                 Printf.eprintf
-                                   "scev-runtime-control-miss header=%s reason=ambiguous-semantic-update phi=t%d matches=%d\n%!"
-                                   header
-                                   base.addrec_phi_temp
-                                   (List.length matches);
-                               None)
-                      | Some candidate ->
-                          if scev_debug then
-                            Printf.eprintf
-                              "scev-runtime-control-miss header=%s reason=unsupported-op op=%s\n%!"
-                              header
-                              (string_of_recurrence_compare
-                                 candidate.recurrence_control_op);
-                          None
-                      | None ->
-                          if scev_debug then
-                            Printf.eprintf
-                              "scev-runtime-control-miss header=%s reason=no-candidate\n%!"
-                              header;
-                          None
-                    in
-
                     let rec preupdate_affine_of_operand
                         iv_temp use_index seen operand =
                       match operand with
@@ -20376,12 +20479,164 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                               None)
                         body_indexed
                     in
-                    let control_update =
-                      match find_unified_control_update () with
+                    let legacy_control_update =
+                      find_control_update ()
+                    in
+                    let unified_control_update =
+                      match
+                        ( runtime_control_candidate,
+                          legacy_control_update )
+                      with
+                      | Some candidate,
+                        Some
+                          ( update_index,
+                            iv_temp,
+                            step_operand,
+                            legacy_step,
+                            bound_operand,
+                            legacy_scale,
+                            legacy_bias )
+                        when
+                          candidate.recurrence_control_op = Lt ->
+                          let candidate_step =
+                            normalize_loop_inv_expr
+                              candidate
+                                .recurrence_control_base
+                                .addrec_step
+                          in
+                          let candidate_scale =
+                            normalize_loop_inv_expr
+                              candidate
+                                .recurrence_control_scale
+                          in
+                          let candidate_bias =
+                            normalize_loop_inv_expr
+                              candidate
+                                .recurrence_control_bias
+                          in
+                          let legacy_step =
+                            normalize_loop_inv_expr
+                              legacy_step
+                          in
+                          let legacy_scale =
+                            normalize_loop_inv_expr
+                              legacy_scale
+                          in
+                          let legacy_bias =
+                            normalize_loop_inv_expr
+                              legacy_bias
+                          in
+                          let bound_expr =
+                            invariant_expr bound_operand
+                          in
+                          let step_agree =
+                            loop_inv_expr_equal
+                              candidate_step legacy_step
+                          in
+                          let scale_agree =
+                            loop_inv_expr_equal
+                              candidate_scale legacy_scale
+                          in
+                          let bias_agree =
+                            loop_inv_expr_equal
+                              candidate_bias legacy_bias
+                          in
+                          let bound_agree =
+                            match bound_expr with
+                            | Some expr ->
+                                loop_inv_expr_equal
+                                  (normalize_loop_inv_expr expr)
+                                  (normalize_loop_inv_expr
+                                     candidate
+                                       .recurrence_control_bound_expr)
+                            | None ->
+                                false
+                          in
+                          if
+                            step_agree
+                            && scale_agree
+                            && bias_agree
+                            && bound_agree
+                          then begin
+                            if scev_debug || debug then
+                              Printf.eprintf
+                                "scev-runtime-control-hit func=%s header=%s control=%s iv=t%d phi=t%d step=%s scale=%s bias=%s bound=%s\n%!"
+                                f.name
+                                header
+                                control_block.label
+                                iv_temp
+                                candidate
+                                  .recurrence_control_base
+                                  .addrec_phi_temp
+                                (string_of_loop_inv_expr
+                                   candidate_step)
+                                (string_of_loop_inv_expr
+                                   candidate_scale)
+                                (string_of_loop_inv_expr
+                                   candidate_bias)
+                                (string_of_loop_inv_expr
+                                   candidate
+                                     .recurrence_control_bound_expr);
+                            Some
+                              ( update_index,
+                                iv_temp,
+                                step_operand,
+                                candidate_step,
+                                bound_operand,
+                                candidate_scale,
+                                candidate_bias )
+                          end
+                          else begin
+                            if scev_debug then
+                              Printf.eprintf
+                                "scev-runtime-control-disagree header=%s iv=t%d phi=t%d step=%b scale=%b bias=%b bound=%b\n%!"
+                                header
+                                iv_temp
+                                candidate
+                                  .recurrence_control_base
+                                  .addrec_phi_temp
+                                step_agree
+                                scale_agree
+                                bias_agree
+                                bound_agree;
+                            None
+                          end
+                      | Some candidate, None ->
+                          if scev_debug then
+                            Printf.eprintf
+                              "scev-runtime-control-miss header=%s reason=no-physical-update phi=t%d\n%!"
+                              header
+                              candidate
+                                .recurrence_control_base
+                                .addrec_phi_temp;
+                          None
+                      | None, Some _ ->
+                          if scev_debug then
+                            Printf.eprintf
+                              "scev-runtime-control-miss header=%s reason=no-candidate\n%!"
+                              header;
+                          None
+                      | None, None ->
+                          if scev_debug then
+                            Printf.eprintf
+                              "scev-runtime-control-miss header=%s reason=no-candidate-or-physical-update\n%!"
+                              header;
+                          None
+                      | Some candidate, Some _ ->
+                          if scev_debug then
+                            Printf.eprintf
+                              "scev-runtime-control-miss header=%s reason=unsupported-op op=%s\n%!"
+                              header
+                              (string_of_recurrence_compare
+                                 candidate.recurrence_control_op);
+                          None
+                    in
+                    let control_update, unified_control_agreed =
+                      match unified_control_update with
                       | Some _ as result ->
-                          result
+                          (result, true)
                       | None ->
-                          find_control_update ()
+                          (legacy_control_update, false)
                     in
                     match control_update with
                     | None ->
@@ -20502,9 +20757,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                     use_index )
                               with
                               | Some candidate, Some point
-                                when
-                                  candidate.recurrence_control_base.addrec_phi_temp
-                                  = iv_temp -> (
+                                when unified_control_agreed -> (
                                   match
                                     recurrence_at
                                       runtime_recurrence_analysis.loop_recurrence_facts
@@ -20558,6 +20811,15 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                       use_index
                                       (string_of_lve_operand operand);
                                   None
+                              | Some _, Some _
+                                when not unified_control_agreed ->
+                                  if scev_debug then
+                                    Printf.eprintf
+                                      "scev-runtime-delta-miss header=%s index=%d operand=%s reason=control-not-unified\n%!"
+                                      header
+                                      use_index
+                                      (string_of_lve_operand operand);
+                                  None
                               | Some _, Some _ ->
                                   None
                             in
@@ -20574,7 +20836,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                     <> None
                                   then
                                     Printf.eprintf
-                                      "scev-runtime-delta header=%s index=%d operand=%s scale=%s bias=%s\n%!"
+                                      "scev-runtime-delta-hit header=%s index=%d operand=%s scale=%s bias=%s\n%!"
                                       header
                                       use_index
                                       (string_of_lve_operand
