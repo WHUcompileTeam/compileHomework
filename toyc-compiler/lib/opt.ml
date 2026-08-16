@@ -16802,11 +16802,12 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                      (fun instr -> Option.is_none (self_add instr))
                      body_instrs
                  in
-                 if
-                   (self_add_count <> 2 && self_add_count <> 3)
-                   || List.length extra_instrs > 6
-                   || not (List.for_all pure_affine_control_instr extra_instrs)
-                 then
+                  if
+                    self_add_count < 1
+                    || self_add_count > 3
+                    || List.length extra_instrs > 6
+                    || not (List.for_all pure_affine_control_instr extra_instrs)
+                  then
                    Error
                      (Printf.sprintf
                         "affine-body-shape blocks=%d instrs=%d self-adds=%d extras=%d"
@@ -16887,7 +16888,10 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                              (self_add instr))
                     |> List.filter_map Fun.id
                   in
-                  if List.length self_adds <> 3 then
+                  if
+                    List.length self_adds < 1
+                    || List.length self_adds > 3
+                  then
                     reject header
                       (Printf.sprintf
                          "self-add-count=%d"
@@ -16895,6 +16899,18 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                   else
                     let body_indexed =
                       List.mapi (fun index instr -> (index, instr)) body_instrs
+                    in
+                    let last_body_def_before use_index temp =
+                      let found = ref None in
+                      List.iteri
+                        (fun index instr ->
+                          if index < use_index then
+                            match defs_temp instr with
+                            | Some dst when dst = temp ->
+                                found := Some (index, instr)
+                            | Some _ | None -> ())
+                        body_instrs;
+                      !found
                     in
                     let last_body_def temp =
                       body_indexed
@@ -16934,6 +16950,12 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                             (LveNeg scale),
                           normalize_loop_inv_expr
                             (LveAdd (invariant, LveNeg bias)) )
+                    in
+                    let summary_operand_of_loop_inv_expr expr =
+                      match normalize_loop_inv_expr expr with
+                      | LveConst value -> Some (Tcg.Imm value)
+                      | LveOperand operand -> Some operand
+                      | LveNeg _ | LveAdd _ | LveMul _ -> None
                     in
                     let rec control_affine_of_operand
                         iv_temp iv_update_index seen operand =
@@ -17017,9 +17039,121 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                       | Tcg.Call _ ->
                           None
                     in
+                    let rec control_update_affine_of_operand
+                        iv_temp use_index seen operand =
+                      match operand with
+                      | Tcg.Temp temp when temp = iv_temp ->
+                          Some (LveConst 1L, LveConst 0L)
+                      | Tcg.Imm value ->
+                          Some (LveConst 0L, LveConst value)
+                      | Tcg.Temp temp as operand -> (
+                          match
+                            lve_invariant_expr_of_operand
+                              loop_defs multi_defs def_instrs operand
+                          with
+                          | Some invariant ->
+                              Some (LveConst 0L, normalize_loop_inv_expr invariant)
+                          | None ->
+                              if IntSet.mem temp seen then None
+                              else
+                                match last_body_def_before use_index temp with
+                                | Some (def_index, instr) ->
+                                    control_update_affine_of_instr
+                                      iv_temp def_index
+                                      (IntSet.add temp seen) instr
+                                | None -> None)
+                    and control_update_affine_of_instr
+                        iv_temp def_index seen = function
+                      | Tcg.Move (_, src)
+                      | Tcg.Un (_, UPlus, src) ->
+                          control_update_affine_of_operand
+                            iv_temp def_index seen src
+                      | Tcg.Un (_, UMinus, src) ->
+                          Option.map
+                            (fun (scale, bias) ->
+                              ( normalize_loop_inv_expr (LveNeg scale),
+                                normalize_loop_inv_expr (LveNeg bias) ))
+                            (control_update_affine_of_operand
+                               iv_temp def_index seen src)
+                      | Tcg.Bin (_, Add, lhs, rhs) -> (
+                          match
+                            ( control_update_affine_of_operand
+                                iv_temp def_index seen lhs,
+                              control_update_affine_of_operand
+                                iv_temp def_index seen rhs )
+                          with
+                          | Some (lhs_scale, lhs_bias), Some (rhs_scale, rhs_bias) ->
+                              Some
+                                ( normalize_loop_inv_expr
+                                    (LveAdd (lhs_scale, rhs_scale)),
+                                  normalize_loop_inv_expr
+                                    (LveAdd (lhs_bias, rhs_bias)) )
+                          | _ -> None)
+                      | Tcg.Bin (_, Sub, lhs, rhs) -> (
+                          match
+                            ( control_update_affine_of_operand
+                                iv_temp def_index seen lhs,
+                              control_update_affine_of_operand
+                                iv_temp def_index seen rhs )
+                          with
+                          | Some (lhs_scale, lhs_bias), Some (rhs_scale, rhs_bias) ->
+                              Some
+                                ( normalize_loop_inv_expr
+                                    (LveAdd (lhs_scale, LveNeg rhs_scale)),
+                                  normalize_loop_inv_expr
+                                    (LveAdd (lhs_bias, LveNeg rhs_bias)) )
+                          | _ -> None)
+                      | Tcg.Bin (_, Mul, lhs, rhs) -> (
+                          match
+                            ( control_update_affine_of_operand
+                                iv_temp def_index seen lhs,
+                              control_update_affine_of_operand
+                                iv_temp def_index seen rhs )
+                          with
+                          | Some (lhs_scale, lhs_bias), Some (rhs_scale, rhs_bias)
+                            when normalize_loop_inv_expr lhs_scale = LveConst 0L ->
+                              Some
+                                ( normalize_loop_inv_expr
+                                    (LveMul (rhs_scale, lhs_bias)),
+                                  normalize_loop_inv_expr
+                                    (LveMul (rhs_bias, lhs_bias)) )
+                          | Some (lhs_scale, lhs_bias), Some (rhs_scale, rhs_bias)
+                            when normalize_loop_inv_expr rhs_scale = LveConst 0L ->
+                              Some
+                                ( normalize_loop_inv_expr
+                                    (LveMul (lhs_scale, rhs_bias)),
+                                  normalize_loop_inv_expr
+                                    (LveMul (lhs_bias, rhs_bias)) )
+                          | _ -> None)
+                      | Tcg.Un (_, UNot, _)
+                      | Tcg.Bin
+                          (_, (Div | Mod | Lt | Le | Gt | Ge | Eq | Ne | LAnd | LOr), _, _)
+                      | Tcg.Load _
+                      | Tcg.Store _
+                      | Tcg.Call _ ->
+                          None
+                    in
                     let find_control_update () =
                       List.find_map
-                        (fun (update_index, dst, step_operand) ->
+                        (fun (update_index, instr) ->
+                          match defs_temp instr with
+                          | None -> None
+                          | Some dst ->
+                              let update_step =
+                                Option.bind
+                                  (control_update_affine_of_instr
+                                     dst update_index IntSet.empty instr)
+                                  (fun (update_scale, update_bias) ->
+                                    if normalize_loop_inv_expr update_scale = LveConst 1L
+                                    then
+                                      Option.map
+                                        (fun step_operand ->
+                                          ( step_operand,
+                                            normalize_loop_inv_expr update_bias ))
+                                        (summary_operand_of_loop_inv_expr update_bias)
+                                    else
+                                      None)
+                              in
                           let lhs_affine =
                             control_affine_of_operand
                               dst update_index IntSet.empty lhs
@@ -17051,40 +17185,37 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                    lhs, scale, bias)
                             | _ -> None
                           in
-                          let step_expr =
-                            lve_invariant_expr_of_operand
-                              loop_defs multi_defs def_instrs step_operand
-                          in
-                          (match normalized with
-                           | Some
-                               (normalized_op, bound_operand,
-                                control_scale, control_bias)
-                             when normalized_op = Lt
-                                  && Option.is_some step_expr ->
-                               let control_scale =
-                                 normalize_loop_inv_expr control_scale
-                               in
-                               let control_bias =
-                                 normalize_loop_inv_expr control_bias
-                               in
-                               if debug then
-                                 Printf.eprintf
-                                   "lve-runtime-control-affine func=%s header=%s control=%s iv=t%d scale=%s bias=%s step=%s bound=%s\n%!"
-                                   f.name header control_block.label dst
-                                   (string_of_loop_inv_expr control_scale)
-                                   (string_of_loop_inv_expr control_bias)
-                                   (string_of_lve_operand step_operand)
-                                   (string_of_lve_operand bound_operand);
-                               Some
-                                 ( update_index,
-                                   dst,
-                                   step_operand,
-                                   Option.get step_expr,
-                                   bound_operand,
-                                   control_scale,
-                                   control_bias )
-                           | Some _ | None -> None))
-                        self_adds
+                          match (normalized, update_step) with
+                          | ( Some
+                                (normalized_op, bound_operand,
+                                 control_scale, control_bias),
+                              Some (step_operand, step_expr) )
+                            when normalized_op = Lt ->
+                              let control_scale =
+                                normalize_loop_inv_expr control_scale
+                              in
+                              let control_bias =
+                                normalize_loop_inv_expr control_bias
+                              in
+                              if debug then
+                                Printf.eprintf
+                                  "lve-runtime-control-affine func=%s header=%s control=%s iv=t%d scale=%s bias=%s step=%s bound=%s\n%!"
+                                  f.name header control_block.label dst
+                                  (string_of_loop_inv_expr control_scale)
+                                  (string_of_loop_inv_expr control_bias)
+                                  (string_of_lve_operand step_operand)
+                                  (string_of_lve_operand bound_operand);
+                              Some
+                                ( update_index,
+                                  dst,
+                                  step_operand,
+                                  step_expr,
+                                  bound_operand,
+                                  control_scale,
+                                  control_bias )
+                          | _ ->
+                              None)
+                        body_indexed
                     in
                     match find_control_update () with
                     | None ->
@@ -17226,26 +17357,43 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                       normalize_loop_inv_expr phase_bias )
                               | Tcg.Temp temp as operand ->
                                   (match
-                                     lve_invariant_expr_of_operand
-                                       loop_defs multi_defs def_instrs operand
+                                     lve_runtime_scale_of_operand
+                                       loop_defs multi_defs def_instrs
+                                       iv_temp operand
                                    with
-                                   | Some invariant ->
+                                   | Some scale ->
+                                       let phase_bias =
+                                         if use_index > iv_update_index then
+                                           normalize_loop_inv_expr
+                                             (LveMul (scale, step_expr))
+                                         else
+                                           LveConst 0L
+                                       in
                                        Some
-                                         ( LveConst 0L,
-                                           normalize_loop_inv_expr invariant )
-                                   | None ->
-                                       if IntSet.mem temp seen then None
-                                       else
-                                         match
-                                           last_body_def_before
-                                             use_index temp
-                                         with
-                                         | Some (def_index, instr) ->
-                                             direct_delta_affine_of_instr
-                                               def_index
-                                               (IntSet.add temp seen)
-                                               instr
-                                         | None -> None)
+                                         ( normalize_loop_inv_expr scale,
+                                           normalize_loop_inv_expr phase_bias )
+                                   | None -> (
+                                       match
+                                         lve_invariant_expr_of_operand
+                                           loop_defs multi_defs def_instrs operand
+                                       with
+                                       | Some invariant ->
+                                           Some
+                                             ( LveConst 0L,
+                                               normalize_loop_inv_expr invariant )
+                                       | None ->
+                                           if IntSet.mem temp seen then None
+                                           else
+                                             match
+                                               last_body_def_before
+                                                 use_index temp
+                                             with
+                                             | Some (def_index, instr) ->
+                                                 direct_delta_affine_of_instr
+                                                   def_index
+                                                   (IntSet.add temp seen)
+                                                   instr
+                                             | None -> None))
                             and direct_delta_affine_of_instr
                                 def_index seen = function
                               | Tcg.Move (_, src)
@@ -17394,16 +17542,20 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                       | _ -> None
                                     in
                             let reduction_shape =
-                              match match_pair () with
-                              | Some
-                                  (acc_temp, derived_temp, delta_operand) ->
-                                  Some
-                                    (`Carrier
-                                      ( acc_temp,
-                                        derived_temp,
-                                        delta_operand ))
+                              match match_direct_reduction () with
+                              | Some _ as direct ->
+                                  direct
                               | None ->
-                                  match_direct_reduction ()
+                                  (match match_pair () with
+                                   | Some
+                                       (acc_temp, derived_temp, delta_operand) ->
+                                       Some
+                                         (`Carrier
+                                           ( acc_temp,
+                                             derived_temp,
+                                             delta_operand ))
+                                   | None ->
+                                       None)
                             in
                             match reduction_shape with
                             | None ->
@@ -18358,14 +18510,19 @@ let optimize_func global_init summaries globals return_globals removable_calls (
         run_stage round "post_licm_algebra"
           algebra_canonicalize_func after_licm_linear
       in
-      let after_licm_dce =
-        run_stage round "post_licm_dce"
-          (eliminate_dead_code_func ~removable_calls summaries globals return_globals)
-          after_licm_algebra
-      in
-      let after_lve_sr =
-        run_stage round "lve_sr" loop_evolution_strength_reduce_func after_licm_dce
-      in
+       let after_licm_dce =
+         run_stage round "post_licm_dce"
+           (eliminate_dead_code_func ~removable_calls summaries globals return_globals)
+           after_licm_algebra
+       in
+       let after_runtime_summary =
+         run_stage round "runtime_summary"
+           (summarize_runtime_symbolic_affine_loops_func summaries globals)
+           after_licm_dce
+       in
+       let after_lve_sr =
+         run_stage round "lve_sr" loop_evolution_strength_reduce_func after_runtime_summary
+       in
       let after_unswitch =
         run_stage round
           ~enabled:(stage_round_enabled profile round "unswitch")
@@ -18534,7 +18691,25 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       let late_algebra = algebra_canonicalize_func late_promoted in
       let late_linear = general_linear_canonicalize_func late_algebra in
       let late_factor = factor_common_mul_func late_linear in
-      let late_lve_sr = loop_evolution_strength_reduce_func late_factor in
+      let late_pre_summary_input =
+        late_factor
+        |> eliminate_dead_code_func
+             ~removable_calls summaries globals return_globals
+        |> copy_coalesce_func summaries globals
+      in
+      let late_pre_runtime_summarized =
+        summarize_runtime_symbolic_affine_loops_func
+          summaries globals late_pre_summary_input
+      in
+      let late_pre_runtime_cleaned =
+        late_pre_runtime_summarized
+        |> eliminate_dead_code_func
+             ~removable_calls summaries globals return_globals
+        |> copy_coalesce_func summaries globals
+      in
+      let late_lve_sr =
+        loop_evolution_strength_reduce_func late_pre_runtime_cleaned
+      in
       let late_dce =
         eliminate_dead_code_func ~removable_calls summaries globals return_globals late_lve_sr
       in
