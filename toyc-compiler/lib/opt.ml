@@ -15929,6 +15929,429 @@ let build_lcssa_lite_report
       !child_place_effects;
   }
 
+(* -------------------------------------------------------------------------- *)
+(* item2.7b: bottom-up child scalar-summary discovery (analysis only)           *)
+(*                                                                            *)
+(* This deliberately reuses the mature counted-loop/reduction machinery.        *)
+(* We do not invent another arithmetic matcher here.  LCSSA provenance decides  *)
+(* WHO owns a live-out write; counted-loop analysis decides WHAT the per-loop    *)
+(* scalar effect is.                                                            *)
+(*                                                                            *)
+(* Direct summary:                                                             *)
+(*   place is written exclusively at the current loop level, the loop has a     *)
+(*   counted control, and [collect_counted_reductions] can prove a reduction    *)
+(*   for that place.                                                            *)
+(*                                                                            *)
+(* Child link:                                                                 *)
+(*   parent sees the place as child-only and names the immediate child whose    *)
+(*   direct summary should be composed later.  No parent recurrence is built    *)
+(*   yet.                                                                       *)
+(* -------------------------------------------------------------------------- *)
+
+type child_scalar_direct_summary = {
+  child_summary_header : Tcg.label;
+  child_summary_parent : Tcg.label option;
+  child_summary_depth : int;
+  child_summary_place : Tcg.place;
+  child_summary_control : counted_loop_info;
+  child_summary_reduction : counted_reduction;
+}
+
+type child_scalar_summary_link = {
+  child_link_parent_header : Tcg.label;
+  child_link_child_header : Tcg.label;
+  child_link_place : Tcg.place;
+  child_link_direct_summary_found : bool;
+}
+
+type child_scalar_summary_report = {
+  child_scalar_direct_summaries : child_scalar_direct_summary list;
+  child_scalar_links : child_scalar_summary_link list;
+}
+
+let string_of_child_operand = function
+  | Tcg.Imm value -> Int64.to_string value
+  | Tcg.Temp temp -> Printf.sprintf "t%d" temp
+
+let rec string_of_child_summary_expr = function
+  | SummaryOperand operand ->
+      string_of_child_operand operand
+  | SummaryPlace place ->
+      lcssa_string_of_place place
+  | SummaryUn (op, expr) ->
+      let op =
+        match op with
+        | UPlus -> "+"
+        | UMinus -> "-"
+        | UNot -> "!"
+      in
+      Printf.sprintf "%s(%s)"
+        op (string_of_child_summary_expr expr)
+  | SummaryBin (op, lhs, rhs) ->
+      let op =
+        match op with
+        | Add -> "+"
+        | Sub -> "-"
+        | Mul -> "*"
+        | Div -> "/"
+        | Mod -> "%"
+        | Lt -> "<"
+        | Le -> "<="
+        | Gt -> ">"
+        | Ge -> ">="
+        | Eq -> "=="
+        | Ne -> "!="
+        | LAnd -> "&&"
+        | LOr -> "||"
+      in
+      Printf.sprintf "(%s%s%s)"
+        (string_of_child_summary_expr lhs)
+        op
+        (string_of_child_summary_expr rhs)
+
+let string_of_child_reduction_step = function
+  | ReductionInvariant expr ->
+      Printf.sprintf "invariant:%s"
+        (string_of_child_summary_expr expr)
+  | ReductionAffine { iv; coeff; bias } ->
+      Printf.sprintf "affine:iv=t%d,coeff=%s,bias=%s"
+        iv.phi_temp
+        (string_of_child_summary_expr coeff)
+        (string_of_child_summary_expr bias)
+  | ReductionQuadratic
+      { iv; quad; triangle; coeff; bias } ->
+      Printf.sprintf
+        "quadratic:iv=t%d,quad=%s,triangle=%s,coeff=%s,bias=%s"
+        iv.phi_temp
+        (string_of_child_summary_expr quad)
+        (string_of_child_summary_expr triangle)
+        (string_of_child_summary_expr coeff)
+        (string_of_child_summary_expr bias)
+  | ReductionCubic
+      { iv; choose3; triangle; coeff; bias } ->
+      Printf.sprintf
+        "cubic:iv=t%d,choose3=%s,triangle=%s,coeff=%s,bias=%s"
+        iv.phi_temp
+        (string_of_child_summary_expr choose3)
+        (string_of_child_summary_expr triangle)
+        (string_of_child_summary_expr coeff)
+        (string_of_child_summary_expr bias)
+  | ReductionCarrierProgression
+      { carrier_temp; step_expr; carrier_subtract;
+        include_updated } ->
+      Printf.sprintf
+        "carrier:t%d,step=%s,subtract=%b,include-updated=%b"
+        carrier_temp
+        (string_of_child_summary_expr step_expr)
+        carrier_subtract include_updated
+
+let string_of_child_counted_kind = function
+  | CountUpLt (bound, bias) ->
+      Printf.sprintf "up-lt:bound=%s,bias=%Ld"
+        (string_of_child_operand bound) bias
+  | CountUpLe (bound, bias) ->
+      Printf.sprintf "up-le:bound=%s,bias=%Ld"
+        (string_of_child_operand bound) bias
+  | CountDownGt (bound, bias) ->
+      Printf.sprintf "down-gt:bound=%s,bias=%Ld"
+        (string_of_child_operand bound) bias
+  | CountDownGe (bound, bias) ->
+      Printf.sprintf "down-ge:bound=%s,bias=%Ld"
+        (string_of_child_operand bound) bias
+  | CountUpLtScaled (bound, scale, bias) ->
+      Printf.sprintf
+        "up-lt-scaled:bound=%s,scale=%Ld,bias=%Ld"
+        (string_of_child_operand bound) scale bias
+  | CountUpLeScaled (bound, scale, bias) ->
+      Printf.sprintf
+        "up-le-scaled:bound=%s,scale=%Ld,bias=%Ld"
+        (string_of_child_operand bound) scale bias
+  | CountDownGtScaled (bound, scale, bias) ->
+      Printf.sprintf
+        "down-gt-scaled:bound=%s,scale=%Ld,bias=%Ld"
+        (string_of_child_operand bound) scale bias
+  | CountDownGeScaled (bound, scale, bias) ->
+      Printf.sprintf
+        "down-ge-scaled:bound=%s,scale=%Ld,bias=%Ld"
+        (string_of_child_operand bound) scale bias
+
+let reduction_targets_place place
+    (reduction : counted_reduction) =
+  match reduction.target with
+  | ReductionPlaceTarget target ->
+      target = place
+  | ReductionTempTarget _ ->
+      false
+
+let direct_place_candidates_of_lcssa_info
+    (info : lcssa_lite_loop_info) =
+  info.lcssa_info_place_liveouts
+  |> List.filter_map
+       (fun item ->
+         if item.lcssa_direct_effect_candidate then
+           Some item.lcssa_place
+         else
+           None)
+  |> List.sort_uniq compare
+
+let build_child_scalar_summary_report
+    summaries globals
+    (f : Cfg.func)
+    (lcssa_report : lcssa_lite_report) =
+  let forest = lcssa_report.lcssa_forest in
+  let get_block =
+    get_block_exn forest.loop_forest_block_map
+  in
+  let blocks_snapshot = f.blocks in
+  let direct_summaries_rev = ref [] in
+
+  (* Bottom-up order matters conceptually even though this stage only
+     discovers direct summaries: deepest loops are established first, so the
+     link phase can reliably ask whether a child already has a summary. *)
+  let headers_bottom_up =
+    forest.loop_forest_headers
+    |> List.filter_map
+         (fun header ->
+           match Hashtbl.find_opt
+                   forest.loop_forest_infos header with
+           | Some info ->
+               Some (header, info.loop_info_depth)
+           | None ->
+               None)
+    |> List.sort
+         (fun (ha, da) (hb, db) ->
+           let by_depth = compare db da in
+           if by_depth <> 0 then by_depth
+           else String.compare ha hb)
+    |> List.map fst
+  in
+
+  List.iter
+    (fun header ->
+      match
+        Hashtbl.find_opt lcssa_report.lcssa_infos header,
+        Hashtbl.find_opt forest.loop_forest_infos header
+      with
+      | Some lcssa_info, Some loop_info ->
+          let direct_places =
+            direct_place_candidates_of_lcssa_info lcssa_info
+          in
+          if direct_places <> [] then begin
+            let loop = loop_info.loop_info_blocks in
+            let
+              ( loop_defs,
+                def_blocks,
+                def_instrs,
+                multi_defs,
+                loop_stable_phis,
+                ivs,
+                control,
+                recurrence_facts ) =
+              analyze_counted_loop_for_elimination
+                header loop get_block
+                f.temp_count blocks_snapshot
+            in
+            match control with
+            | None ->
+                ()
+            | Some control ->
+                let effects =
+                  collect_loop_effects
+                    summaries globals loop blocks_snapshot
+                in
+                let invariant_loaded_places =
+                  PlaceSet.diff
+                    (local_places (locals_in_func f))
+                    (local_places effects.modified_places)
+                in
+                let live_in_t, live_in_p =
+                  compute_liveness summaries globals f
+                in
+                let live_t_exit =
+                  table_find_or_empty
+                    live_in_t control.exit_label IntSet.empty
+                in
+                let live_p_exit =
+                  table_find_or_empty
+                    live_in_p control.exit_label PlaceSet.empty
+                in
+                let loop_live_defs =
+                  IntSet.inter loop_defs live_t_exit
+                in
+                let excluded_temps =
+                  List.fold_left
+                    (fun acc (iv : basic_induction_var) ->
+                      IntSet.add iv.phi_temp acc)
+                    IntSet.empty ivs
+                in
+                let requested_places =
+                  List.fold_left
+                    (fun acc place ->
+                      if PlaceSet.mem place live_p_exit then
+                        PlaceSet.add place acc
+                      else
+                        acc)
+                    PlaceSet.empty direct_places
+                in
+                let reductions =
+                  collect_counted_reductions
+                    ~recurrence_facts
+                    header
+                    loop
+                    invariant_loaded_places
+                    loop_defs
+                    get_block
+                    def_blocks
+                    loop_stable_phis
+                    multi_defs
+                    def_instrs
+                    ivs
+                    excluded_temps
+                    loop_live_defs
+                    requested_places
+                in
+                let reductions, _ =
+                  resolve_counted_carrier_orders
+                    header loop get_block
+                    multi_defs def_instrs ivs reductions
+                in
+                List.iter
+                  (fun place ->
+                    match
+                      List.find_opt
+                        (reduction_targets_place place)
+                        reductions
+                    with
+                    | None ->
+                        ()
+                    | Some reduction ->
+                        direct_summaries_rev :=
+                          {
+                            child_summary_header = header;
+                            child_summary_parent =
+                              loop_info.loop_info_parent;
+                            child_summary_depth =
+                              loop_info.loop_info_depth;
+                            child_summary_place = place;
+                            child_summary_control = control;
+                            child_summary_reduction = reduction;
+                          }
+                          :: !direct_summaries_rev)
+                  direct_places
+          end
+      | _ ->
+          ())
+    headers_bottom_up;
+
+  let direct_summaries =
+    List.rev !direct_summaries_rev
+  in
+  let direct_summary_exists child_header place =
+    List.exists
+      (fun summary ->
+        summary.child_summary_header = child_header
+        && summary.child_summary_place = place)
+      direct_summaries
+  in
+  let links =
+    forest.loop_forest_headers
+    |> List.concat_map
+         (fun parent_header ->
+           match
+             Hashtbl.find_opt
+               lcssa_report.lcssa_infos parent_header
+           with
+           | None ->
+               []
+           | Some info ->
+               info.lcssa_info_place_liveouts
+               |> List.concat_map
+                    (fun item ->
+                      if
+                        not item.lcssa_child_effect_candidate
+                      then
+                        []
+                      else
+                        item.lcssa_child_store_headers
+                        |> List.map
+                             (fun child_header ->
+                               {
+                                 child_link_parent_header =
+                                   parent_header;
+                                 child_link_child_header =
+                                   child_header;
+                                 child_link_place =
+                                   item.lcssa_place;
+                                 child_link_direct_summary_found =
+                                   direct_summary_exists
+                                     child_header
+                                     item.lcssa_place;
+                               })))
+  in
+  {
+    child_scalar_direct_summaries =
+      direct_summaries;
+    child_scalar_links = links;
+  }
+
+let debug_child_scalar_summary_report
+    summaries globals
+    (f : Cfg.func)
+    (lcssa_report : lcssa_lite_report) =
+  if
+    Sys.getenv_opt "TOYC_DEBUG_LCSSA_LITE"
+    <> None
+  then begin
+    let report =
+      build_child_scalar_summary_report
+        summaries globals f lcssa_report
+    in
+    List.iter
+      (fun summary ->
+        let reduction = summary.child_summary_reduction in
+        Printf.eprintf
+          "child-scalar-direct func=%s header=%s depth=%d parent=%s place=%s control-iv=t%d outside-inputs=%d iv-step=%Ld control=%s subtract=%b reduction=%s\n%!"
+          f.name
+          summary.child_summary_header
+          summary.child_summary_depth
+          (match summary.child_summary_parent with
+           | Some parent -> parent
+           | None -> "<root>")
+          (lcssa_string_of_place
+             summary.child_summary_place)
+          summary.child_summary_control.control_iv.phi_temp
+          (List.length
+             summary.child_summary_control.control_iv.outside_inputs)
+          summary.child_summary_control.control_iv.step
+          (string_of_child_counted_kind
+             summary.child_summary_control.kind)
+          reduction.subtract
+          (string_of_child_reduction_step
+             reduction.step))
+      report.child_scalar_direct_summaries;
+    List.iter
+      (fun link ->
+        Printf.eprintf
+          "child-scalar-link func=%s parent=%s child=%s place=%s direct-summary-found=%b\n%!"
+          f.name
+          link.child_link_parent_header
+          link.child_link_child_header
+          (lcssa_string_of_place link.child_link_place)
+          link.child_link_direct_summary_found)
+      report.child_scalar_links;
+    Printf.eprintf
+      "child-scalar-summary func=%s direct=%d links=%d resolved-links=%d\n%!"
+      f.name
+      (List.length report.child_scalar_direct_summaries)
+      (List.length report.child_scalar_links)
+      (List.fold_left
+         (fun count link ->
+           if link.child_link_direct_summary_found
+           then count + 1
+           else count)
+         0 report.child_scalar_links)
+  end
+
 let debug_lcssa_lite_report
     summaries globals
     (f : Cfg.func) =
@@ -15997,7 +16420,9 @@ let debug_lcssa_lite_report
       report.lcssa_single_exit_temp_materializable_count
       report.lcssa_single_exit_place_summary_count
       report.lcssa_direct_place_effect_count
-      report.lcssa_child_place_effect_count
+      report.lcssa_child_place_effect_count;
+    debug_child_scalar_summary_report
+      summaries globals f report
   end
 
 let collect_direct_extractable_reductions loop get_block backedge_preds reductions =
@@ -24269,6 +24694,22 @@ let optimize_func global_init summaries globals return_globals removable_calls (
     | Some _ | None -> current
   in
   let run_stage round ?(enabled = true) stage pass current =
+    let debug_child_summary_boundary when_ current =
+      if
+        Sys.getenv_opt "TOYC_DEBUG_LCSSA_LITE" <> None
+        &&
+        (stage = "split_reductions"
+         || stage = "counted_loops")
+      then
+        debug_lcssa_stage
+          (Printf.sprintf
+             "round%d-%s-%s"
+             round when_ stage)
+          current
+    in
+    let () =
+      debug_child_summary_boundary "pre" current
+    in
     if not enabled then begin
       if debug_pass_times then
         Printf.eprintf "pass-time func=%s round=%d stage=%s skipped profile=%s\n%!"
@@ -24302,6 +24743,9 @@ let optimize_func global_init summaries globals return_globals removable_calls (
               promoted.name round stage;
           current
         end
+      in
+      let () =
+        debug_child_summary_boundary "post" next
       in
       if debug_pass_times then begin
         let elapsed_ms = (Sys.time () -. start_time) *. 1000.0 in
