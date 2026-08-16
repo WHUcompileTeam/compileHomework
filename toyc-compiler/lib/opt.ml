@@ -42,6 +42,7 @@ let bool_int b = if b then 1L else 0L
 let int32_modulus = 0x1_0000_0000L
 let int32_sign_bit = 0x8000_0000L
 let int32_mask = 0xFFFF_FFFFL
+let int32_signed_max = 2147483647L
 
 let i32 value =
   let masked = Int64.logand value int32_mask in
@@ -5584,6 +5585,10 @@ type counted_loop_kind =
   | CountUpLe of Tcg.operand * int64
   | CountDownGt of Tcg.operand * int64
   | CountDownGe of Tcg.operand * int64
+  | CountUpLtScaled of Tcg.operand * int64 * int64
+  | CountUpLeScaled of Tcg.operand * int64 * int64
+  | CountDownGtScaled of Tcg.operand * int64 * int64
+  | CountDownGeScaled of Tcg.operand * int64 * int64
 
 type normalized_limit =
   | LimitConst of int64
@@ -5596,6 +5601,44 @@ type counted_loop_info = {
   exit_label : Tcg.label;
   kind : counted_loop_kind;
 }
+
+let counted_kind_scale = function
+  | CountUpLt (_, _)
+  | CountUpLe (_, _)
+  | CountDownGt (_, _)
+  | CountDownGe (_, _) ->
+      1L
+  | CountUpLtScaled (_, scale, _)
+  | CountUpLeScaled (_, scale, _)
+  | CountDownGtScaled (_, scale, _)
+  | CountDownGeScaled (_, scale, _) ->
+      scale
+
+let counted_kind_bias = function
+  | CountUpLt (_, bias)
+  | CountUpLe (_, bias)
+  | CountDownGt (_, bias)
+  | CountDownGe (_, bias) ->
+      bias
+  | CountUpLtScaled (_, _, bias)
+  | CountUpLeScaled (_, _, bias)
+  | CountDownGtScaled (_, _, bias)
+  | CountDownGeScaled (_, _, bias) ->
+      bias
+
+let counted_kind_bound = function
+  | CountUpLt (bound, _)
+  | CountUpLe (bound, _)
+  | CountDownGt (bound, _)
+  | CountDownGe (bound, _) ->
+      bound
+  | CountUpLtScaled (bound, _, _)
+  | CountUpLeScaled (bound, _, _)
+  | CountDownGtScaled (bound, _, _)
+  | CountDownGeScaled (bound, _, _) ->
+      bound
+
+let counted_kind_has_unit_scale kind = counted_kind_scale kind = 1L
 
 type summary_expr =
   | SummaryOperand of Tcg.operand
@@ -5727,6 +5770,10 @@ let resolve_compare_operand_in_block block multi_defs def_instrs operand =
   loop IntSet.empty false operand
 
 let range_of_counted_iv_expr kind expr_bias =
+  let floor_div_pos numer denom =
+    if denom <= 0L then None
+    else Some (Int64.div numer denom)
+  in
   match kind with
   | CountUpLt (Tcg.Imm bound, control_bias) ->
       {
@@ -5748,7 +5795,31 @@ let range_of_counted_iv_expr kind expr_bias =
         min_value = Some Int64.(sub bound control_bias |> add expr_bias);
         max_value = None;
       }
-  | CountUpLt _ | CountUpLe _ | CountDownGt _ | CountDownGe _ ->
+  | CountUpLtScaled (Tcg.Imm bound, scale, control_bias) when scale > 0L -> (
+      match floor_div_pos Int64.(sub (sub bound 1L) control_bias) scale with
+      | Some max_iv -> { min_value = None; max_value = Some Int64.(add max_iv expr_bias) }
+      | None -> { min_value = None; max_value = None })
+  | CountUpLeScaled (Tcg.Imm bound, scale, control_bias) when scale > 0L -> (
+      match floor_div_pos Int64.(sub bound control_bias) scale with
+      | Some max_iv -> { min_value = None; max_value = Some Int64.(add max_iv expr_bias) }
+      | None -> { min_value = None; max_value = None })
+  | CountDownGtScaled (Tcg.Imm bound, scale, control_bias) when scale > 0L -> (
+      match floor_div_pos Int64.(sub (sub bound control_bias) (neg 1L)) scale with
+      | Some floor_bound ->
+          { min_value = Some Int64.(add floor_bound expr_bias |> add 1L); max_value = None }
+      | None -> { min_value = None; max_value = None })
+  | CountDownGeScaled (Tcg.Imm bound, scale, control_bias) when scale > 0L -> (
+      match floor_div_pos Int64.(sub bound control_bias) scale with
+      | Some min_iv -> { min_value = Some Int64.(add min_iv expr_bias); max_value = None }
+      | None -> { min_value = None; max_value = None })
+  | CountUpLt _
+  | CountUpLe _
+  | CountDownGt _
+  | CountDownGe _
+  | CountUpLtScaled _
+  | CountUpLeScaled _
+  | CountDownGtScaled _
+  | CountDownGeScaled _ ->
       { min_value = None; max_value = None }
 
 let compare_truth_from_range op range constant =
@@ -6083,9 +6154,14 @@ let classify_counted_loop_header
 
      with loop-invariant scale/bias.
 
-     v1 is diagnostic only.  It cannot change the selected counted-loop kind,
-     so this layer is safe to compare against the mature matcher before the
-     trip-count representation is generalized. *)
+     v1 originally started as diagnostic-only.  We now allow it to feed the
+     counted-loop matcher, but only when it collapses back to the mature
+     representation:
+
+         iv + constant_bias
+
+     against a loop-invariant bound.  More general symbolic scales/biases are
+     still left to the dedicated runtime symbolic summary pass. *)
   let invariant_expr_of_control_operand operand =
     lve_invariant_expr_of_operand
       loop_defs multi_defs def_instrs operand
@@ -6257,30 +6333,65 @@ let classify_counted_loop_header
         debug_phase_affine_operand "rhs" rhs
     | None -> ()
   end;
+  let phase_affine_const_control operand =
+    match phase_affine_control_of_operand IntSet.empty operand with
+    | Some (iv, scale, bias) -> (
+        match
+          ( loop_inv_expr_const_opt scale,
+            loop_inv_expr_const_opt bias )
+        with
+        | Some scale_value, Some bias_value
+          when scale_value > 0L
+               && scale_value <= int32_signed_max
+               && iv.step <> Int64.min_int ->
+            let stride = Int64.abs iv.step in
+            if stride <= 0L then None
+            else
+              let product = Int64.mul scale_value stride in
+              if
+                product <= 0L
+                || product > int32_signed_max
+                || Int64.div product stride <> scale_value
+              then None
+              else Some (iv, scale_value, bias_value)
+        | _ -> None)
+    | None -> None
+  in
+  let normalized_control_iv_affine operand =
+    match phase_affine_const_control operand with
+    | Some match_ -> Some match_
+    | None -> (
+        match control_iv_bias_of_operand IntSet.empty operand with
+        | Some (iv, bias) -> Some (iv, 1L, bias)
+        | None -> None)
+  in
+  let build_counted_kind step op bound scale bias =
+    match (step, op, scale) with
+    | step, Lt, 1L when step > 0L -> Some (CountUpLt (bound, bias))
+    | step, Le, 1L when step > 0L -> Some (CountUpLe (bound, bias))
+    | step, Gt, 1L when step < 0L -> Some (CountDownGt (bound, bias))
+    | step, Ge, 1L when step < 0L -> Some (CountDownGe (bound, bias))
+    | step, Lt, _ when step > 0L -> Some (CountUpLtScaled (bound, scale, bias))
+    | step, Le, _ when step > 0L -> Some (CountUpLeScaled (bound, scale, bias))
+    | step, Gt, _ when step < 0L -> Some (CountDownGtScaled (bound, scale, bias))
+    | step, Ge, _ when step < 0L -> Some (CountDownGeScaled (bound, scale, bias))
+    | _ -> None
+  in
   let match_control_iv op lhs rhs =
-    match (control_iv_bias_of_operand IntSet.empty lhs, invariant rhs) with
-    | Some (iv, bias), true ->
+    match (normalized_control_iv_affine lhs, invariant rhs) with
+    | Some (iv, scale, bias), true ->
         let step = iv.step in
         if step = 0L then None
-        else
-          (match (step, op) with
-          | step, Lt when step > 0L -> Some (iv, CountUpLt (rhs, bias))
-          | step, Le when step > 0L -> Some (iv, CountUpLe (rhs, bias))
-          | step, Gt when step < 0L -> Some (iv, CountDownGt (rhs, bias))
-          | step, Ge when step < 0L -> Some (iv, CountDownGe (rhs, bias))
-          | _ -> None)
+        else Option.map (fun kind -> (iv, kind)) (build_counted_kind step op rhs scale bias)
     | _ -> (
-        match (control_iv_bias_of_operand IntSet.empty rhs, invariant lhs) with
-        | Some (iv, bias), true ->
+        match (normalized_control_iv_affine rhs, invariant lhs) with
+        | Some (iv, scale, bias), true ->
             let step = iv.step in
             if step = 0L then None
             else
-              (match (step, op) with
-              | step, Gt when step > 0L -> Some (iv, CountUpLt (lhs, bias))
-              | step, Ge when step > 0L -> Some (iv, CountUpLe (lhs, bias))
-              | step, Lt when step < 0L -> Some (iv, CountDownGt (lhs, bias))
-              | step, Le when step < 0L -> Some (iv, CountDownGe (lhs, bias))
-              | _ -> None)
+              Option.map
+                (fun kind -> (iv, kind))
+                (build_counted_kind step (swap_compare op) lhs scale bias)
         | _ -> None)
   in
   let classify_targets op lhs rhs if_true if_false =
@@ -6647,6 +6758,14 @@ let build_trip_count_instrs fresh_temp phi_temp step kind =
           let adjusted = fresh_temp () in
           ([ simplify_simple_instr (Tcg.Bin (adjusted, Sub, bound, Tcg.Imm bias)) ], Tcg.Temp adjusted)
   in
+  let scale_phi scale =
+    if scale = 1L then ([], Tcg.Temp phi_temp)
+    else
+      let scaled = fresh_temp () in
+      ( [ simplify_simple_instr
+            (Tcg.Bin (scaled, Mul, Tcg.Temp phi_temp, Tcg.Imm scale)) ],
+        Tcg.Temp scaled )
+  in
   let stride = if step < 0L then Int64.neg step else step in
   let diff = fresh_temp () in
   match kind with
@@ -6670,6 +6789,34 @@ let build_trip_count_instrs fresh_temp phi_temp step kind =
       let diff_instr = simplify_simple_instr (Tcg.Bin (diff, Sub, Tcg.Temp phi_temp, bound)) in
       let trip_instrs, trip = build_nonnegative_inclusive_div fresh_temp diff stride in
       (bound_instrs @ (diff_instr :: trip_instrs), trip)
+  | CountUpLtScaled (bound, scale, bias) ->
+      let bound_instrs, bound = adjust_bound bound bias in
+      let phi_instrs, scaled_phi = scale_phi scale in
+      let diff_instr = simplify_simple_instr (Tcg.Bin (diff, Sub, bound, scaled_phi)) in
+      let divisor = Int64.mul scale stride in
+      let trip_instrs, trip = build_nonnegative_ceil_div fresh_temp diff divisor in
+      (bound_instrs @ phi_instrs @ (diff_instr :: trip_instrs), trip)
+  | CountUpLeScaled (bound, scale, bias) ->
+      let bound_instrs, bound = adjust_bound bound bias in
+      let phi_instrs, scaled_phi = scale_phi scale in
+      let diff_instr = simplify_simple_instr (Tcg.Bin (diff, Sub, bound, scaled_phi)) in
+      let divisor = Int64.mul scale stride in
+      let trip_instrs, trip = build_nonnegative_inclusive_div fresh_temp diff divisor in
+      (bound_instrs @ phi_instrs @ (diff_instr :: trip_instrs), trip)
+  | CountDownGtScaled (bound, scale, bias) ->
+      let bound_instrs, bound = adjust_bound bound bias in
+      let phi_instrs, scaled_phi = scale_phi scale in
+      let diff_instr = simplify_simple_instr (Tcg.Bin (diff, Sub, scaled_phi, bound)) in
+      let divisor = Int64.mul scale stride in
+      let trip_instrs, trip = build_nonnegative_ceil_div fresh_temp diff divisor in
+      (bound_instrs @ phi_instrs @ (diff_instr :: trip_instrs), trip)
+  | CountDownGeScaled (bound, scale, bias) ->
+      let bound_instrs, bound = adjust_bound bound bias in
+      let phi_instrs, scaled_phi = scale_phi scale in
+      let diff_instr = simplify_simple_instr (Tcg.Bin (diff, Sub, scaled_phi, bound)) in
+      let divisor = Int64.mul scale stride in
+      let trip_instrs, trip = build_nonnegative_inclusive_div fresh_temp diff divisor in
+      (bound_instrs @ phi_instrs @ (diff_instr :: trip_instrs), trip)
 
 let int64_floor_div numer denom =
   let quotient = Int64.div numer denom in
@@ -6710,6 +6857,34 @@ let constant_trip_count_of_kind resolve_operand init_value step = function
       match resolve_operand bound with
       | Some bound ->
           int64_nonnegative_inclusive_div Int64.(sub init_value (sub bound bias)) (Int64.neg step)
+      | None -> None)
+  | CountUpLtScaled (bound, scale, bias) -> (
+      match resolve_operand bound with
+      | Some bound ->
+          int64_nonnegative_ceil_div
+            Int64.(sub (sub bound bias) (mul scale init_value))
+            Int64.(mul scale step)
+      | None -> None)
+  | CountUpLeScaled (bound, scale, bias) -> (
+      match resolve_operand bound with
+      | Some bound ->
+          int64_nonnegative_inclusive_div
+            Int64.(sub (sub bound bias) (mul scale init_value))
+            Int64.(mul scale step)
+      | None -> None)
+  | CountDownGtScaled (bound, scale, bias) -> (
+      match resolve_operand bound with
+      | Some bound ->
+          int64_nonnegative_ceil_div
+            Int64.(sub (sub (mul scale init_value) bound) (neg bias))
+            Int64.(mul scale (neg step))
+      | None -> None)
+  | CountDownGeScaled (bound, scale, bias) -> (
+      match resolve_operand bound with
+      | Some bound ->
+          int64_nonnegative_inclusive_div
+            Int64.(sub (sub (mul scale init_value) bound) (neg bias))
+            Int64.(mul scale (neg step))
       | None -> None)
 
 let build_iv_final_update fresh_temp trip_temp (iv : basic_induction_var) =
@@ -11986,7 +12161,11 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
         | CountUpLt _
         | CountUpLe _
         | CountDownGt _
-        | CountDownGe _ ->
+        | CountDownGe _
+        | CountUpLtScaled _
+        | CountUpLeScaled _
+        | CountDownGtScaled _
+        | CountDownGeScaled _ ->
             false
       in
 
@@ -12290,10 +12469,18 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                     | Some _, CountUpLe _
                     | Some _, CountDownGt _
                     | Some _, CountDownGe _
+                    | Some _, CountUpLtScaled _
+                    | Some _, CountUpLeScaled _
+                    | Some _, CountDownGtScaled _
+                    | Some _, CountDownGeScaled _
                     | None, CountUpLt _
                     | None, CountUpLe _
                     | None, CountDownGt _
-                    | None, CountDownGe _ ->
+                    | None, CountDownGe _
+                    | None, CountUpLtScaled _
+                    | None, CountUpLeScaled _
+                    | None, CountDownGtScaled _
+                    | None, CountDownGeScaled _ ->
                         None
                 in
 
@@ -15581,6 +15768,11 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
       | CountUpLe (bound, bias) -> normalize_limit_operand loop_defs multi_defs def_instrs bound Int64.(sub 1L bias)
       | CountDownGt (bound, bias) -> normalize_limit_operand loop_defs multi_defs def_instrs bound Int64.(neg bias)
       | CountDownGe (bound, bias) -> normalize_limit_operand loop_defs multi_defs def_instrs bound Int64.(neg bias)
+      | CountUpLtScaled _
+      | CountUpLeScaled _
+      | CountDownGtScaled _
+      | CountDownGeScaled _ ->
+          None
     in
     let normalized_limit_is_entry_invariant loop_defs = function
       | LimitConst _ -> true
@@ -15630,8 +15822,8 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
       (body, branch_with_rhs compare_op iv_temp rhs if_true if_false)
     in
     let loop_counts_up = function
-      | CountUpLt _ | CountUpLe _ -> true
-      | CountDownGt _ | CountDownGe _ -> false
+      | CountUpLt _ | CountUpLe _ | CountUpLtScaled _ | CountUpLeScaled _ -> true
+      | CountDownGt _ | CountDownGe _ | CountDownGtScaled _ | CountDownGeScaled _ -> false
     in
     let first_phase_uses_true_branch kind split_op =
       if loop_counts_up kind then
@@ -15668,10 +15860,23 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
             | Gt | Le -> Int64.(add (neg bias) 1L)
             | Ge | Lt -> Int64.neg bias
             | Eq | Ne | Add | Sub | Mul | Div | Mod | LAnd | LOr -> 0L)
+        | CountUpLtScaled _
+        | CountUpLeScaled _
+        | CountDownGtScaled _
+        | CountDownGeScaled _ ->
+            0L
       in
-      match split_op with
+      match (kind, split_op) with
+      | ( CountUpLtScaled _
+        | CountUpLeScaled _
+        | CountDownGtScaled _
+        | CountDownGeScaled _ ),
+        _ ->
+          None
+      | _, split_op ->
+          (match split_op with
       | Lt | Le | Gt | Ge -> normalize_limit_operand loop_defs multi_defs def_instrs operand delta
-      | Eq | Ne | Add | Sub | Mul | Div | Mod | LAnd | LOr -> None
+      | Eq | Ne | Add | Sub | Mul | Div | Mod | LAnd | LOr -> None)
     in
     let should_split_loop loop_blocks outer_limit prefix_limit =
       let block_count = List.length loop_blocks in
@@ -15746,6 +15951,10 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
                 | CountUpLe _ -> Le
                 | CountDownGt _ -> Gt
                 | CountDownGe _ -> Ge
+                | CountUpLtScaled _ -> Lt
+                | CountUpLeScaled _ -> Le
+                | CountDownGtScaled _ -> Gt
+                | CountDownGeScaled _ -> Ge
               in
               match branch_term_outcomes split_block.term with
                 | Some (branch_a, branch_b)
@@ -18185,7 +18394,12 @@ let strict_unit_counted_control = function
           info.control_iv.step = 1L && bias = 0L
       | CountDownGt (_, bias) ->
           info.control_iv.step = -1L && bias = 0L
-      | CountUpLe _ | CountDownGe _ ->
+      | CountUpLe _
+      | CountDownGe _
+      | CountUpLtScaled _
+      | CountUpLeScaled _
+      | CountDownGtScaled _
+      | CountDownGeScaled _ ->
           false)
   | None -> false
 
