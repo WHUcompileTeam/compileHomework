@@ -3603,6 +3603,288 @@ let discover_natural_loops (f : Cfg.func) =
   in
   (block_map, loops, headers)
 
+(* -------------------------------------------------------------------------- *)
+(* item2.1: LoopForest / canonical loop metadata                              *)
+(*                                                                            *)
+(* [discover_natural_loops] intentionally remains the low-level compatibility  *)
+(* API used by older passes.  LoopForest adds the hierarchy and structural     *)
+(* facts that nested-loop reasoning needs without changing those old clients.   *)
+(*                                                                            *)
+(* Important distinction:                                                     *)
+(*   blocks            = the complete natural-loop region, including children; *)
+(*   exclusive_blocks  = blocks executed at this loop level, excluding all     *)
+(*                       immediate child-loop regions (and therefore their      *)
+(*                       descendants).                                         *)
+(*                                                                            *)
+(* This is the key fact missing from the old global direct-AddRec recognizer:   *)
+(* a static self-update inside a child loop is not a once-per-parent-iteration  *)
+(* update.                                                                      *)
+(* -------------------------------------------------------------------------- *)
+
+type loop_forest_info = {
+  loop_info_header : Tcg.label;
+  loop_info_blocks : LabelSet.t;
+  loop_info_parent : Tcg.label option;
+  loop_info_children : Tcg.label list;
+  loop_info_depth : int;
+  loop_info_exclusive_blocks : LabelSet.t;
+  loop_info_preheader : Tcg.label option;
+  loop_info_latches : Tcg.label list;
+  loop_info_exit_edges : (Tcg.label * Tcg.label) list;
+  loop_info_exit_targets : Tcg.label list;
+}
+
+type loop_forest = {
+  loop_forest_block_map : (Tcg.label, Cfg.block) Hashtbl.t;
+  loop_forest_loops : (Tcg.label, LabelSet.t) Hashtbl.t;
+  loop_forest_headers : Tcg.label list;
+  loop_forest_infos : (Tcg.label, loop_forest_info) Hashtbl.t;
+  loop_forest_roots : Tcg.label list;
+}
+
+let strict_labelset_subset a b =
+  LabelSet.subset a b && not (LabelSet.equal a b)
+
+let build_loop_forest (f : Cfg.func) =
+  let block_map, loops, headers =
+    discover_natural_loops f
+  in
+  let parent_of = Hashtbl.create (max 8 (List.length headers)) in
+  List.iter
+    (fun header ->
+      let blocks =
+        table_find_or_empty loops header LabelSet.empty
+      in
+      let parent =
+        headers
+        |> List.filter_map
+             (fun candidate_header ->
+               if candidate_header = header then None
+               else
+                 let candidate_blocks =
+                   table_find_or_empty
+                     loops candidate_header LabelSet.empty
+                 in
+                 if
+                   strict_labelset_subset
+                     blocks candidate_blocks
+                 then
+                   Some
+                     ( candidate_header,
+                       LabelSet.cardinal candidate_blocks )
+                 else
+                   None)
+        |> List.sort
+             (fun (ha, sa) (hb, sb) ->
+               let by_size = compare sa sb in
+               if by_size <> 0 then by_size
+               else String.compare ha hb)
+        |> function
+        | (parent, _) :: _ -> Some parent
+        | [] -> None
+      in
+      Hashtbl.replace parent_of header parent)
+    headers;
+  let children_of =
+    Hashtbl.create (max 8 (List.length headers))
+  in
+  List.iter
+    (fun header ->
+      Hashtbl.replace children_of header [])
+    headers;
+  List.iter
+    (fun header ->
+      match Hashtbl.find_opt parent_of header with
+      | Some (Some parent) ->
+          let old =
+            Option.value
+              ~default:[]
+              (Hashtbl.find_opt children_of parent)
+          in
+          Hashtbl.replace
+            children_of parent (header :: old)
+      | Some None
+      | None ->
+          ())
+    headers;
+  let depth_memo =
+    Hashtbl.create (max 8 (List.length headers))
+  in
+  let rec depth_of seen header =
+    match Hashtbl.find_opt depth_memo header with
+    | Some depth ->
+        depth
+    | None ->
+        if LabelSet.mem header seen then 0
+        else
+          let depth =
+            match Hashtbl.find_opt parent_of header with
+            | Some (Some parent) ->
+                1
+                + depth_of
+                    (LabelSet.add header seen)
+                    parent
+            | Some None
+            | None ->
+                0
+          in
+          Hashtbl.replace depth_memo header depth;
+          depth
+  in
+  let infos =
+    Hashtbl.create (max 8 (List.length headers))
+  in
+  List.iter
+    (fun header ->
+      let blocks =
+        table_find_or_empty loops header LabelSet.empty
+      in
+      let children =
+        Option.value
+          ~default:[]
+          (Hashtbl.find_opt children_of header)
+        |> List.sort String.compare
+      in
+      let exclusive_blocks =
+        List.fold_left
+          (fun exclusive child ->
+            LabelSet.diff
+              exclusive
+              (table_find_or_empty
+                 loops child LabelSet.empty))
+          blocks children
+      in
+      let header_block =
+        get_block_exn block_map header
+      in
+      let outside_preds =
+        List.filter
+          (fun pred ->
+            not (LabelSet.mem pred blocks))
+          header_block.preds
+      in
+      let preheader =
+        match outside_preds with
+        | [ pred ] ->
+            let pred_block =
+              get_block_exn block_map pred
+            in
+            if pred_block.succs = [ header ]
+            then Some pred
+            else None
+        | []
+        | _ :: _ :: _ ->
+            None
+      in
+      let latches =
+        header_block.preds
+        |> List.filter
+             (fun pred -> LabelSet.mem pred blocks)
+        |> List.sort_uniq String.compare
+      in
+      let exit_edges =
+        LabelSet.fold
+          (fun label edges ->
+            let block =
+              get_block_exn block_map label
+            in
+            List.fold_left
+              (fun edges succ ->
+                if LabelSet.mem succ blocks then
+                  edges
+                else
+                  (label, succ) :: edges)
+              edges block.succs)
+          blocks []
+        |> List.sort_uniq compare
+      in
+      let exit_targets =
+        exit_edges
+        |> List.map snd
+        |> List.sort_uniq String.compare
+      in
+      let parent =
+        match Hashtbl.find_opt parent_of header with
+        | Some parent -> parent
+        | None -> None
+      in
+      let info =
+        {
+          loop_info_header = header;
+          loop_info_blocks = blocks;
+          loop_info_parent = parent;
+          loop_info_children = children;
+          loop_info_depth =
+            depth_of LabelSet.empty header;
+          loop_info_exclusive_blocks =
+            exclusive_blocks;
+          loop_info_preheader = preheader;
+          loop_info_latches = latches;
+          loop_info_exit_edges = exit_edges;
+          loop_info_exit_targets = exit_targets;
+        }
+      in
+      Hashtbl.replace infos header info)
+    headers;
+  let roots =
+    headers
+    |> List.filter
+         (fun header ->
+           match Hashtbl.find_opt parent_of header with
+           | Some None
+           | None ->
+               true
+           | Some (Some _) ->
+               false)
+    |> List.sort String.compare
+  in
+  {
+    loop_forest_block_map = block_map;
+    loop_forest_loops = loops;
+    loop_forest_headers = headers;
+    loop_forest_infos = infos;
+    loop_forest_roots = roots;
+  }
+
+let debug_loop_forest (f : Cfg.func) =
+  if Sys.getenv_opt "TOYC_DEBUG_LOOP_FOREST" <> None then begin
+    let forest = build_loop_forest f in
+    List.iter
+      (fun header ->
+        match
+          Hashtbl.find_opt
+            forest.loop_forest_infos header
+        with
+        | None ->
+            ()
+        | Some info ->
+            Printf.eprintf
+              "loop-forest func=%s header=%s depth=%d parent=%s children={%s} blocks=%d exclusive=%d preheader=%s latches={%s} exits={%s}\n%!"
+              f.name
+              header
+              info.loop_info_depth
+              (match info.loop_info_parent with
+               | Some parent -> parent
+               | None -> "<root>")
+              (String.concat ","
+                 info.loop_info_children)
+              (LabelSet.cardinal
+                 info.loop_info_blocks)
+              (LabelSet.cardinal
+                 info.loop_info_exclusive_blocks)
+              (match info.loop_info_preheader with
+               | Some preheader -> preheader
+               | None -> "<none>")
+              (String.concat ","
+                 info.loop_info_latches)
+              (info.loop_info_exit_edges
+               |> List.map
+                    (fun (src, dst) ->
+                      src ^ "->" ^ dst)
+               |> String.concat ","))
+      forest.loop_forest_headers
+  end
+
 let tailrec_elim_func (f : Cfg.func) =
   let tail_loop_label = f.entry in
   let next_temp = ref f.temp_count in
@@ -3713,8 +3995,14 @@ let loop_canonicalize_func summaries globals (f : Cfg.func) =
     Printf.sprintf ".L%s_canon_cmp_%d" f.label id
   in
   let rec apply (current : Cfg.func) =
-    let live_in_t, live_in_p = compute_liveness summaries globals current in
-    let _, loops, headers = discover_natural_loops current in
+    let live_in_t, live_in_p =
+      compute_liveness summaries globals current
+    in
+    let forest = build_loop_forest current in
+    let loops = forest.loop_forest_loops in
+    let headers = forest.loop_forest_headers in
+    if Sys.getenv_opt "TOYC_DEBUG_LOOP_FOREST" <> None then
+      debug_loop_forest current;
     if headers = [] then current
     else
       let current_blocks = Hashtbl.create (List.length current.blocks + (3 * List.length headers)) in
@@ -5434,7 +5722,143 @@ let symbolic_induction_step_of_instr_on_chain
   | Tcg.Call _ ->
       None
 
+(* item2.4: prove that a physical update executes exactly once for every
+   completed logical iteration of [header]'s natural loop.
+
+   Soundness conditions are deliberately structural and conservative:
+     1. the temp has exactly one definition inside this loop;
+     2. every path from the current header to every latch/backedge predecessor
+        must pass through the update block;
+     3. after removing edges that start the next iteration (edges to [header]),
+        the update block cannot reach itself.
+
+   Condition (3) is the crucial nested-loop fence.  An update located inside a
+   child loop lies on an internal cycle and is therefore rejected as a direct
+   AddRec of the parent loop. *)
+
+let reachable_in_loop
+    loop get_block
+    ~start ~target
+    ~blocked
+    ~drop_edges_to_header
+    header =
+  if LabelSet.mem start blocked then false
+  else
+    let rec visit work seen =
+      match work with
+      | [] ->
+          false
+      | label :: rest ->
+          if label = target then true
+          else if
+            LabelSet.mem label seen
+            || LabelSet.mem label blocked
+          then
+            visit rest seen
+          else
+            let seen = LabelSet.add label seen in
+            let block : Cfg.block =
+              get_block label
+            in
+            let succs =
+              block.succs
+              |> List.filter
+                   (fun succ ->
+                     LabelSet.mem succ loop
+                     && not
+                          (drop_edges_to_header
+                           && succ = header)
+                     && not
+                          (LabelSet.mem succ blocked))
+            in
+            visit
+              (List.rev_append succs rest)
+              seen
+    in
+    visit [ start ] LabelSet.empty
+
+let direct_update_exactly_once_proof
+    header loop get_block phi_temp =
+  let header_block : Cfg.block =
+    get_block header
+  in
+  let latches =
+    header_block.preds
+    |> List.filter
+         (fun pred -> LabelSet.mem pred loop)
+    |> List.sort_uniq String.compare
+  in
+  let def_sites =
+    LabelSet.fold
+      (fun label sites ->
+        let block : Cfg.block =
+          get_block label
+        in
+        List.fold_left
+          (fun sites instr ->
+            match defs_temp instr with
+            | Some dst when dst = phi_temp ->
+                label :: sites
+            | Some _
+            | None ->
+                sites)
+          sites block.body)
+      loop []
+  in
+  match def_sites with
+  | [ update_label ] ->
+      if latches = [] then
+        Error "no-latch"
+      else
+        let must_execute =
+          if update_label = header then true
+          else
+            let blocked =
+              LabelSet.singleton update_label
+            in
+            List.for_all
+              (fun latch ->
+                not
+                  (reachable_in_loop
+                     loop get_block
+                     ~start:header
+                     ~target:latch
+                     ~blocked
+                     ~drop_edges_to_header:false
+                     header))
+              latches
+        in
+        if not must_execute then
+          Error "update-not-on-every-backedge-path"
+        else
+          let update_block : Cfg.block =
+            get_block update_label
+          in
+          let repeats_within_iteration =
+            List.exists
+              (fun succ ->
+                LabelSet.mem succ loop
+                && succ <> header
+                && reachable_in_loop
+                     loop get_block
+                     ~start:succ
+                     ~target:update_label
+                     ~blocked:LabelSet.empty
+                     ~drop_edges_to_header:true
+                     header)
+              update_block.succs
+          in
+          if repeats_within_iteration then
+            Error "update-in-internal-cycle"
+          else
+            Ok update_label
+  | [] ->
+      Error "no-loop-definition"
+  | _ :: _ :: _ ->
+      Error "multiple-loop-definitions"
+
 let analyze_direct_self_addrecs
+    ?(require_exactly_once = true)
     header loop get_block loop_defs multi_defs def_instrs
     excluded_temps =
   let header_block : Cfg.block = get_block header in
@@ -5567,28 +5991,55 @@ let analyze_direct_self_addrecs
             List.for_all
               (fun (_, step) ->
                 loop_inv_expr_equal first_step step)
-              rest ->
-            let addrec =
-              {
-                addrec_phi_temp = phi_temp;
-                addrec_outside_inputs = outside_inputs;
-                addrec_backedge_preds = backedge_preds;
-                addrec_step =
-                  normalize_loop_inv_expr first_step;
-              }
+              rest -> (
+            let execution_proof =
+              if require_exactly_once then
+                direct_update_exactly_once_proof
+                  header loop get_block phi_temp
+              else
+                Ok "<experimental>"
             in
-            if
-              Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
-              <> None
-            then
-              Printf.eprintf
-                "scev-direct-addrec header=%s phi=t%d step=%s outside=%d backedges=%d\n%!"
-                header phi_temp
-                (string_of_loop_inv_expr
-                   addrec.addrec_step)
-                (List.length outside_inputs)
-                (List.length backedge_preds);
-            addrec :: addrecs
+            match execution_proof with
+            | Error reason ->
+                if
+                  Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
+                  <> None
+                then
+                  Printf.eprintf
+                    "scev-direct-addrec-exactly-once-reject header=%s phi=t%d step=%s reason=%s\n%!"
+                    header phi_temp
+                    (string_of_loop_inv_expr
+                       (normalize_loop_inv_expr first_step))
+                    reason;
+                addrecs
+            | Ok update_label ->
+                let addrec =
+                  {
+                    addrec_phi_temp = phi_temp;
+                    addrec_outside_inputs = outside_inputs;
+                    addrec_backedge_preds = backedge_preds;
+                    addrec_step =
+                      normalize_loop_inv_expr first_step;
+                  }
+                in
+                if
+                  Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
+                  <> None
+                then begin
+                  Printf.eprintf
+                    "scev-direct-addrec-exactly-once-hit header=%s phi=t%d update=%s step=%s\n%!"
+                    header phi_temp update_label
+                    (string_of_loop_inv_expr
+                       addrec.addrec_step);
+                  Printf.eprintf
+                    "scev-direct-addrec header=%s phi=t%d step=%s outside=%d backedges=%d\n%!"
+                    header phi_temp
+                    (string_of_loop_inv_expr
+                       addrec.addrec_step)
+                    (List.length outside_inputs)
+                    (List.length backedge_preds)
+                end;
+                addrec :: addrecs)
         | _ ->
             addrecs)
       candidates
@@ -5721,47 +6172,44 @@ let analyze_loop_addrecs
       loop_defs multi_defs def_instrs
       logical_temps
   in
-  (* Global direct-self AddRec recovery is deliberately fenced off by
-     default.
-
-     Unlike recovered logical/edge-copy recurrences, a physical
-       t = t + invariant
-     instruction does not by itself prove that the update executes exactly
-     once per logical iteration of every enclosing natural loop.  In
-     particular, the same static instruction may execute repeatedly inside a
-     nested subloop.  Treating such a temp as a global AddRec can therefore
-     make the semantic step smaller than the true per-iteration delta and can
-     poison later loop summaries.
-
-     Keep the recognizer available for diagnostics/experimentation, but only
-     logical AddRecs feed the general RecurrenceFacts layer by default.
-     Runtime-summary rotated-loop recovery remains a separate, locally gated
-     mechanism. *)
-  if
-    Sys.getenv_opt "TOYC_EXPERIMENTAL_GLOBAL_DIRECT_ADDREC"
-    <> None
-  then begin
+  let direct_addrecs =
     if
-      Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
+      Sys.getenv_opt
+        "TOYC_EXPERIMENTAL_GLOBAL_DIRECT_ADDREC"
       <> None
-      && direct_addrecs <> []
-    then
-      Printf.eprintf
-        "scev-global-direct-addrec-mode header=%s mode=enabled candidates=%d\n%!"
-        header (List.length direct_addrecs);
-    logical_addrecs @ direct_addrecs
-  end
-  else begin
-    if
-      Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
-      <> None
-      && direct_addrecs <> []
-    then
-      Printf.eprintf
-        "scev-global-direct-addrec-mode header=%s mode=fenced candidates=%d\n%!"
-        header (List.length direct_addrecs);
-    logical_addrecs
-  end
+    then begin
+      let unrestricted =
+        analyze_direct_self_addrecs
+          ~require_exactly_once:false
+          header loop get_block
+          loop_defs multi_defs def_instrs
+          logical_temps
+      in
+      if
+        Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
+        <> None
+      then
+        Printf.eprintf
+          "scev-global-direct-addrec-mode header=%s mode=experimental-unrestricted safe=%d unrestricted=%d\n%!"
+          header
+          (List.length direct_addrecs)
+          (List.length unrestricted);
+      unrestricted
+    end
+    else begin
+      if
+        Sys.getenv_opt "TOYC_DEBUG_SCEV_UNIFIED"
+        <> None
+        && direct_addrecs <> []
+      then
+        Printf.eprintf
+          "scev-global-direct-addrec-mode header=%s mode=exactly-once safe=%d\n%!"
+          header (List.length direct_addrecs);
+      direct_addrecs
+    end
+  in
+  logical_addrecs @ direct_addrecs
+
 
 
 (* -------------------------------------------------------------------------- *)
