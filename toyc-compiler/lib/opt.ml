@@ -7483,91 +7483,6 @@ let symbolic_trip_effective_step
        ( spec.symbolic_trip_scale,
          spec.symbolic_trip_step ))
 
-type symbolic_trip_proof_family =
-  | SymbolicTripUnitLt
-  | SymbolicTripPositiveAffineLt
-
-let classify_symbolic_trip_proof_family
-    (spec : symbolic_trip_spec) =
-  if not (symbolic_trip_is_zero_start_lt spec) then
-    None
-  else if
-    loop_inv_expr_equal
-      spec.symbolic_trip_scale scalar_inv_one
-    && loop_inv_expr_equal
-         spec.symbolic_trip_bias scalar_inv_zero
-  then
-    Some SymbolicTripUnitLt
-  else
-    Some SymbolicTripPositiveAffineLt
-
-let string_of_symbolic_trip_proof_family = function
-  | SymbolicTripUnitLt ->
-      "unit-lt"
-  | SymbolicTripPositiveAffineLt ->
-      "positive-affine-lt"
-
-(* Static proof for the elimination-only scaled-control path.
-
-   This is deliberately narrower than runtime proof:
-     start = 0
-     op = <
-     scale/step/bias/bound are all constants
-     scale > 0, step > 0, bias >= 0
-     effective_step = scale*step is positive and <= INT32_MAX
-     if the loop enters, the final failing control value is <= INT32_MAX.
-
-   The zero-trip case is still protected by the original loop guard in the
-   counted elimination path, so [bound <= bias] is safe without evaluating
-   the summary trip expression. *)
-let static_positive_affine_lt_proof
-    (spec : symbolic_trip_spec) =
-  match
-    ( loop_inv_expr_const_opt spec.symbolic_trip_start,
-      loop_inv_expr_const_opt spec.symbolic_trip_step,
-      loop_inv_expr_const_opt spec.symbolic_trip_scale,
-      loop_inv_expr_const_opt spec.symbolic_trip_bias,
-      loop_inv_expr_const_opt spec.symbolic_trip_bound,
-      spec.symbolic_trip_op )
-  with
-  | Some 0L,
-    Some step,
-    Some scale,
-    Some bias,
-    Some bound,
-    Lt
-    when scale > 0L
-         && step > 0L
-         && bias >= 0L ->
-      let effective_step =
-        Int64.mul scale step
-      in
-      if
-        effective_step <= 0L
-        || effective_step > 2147483647L
-      then
-        None
-      else if bound <= bias then
-        Some 0L
-      else
-        let delta = Int64.sub bound bias in
-        let q = Int64.div delta effective_step in
-        let r = Int64.rem delta effective_step in
-        let trip =
-          if r = 0L then q else Int64.succ q
-        in
-        let max_trip =
-          Int64.div
-            (Int64.sub 2147483647L bias)
-            effective_step
-        in
-        if trip <= max_trip then
-          Some trip
-        else
-          None
-  | _ ->
-      None
-
 let string_of_recurrence_compare = function
   | Lt -> "lt"
   | Le -> "le"
@@ -7739,91 +7654,33 @@ let proven_counted_control_of_recurrence_candidate
       None
   | Some spec -> (
       match
-        basic_iv_of_scalar_addrec
-          header loop get_block
-          candidate.recurrence_control_base
+        ( loop_inv_expr_const_opt
+            spec.symbolic_trip_scale,
+          loop_inv_expr_const_opt
+            spec.symbolic_trip_bias,
+          basic_iv_of_scalar_addrec
+            header loop get_block
+            candidate.recurrence_control_base )
       with
-      | None ->
-          None
-      | Some control_iv -> (
-          match
-            ( loop_inv_expr_const_opt
-                spec.symbolic_trip_scale,
-              loop_inv_expr_const_opt
-                spec.symbolic_trip_bias )
-          with
-          | Some 1L, Some 0L ->
-              Option.map
-                (fun kind ->
-                  {
-                    control_iv;
-                    control_label =
-                      candidate.recurrence_control_label;
-                    inside_label =
-                      candidate.recurrence_control_inside_label;
-                    exit_label =
-                      candidate.recurrence_control_exit_label;
-                    kind;
-                  })
-                (build_kind control_iv.step)
-          | Some scale, Some bias
-            when
-              candidate.recurrence_control_op = Lt
-              && scale > 0L
-              && bias >= 0L
-              && Option.is_some
-                   (static_positive_affine_lt_proof spec) ->
-              (match
-                 candidate.recurrence_control_bound_operand
-               with
-               | Tcg.Imm _ ->
-                   if
-                     Sys.getenv_opt
-                       "TOYC_DEBUG_SCEV_UNIFIED"
-                     <> None
-                   then
-                     Printf.eprintf
-                       "symbolic-trip-static-proof-hit header=%s family=positive-affine-lt phi=t%d start=%s step=%s scale=%Ld bias=%Ld bound=%s trip=%s\n%!"
-                       header
-                       control_iv.phi_temp
-                       (string_of_loop_inv_expr
-                          spec.symbolic_trip_start)
-                       (string_of_loop_inv_expr
-                          spec.symbolic_trip_step)
-                       scale bias
-                       (string_of_loop_inv_expr
-                          spec.symbolic_trip_bound)
-                       (match
-                          static_positive_affine_lt_proof
-                            spec
-                        with
-                        | Some trip ->
-                            Int64.to_string trip
-                        | None ->
-                            "<none>");
-                   Some
-                     {
-                       control_iv;
-                       control_label =
-                         candidate.recurrence_control_label;
-                       inside_label =
-                         candidate.recurrence_control_inside_label;
-                       exit_label =
-                         candidate.recurrence_control_exit_label;
-                       kind =
-                         CountUpLtScaled
-                           ( candidate
-                               .recurrence_control_bound_operand,
-                             scale,
-                             bias );
-                     }
-               | Tcg.Temp _ ->
-                   None)
-          | Some _, Some _
-          | Some _, None
-          | None, Some _
-          | None, None ->
-              None))
+      | Some 1L, Some 0L, Some control_iv ->
+          Option.map
+            (fun kind ->
+              {
+                control_iv;
+                control_label =
+                  candidate.recurrence_control_label;
+                inside_label =
+                  candidate.recurrence_control_inside_label;
+                exit_label =
+                  candidate.recurrence_control_exit_label;
+                kind;
+              })
+            (build_kind control_iv.step)
+      | _ ->
+          (* Recognition and proof are separate.  Scaled/biased/symbolic-step
+             controls are represented by [symbolic_trip_spec], but only the
+             old proven subset enters mature counted lowering here. *)
+          None)
 
 let classify_counted_loop_header
     control_label
@@ -8908,7 +8765,55 @@ let int64_nonnegative_inclusive_div numer denom =
 
 let exact_trip_count_of_symbolic_spec
     (spec : symbolic_trip_spec) =
-  static_positive_affine_lt_proof spec
+  match
+    ( loop_inv_expr_const_opt spec.symbolic_trip_start,
+      loop_inv_expr_const_opt spec.symbolic_trip_step,
+      loop_inv_expr_const_opt spec.symbolic_trip_scale,
+      loop_inv_expr_const_opt spec.symbolic_trip_bias,
+      loop_inv_expr_const_opt spec.symbolic_trip_bound,
+      spec.symbolic_trip_op )
+  with
+  | Some start,
+    Some step,
+    Some scale,
+    Some bias,
+    Some bound,
+    Lt
+    when
+      start = 0L
+      && scale > 0L
+      && step > 0L
+      && bias >= 0L ->
+      let effective_step =
+        Int64.mul scale step
+      in
+      if
+        effective_step <= 0L
+        || effective_step > 2147483647L
+      then
+        None
+      else if bound <= bias then
+        Some 0L
+      else
+        Option.bind
+          (int64_nonnegative_ceil_div
+             Int64.(sub bound bias)
+             effective_step)
+          (fun trip ->
+            (* The original loop evaluates the failing comparison at k=trip.
+               Prove that this final control expression is also monotone
+               signed-i32 rather than relying on wrapped arithmetic. *)
+            let max_trip =
+              Int64.div
+                Int64.(sub 2147483647L bias)
+                effective_step
+            in
+            if trip <= max_trip then
+              Some trip
+            else
+              None)
+  | _ ->
+      None
 
 let constant_trip_count_of_kind resolve_operand init_value step = function
   | CountUpLt (bound, bias) -> (
@@ -20839,99 +20744,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                               None)
                         body_indexed
                     in
-                    let find_candidate_physical_update
-                        (candidate : recurrence_control_candidate) =
-                      let phi_temp =
-                        candidate.recurrence_control_base.addrec_phi_temp
-                      in
-                      let candidate_step =
-                        normalize_loop_inv_expr
-                          candidate.recurrence_control_base.addrec_step
-                      in
-                      let matching_updates =
-                        body_indexed
-                        |> List.filter_map
-                             (fun (update_index, instr) ->
-                               match defs_temp instr with
-                               | Some dst when dst = phi_temp -> (
-                                   match
-                                     control_update_affine_of_instr
-                                       dst update_index
-                                       IntSet.empty instr
-                                   with
-                                   | Some
-                                       ( update_scale,
-                                         update_bias )
-                                     when
-                                       loop_inv_expr_equal
-                                         (normalize_loop_inv_expr
-                                            update_scale)
-                                         scalar_inv_one
-                                       && loop_inv_expr_equal
-                                            (normalize_loop_inv_expr
-                                               update_bias)
-                                            candidate_step ->
-                                       Some
-                                         ( update_index,
-                                           dst )
-                                   | Some _
-                                   | None ->
-                                       None)
-                               | Some _
-                               | None ->
-                                   None)
-                      in
-                      match matching_updates with
-                      | [ (update_index, dst) ] ->
-                          if scev_debug || debug then
-                            Printf.eprintf
-                              "scev-runtime-control-direct-bind-hit func=%s header=%s control=%s iv=t%d phi=t%d step=%s scale=%s bias=%s bound=%s\n%!"
-                              f.name
-                              header
-                              candidate.recurrence_control_label
-                              dst
-                              phi_temp
-                              (string_of_loop_inv_expr
-                                 candidate_step)
-                              (string_of_loop_inv_expr
-                                 candidate.recurrence_control_scale)
-                              (string_of_loop_inv_expr
-                                 candidate.recurrence_control_bias)
-                              (string_of_loop_inv_expr
-                                 candidate.recurrence_control_bound_expr);
-                          Some
-                            ( update_index,
-                              dst,
-                              candidate_step,
-                              candidate.recurrence_control_bound_operand,
-                              normalize_loop_inv_expr
-                                candidate.recurrence_control_scale,
-                              normalize_loop_inv_expr
-                                candidate.recurrence_control_bias )
-                      | [] ->
-                          if scev_debug then
-                            Printf.eprintf
-                              "scev-runtime-control-direct-bind-miss header=%s phi=t%d reason=no-matching-update\n%!"
-                              header phi_temp;
-                          None
-                      | matches ->
-                          if scev_debug then
-                            Printf.eprintf
-                              "scev-runtime-control-direct-bind-miss header=%s phi=t%d reason=ambiguous-updates count=%d\n%!"
-                              header phi_temp
-                              (List.length matches);
-                          None
-                    in
-                    let candidate_control_update =
-                      match runtime_control_candidate with
-                      | Some candidate
-                        when
-                          candidate.recurrence_control_op = Lt ->
-                          find_candidate_physical_update candidate
-                      | Some _
-                      | None ->
-                          None
-                    in
                     let legacy_control_update =
                       find_control_update ()
                     in
@@ -21100,15 +20912,11 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                           None
                     in
                     let control_update, unified_control_agreed =
-                      match candidate_control_update with
+                      match unified_control_update with
                       | Some _ as result ->
                           (result, true)
-                      | None -> (
-                          match unified_control_update with
-                          | Some _ as result ->
-                              (result, true)
-                          | None ->
-                              (legacy_control_update, false))
+                      | None ->
+                          (legacy_control_update, false)
                     in
                     match control_update with
                     | None ->
@@ -21131,29 +20939,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                           | None ->
                               None
                         in
-                        let symbolic_trip_family =
-                          Option.bind
-                            symbolic_trip_spec
-                            classify_symbolic_trip_proof_family
-                        in
-                        (if scev_debug then
-                           match symbolic_trip_spec with
-                           | Some spec ->
-                               Printf.eprintf
-                                 "symbolic-trip-runtime-bridge-hit header=%s start=%s step=%s scale=%s bias=%s bound=%s\n%!"
-                                 header
-                                 (string_of_loop_inv_expr
-                                    spec.symbolic_trip_start)
-                                 (string_of_loop_inv_expr
-                                    spec.symbolic_trip_step)
-                                 (string_of_loop_inv_expr
-                                    spec.symbolic_trip_scale)
-                                 (string_of_loop_inv_expr
-                                    spec.symbolic_trip_bias)
-                                 (string_of_loop_inv_expr
-                                    spec.symbolic_trip_bound)
-                           | None ->
-                               ());
                         let initial_iv =
                           reaching_seed_on_edge
                             ~header ~pred_label:preheader_label iv_temp
@@ -21273,38 +21058,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                       | None ->
                                           "<runtime-proof>")
                                | None ->
-                                   ());
-                            (if scev_debug then
-                               match
-                                 ( symbolic_trip_spec,
-                                   symbolic_trip_family )
-                               with
-                               | Some spec, Some family ->
-                                   Printf.eprintf
-                                     "symbolic-trip-proof-ready header=%s family=%s start=%s step=%s scale=%s bias=%s bound=%s mode=%s\n%!"
-                                     header
-                                     (string_of_symbolic_trip_proof_family
-                                        family)
-                                     (string_of_loop_inv_expr
-                                        spec.symbolic_trip_start)
-                                     (string_of_loop_inv_expr
-                                        spec.symbolic_trip_step)
-                                     (string_of_loop_inv_expr
-                                        spec.symbolic_trip_scale)
-                                     (string_of_loop_inv_expr
-                                        spec.symbolic_trip_bias)
-                                     (string_of_loop_inv_expr
-                                        spec.symbolic_trip_bound)
-                                     (match
-                                        exact_trip_count_of_symbolic_spec
-                                          spec
-                                      with
-                                      | Some _ ->
-                                          "static-exact"
-                                      | None ->
-                                          "runtime-guarded")
-                               | Some _, None
-                               | None, _ ->
                                    ());
                             let non_iv =
                               List.filter
@@ -22006,28 +21759,22 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                     @ reconstruction_instrs
                                               in
                                               if
-                                                not
-                                                  (loop_inv_expr_equal
-                                                     control_scale
-                                                     scalar_inv_one)
-                                                || not
-                                                     (loop_inv_expr_equal
-                                                        control_bias
-                                                        scalar_inv_zero)
-                                              then begin
+                                              normalize_loop_inv_expr
+                                                control_scale
+                                              <> LveConst 1L
+                                              || normalize_loop_inv_expr
+                                                   control_bias
+                                                 <> LveConst 0L
+                                            then begin
                                               (if scev_debug then
-                                                 match
-                                                   ( symbolic_trip_spec,
-                                                     symbolic_trip_family )
-                                                 with
-                                                 | Some spec,
-                                                   Some
-                                                     SymbolicTripPositiveAffineLt ->
+                                                 match symbolic_trip_spec with
+                                                 | Some spec
+                                                   when
+                                                     symbolic_trip_is_zero_start_lt
+                                                       spec ->
                                                      Printf.eprintf
-                                                       "symbolic-trip-runtime-proof-hit header=%s family=%s start=%s step=%s scale=%s bias=%s bound=%s applied=true\n%!"
+                                                       "symbolic-trip-runtime-proof-hit header=%s family=positive-affine-lt start=%s step=%s scale=%s bias=%s bound=%s\n%!"
                                                        header
-                                                       (string_of_symbolic_trip_proof_family
-                                                          SymbolicTripPositiveAffineLt)
                                                        (string_of_loop_inv_expr
                                                           spec.symbolic_trip_start)
                                                        (string_of_loop_inv_expr
@@ -22038,9 +21785,8 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                           spec.symbolic_trip_bias)
                                                        (string_of_loop_inv_expr
                                                           spec.symbolic_trip_bound)
-                                                 | Some _, Some SymbolicTripUnitLt
-                                                 | Some _, None
-                                                 | None, _ ->
+                                                 | Some _
+                                                 | None ->
                                                      ());
                                               (* Runtime invariant affine-control
                                                  extension:
@@ -22420,34 +22166,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                       bound_operand)
                                                   header
                                             end else begin
-                                              (if scev_debug then
-                                                 match
-                                                   ( symbolic_trip_spec,
-                                                     symbolic_trip_family )
-                                                 with
-                                                 | Some spec,
-                                                   Some SymbolicTripUnitLt ->
-                                                     Printf.eprintf
-                                                       "symbolic-trip-runtime-proof-hit header=%s family=%s start=%s step=%s scale=%s bias=%s bound=%s applied=true\n%!"
-                                                       header
-                                                       (string_of_symbolic_trip_proof_family
-                                                          SymbolicTripUnitLt)
-                                                       (string_of_loop_inv_expr
-                                                          spec.symbolic_trip_start)
-                                                       (string_of_loop_inv_expr
-                                                          spec.symbolic_trip_step)
-                                                       (string_of_loop_inv_expr
-                                                          spec.symbolic_trip_scale)
-                                                       (string_of_loop_inv_expr
-                                                          spec.symbolic_trip_bias)
-                                                       (string_of_loop_inv_expr
-                                                          spec.symbolic_trip_bound)
-                                                 | Some _,
-                                                   Some
-                                                     SymbolicTripPositiveAffineLt
-                                                 | Some _, None
-                                                 | None, _ ->
-                                                     ());
                                               let guard_label = fresh_label "guard" in
                                               let calc_label = fresh_label "calc" in
                                               let apply_label = fresh_label "apply" in
