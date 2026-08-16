@@ -3749,7 +3749,12 @@ type basic_induction_var = {
   outside_inputs : (Tcg.label * Tcg.operand) list;
   backedge_preds : Tcg.label list;
   step : int64;
+  origin : [ `Syntactic | `Semantic ];
 }
+
+let string_of_basic_iv_origin = function
+  | `Syntactic -> "syntactic"
+  | `Semantic -> "semantic"
 
 (* step112: a deliberately small symbolic loop-value language.
 
@@ -4533,6 +4538,7 @@ let collect_basic_induction_vars header loop get_block loop_defs multi_defs def_
                         List.filter (fun (pred, _) -> List.mem pred outside_preds) incoming;
                       backedge_preds;
                       step;
+                      origin = `Syntactic;
                     }
                 else None
             | _ -> None)
@@ -4604,6 +4610,7 @@ let collect_basic_induction_vars header loop get_block loop_defs multi_defs def_
                   outside_inputs;
                   backedge_preds;
                   step;
+                  origin = `Syntactic;
                 }
                 :: acc
               end
@@ -5452,6 +5459,7 @@ let basic_iv_of_scalar_addrec
               outside_inputs;
               backedge_preds = addrec.addrec_backedge_preds;
               step;
+              origin = `Semantic;
             })
 
 
@@ -6339,10 +6347,25 @@ let find_counted_loop_control
                 loop_stable_phis
                 multi_defs
                 def_instrs
-                ivs
-                get_block
-                block
+                 ivs
+                 get_block
+                 block
           | Some _ | None -> None)
+
+let merge_basic_induction_vars
+    (primary : basic_induction_var list)
+    (secondary : basic_induction_var list) =
+  let seen =
+    List.fold_left
+      (fun seen (iv : basic_induction_var) -> IntSet.add iv.phi_temp seen)
+      IntSet.empty primary
+  in
+  let extra =
+    List.filter
+      (fun (iv : basic_induction_var) -> not (IntSet.mem iv.phi_temp seen))
+      secondary
+  in
+  primary @ extra
 
 let analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs =
   let syntactic =
@@ -6360,41 +6383,31 @@ let analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs
     |> List.filter_map
          (basic_iv_of_scalar_addrec header loop get_block)
   in
-  let seen =
-    List.fold_left
-      (fun seen (iv : basic_induction_var) ->
-        IntSet.add iv.phi_temp seen)
-      IntSet.empty syntactic
-  in
+  let merged = merge_basic_induction_vars syntactic semantic in
   let semantic_new =
-    List.filter
-      (fun (iv : basic_induction_var) ->
-        not (IntSet.mem iv.phi_temp seen))
-      semantic
+    List.filter (fun (iv : basic_induction_var) -> iv.origin = `Semantic) merged
   in
   if Sys.getenv_opt "TOYC_DEBUG_SCALAR_RECURRENCE" <> None then begin
     Printf.eprintf
-      "scalar-iv-compare header=%s old=%d semantic=%d new=%d
+      "scalar-iv-compare header=%s old=%d semantic=%d merged=%d new=%d
 %!"
       header
       (List.length syntactic)
       (List.length semantic)
+      (List.length merged)
       (List.length semantic_new);
     List.iter
       (fun (iv : basic_induction_var) ->
         Printf.eprintf
-          "scalar-iv-new header=%s phi=t%d step=%Ld outside=%d backedges=%d
+          "scalar-iv-new header=%s phi=t%d step=%Ld outside=%d backedges=%d origin=%s
 %!"
           header iv.phi_temp iv.step
           (List.length iv.outside_inputs)
-          (List.length iv.backedge_preds))
+          (List.length iv.backedge_preds)
+          (string_of_basic_iv_origin iv.origin))
       semantic_new
   end;
-  (* ScalarRecurrence is diagnostic-only at this stage.
-     Do NOT feed semantic-only IVs into the mature counted-loop pipeline yet:
-     [basic_iv_of_scalar_addrec] does not carry the program-point/phase proof
-     that the old syntactic/snapshot recognizers rely on. *)
-  syntactic
+  merged
 
 let analyze_counted_control header loop get_block loop_defs loop_stable_phis multi_defs def_instrs =
   let ivs = analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs in
