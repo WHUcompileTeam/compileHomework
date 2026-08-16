@@ -16525,6 +16525,54 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
    either arm is therefore semantics-preserving. *)
 let fold_late_equivalent_diamonds_func (f : Cfg.func) =
   let debug = Sys.getenv_opt "TOYC_DEBUG_EQUIV_BRANCH" <> None in
+  let bind_temp_pair fwd rev lhs rhs =
+    match (IntMap.find_opt lhs fwd, IntMap.find_opt rhs rev) with
+    | Some rhs', Some lhs' -> if rhs' = rhs && lhs' = lhs then Some (fwd, rev) else None
+    | Some rhs', None ->
+        if rhs' = rhs then Some (fwd, IntMap.add rhs lhs rev) else None
+    | None, Some lhs' ->
+        if lhs' = lhs then Some (IntMap.add lhs rhs fwd, rev) else None
+    | None, None ->
+        Some (IntMap.add lhs rhs fwd, IntMap.add rhs lhs rev)
+  in
+  let operand_alpha_equal fwd rev lhs rhs =
+    match (lhs, rhs) with
+    | Tcg.Imm a, Tcg.Imm b -> a = b
+    | Tcg.Temp a, Tcg.Temp b -> (
+        match (IntMap.find_opt a fwd, IntMap.find_opt b rev) with
+        | Some rhs', Some lhs' -> rhs' = b && lhs' = a
+        | Some rhs', None -> rhs' = b
+        | None, Some lhs' -> lhs' = a
+        | None, None -> a = b)
+    | (Tcg.Imm _ | Tcg.Temp _), (Tcg.Imm _ | Tcg.Temp _) -> false
+  in
+  let scalar_instrs_alpha_equal body_a body_b =
+    let rec loop fwd rev xs ys =
+      match (xs, ys) with
+      | [], [] -> true
+      | instr_a :: rest_a, instr_b :: rest_b -> (
+          let next_maps =
+            match (instr_a, instr_b) with
+            | Tcg.Move (dst_a, src_a), Tcg.Move (dst_b, src_b)
+            | Tcg.Un (dst_a, UPlus, src_a), Tcg.Un (dst_b, UPlus, src_b)
+            | Tcg.Un (dst_a, UMinus, src_a), Tcg.Un (dst_b, UMinus, src_b)
+              when operand_alpha_equal fwd rev src_a src_b ->
+                bind_temp_pair fwd rev dst_a dst_b
+            | Tcg.Bin (dst_a, op_a, lhs_a, rhs_a), Tcg.Bin (dst_b, op_b, lhs_b, rhs_b)
+              when op_a = op_b
+                   && operand_alpha_equal fwd rev lhs_a lhs_b
+                   && operand_alpha_equal fwd rev rhs_a rhs_b ->
+                bind_temp_pair fwd rev dst_a dst_b
+            | _ ->
+                None
+          in
+          (match next_maps with
+           | Some (fwd, rev) -> loop fwd rev rest_a rest_b
+           | None -> false))
+      | _ -> false
+    in
+    loop IntMap.empty IntMap.empty body_a body_b
+  in
   let rec iterate fuel (current : Cfg.func) =
     if fuel = 0 then current
     else
@@ -16556,11 +16604,11 @@ let fold_late_equivalent_diamonds_func (f : Cfg.func) =
                     match (arm_a.term, arm_b.term) with
                     | Cfg.Jump join_a, Cfg.Jump join_b
                       when join_a = join_b
-                           && arm_a.body = arm_b.body ->
-                        changed := true;
-                        if debug then
-                          Printf.eprintf
-                            "equiv-branch-fold func=%s branch=%s arms=%s,%s join=%s body-instrs=%d\n%!"
+                           && scalar_instrs_alpha_equal arm_a.body arm_b.body ->
+                         changed := true;
+                         if debug then
+                           Printf.eprintf
+                             "equiv-branch-fold func=%s branch=%s arms=%s,%s join=%s body-instrs=%d\n%!"
                             current.name block.label a b join_a
                             (List.length arm_a.body);
                         let term = Cfg.Jump a in
@@ -16845,25 +16893,42 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                    | Tcg.Call _ ->
                        false
                  in
-                 let extra_instrs =
-                   List.filter
-                     (fun instr -> Option.is_none (self_add instr))
-                     body_instrs
-                 in
+                  let extra_instrs =
+                    List.filter
+                      (fun instr -> Option.is_none (self_add instr))
+                      body_instrs
+                  in
+                  let extra_instr_budget = 6 in
+                  let nonpure_extra =
+                    List.filter
+                      (fun instr -> not (pure_affine_control_instr instr))
+                      extra_instrs
+                  in
                   if
                     self_add_count < 1
                     || self_add_count > 3
-                    || List.length extra_instrs > 6
-                    || not (List.for_all pure_affine_control_instr extra_instrs)
+                    || List.length extra_instrs > extra_instr_budget
+                    || nonpure_extra <> []
                   then
-                   Error
-                     (Printf.sprintf
-                        "affine-body-shape blocks=%d instrs=%d self-adds=%d extras=%d"
-                        (List.length body_labels
-                         + if control_block.body = [] then 0 else 1)
-                        (List.length body_instrs)
-                        self_add_count
-                        (List.length extra_instrs))
+                    let () =
+                      if debug && nonpure_extra <> [] then
+                        List.iteri
+                          (fun index instr ->
+                            Printf.eprintf
+                              "lve-runtime-summary-nonpure func=%s control=%s index=%d instr=%s\n%!"
+                              f.name control_block.label index (string_of_simple_instr instr))
+                          nonpure_extra
+                    in
+                    Error
+                      (Printf.sprintf
+                         "affine-body-shape blocks=%d instrs=%d self-adds=%d extras=%d budget=%d nonpure=%d"
+                         (List.length body_labels
+                          + if control_block.body = [] then 0 else 1)
+                         (List.length body_instrs)
+                         self_add_count
+                         (List.length extra_instrs)
+                         extra_instr_budget
+                         (List.length nonpure_extra))
                  else
                    Ok
                      ( body_instrs,
@@ -17628,7 +17693,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                       in
                                       if scale_available && bias_available then
                                         Some
-                                          (`Direct
+                                          (`DirectAffine
                                             ( acc_temp,
                                               delta_scale,
                                               delta_bias ))
@@ -17786,20 +17851,20 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                   "no-runtime-affine-reduction"
                             | Some reduction_shape ->
                                 (match reduction_shape with
-                                 | `Direct (acc, scale, bias) when debug ->
+                                 | `DirectAffine (acc, scale, bias) when debug ->
                                      Printf.eprintf
-                                       "lve-runtime-direct-affine-reduction func=%s header=%s iv=t%d acc=t%d scale=%s bias=%s step=%s\n%!"
-                                       f.name header iv_temp acc
-                                       (string_of_loop_inv_expr scale)
-                                       (string_of_loop_inv_expr bias)
-                                       (string_of_lve_operand step_operand)
-                                 | `Direct _
+                                        "lve-runtime-direct-affine-reduction func=%s header=%s iv=t%d acc=t%d scale=%s bias=%s step=%s\n%!"
+                                        f.name header iv_temp acc
+                                        (string_of_loop_inv_expr scale)
+                                        (string_of_loop_inv_expr bias)
+                                        (string_of_lve_operand step_operand)
+                                 | `DirectAffine _
                                  | `Carrier _ ->
                                      ());
                                 let acc_temp =
                                   match reduction_shape with
                                   | `Carrier (acc, _, _)
-                                  | `Direct (acc, _, _) ->
+                                  | `DirectAffine (acc, _, _) ->
                                       acc
                                 in
                                 let live_exit =
@@ -17954,7 +18019,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                                 Tcg.Temp
                                                                   total_delta )) ]
                                                     @ reconstruction_instrs
-                                                | `Direct
+                                                | `DirectAffine
                                                     ( _,
                                                       delta_scale,
                                                       delta_bias ) ->
@@ -18402,18 +18467,19 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                          derived
                                                          (string_of_lve_operand
                                                             delta)
-                                                   | `Direct
-                                                       (_, scale, bias) ->
-                                                       Printf.sprintf
-                                                         "direct:scale=%s,bias=%s"
-                                                         (string_of_loop_inv_expr
-                                                            scale)
-                                                         (string_of_loop_inv_expr
-                                                            bias))
-                                                  (string_of_lve_operand
-                                                     step_operand)
-                                                  (string_of_lve_operand
-                                                     bound_operand)
+                                                   | `DirectAffine
+                                                        (_, scale, bias) ->
+                                                        Printf.sprintf
+                                                          "direct-affine:scale=%s,bias=%s"
+                                                          (string_of_loop_inv_expr
+                                                             scale)
+                                                          (string_of_loop_inv_expr
+                                                             bias)
+                                                  )
+                                                   (string_of_lve_operand
+                                                      step_operand)
+                                                   (string_of_lve_operand
+                                                      bound_operand)
                                                   header
                                             end else begin
                                               let guard_label = fresh_label "guard" in
@@ -18553,17 +18619,18 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                          derived
                                                          (string_of_lve_operand
                                                             delta)
-                                                   | `Direct
-                                                       (_, scale, bias) ->
-                                                       Printf.sprintf
-                                                         "direct:scale=%s,bias=%s"
-                                                         (string_of_loop_inv_expr
-                                                            scale)
-                                                         (string_of_loop_inv_expr
-                                                            bias))
-                                                  (string_of_lve_operand step_operand)
-                                                  (string_of_lve_operand bound_operand)
-                                                  header
+                                                   | `DirectAffine
+                                                        (_, scale, bias) ->
+                                                        Printf.sprintf
+                                                          "direct-affine:scale=%s,bias=%s"
+                                                          (string_of_loop_inv_expr
+                                                             scale)
+                                                          (string_of_loop_inv_expr
+                                                             bias)
+                                                  )
+                                                   (string_of_lve_operand step_operand)
+                                                   (string_of_lve_operand bound_operand)
+                                                   header
                                              end)
       | _ -> reject header "outside-predecessor-count")
       headers;
@@ -18995,6 +19062,15 @@ let optimize_func global_init summaries globals return_globals removable_calls (
              ~removable_calls summaries globals return_globals
         |> copy_coalesce_func summaries globals
       in
+      let late_equiv_recanon =
+        late_equiv_cleaned
+        |> algebra_canonicalize_func
+        |> general_linear_canonicalize_func
+        |> factor_common_mul_func
+        |> eliminate_dead_code_func
+             ~removable_calls summaries globals return_globals
+        |> copy_coalesce_func summaries globals
+      in
       let late_runtime_summarized =
         summarize_runtime_symbolic_affine_loops_func
           summaries globals late_equiv_cleaned
@@ -19032,6 +19108,7 @@ let optimize_func global_init summaries globals return_globals removable_calls (
           [
             ("pre-final-merge", with_hoisted_loop_bounds);
             ("late-runtime-cleaned", late_runtime_cleaned);
+            ("late-equiv-recanon", late_equiv_recanon);
             ("late-equiv-cleaned", late_equiv_cleaned);
             ("late-coalesced", late_coalesced);
             ("pre-late-mem2reg", optimized);
