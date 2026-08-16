@@ -5121,6 +5121,388 @@ let analyze_loop_addrecs header loop get_block loop_defs multi_defs def_instrs =
              None)
 
 
+(* -------------------------------------------------------------------------- *)
+(* step136: unified scalar recurrence layer (SCEV-lite facade)                *)
+(*                                                                            *)
+(* The optimizer historically has two partially-overlapping induction views:  *)
+(*   - [basic_induction_var], whose step must be an int64;                     *)
+(*   - [loop_addrec], whose step may be a symbolic loop-invariant expression.  *)
+(*                                                                            *)
+(* This layer gives consumers one semantic vocabulary for scalar values.       *)
+(* It is deliberately analysis-only in v1 and reuses the already path-sensitive*)
+(* logical-PHI/AddRec recovery above.                                          *)
+(*                                                                            *)
+(* Canonical meaning:                                                         *)
+(*   ScalarAddRec base               = base(k)                                 *)
+(*   ScalarAffine {base;scale;bias}  = scale * base(k) + bias                  *)
+(*                                                                            *)
+(* Therefore i, i+c, i-c and a*i+b all share one representation.  A symbolic  *)
+(* update such as [row += cols] is an AddRec whose [addrec_step] is the         *)
+(* invariant expression [cols].                                               *)
+(* -------------------------------------------------------------------------- *)
+
+type scalar_recurrence =
+  | ScalarConst of int64
+  | ScalarInvariant of loop_inv_expr
+  | ScalarAddRec of loop_addrec
+  | ScalarAffine of {
+      scalar_base : loop_addrec;
+      scalar_scale : loop_inv_expr;
+      scalar_bias : loop_inv_expr;
+    }
+
+let scalar_inv_zero = LveConst 0L
+let scalar_inv_one = LveConst 1L
+
+let loop_inv_expr_const_opt expr =
+  match normalize_loop_inv_expr expr with
+  | LveConst value -> Some value
+  | LveOperand _
+  | LveNeg _
+  | LveAdd _
+  | LveMul _ ->
+      None
+
+let scalar_recurrence_scale_bias = function
+  | ScalarAddRec base ->
+      Some (base, scalar_inv_one, scalar_inv_zero)
+  | ScalarAffine { scalar_base; scalar_scale; scalar_bias } ->
+      Some
+        ( scalar_base,
+          normalize_loop_inv_expr scalar_scale,
+          normalize_loop_inv_expr scalar_bias )
+  | ScalarConst _ | ScalarInvariant _ ->
+      None
+
+let rec normalize_scalar_recurrence = function
+  | ScalarConst value -> ScalarConst (i32 value)
+  | ScalarInvariant expr -> (
+      match normalize_loop_inv_expr expr with
+      | LveConst value -> ScalarConst value
+      | expr -> ScalarInvariant expr)
+  | ScalarAddRec base ->
+      ScalarAddRec
+        { base with addrec_step = normalize_loop_inv_expr base.addrec_step }
+  | ScalarAffine { scalar_base; scalar_scale; scalar_bias } ->
+      let scalar_base =
+        { scalar_base with
+          addrec_step = normalize_loop_inv_expr scalar_base.addrec_step }
+      in
+      let scalar_scale = normalize_loop_inv_expr scalar_scale in
+      let scalar_bias = normalize_loop_inv_expr scalar_bias in
+      begin
+        match scalar_scale with
+        | LveConst 0L ->
+            normalize_scalar_recurrence (ScalarInvariant scalar_bias)
+        | LveConst 1L when scalar_bias = LveConst 0L ->
+            ScalarAddRec scalar_base
+        | _ ->
+            ScalarAffine { scalar_base; scalar_scale; scalar_bias }
+      end
+
+let scalar_recurrence_invariant_expr = function
+  | ScalarConst value -> Some (LveConst value)
+  | ScalarInvariant expr -> Some (normalize_loop_inv_expr expr)
+  | ScalarAddRec _ | ScalarAffine _ -> None
+
+let scalar_recurrence_affine base scale bias =
+  normalize_scalar_recurrence
+    (ScalarAffine
+       {
+         scalar_base = base;
+         scalar_scale = normalize_loop_inv_expr scale;
+         scalar_bias = normalize_loop_inv_expr bias;
+       })
+
+let scalar_recurrence_neg = function
+  | ScalarConst value -> ScalarConst (i32 Int64.(neg value))
+  | ScalarInvariant expr ->
+      normalize_scalar_recurrence (ScalarInvariant (LveNeg expr))
+  | ScalarAddRec base ->
+      scalar_recurrence_affine base (LveConst (-1L)) (LveConst 0L)
+  | ScalarAffine { scalar_base; scalar_scale; scalar_bias } ->
+      scalar_recurrence_affine
+        scalar_base
+        (LveNeg scalar_scale)
+        (LveNeg scalar_bias)
+
+let scalar_same_base lhs rhs =
+  lhs.addrec_phi_temp = rhs.addrec_phi_temp
+  && loop_inv_expr_equal lhs.addrec_step rhs.addrec_step
+
+let scalar_recurrence_add_invariant recurrence invariant =
+  match scalar_recurrence_scale_bias recurrence with
+  | Some (base, scale, bias) ->
+      Some
+        (scalar_recurrence_affine
+           base scale
+           (normalize_loop_inv_expr (LveAdd (bias, invariant))))
+  | None -> None
+
+let scalar_recurrence_add lhs rhs =
+  let lhs = normalize_scalar_recurrence lhs in
+  let rhs = normalize_scalar_recurrence rhs in
+  match (lhs, rhs) with
+  | ScalarConst lhs, ScalarConst rhs ->
+      Some (ScalarConst (i32 Int64.(add lhs rhs)))
+  | ScalarConst value, ((ScalarAddRec _ | ScalarAffine _) as recurrence)
+  | ((ScalarAddRec _ | ScalarAffine _) as recurrence), ScalarConst value ->
+      scalar_recurrence_add_invariant recurrence (LveConst value)
+  | ScalarConst value, ScalarInvariant invariant
+  | ScalarInvariant invariant, ScalarConst value ->
+      Some
+        (normalize_scalar_recurrence
+           (ScalarInvariant
+              (normalize_loop_inv_expr
+                 (LveAdd (LveConst value, invariant)))))
+  | ScalarInvariant lhs, ScalarInvariant rhs ->
+      Some
+        (normalize_scalar_recurrence
+           (ScalarInvariant
+              (normalize_loop_inv_expr (LveAdd (lhs, rhs)))))
+  | ((ScalarAddRec _ | ScalarAffine _) as recurrence),
+    ScalarInvariant invariant
+  | ScalarInvariant invariant,
+    ((ScalarAddRec _ | ScalarAffine _) as recurrence) ->
+      scalar_recurrence_add_invariant recurrence invariant
+  | (ScalarAddRec _ | ScalarAffine _),
+    (ScalarAddRec _ | ScalarAffine _) ->
+      begin
+        match
+          ( scalar_recurrence_scale_bias lhs,
+            scalar_recurrence_scale_bias rhs )
+        with
+        | Some (lhs_base, lhs_scale, lhs_bias),
+          Some (rhs_base, rhs_scale, rhs_bias)
+          when scalar_same_base lhs_base rhs_base ->
+            Some
+              (scalar_recurrence_affine
+                 lhs_base
+                 (normalize_loop_inv_expr (LveAdd (lhs_scale, rhs_scale)))
+                 (normalize_loop_inv_expr (LveAdd (lhs_bias, rhs_bias))))
+        | _ -> None
+      end
+
+let scalar_recurrence_sub lhs rhs =
+  scalar_recurrence_add lhs (scalar_recurrence_neg rhs)
+
+let scalar_recurrence_mul lhs rhs =
+  let lhs = normalize_scalar_recurrence lhs in
+  let rhs = normalize_scalar_recurrence rhs in
+  match
+    ( scalar_recurrence_invariant_expr lhs,
+      scalar_recurrence_invariant_expr rhs )
+  with
+  | Some lhs, Some rhs ->
+      Some
+        (normalize_scalar_recurrence
+           (ScalarInvariant
+              (normalize_loop_inv_expr (LveMul (lhs, rhs)))))
+  | Some invariant, None
+  | None, Some invariant ->
+      let recurrence = if Option.is_some (scalar_recurrence_invariant_expr lhs)
+        then rhs else lhs
+      in
+      begin
+        match scalar_recurrence_scale_bias recurrence with
+        | Some (base, scale, bias) ->
+            Some
+              (scalar_recurrence_affine
+                 base
+                 (normalize_loop_inv_expr (LveMul (scale, invariant)))
+                 (normalize_loop_inv_expr (LveMul (bias, invariant))))
+        | None -> None
+      end
+  | None, None ->
+      (* v1 deliberately excludes products of two varying recurrences. *)
+      None
+
+let string_of_scalar_recurrence recurrence =
+  match normalize_scalar_recurrence recurrence with
+  | ScalarConst value ->
+      Printf.sprintf "Const(%Ld)" value
+  | ScalarInvariant expr ->
+      Printf.sprintf "Invariant(%s)" (string_of_loop_inv_expr expr)
+  | ScalarAddRec base ->
+      Printf.sprintf
+        "AddRec(phi=t%d,step=%s)"
+        base.addrec_phi_temp
+        (string_of_loop_inv_expr base.addrec_step)
+  | ScalarAffine { scalar_base; scalar_scale; scalar_bias } ->
+      Printf.sprintf
+        "Affine(phi=t%d,step=%s,scale=%s,bias=%s)"
+        scalar_base.addrec_phi_temp
+        (string_of_loop_inv_expr scalar_base.addrec_step)
+        (string_of_loop_inv_expr scalar_scale)
+        (string_of_loop_inv_expr scalar_bias)
+
+let scalar_addrec_table addrecs =
+  let table = Hashtbl.create (max 8 (List.length addrecs)) in
+  List.iter
+    (fun (addrec : loop_addrec) ->
+      Hashtbl.replace table addrec.addrec_phi_temp addrec)
+    addrecs;
+  table
+
+let scalar_recurrence_of_operand
+    loop_defs
+    multi_defs
+    def_instrs
+    addrecs
+    (block : Cfg.block)
+    operand
+  =
+  let addrec_by_temp = scalar_addrec_table addrecs in
+  let rec analyze seen operand =
+    let operand = resolve_block_operand block operand in
+    match operand with
+    | Tcg.Imm value -> Some (ScalarConst value)
+    | Tcg.Temp temp -> (
+        match Hashtbl.find_opt addrec_by_temp temp with
+        | Some addrec -> Some (ScalarAddRec addrec)
+        | None ->
+            if not (IntSet.mem temp loop_defs) then
+              Option.map
+                (fun expr -> normalize_scalar_recurrence (ScalarInvariant expr))
+                (lve_invariant_expr_of_operand
+                   loop_defs multi_defs def_instrs operand)
+            else if IntSet.mem temp seen || IntSet.mem temp multi_defs then
+              None
+            else
+              let seen = IntSet.add temp seen in
+              match
+                last_def_of_temp block temp,
+                Hashtbl.find_opt def_instrs temp
+              with
+              | Some instr, _
+              | None, Some instr ->
+                  analyze_instr seen instr
+              | None, None ->
+                  None)
+  and analyze_instr seen = function
+    | Tcg.Move (_, src)
+    | Tcg.Un (_, UPlus, src) ->
+        analyze seen src
+    | Tcg.Un (_, UMinus, src) ->
+        Option.map scalar_recurrence_neg (analyze seen src)
+    | Tcg.Bin (_, Add, lhs, rhs) ->
+        Option.bind (analyze seen lhs) (fun lhs ->
+            Option.bind (analyze seen rhs) (scalar_recurrence_add lhs))
+    | Tcg.Bin (_, Sub, lhs, rhs) ->
+        Option.bind (analyze seen lhs) (fun lhs ->
+            Option.bind (analyze seen rhs) (scalar_recurrence_sub lhs))
+    | Tcg.Bin (_, Mul, lhs, rhs) ->
+        Option.bind (analyze seen lhs) (fun lhs ->
+            Option.bind (analyze seen rhs) (scalar_recurrence_mul lhs))
+    | Tcg.Un (_, UNot, _)
+    | Tcg.Bin (_, (Div | Mod | Lt | Le | Gt | Ge | Eq | Ne | LAnd | LOr), _, _)
+    | Tcg.Load _
+    | Tcg.Store _
+    | Tcg.Call _ ->
+        None
+  in
+  analyze IntSet.empty operand
+  |> Option.map normalize_scalar_recurrence
+
+let scalar_outside_inputs
+    header loop get_block (addrec : loop_addrec) =
+  let header_block : Cfg.block = get_block header in
+  let outside_preds =
+    List.filter
+      (fun pred -> not (LabelSet.mem pred loop))
+      header_block.preds
+  in
+  let seed_for_pred pred =
+    match
+      reaching_move_cases_on_edge
+        get_block ~stop_label:header ~pred_label:pred
+        addrec.addrec_phi_temp
+    with
+    | None -> None
+    | Some cases ->
+        let values =
+          cases
+          |> dedup_reaching_move_cases
+          |> List.map (fun case ->
+                 resolve_chain_operand
+                   case.reaching_chain case.reaching_source)
+          |> List.sort_uniq compare
+        in
+        begin
+          match values with
+          | [ value ] -> Some (pred, value)
+          | [] | _ :: _ :: _ -> None
+        end
+  in
+  let inputs = List.filter_map seed_for_pred outside_preds in
+  if List.length inputs = List.length outside_preds then Some inputs
+  else None
+
+let basic_iv_of_scalar_addrec
+    header loop get_block (addrec : loop_addrec) =
+  match loop_inv_expr_const_opt addrec.addrec_step with
+  | None -> None
+  | Some step -> (
+      match scalar_outside_inputs header loop get_block addrec with
+      | None -> None
+      | Some outside_inputs ->
+          Some
+            {
+              phi_temp = addrec.addrec_phi_temp;
+              outside_inputs;
+              backedge_preds = addrec.addrec_backedge_preds;
+              step;
+            })
+
+
+let debug_scalar_recurrence_loop
+    header loop get_block loop_defs multi_defs def_instrs addrecs =
+  if Sys.getenv_opt "TOYC_DEBUG_SCALAR_RECURRENCE" <> None then begin
+    List.iter
+      (fun (addrec : loop_addrec) ->
+        let recurrence = ScalarAddRec addrec in
+        let step_kind =
+          match loop_inv_expr_const_opt addrec.addrec_step with
+          | Some _ -> "constant"
+          | None -> "symbolic"
+        in
+        Printf.eprintf
+          "scalar-rec header=%s phi=t%d kind=%s recurrence=%s\n%!"
+          header addrec.addrec_phi_temp step_kind
+          (string_of_scalar_recurrence recurrence))
+      addrecs;
+
+    (* Probe every pure arithmetic destination once.  This is diagnostic only,
+       but it verifies that the unified layer really sees i+c / a*i+b rather
+       than merely rediscovering PHIs. *)
+    LabelSet.iter
+      (fun label ->
+        let block : Cfg.block = get_block label in
+        List.iter
+          (fun instr ->
+            match defs_temp instr with
+            | Some dst -> (
+                match
+                  scalar_recurrence_of_operand
+                    loop_defs multi_defs def_instrs addrecs block
+                    (Tcg.Temp dst)
+                with
+                | Some (ScalarAddRec _ as recurrence)
+                | Some (ScalarAffine _ as recurrence) ->
+                    Printf.eprintf
+                      "scalar-expr header=%s block=%s temp=t%d recurrence=%s\n%!"
+                      header block.label dst
+                      (string_of_scalar_recurrence recurrence)
+                | Some (ScalarConst _)
+                | Some (ScalarInvariant _)
+                | None ->
+                    ())
+            | None -> ())
+          block.body)
+      loop
+  end
+
+
 let lve_operand_available_before_preds doms def_blocks multi_defs preds = function
   | Tcg.Imm _ -> true
   | Tcg.Temp temp ->
@@ -5673,6 +6055,200 @@ let classify_counted_loop_header
                    | None -> control_iv_bias_of_operand (IntSet.add temp seen) lhs)
                | Some _ | None -> None)))
   in
+  (* step138: phase-aware affine control analysis.
+
+     IMPORTANT: the scalar recurrence attached to a PHI is an iteration-entry
+     recurrence.  A use in a split/latch/post-update block can be one or more
+     updates later.  Therefore this analysis never uses a bare ScalarAddRec as
+     a program-point fact.
+
+     Instead, the existing position-sensitive [control_iv_bias_of_operand] is
+     the leaf oracle.  It already accounts for snapshot temporaries and
+     trailing IV updates on incoming chains.  Only after a leaf has been
+     assigned a phase-correct
+
+         iv + constant_bias
+
+     do we propagate pure arithmetic in THIS control block to discover
+
+         scale * iv + bias
+
+     with loop-invariant scale/bias.
+
+     v1 is diagnostic only.  It cannot change the selected counted-loop kind,
+     so this layer is safe to compare against the mature matcher before the
+     trip-count representation is generalized. *)
+  let invariant_expr_of_control_operand operand =
+    lve_invariant_expr_of_operand
+      loop_defs multi_defs def_instrs operand
+    |> Option.map normalize_loop_inv_expr
+  in
+  let affine_add_bias (iv, scale, bias) delta =
+    ( iv,
+      scale,
+      normalize_loop_inv_expr (LveAdd (bias, delta)) )
+  in
+  let affine_sub_bias (iv, scale, bias) delta =
+    ( iv,
+      scale,
+      normalize_loop_inv_expr (LveAdd (bias, LveNeg delta)) )
+  in
+  let affine_scale (iv, scale, bias) factor =
+    ( iv,
+      normalize_loop_inv_expr (LveMul (scale, factor)),
+      normalize_loop_inv_expr (LveMul (bias, factor)) )
+  in
+  let rec phase_affine_control_of_operand seen operand =
+    (* First ask the mature matcher.  This is the only place where a
+       cross-block/snapshot value is turned into an IV fact. *)
+    match control_iv_bias_of_operand IntSet.empty operand with
+    | Some (iv, bias) ->
+        Some (iv, LveConst 1L, LveConst bias)
+    | None -> (
+        match operand with
+        | Tcg.Imm _ -> None
+        | Tcg.Temp temp ->
+            if IntSet.mem temp seen || IntSet.mem temp multi_defs then None
+            else
+              (* Composite affine propagation is deliberately local to the
+                 control block.  A nonlocal temp must first be recognized by
+                 the phase-aware leaf oracle above. *)
+              match last_def_of_temp block temp with
+              | None -> None
+              | Some instr ->
+                  phase_affine_control_of_instr
+                    (IntSet.add temp seen) instr)
+  and phase_affine_control_of_instr seen = function
+    | Tcg.Move (_, src)
+    | Tcg.Un (_, UPlus, src) ->
+        phase_affine_control_of_operand seen src
+    | Tcg.Un (_, UMinus, src) ->
+        Option.map
+          (fun affine -> affine_scale affine (LveConst (-1L)))
+          (phase_affine_control_of_operand seen src)
+    | Tcg.Bin (_, Add, lhs, rhs) -> (
+        match
+          ( phase_affine_control_of_operand seen lhs,
+            phase_affine_control_of_operand seen rhs,
+            invariant_expr_of_control_operand lhs,
+            invariant_expr_of_control_operand rhs )
+        with
+        | Some affine, None, _, Some invariant
+        | None, Some affine, Some invariant, _ ->
+            Some (affine_add_bias affine invariant)
+        | _ -> None)
+    | Tcg.Bin (_, Sub, lhs, rhs) -> (
+        match
+          ( phase_affine_control_of_operand seen lhs,
+            phase_affine_control_of_operand seen rhs,
+            invariant_expr_of_control_operand lhs,
+            invariant_expr_of_control_operand rhs )
+        with
+        | Some affine, None, _, Some invariant ->
+            Some (affine_sub_bias affine invariant)
+        | None, Some affine, Some invariant, _ ->
+            (* invariant - (a*iv+b) = (-a)*iv + (invariant-b) *)
+            let iv, scale, bias =
+              affine_scale affine (LveConst (-1L))
+            in
+            Some
+              ( iv,
+                scale,
+                normalize_loop_inv_expr
+                  (LveAdd (invariant, bias)) )
+        | _ -> None)
+    | Tcg.Bin (_, Mul, lhs, rhs) -> (
+        match
+          ( phase_affine_control_of_operand seen lhs,
+            phase_affine_control_of_operand seen rhs,
+            invariant_expr_of_control_operand lhs,
+            invariant_expr_of_control_operand rhs )
+        with
+        | Some affine, None, _, Some invariant
+        | None, Some affine, Some invariant, _ ->
+            Some (affine_scale affine invariant)
+        | _ -> None)
+    | Tcg.Un (_, UNot, _)
+    | Tcg.Bin
+        (_, (Div | Mod | Lt | Le | Gt | Ge | Eq | Ne | LAnd | LOr), _, _)
+    | Tcg.Load _
+    | Tcg.Store _
+    | Tcg.Call _ ->
+        None
+  in
+  let phase_affine_equal_old
+      (iv : basic_induction_var) scale bias
+      (old_iv : basic_induction_var) old_bias =
+    iv.phi_temp = old_iv.phi_temp
+    &&
+    match
+      ( normalize_loop_inv_expr scale,
+        normalize_loop_inv_expr bias )
+    with
+    | LveConst 1L, LveConst bias_value ->
+        i32 bias_value = i32 old_bias
+    | _ -> false
+  in
+  let debug_phase_affine_operand side operand =
+    if Sys.getenv_opt "TOYC_DEBUG_PHASE_AFFINE_CONTROL" <> None
+       || Sys.getenv_opt "TOYC_DEBUG_PHASE_VALIDATE" <> None
+    then
+      let fresh =
+        phase_affine_control_of_operand IntSet.empty operand
+      in
+      let old =
+        control_iv_bias_of_operand IntSet.empty operand
+      in
+      match (old, fresh) with
+      | None, None -> ()
+      | Some (old_iv, old_bias), None ->
+          if Sys.getenv_opt "TOYC_DEBUG_PHASE_VALIDATE" <> None then
+            Printf.eprintf
+              "phase-validate-missing label=%s side=%s old_phi=t%d old_bias=%Ld\n%!"
+              control_label side old_iv.phi_temp old_bias
+      | Some (old_iv, old_bias),
+        Some (iv, scale, bias) ->
+          let agrees =
+            phase_affine_equal_old
+              iv scale bias old_iv old_bias
+          in
+          if Sys.getenv_opt "TOYC_DEBUG_PHASE_VALIDATE" <> None then
+            Printf.eprintf
+              "phase-validate-%s label=%s side=%s old_phi=t%d old_bias=%Ld new_phi=t%d scale=%s bias=%s\n%!"
+              (if agrees then "agree" else "disagree")
+              control_label side
+              old_iv.phi_temp old_bias
+              iv.phi_temp
+              (string_of_loop_inv_expr scale)
+              (string_of_loop_inv_expr bias)
+          else if Sys.getenv_opt "TOYC_DEBUG_PHASE_AFFINE_CONTROL" <> None then
+            Printf.eprintf
+              "phase-affine-control label=%s side=%s phi=t%d scale=%s bias=%s old=t%d+%Ld\n%!"
+              control_label side iv.phi_temp
+              (string_of_loop_inv_expr scale)
+              (string_of_loop_inv_expr bias)
+              old_iv.phi_temp old_bias
+      | None, Some (iv, scale, bias) ->
+          if Sys.getenv_opt "TOYC_DEBUG_PHASE_VALIDATE" <> None then
+            Printf.eprintf
+              "phase-validate-extension label=%s side=%s phi=t%d scale=%s bias=%s\n%!"
+              control_label side iv.phi_temp
+              (string_of_loop_inv_expr scale)
+              (string_of_loop_inv_expr bias)
+          else if Sys.getenv_opt "TOYC_DEBUG_PHASE_AFFINE_CONTROL" <> None then
+            Printf.eprintf
+              "phase-affine-control label=%s side=%s phi=t%d scale=%s bias=%s old=none\n%!"
+              control_label side iv.phi_temp
+              (string_of_loop_inv_expr scale)
+              (string_of_loop_inv_expr bias)
+  in
+  begin
+    match branch_compare_shape_in_block block multi_defs def_instrs term with
+    | Some (_, lhs, rhs, _, _) ->
+        debug_phase_affine_operand "lhs" lhs;
+        debug_phase_affine_operand "rhs" rhs
+    | None -> ()
+  end;
   let match_control_iv op lhs rhs =
     match (control_iv_bias_of_operand IntSet.empty lhs, invariant rhs) with
     | Some (iv, bias), true ->
@@ -5769,7 +6345,56 @@ let find_counted_loop_control
           | Some _ | None -> None)
 
 let analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs =
-  collect_basic_induction_vars header loop get_block loop_defs multi_defs def_instrs
+  let syntactic =
+    collect_basic_induction_vars
+      header loop get_block loop_defs multi_defs def_instrs
+  in
+  let addrecs =
+    analyze_loop_addrecs
+      header loop get_block loop_defs multi_defs def_instrs
+  in
+  debug_scalar_recurrence_loop
+    header loop get_block loop_defs multi_defs def_instrs addrecs;
+  let semantic =
+    addrecs
+    |> List.filter_map
+         (basic_iv_of_scalar_addrec header loop get_block)
+  in
+  let seen =
+    List.fold_left
+      (fun seen (iv : basic_induction_var) ->
+        IntSet.add iv.phi_temp seen)
+      IntSet.empty syntactic
+  in
+  let semantic_new =
+    List.filter
+      (fun (iv : basic_induction_var) ->
+        not (IntSet.mem iv.phi_temp seen))
+      semantic
+  in
+  if Sys.getenv_opt "TOYC_DEBUG_SCALAR_RECURRENCE" <> None then begin
+    Printf.eprintf
+      "scalar-iv-compare header=%s old=%d semantic=%d new=%d
+%!"
+      header
+      (List.length syntactic)
+      (List.length semantic)
+      (List.length semantic_new);
+    List.iter
+      (fun (iv : basic_induction_var) ->
+        Printf.eprintf
+          "scalar-iv-new header=%s phi=t%d step=%Ld outside=%d backedges=%d
+%!"
+          header iv.phi_temp iv.step
+          (List.length iv.outside_inputs)
+          (List.length iv.backedge_preds))
+      semantic_new
+  end;
+  (* ScalarRecurrence is diagnostic-only at this stage.
+     Do NOT feed semantic-only IVs into the mature counted-loop pipeline yet:
+     [basic_iv_of_scalar_addrec] does not carry the program-point/phase proof
+     that the old syntactic/snapshot recognizers rely on. *)
+  syntactic
 
 let analyze_counted_control header loop get_block loop_defs loop_stable_phis multi_defs def_instrs =
   let ivs = analyze_induction_vars header loop get_block loop_defs multi_defs def_instrs in
@@ -12269,7 +12894,8 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                   let summary_label = fresh_summary_label () in
                   let control_block = get_block info.control_label in
                   let zero_trip_state_simple =
-                    reconstruction_order = []
+                    f.params = []
+                    && reconstruction_order = []
                     && place_mirrors = []
                   in
                   let zero_trip_elided =
@@ -15678,16 +16304,45 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                        else count)
                      0 body_instrs
                  in
-                 if List.length body_instrs <> 3
-                    || self_add_count <> 3
+                 let self_add_dsts =
+                   List.fold_left
+                     (fun dsts instr ->
+                       match self_add instr with
+                       | Some (dst, _) -> IntSet.add dst dsts
+                       | None -> dsts)
+                     IntSet.empty body_instrs
+                 in
+                 let pure_affine_control_instr instr =
+                   match instr with
+                   | Tcg.Move (dst, _)
+                   | Tcg.Un (dst, (UPlus | UMinus), _)
+                   | Tcg.Bin (dst, (Add | Sub | Mul), _, _) ->
+                       not (IntSet.mem dst self_add_dsts)
+                   | Tcg.Un (_, UNot, _)
+                   | Tcg.Bin
+                       (_, (Div | Mod | Lt | Le | Gt | Ge | Eq | Ne | LAnd | LOr), _, _)
+                   | Tcg.Load _
+                   | Tcg.Store _
+                   | Tcg.Call _ ->
+                       false
+                 in
+                 let extra_instrs =
+                   List.filter
+                     (fun instr -> Option.is_none (self_add instr))
+                     body_instrs
+                 in
+                 if self_add_count <> 3
+                    || List.length extra_instrs > 4
+                    || not (List.for_all pure_affine_control_instr extra_instrs)
                  then
                    Error
                      (Printf.sprintf
-                        "affine-body-shape blocks=%d instrs=%d self-adds=%d"
+                        "affine-body-shape blocks=%d instrs=%d self-adds=%d extras=%d"
                         (List.length body_labels
                          + if control_block.body = [] then 0 else 1)
                         (List.length body_instrs)
-                        self_add_count)
+                        self_add_count
+                        (List.length extra_instrs))
                  else
                    Ok
                      ( body_instrs,
@@ -15766,75 +16421,216 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                          "self-add-count=%d"
                          (List.length self_adds))
                   else
-                    let control_chain =
-                      control_block
-                      :: (body_labels
-                          |> List.rev
-                          |> List.map get_block)
+                    let body_indexed =
+                      List.mapi (fun index instr -> (index, instr)) body_instrs
                     in
-                    let string_of_binop_debug = function
-                      | Add -> "add" | Sub -> "sub" | Mul -> "mul"
-                      | Div -> "div" | Mod -> "mod"
-                      | Lt -> "lt" | Le -> "le" | Gt -> "gt"
-                      | Ge -> "ge" | Eq -> "eq" | Ne -> "ne"
-                      | LAnd -> "land" | LOr -> "lor"
+                    let last_body_def temp =
+                      body_indexed
+                      |> List.rev
+                      |> List.find_map (fun (index, instr) ->
+                             match defs_temp instr with
+                             | Some dst when dst = temp -> Some (index, instr)
+                             | Some _ | None -> None)
                     in
-                    let operand_is_temp_value temp operand =
-                      resolves_to_induction_temp_on_chain
-                        control_chain multi_defs def_instrs temp operand
-                      || resolves_to_induction_temp_in_block
-                           control_block multi_defs def_instrs temp operand
-                      || resolves_to_induction_temp
-                           multi_defs def_instrs temp operand
+                    let invariant_expr operand =
+                      lve_invariant_expr_of_operand
+                        loop_defs multi_defs def_instrs operand
+                      |> Option.map normalize_loop_inv_expr
+                    in
+                    let affine_add_invariant (scale, bias) invariant =
+                      Some
+                        ( normalize_loop_inv_expr scale,
+                          normalize_loop_inv_expr
+                            (LveAdd (bias, invariant)) )
+                    in
+                    let affine_sub_invariant (scale, bias) invariant =
+                      Some
+                        ( normalize_loop_inv_expr scale,
+                          normalize_loop_inv_expr
+                            (LveAdd (bias, LveNeg invariant)) )
+                    in
+                    let affine_mul_invariant (scale, bias) invariant =
+                      Some
+                        ( normalize_loop_inv_expr
+                            (LveMul (scale, invariant)),
+                          normalize_loop_inv_expr
+                            (LveMul (bias, invariant)) )
+                    in
+                    let affine_invariant_minus invariant (scale, bias) =
+                      Some
+                        ( normalize_loop_inv_expr
+                            (LveNeg scale),
+                          normalize_loop_inv_expr
+                            (LveAdd (invariant, LveNeg bias)) )
+                    in
+                    let rec control_affine_of_operand
+                        iv_temp iv_update_index seen operand =
+                      match operand with
+                      | Tcg.Temp temp when temp = iv_temp ->
+                          Some (LveConst 1L, LveConst 0L)
+                      | Tcg.Imm _ ->
+                          None
+                      | Tcg.Temp temp ->
+                          if IntSet.mem temp seen then None
+                          else
+                            match last_body_def temp with
+                            | Some (def_index, instr)
+                              when def_index > iv_update_index ->
+                                control_affine_of_instr
+                                  iv_temp iv_update_index
+                                  (IntSet.add temp seen) instr
+                            | Some _ | None ->
+                                None
+                    and control_affine_of_instr
+                        iv_temp iv_update_index seen = function
+                      | Tcg.Move (_, src)
+                      | Tcg.Un (_, UPlus, src) ->
+                          control_affine_of_operand
+                            iv_temp iv_update_index seen src
+                      | Tcg.Un (_, UMinus, src) ->
+                          Option.bind
+                            (control_affine_of_operand
+                               iv_temp iv_update_index seen src)
+                            (fun (scale, bias) ->
+                              Some
+                                ( normalize_loop_inv_expr
+                                    (LveNeg scale),
+                                  normalize_loop_inv_expr
+                                    (LveNeg bias) ))
+                      | Tcg.Bin (_, Add, lhs, rhs) -> (
+                          match
+                            ( control_affine_of_operand
+                                iv_temp iv_update_index seen lhs,
+                              control_affine_of_operand
+                                iv_temp iv_update_index seen rhs,
+                              invariant_expr lhs,
+                              invariant_expr rhs )
+                          with
+                          | Some affine, None, _, Some invariant
+                          | None, Some affine, Some invariant, _ ->
+                              affine_add_invariant affine invariant
+                          | _ -> None)
+                      | Tcg.Bin (_, Sub, lhs, rhs) -> (
+                          match
+                            ( control_affine_of_operand
+                                iv_temp iv_update_index seen lhs,
+                              control_affine_of_operand
+                                iv_temp iv_update_index seen rhs,
+                              invariant_expr lhs,
+                              invariant_expr rhs )
+                          with
+                          | Some affine, None, _, Some invariant ->
+                              affine_sub_invariant affine invariant
+                          | None, Some affine, Some invariant, _ ->
+                              affine_invariant_minus invariant affine
+                          | _ -> None)
+                      | Tcg.Bin (_, Mul, lhs, rhs) -> (
+                          match
+                            ( control_affine_of_operand
+                                iv_temp iv_update_index seen lhs,
+                              control_affine_of_operand
+                                iv_temp iv_update_index seen rhs,
+                              invariant_expr lhs,
+                              invariant_expr rhs )
+                          with
+                          | Some affine, None, _, Some invariant
+                          | None, Some affine, Some invariant, _ ->
+                              affine_mul_invariant affine invariant
+                          | _ -> None)
+                      | Tcg.Un (_, UNot, _)
+                      | Tcg.Bin
+                          (_, (Div | Mod | Lt | Le | Gt | Ge | Eq | Ne | LAnd | LOr), _, _)
+                      | Tcg.Load _
+                      | Tcg.Store _
+                      | Tcg.Call _ ->
+                          None
                     in
                     let find_control_update () =
                       List.find_map
-                        (fun (_index, dst, step_operand) ->
-                          let lhs_is_iv = operand_is_temp_value dst lhs in
-                          let rhs_is_iv = operand_is_temp_value dst rhs in
-                          let normalized_op, bound_operand =
-                            if lhs_is_iv && not rhs_is_iv then
-                              (branch_op, rhs)
-                            else if rhs_is_iv && not lhs_is_iv then
-                              (swap_compare branch_op, lhs)
-                            else
-                              (Eq, Tcg.Imm 0L)
+                        (fun (update_index, dst, step_operand) ->
+                          let lhs_affine =
+                            control_affine_of_operand
+                              dst update_index IntSet.empty lhs
+                          in
+                          let rhs_affine =
+                            control_affine_of_operand
+                              dst update_index IntSet.empty rhs
+                          in
+                          let lhs_invariant =
+                            Option.is_some
+                              (lve_invariant_expr_of_operand
+                                 loop_defs multi_defs def_instrs lhs)
+                          in
+                          let rhs_invariant =
+                            Option.is_some
+                              (lve_invariant_expr_of_operand
+                                 loop_defs multi_defs def_instrs rhs)
+                          in
+                          let normalized =
+                            match
+                              (lhs_affine, rhs_affine,
+                               lhs_invariant, rhs_invariant)
+                            with
+                            | Some (scale, bias), None, _, true ->
+                                Some (branch_op, rhs, scale, bias)
+                            | None, Some (scale, bias), true, _ ->
+                                Some
+                                  (swap_compare branch_op,
+                                   lhs, scale, bias)
+                            | _ -> None
                           in
                           let step_expr =
                             lve_invariant_expr_of_operand
                               loop_defs multi_defs def_instrs step_operand
                           in
-                          (if debug then
-                             Printf.eprintf
-                               "lve-runtime-control-match func=%s header=%s control=%s iv=t%d op=%s lhs=%s rhs=%s lhs-iv=%b rhs-iv=%b normalized=%s step=%s invariant=%b\n%!"
-                               f.name header control_block.label dst
-                               (string_of_binop_debug branch_op)
-                               (string_of_lve_operand lhs)
-                               (string_of_lve_operand rhs)
-                               lhs_is_iv rhs_is_iv
-                               (string_of_binop_debug normalized_op)
-                               (string_of_lve_operand step_operand)
-                               (Option.is_some step_expr));
-                          if
-                            normalized_op = Lt
-                            && Option.is_some step_expr
-                          then
-                            Some (dst, step_operand, bound_operand)
-                          else None)
+                          (match normalized with
+                           | Some
+                               (normalized_op, bound_operand,
+                                control_scale, control_bias)
+                             when normalized_op = Lt
+                                  && Option.is_some step_expr ->
+                               let control_scale =
+                                 normalize_loop_inv_expr control_scale
+                               in
+                               let control_bias =
+                                 normalize_loop_inv_expr control_bias
+                               in
+                               if debug then
+                                 Printf.eprintf
+                                   "lve-runtime-control-affine func=%s header=%s control=%s iv=t%d scale=%s bias=%s step=%s bound=%s\n%!"
+                                   f.name header control_block.label dst
+                                   (string_of_loop_inv_expr control_scale)
+                                   (string_of_loop_inv_expr control_bias)
+                                   (string_of_lve_operand step_operand)
+                                   (string_of_lve_operand bound_operand);
+                               Some
+                                 ( dst,
+                                   step_operand,
+                                   bound_operand,
+                                   control_scale,
+                                   control_bias )
+                           | Some _ | None -> None))
                         self_adds
                     in
                     match find_control_update () with
                     | None ->
-                        reject header "no-symbolic-lt-control-update"
-                    | Some (iv_temp, step_operand, bound_operand) ->
+                        reject header "no-symbolic-affine-lt-control-update"
+                    | Some
+                        ( iv_temp,
+                          step_operand,
+                          bound_operand,
+                          control_scale,
+                          control_bias ) ->
                         let initial_iv =
                           reaching_seed_on_edge
                             ~header ~pred_label:preheader_label iv_temp
                         in
                         (if debug then
                            Printf.eprintf
-                             "lve-runtime-summary-candidate func=%s header=%s iv=t%d step=%s bound=%s init=%s\n%!"
+                             "lve-runtime-summary-candidate func=%s header=%s iv=t%d scale=%s bias=%s step=%s bound=%s init=%s\n%!"
                              f.name header iv_temp
+                             (string_of_loop_inv_expr control_scale)
+                             (string_of_loop_inv_expr control_bias)
                              (string_of_lve_operand step_operand)
                              (string_of_lve_operand bound_operand)
                              (match initial_iv with
@@ -15853,11 +16649,27 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                               def_blocks multi_defs preheader_label
                               bound_operand
                           in
-                          if not step_available || not bound_available then
+                          let scale_available =
+                            lve_expr_available_before_preds
+                              doms def_blocks multi_defs
+                              [ preheader_label ] control_scale
+                          in
+                          let bias_available =
+                            lve_expr_available_before_preds
+                              doms def_blocks multi_defs
+                              [ preheader_label ] control_bias
+                          in
+                          if
+                            not step_available
+                            || not bound_available
+                            || not scale_available
+                            || not bias_available
+                          then
                             reject header
                               (Printf.sprintf
-                                 "operand-unavailable step=%b bound=%b"
-                                 step_available bound_available)
+                                 "operand-unavailable step=%b bound=%b scale=%b bias=%b"
+                                 step_available bound_available
+                                 scale_available bias_available)
                           else
                             let non_iv =
                               List.filter
@@ -15942,7 +16754,416 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                             in
                                             if not preheader_reaches_loop then
                                               reject header "preheader-no-longer-reaches-loop"
-                                            else begin
+                                            else if
+                                              normalize_loop_inv_expr
+                                                control_scale
+                                              <> LveConst 1L
+                                              || normalize_loop_inv_expr
+                                                   control_bias
+                                                 <> LveConst 0L
+                                            then begin
+                                              (* Runtime invariant affine-control
+                                                 extension:
+
+                                                   control = A * iv + B
+                                                   iv += step
+
+                                                 where A/B/step are pure
+                                                 loop-invariant i32 values and
+                                                 iv0=0.
+
+                                                 We never algebraically solve
+                                                 the source comparison.  Instead
+                                                 control itself is treated as an
+                                                 AddRec with
+
+                                                   control_step = A * step.
+
+                                                 The summary path is guarded by
+                                                 runtime proofs that preserve
+                                                 signed-i32 no-wrap monotonicity:
+                                                   A > 0
+                                                   B >= 0
+                                                   step > 0
+                                                   step <= INT32_MAX / A
+                                                   bound > B
+                                                   trip <=
+                                                     (INT32_MAX-B)/(A*step)
+
+                                                 Any failed proof falls back to
+                                                 the untouched original loop. *)
+                                              let values_label =
+                                                fresh_label "affine_values"
+                                              in
+                                              let scale_guard_label =
+                                                fresh_label "affine_scale_guard"
+                                              in
+                                              let bias_guard_label =
+                                                fresh_label "affine_bias_guard"
+                                              in
+                                              let step_guard_label =
+                                                fresh_label "affine_step_guard"
+                                              in
+                                              let product_guard_label =
+                                                fresh_label "affine_product_guard"
+                                              in
+                                              let bound_guard_label =
+                                                fresh_label "affine_bound_guard"
+                                              in
+                                              let calc_label =
+                                                fresh_label "affine_calc"
+                                              in
+                                              let apply_label =
+                                                fresh_label "affine_apply"
+                                              in
+
+                                              let redirected_term =
+                                                rewrite_term_successor
+                                                  preheader.term
+                                                  ~from_label:header
+                                                  ~to_label:values_label
+                                              in
+                                              update_block
+                                                {
+                                                  preheader with
+                                                  term = redirected_term;
+                                                  succs =
+                                                    Cfg.successors redirected_term;
+                                                };
+
+                                              let materialize_inv_expr expr =
+                                                match
+                                                  normalize_loop_inv_expr expr
+                                                with
+                                                | LveConst value ->
+                                                    ([], Tcg.Imm value)
+                                                | LveOperand operand ->
+                                                    ([], operand)
+                                                | complex ->
+                                                    let temp = fresh_temp () in
+                                                    ( emit_loop_inv_expr
+                                                        fresh_temp temp complex,
+                                                      Tcg.Temp temp )
+                                              in
+                                              let scale_prep, scale_operand =
+                                                materialize_inv_expr
+                                                  control_scale
+                                              in
+                                              let bias_prep, bias_operand =
+                                                materialize_inv_expr
+                                                  control_bias
+                                              in
+                                              let values_body =
+                                                scale_prep @ bias_prep
+                                              in
+                                              let values_term =
+                                                Cfg.BranchCompare
+                                                  ( Gt,
+                                                    scale_operand,
+                                                    Tcg.Imm 0L,
+                                                    scale_guard_label,
+                                                    header )
+                                              in
+                                              let values_block =
+                                                {
+                                                  Cfg.label = values_label;
+                                                  body = values_body;
+                                                  term = values_term;
+                                                  preds = [];
+                                                  succs =
+                                                    Cfg.successors values_term;
+                                                }
+                                              in
+
+                                              let scale_guard_term =
+                                                Cfg.BranchCompare
+                                                  ( Ge,
+                                                    bias_operand,
+                                                    Tcg.Imm 0L,
+                                                    bias_guard_label,
+                                                    header )
+                                              in
+                                              let scale_guard_block =
+                                                {
+                                                  Cfg.label = scale_guard_label;
+                                                  body = [];
+                                                  term = scale_guard_term;
+                                                  preds = [];
+                                                  succs =
+                                                    Cfg.successors
+                                                      scale_guard_term;
+                                                }
+                                              in
+
+                                              let bias_guard_term =
+                                                Cfg.BranchCompare
+                                                  ( Gt,
+                                                    step_operand,
+                                                    Tcg.Imm 0L,
+                                                    step_guard_label,
+                                                    header )
+                                              in
+                                              let bias_guard_block =
+                                                {
+                                                  Cfg.label = bias_guard_label;
+                                                  body = [];
+                                                  term = bias_guard_term;
+                                                  preds = [];
+                                                  succs =
+                                                    Cfg.successors
+                                                      bias_guard_term;
+                                                }
+                                              in
+
+                                              let max_step = fresh_temp () in
+                                              let step_guard_body =
+                                                [ simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( max_step,
+                                                         Div,
+                                                         Tcg.Imm 2147483647L,
+                                                         scale_operand )) ]
+                                              in
+                                              let step_guard_term =
+                                                Cfg.BranchCompare
+                                                  ( Le,
+                                                    step_operand,
+                                                    Tcg.Temp max_step,
+                                                    product_guard_label,
+                                                    header )
+                                              in
+                                              let step_guard_block =
+                                                {
+                                                  Cfg.label = step_guard_label;
+                                                  body = step_guard_body;
+                                                  term = step_guard_term;
+                                                  preds = [];
+                                                  succs =
+                                                    Cfg.successors
+                                                      step_guard_term;
+                                                }
+                                              in
+
+                                              let product_guard_term =
+                                                Cfg.BranchCompare
+                                                  ( Gt,
+                                                    bound_operand,
+                                                    bias_operand,
+                                                    bound_guard_label,
+                                                    header )
+                                              in
+                                              let product_guard_block =
+                                                {
+                                                  Cfg.label =
+                                                    product_guard_label;
+                                                  body = [];
+                                                  term = product_guard_term;
+                                                  preds = [];
+                                                  succs =
+                                                    Cfg.successors
+                                                      product_guard_term;
+                                                }
+                                              in
+
+                                              let effective_step =
+                                                fresh_temp ()
+                                              in
+                                              let adjusted_bound =
+                                                fresh_temp ()
+                                              in
+                                              let max_control_delta =
+                                                fresh_temp ()
+                                              in
+                                              let bound_guard_body =
+                                                [ simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( effective_step,
+                                                         Mul,
+                                                         step_operand,
+                                                         scale_operand ));
+                                                  simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( adjusted_bound,
+                                                         Sub,
+                                                         bound_operand,
+                                                         bias_operand ));
+                                                  simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( max_control_delta,
+                                                         Sub,
+                                                         Tcg.Imm 2147483647L,
+                                                         bias_operand )) ]
+                                              in
+                                              let bound_guard_term =
+                                                Cfg.Jump calc_label
+                                              in
+                                              let bound_guard_block =
+                                                {
+                                                  Cfg.label = bound_guard_label;
+                                                  body = bound_guard_body;
+                                                  term = bound_guard_term;
+                                                  preds = [];
+                                                  succs = [ calc_label ];
+                                                }
+                                              in
+
+                                              let quotient = fresh_temp () in
+                                              let remainder = fresh_temp () in
+                                              let has_remainder =
+                                                fresh_temp ()
+                                              in
+                                              let trip = fresh_temp () in
+                                              let max_trip = fresh_temp () in
+                                              let calc_body =
+                                                [ simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( quotient,
+                                                         Div,
+                                                         Tcg.Temp
+                                                           adjusted_bound,
+                                                         Tcg.Temp
+                                                           effective_step ));
+                                                  simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( remainder,
+                                                         Mod,
+                                                         Tcg.Temp
+                                                           adjusted_bound,
+                                                         Tcg.Temp
+                                                           effective_step ));
+                                                  simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( has_remainder,
+                                                         Ne,
+                                                         Tcg.Temp remainder,
+                                                         Tcg.Imm 0L ));
+                                                  simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( trip,
+                                                         Add,
+                                                         Tcg.Temp quotient,
+                                                         Tcg.Temp
+                                                           has_remainder ));
+                                                  simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( max_trip,
+                                                         Div,
+                                                         Tcg.Temp
+                                                           max_control_delta,
+                                                         Tcg.Temp
+                                                           effective_step )) ]
+                                              in
+                                              let calc_term =
+                                                Cfg.BranchCompare
+                                                  ( Le,
+                                                    Tcg.Temp trip,
+                                                    Tcg.Temp max_trip,
+                                                    apply_label,
+                                                    header )
+                                              in
+                                              let calc_block =
+                                                {
+                                                  Cfg.label = calc_label;
+                                                  body = calc_body;
+                                                  term = calc_term;
+                                                  preds = [];
+                                                  succs =
+                                                    Cfg.successors calc_term;
+                                                }
+                                              in
+
+                                              let triangle_instrs, triangle =
+                                                build_triangle_number_instrs
+                                                  fresh_temp trip
+                                              in
+                                              let base_delta =
+                                                fresh_temp ()
+                                              in
+                                              let series_delta =
+                                                fresh_temp ()
+                                              in
+                                              let total_delta =
+                                                fresh_temp ()
+                                              in
+                                              let apply_body =
+                                                triangle_instrs
+                                                @ [ simplify_simple_instr
+                                                      (Tcg.Bin
+                                                         ( base_delta,
+                                                           Mul,
+                                                           Tcg.Temp trip,
+                                                           Tcg.Temp
+                                                             derived_temp ));
+                                                    simplify_simple_instr
+                                                      (Tcg.Bin
+                                                         ( series_delta,
+                                                           Mul,
+                                                           Tcg.Temp triangle,
+                                                           delta_operand ));
+                                                    simplify_simple_instr
+                                                      (Tcg.Bin
+                                                         ( total_delta,
+                                                           Add,
+                                                           Tcg.Temp
+                                                             base_delta,
+                                                           Tcg.Temp
+                                                             series_delta ));
+                                                    simplify_simple_instr
+                                                      (Tcg.Bin
+                                                         ( acc_temp,
+                                                           Add,
+                                                           Tcg.Temp acc_temp,
+                                                           Tcg.Temp
+                                                             total_delta )) ]
+                                              in
+                                              let apply_block =
+                                                {
+                                                  Cfg.label = apply_label;
+                                                  body = apply_body;
+                                                  term =
+                                                    Cfg.Jump exit_label;
+                                                  preds = [];
+                                                  succs = [ exit_label ];
+                                                }
+                                              in
+
+                                              List.iter
+                                                (fun
+                                                  (new_block : Cfg.block) ->
+                                                  Hashtbl.replace
+                                                    current_blocks
+                                                    new_block.label
+                                                    new_block;
+                                                  new_blocks_rev :=
+                                                    new_block.label
+                                                    :: !new_blocks_rev)
+                                                [ values_block;
+                                                  scale_guard_block;
+                                                  bias_guard_block;
+                                                  step_guard_block;
+                                                  product_guard_block;
+                                                  bound_guard_block;
+                                                  calc_block;
+                                                  apply_block ];
+
+                                              changed := true;
+                                              if debug then
+                                                Printf.eprintf
+                                                  "lve-runtime-invariant-affine-summary func=%s header=%s iv=t%d scale=%s bias=%s acc=t%d derived=t%d step=%s bound=%s delta=%s fallback=%s\n%!"
+                                                  f.name header iv_temp
+                                                  (string_of_loop_inv_expr
+                                                     control_scale)
+                                                  (string_of_loop_inv_expr
+                                                     control_bias)
+                                                  acc_temp derived_temp
+                                                  (string_of_lve_operand
+                                                     step_operand)
+                                                  (string_of_lve_operand
+                                                     bound_operand)
+                                                  (string_of_lve_operand
+                                                     delta_operand)
+                                                  header
+                                            end else begin
                                               let guard_label = fresh_label "guard" in
                                               let calc_label = fresh_label "calc" in
                                               let apply_label = fresh_label "apply" in
@@ -16107,7 +17328,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                   (string_of_lve_operand bound_operand)
                                                   (string_of_lve_operand delta_operand)
                                                   header
-                                            end)
+                                             end)
       | _ -> reject header "outside-predecessor-count")
       headers;
 
