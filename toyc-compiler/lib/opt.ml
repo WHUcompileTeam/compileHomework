@@ -13065,6 +13065,7 @@ let collect_counted_reductions
   let summary_expr_semantic_equal lhs rhs =
     summary_semantic_key lhs
     = summary_semantic_key rhs
+  in
 
   let basic_iv_semantic_equal
       (lhs : basic_induction_var)
