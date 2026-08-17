@@ -3505,7 +3505,7 @@ let mem2reg_eliminate_trivial_phi_temps
     Cfg.rebuild_edges { f with blocks }
   end
 
-let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
+let mem2reg_func ?(optimistic_loop_phi = false) ?(preserve_loop_phi_shape = false) (f : Cfg.func) =
   let all_candidates = collect_local_ids f in
   let rec attempt (current : Cfg.func) candidates =
     if IntSet.is_empty candidates then current
@@ -3987,11 +3987,21 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
         let debug_phi =
           Sys.getenv_opt "TOYC_DEBUG_MEM2REG_EDGE_COPY" <> None
         in
+        (* v51 early-shape bridge: the old high-performing pipeline kept the
+           freshly lowered PHI/edge-copy structure intact until loop
+           canonicalization / diamond splitting had consumed it.  Item4 added
+           self-trivial PHI elimination here; that is semantically useful, but
+           doing it in the first mem2reg pass can erase exactly the recurrence
+           shape used by split_counted_diamond_loops_func.  Allow callers to
+           preserve this representation in the early analysis pass only. *)
         let before_compact =
-          mem2reg_eliminate_trivial_phi_temps
-            ~debug:debug_phi
+          if preserve_loop_phi_shape then
             before_phi_elim
-            safe_substitutions
+          else
+            mem2reg_eliminate_trivial_phi_temps
+              ~debug:debug_phi
+              before_phi_elim
+              safe_substitutions
         in
         if debug_phi then begin
           let uses = temp_use_counts before_compact in
@@ -4040,8 +4050,11 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
             before_phi_elim.temp_count
         end;
         let promoted =
-          before_compact
-          |> compact_temp_ids_func ~debug_tag:"mem2reg"
+          if preserve_loop_phi_shape then
+            before_compact
+          else
+            before_compact
+            |> compact_temp_ids_func ~debug_tag:"mem2reg"
         in
         if IntSet.is_empty !failed then promoted else attempt promoted !failed
     end
@@ -28095,72 +28108,28 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       debug_lcssa_lite_report summaries globals current
     end
   in
-  (* v48 experimental hybrid early mem2reg.
+  (* v51: restore the early representation used by the old high-performing
+     step113 pipeline: conservative mem2reg, but preserve lowered loop-PHI edge
+     copies until loop canonicalization / diamond splitting has consumed them.
 
-     v46 established that making *all* early loop PHIs optimistic is unsound
-     for the current counted-loop provenance model:
+     This separates two concerns that item4 accidentally coupled:
+       - correctness: do NOT use optimistic loop-PHI promotion before trusted
+         recurrence analysis;
+       - performance: do NOT erase/compact the conservative PHI transport shape
+         before branch-loop splitting sees it.
 
-       tailrec_acc_sum        21 -> 15
-       nest3_rect_small       14 -> 95
-
-     But keeping every function conservative also causes a large p07_loop
-     regression, because ordinary one-level loops never expose their scalar
-     IV/reduction PHIs early enough.
-
-     Recover that performance without re-opening the two known unsafe classes:
-       - a true nested natural-loop forest stays conservative;
-       - a synthetic tail-recursion entry stays conservative;
-       - otherwise, when explicitly enabled, use optimistic loop-PHI mem2reg.
-
-     Note that "multiple loops" is NOT treated as nested: two sequential sibling
-     loops may still use the optimistic path.  We test actual containment of one
-     natural-loop header in another natural-loop body. *)
-  (* v49 submission behavior: the evaluator only sees the repository and does
-     not provide feature-enable environment variables.  Make the already-gated
-     hybrid policy the default, while retaining an explicit disable switch for
-     local rollback/debugging. *)
-  let enable_hybrid_early_optimistic_mem2reg =
-    Sys.getenv_opt "TOYC_DISABLE_HYBRID_EARLY_OPTIMISTIC_MEM2REG" = None
-  in
-  let _, early_loops, early_headers = discover_natural_loops f in
-  let has_nested_natural_loop =
-    List.exists
-      (fun parent_header ->
-        let parent_loop =
-          table_find_or_empty early_loops parent_header LabelSet.empty
-        in
-        List.exists
-          (fun child_header ->
-            child_header <> parent_header
-            && LabelSet.mem child_header parent_loop)
-          early_headers)
-      early_headers
-  in
-  let synthetic_tail_entry =
-    contains_substring f.entry "_tail_entry_"
-  in
-  let use_early_optimistic_mem2reg =
-    enable_hybrid_early_optimistic_mem2reg
-    && not has_nested_natural_loop
-    && not synthetic_tail_entry
-  in
+     Later/cascade mem2reg passes keep the normal aggressive cleanup. *)
   let early_mem2reg =
-    if use_early_optimistic_mem2reg then
-      mem2reg_func ~optimistic_loop_phi:true f
-    else
-      mem2reg_func f
+    mem2reg_func ~preserve_loop_phi_shape:true f
   in
   if
     Sys.getenv_opt "TOYC_DEBUG_EARLY_MEM2REG_MODE" <> None
     || Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None
   then
     Printf.eprintf
-      "early-mem2reg-mode func=%s mode=%s nested=%b tail-entry=%b loops=%d\n%!"
+      "early-mem2reg-mode func=%s mode=conservative-preserve-shape loops=%d\n%!"
       f.name
-      (if use_early_optimistic_mem2reg then "optimistic" else "conservative")
-      has_nested_natural_loop
-      synthetic_tail_entry
-      (List.length early_headers);
+      (let _, _, headers = discover_natural_loops f in List.length headers);
   let promoted_before_move_cleanup =
     early_mem2reg |> promote_globals_func summaries globals
   in
