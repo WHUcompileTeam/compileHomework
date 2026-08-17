@@ -23562,11 +23562,14 @@ let item6_canonical_adoption_audit (f : Cfg.func) =
 
 let algebra_canonicalize_func (f : Cfg.func) =
   let () = item6_canonical_adoption_audit f in
-  (* item6 v4/v5: consume the shared canonical scalar identity only when it
-     proves an entire operation can collapse.  v4 folds semantic self-ops;
-     v5 extends the existing add/sub cancellation matcher to canonical-equal
-     operands.  Neither pass reassociates or reifies a canonical expression
-     tree, so downstream passes keep their preferred physical IR shapes. *)
+  (* item6 v4/v5/v6: consume the shared canonical scalar identity only when
+     it proves an entire operation can collapse.  v4 folds semantic self-ops;
+     v5 extends the existing one-level add/sub cancellation matcher to
+     canonical-equal operands.  v6 additionally computes the canonical
+     remainder of a subtraction, but only materializes it when the whole
+     remainder collapses to a single Move (an existing temp or immediate).
+     This deliberately avoids rebuilding/reassociating expression trees, so
+     downstream passes keep their preferred physical IR shapes. *)
   let semantic_analyze = make_linear_analyzer f in
   let _, _, def_instrs, multi_defs =
     analyze_temp_defs_of_blocks f.temp_count f.blocks
@@ -23599,6 +23602,34 @@ let algebra_canonicalize_func (f : Cfg.func) =
   let semantic_only_equal lhs rhs =
     not (operand_equal lhs rhs)
     && semantic_operand_equal lhs rhs
+  in
+  let semantic_sub_remainder_move dst lhs rhs =
+    (* Unlike v5's one-level matcher, compare the complete canonical linear
+       forms.  This catches shapes such as
+
+           a = (x + one) + two
+           b = one + two
+           a - b  ==>  x
+
+       but still refuses to synthesize a new arithmetic tree.  Only a complete
+       collapse to one existing operand/immediate is accepted. *)
+    let remainder =
+      canonical_scalar_sub
+        (semantic_analyze lhs)
+        (semantic_analyze rhs)
+    in
+    let key = canonical_scalar_key_of_form remainder in
+    if not (canonical_key_uses_only_unique_temps key) then
+      None
+    else
+      match reify_linear_one_instr dst remainder with
+      | Some (Tcg.Move _ as rewritten) -> Some rewritten
+      | Some (Tcg.Un _)
+      | Some (Tcg.Bin _)
+      | Some (Tcg.Load _)
+      | Some (Tcg.Store _)
+      | Some (Tcg.Call _)
+      | None -> None
   in
   let use_counts = temp_use_counts f.blocks in
   let use_count temp =
@@ -23746,6 +23777,7 @@ let algebra_canonicalize_func (f : Cfg.func) =
   let rewrites = ref 0 in
   let cancellation_rewrites = ref 0 in
   let semantic_cancellation_rewrites = ref 0 in
+  let semantic_remainder_rewrites = ref 0 in
   let semantic_self_rewrites = ref 0 in
   let semantic_self_fold = function
     | Tcg.Bin
@@ -23807,18 +23839,23 @@ let algebra_canonicalize_func (f : Cfg.func) =
               if semantic then incr semantic_cancellation_rewrites;
               rewritten
           | None -> (
-              match (lhs, rhs) with
-              | lhs, Tcg.Imm c -> (
-                  match affine_of_operand IntSet.empty lhs with
-                  | Some (base, sign, bias, true) ->
-                      build_affine dst (base, sign, sub_i32 bias c)
-                  | Some _ | None -> initial)
-              | Tcg.Imm c, rhs -> (
-                  match affine_of_operand IntSet.empty rhs with
-                  | Some (base, sign, bias, true) ->
-                      build_affine dst (base, -sign, sub_i32 c bias)
-                  | Some _ | None -> initial)
-              | Tcg.Temp _, Tcg.Temp _ -> initial))
+              match semantic_sub_remainder_move dst lhs rhs with
+              | Some rewritten ->
+                  incr semantic_remainder_rewrites;
+                  rewritten
+              | None -> (
+                  match (lhs, rhs) with
+                  | lhs, Tcg.Imm c -> (
+                      match affine_of_operand IntSet.empty lhs with
+                      | Some (base, sign, bias, true) ->
+                          build_affine dst (base, sign, sub_i32 bias c)
+                      | Some _ | None -> initial)
+                  | Tcg.Imm c, rhs -> (
+                      match affine_of_operand IntSet.empty rhs with
+                      | Some (base, sign, bias, true) ->
+                          build_affine dst (base, -sign, sub_i32 c bias)
+                      | Some _ | None -> initial)
+                  | Tcg.Temp _, Tcg.Temp _ -> initial)))
       | Tcg.Bin (dst, Mul, lhs, rhs) ->
           let lhs, rhs =
             match (lhs, rhs) with
@@ -23854,9 +23891,10 @@ let algebra_canonicalize_func (f : Cfg.func) =
   in
   if Sys.getenv_opt "TOYC_DEBUG_ALGEBRA" <> None then
     Printf.eprintf
-      "algebra func=%s rewrites=%d cancellations=%d semantic-cancellations=%d semantic-self=%d\n%!"
+      "algebra func=%s rewrites=%d cancellations=%d semantic-cancellations=%d semantic-remainders=%d semantic-self=%d\n%!"
       f.name !rewrites !cancellation_rewrites
-      !semantic_cancellation_rewrites !semantic_self_rewrites;
+      !semantic_cancellation_rewrites !semantic_remainder_rewrites
+      !semantic_self_rewrites;
   if
     Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" <> None
     && !semantic_self_rewrites > 0
@@ -23871,6 +23909,13 @@ let algebra_canonicalize_func (f : Cfg.func) =
     Printf.eprintf
       "item6-semantic-cancel func=%s rewrites=%d\n%!"
       f.name !semantic_cancellation_rewrites;
+  if
+    Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" <> None
+    && !semantic_remainder_rewrites > 0
+  then
+    Printf.eprintf
+      "item6-semantic-remainder func=%s rewrites=%d\n%!"
+      f.name !semantic_remainder_rewrites;
   if !rewrites = 0 then f else Cfg.rebuild_edges { f with blocks }
 
 let general_linear_canonicalize_func (f : Cfg.func) =
