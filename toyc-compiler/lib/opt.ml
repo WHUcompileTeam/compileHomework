@@ -32615,6 +32615,73 @@ let find_late_store_cfg_inline_profitable_site
   in
   find f.blocks
 
+(* item7 v16: roll the same incremental static-growth profitability policy
+   out to CFG Div/Mod and the narrow cyclic CFG Div/Mod inliner.  This is a
+   generic CFG-site policy: it measures code/temp namespace duplicated by
+   repeated same-callee sites, rather than the caller's absolute temp_count.
+
+   Keep semantic eligibility separate from profitability.  The family-specific
+   candidate tables still decide whether Store/Call/DivMod/cycle shapes are
+   legal; this helper only decides whether cloning a legal CFG candidate is
+   worthwhile.  A rejected site is skipped rather than stopping the whole
+   caller, avoiding head-of-line blocking for unknown programs. *)
+let item7_debug_cfg_growth_policy_v16 family
+    (f : Cfg.func)
+    ((site_label, _, _, callee_label, _, _, _) : late_store_cfg_inline_site)
+    (metrics : item7_store_cfg_growth_metrics)
+    decision =
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_PROFIT_POLICY" <> None then
+    Printf.eprintf
+      "item7-profit-policy family=%s caller=%s callee=%s site=%s decision=%s in-loop=%d repeat=%d callee-instrs=%d static-instr-growth=%d static-temp-growth=%d instr-budget=%d temp-budget=%d\n%!"
+      family f.name callee_label site_label decision
+      (if metrics.item7_growth_in_loop then 1 else 0)
+      metrics.item7_growth_repeat_sites
+      metrics.item7_growth_callee_instrs
+      metrics.item7_growth_static_instrs
+      metrics.item7_growth_static_temps
+      item7_inline_static_growth_instr_budget
+      item7_inline_static_growth_temp_budget
+
+let find_item7_cfg_growth_profitable_site_v16
+    family
+    (table : (string, Cfg.func) Hashtbl.t)
+    (f : Cfg.func) : late_store_cfg_inline_site option =
+  let rec find_in_body block_label rev_prefix = function
+    | [] -> None
+    | (Tcg.Call (dst_opt, callee, args) as instr) :: rest -> (
+        match Hashtbl.find_opt table callee with
+        | Some (candidate : Cfg.func)
+          when callee <> f.label
+               && List.length args = List.length candidate.params ->
+            let site =
+              ( block_label,
+                List.rev rev_prefix,
+                dst_opt,
+                callee,
+                args,
+                rest,
+                candidate )
+            in
+            let metrics = item7_store_cfg_growth_metrics f site in
+            let profitable = item7_store_cfg_growth_profitable metrics in
+            item7_debug_cfg_growth_policy_v16 family f site metrics
+              (if profitable then "allow" else "reject-static-growth");
+            if profitable then Some site
+            else find_in_body block_label (instr :: rev_prefix) rest
+        | Some _ | None ->
+            find_in_body block_label (instr :: rev_prefix) rest)
+    | instr :: rest ->
+        find_in_body block_label (instr :: rev_prefix) rest
+  in
+  let rec find = function
+    | [] -> None
+    | (block : Cfg.block) :: rest -> (
+        match find_in_body block.label [] block.body with
+        | Some _ as site -> site
+        | None -> find rest)
+  in
+  find f.blocks
+
 let inline_late_store_cfg_calls_func summaries globals
     (table : (string, Cfg.func) Hashtbl.t)
     (f : Cfg.func) =
@@ -32798,14 +32865,78 @@ let block_labels_in_natural_loops (f : Cfg.func) =
     (fun _ loop acc -> LabelSet.union loop acc)
     loops LabelSet.empty
 
+(* item7 v17: move the single-block Div/Mod inliner onto the same
+   incremental static-growth profitability foundation used by Store-CFG and
+   Div/Mod-CFG.  Keep scalar semantic eligibility unchanged: the callee must
+   still be a one-block leaf and every Div/Mod is cloned literally, with no
+   post-inline DCE.
+
+   Unlike CFG-site finders, the scalar inliner already scans past a rejected
+   call, so it has no head-of-line blocking bug.  The remaining old heuristic
+   here was only the absolute [caller temps + callee temps <= 40] guard.
+   Replace that with marginal static expansion: repeated same-callee sites must
+   fit the shared growth budgets.  This avoids penalizing an already-large
+   caller merely for existing, while still bounding repeated code/temp cloning. *)
+type item7_scalar_growth_metrics = {
+  item7_scalar_repeat_sites : int;
+  item7_scalar_callee_instrs : int;
+  item7_scalar_static_instrs : int;
+  item7_scalar_static_temps : int;
+  item7_scalar_in_loop : bool;
+}
+
+let item7_divmod_scalar_growth_metrics
+    (f : Cfg.func)
+    block_label
+    callee_label
+    (candidate : late_divmod_scalar_inline_candidate) =
+  let repeat_sites =
+    max 1 (item7_count_direct_calls_to_label_early f callee_label)
+  in
+  let callee_instrs = List.length candidate.divmod_scalar_block.body in
+  {
+    item7_scalar_repeat_sites = repeat_sites;
+    item7_scalar_callee_instrs = callee_instrs;
+    item7_scalar_static_instrs = repeat_sites * callee_instrs;
+    item7_scalar_static_temps =
+      repeat_sites * candidate.divmod_scalar_func.temp_count;
+    item7_scalar_in_loop =
+      LabelSet.mem block_label (block_labels_in_natural_loops f);
+  }
+
+let item7_divmod_scalar_growth_profitable
+    (metrics : item7_scalar_growth_metrics) =
+  metrics.item7_scalar_repeat_sites <= 1
+  ||
+  (metrics.item7_scalar_static_instrs
+     <= item7_inline_static_growth_instr_budget
+   && metrics.item7_scalar_static_temps
+      <= item7_inline_static_growth_temp_budget)
+
+let item7_debug_divmod_scalar_growth_policy
+    (f : Cfg.func)
+    block_label
+    callee_label
+    (metrics : item7_scalar_growth_metrics)
+    decision =
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_PROFIT_POLICY" <> None then
+    Printf.eprintf
+      "item7-profit-policy family=divmod-scalar caller=%s callee=%s site=%s decision=%s in-loop=%d repeat=%d callee-instrs=%d static-instr-growth=%d static-temp-growth=%d instr-budget=%d temp-budget=%d\n%!"
+      f.name callee_label block_label decision
+      (if metrics.item7_scalar_in_loop then 1 else 0)
+      metrics.item7_scalar_repeat_sites
+      metrics.item7_scalar_callee_instrs
+      metrics.item7_scalar_static_instrs
+      metrics.item7_scalar_static_temps
+      item7_inline_static_growth_instr_budget
+      item7_inline_static_growth_temp_budget
+
 let rewrite_late_divmod_scalar_calls_func
     (table : (string, late_divmod_scalar_inline_candidate) Hashtbl.t)
     (f : Cfg.func) =
   let next_temp = ref f.temp_count in
   let sites_left = ref late_scalar_inline_max_sites_per_func in
   let replaced = ref 0 in
-  let loop_labels = block_labels_in_natural_loops f in
-
   let expand_call dst_opt args
       (candidate : late_divmod_scalar_inline_candidate) =
     let callee = candidate.divmod_scalar_func in
@@ -32856,18 +32987,24 @@ let rewrite_late_divmod_scalar_calls_func
         when !sites_left > 0 -> (
           match Hashtbl.find_opt table callee with
           | Some candidate when callee <> f.label ->
-              let in_loop = LabelSet.mem block_label loop_labels in
-              let projected = !next_temp + candidate.divmod_scalar_func.temp_count in
-              let profitable =
-                in_loop
-                || projected <= late_store_cfg_inline_nonloop_projected_temp_cap
+              let metrics =
+                item7_divmod_scalar_growth_metrics
+                  f block_label callee candidate
               in
+              let profitable =
+                item7_divmod_scalar_growth_profitable metrics
+              in
+              item7_debug_divmod_scalar_growth_policy
+                f block_label callee metrics
+                (if profitable then "allow" else "reject-static-growth");
               if not profitable then begin
                 if Sys.getenv_opt "TOYC_DEBUG_ITEM7_DIVMOD_GUARD" <> None then
                   Printf.eprintf
-                    "item7-divmod-guard caller=%s callee=%s site=%s projected=%d cap=%d reason=nonloop-pressure\n%!"
-                    f.name candidate.divmod_scalar_func.name block_label projected
-                    late_store_cfg_inline_nonloop_projected_temp_cap;
+                    "item7-divmod-guard caller=%s callee=%s site=%s repeat=%d static-instr-growth=%d static-temp-growth=%d reason=static-growth\n%!"
+                    f.name candidate.divmod_scalar_func.name block_label
+                    metrics.item7_scalar_repeat_sites
+                    metrics.item7_scalar_static_instrs
+                    metrics.item7_scalar_static_temps;
                 loop (instr :: rev_acc) rest
               end else (
                 match expand_call dst_opt args candidate with
@@ -33048,24 +33185,16 @@ let inline_late_divmod_cfg_calls_func
   let rec apply serial fuel count current =
     if fuel = 0 then (current, count)
     else
-      match find_late_store_cfg_inline_site table current with
+      match
+        find_item7_cfg_growth_profitable_site_v16
+          "divmod-cfg" table current
+      with
       | None -> (current, count)
       | Some site ->
-          if not (late_store_cfg_inline_site_profitable current site) then begin
-            if Sys.getenv_opt "TOYC_DEBUG_ITEM7_DIVMOD_CFG_GUARD" <> None then begin
-              let site_label, _, _, callee_label, _, _, callee = site in
-              Printf.eprintf
-                "item7-divmod-cfg-guard caller=%s callee=%s site=%s caller-temps=%d callee-temps=%d projected=%d cap=%d reason=nonloop-pressure\n%!"
-                current.name callee_label site_label current.temp_count
-                callee.temp_count (current.temp_count + callee.temp_count)
-                late_store_cfg_inline_nonloop_projected_temp_cap
-            end;
-            (current, count)
-          end else
-            match inline_one_late_store_cfg_call serial current site with
-            | None -> (current, count)
-            | Some next ->
-                apply (serial + 1) (fuel - 1) (count + 1) next
+          match inline_one_late_store_cfg_call serial current site with
+          | None -> (current, count)
+          | Some next ->
+              apply (serial + 1) (fuel - 1) (count + 1) next
   in
   apply 0 late_store_cfg_inline_max_sites_per_func 0 f
 
@@ -33250,26 +33379,16 @@ let inline_late_divmod_singleblock_cycle_calls_func
   let rec apply serial fuel count current =
     if fuel = 0 then (current, count)
     else
-      match find_late_store_cfg_inline_site table current with
+      match
+        find_item7_cfg_growth_profitable_site_v16
+          "divmod-cycle" table current
+      with
       | None -> (current, count)
       | Some site ->
-          if not (late_store_cfg_inline_site_profitable current site) then begin
-            if
-              Sys.getenv_opt "TOYC_DEBUG_ITEM7_DIVMOD_CYCLE_GUARD" <> None
-            then begin
-              let site_label, _, _, callee_label, _, _, callee = site in
-              Printf.eprintf
-                "item7-divmod-cycle-guard caller=%s callee=%s site=%s caller-temps=%d callee-temps=%d projected=%d cap=%d reason=nonloop-pressure\n%!"
-                current.name callee_label site_label current.temp_count
-                callee.temp_count (current.temp_count + callee.temp_count)
-                late_store_cfg_inline_nonloop_projected_temp_cap
-            end;
-            (current, count)
-          end else
-            match inline_one_late_store_cfg_call serial current site with
-            | None -> (current, count)
-            | Some next ->
-                apply (serial + 1) (fuel - 1) (count + 1) next
+          match inline_one_late_store_cfg_call serial current site with
+          | None -> (current, count)
+          | Some next ->
+              apply (serial + 1) (fuel - 1) (count + 1) next
   in
   apply 0 late_store_cfg_inline_max_sites_per_func 0 f
 
@@ -33302,6 +33421,294 @@ let inline_late_divmod_singleblock_cycle_calls_program
   if Sys.getenv_opt "TOYC_DEBUG_ITEM7_DIVMOD_CYCLE_INLINE" <> None then
     Printf.eprintf
       "item7-divmod-cycle-inline replaced=%d\n%!" !total_replaced;
+  result
+
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v18: generalized sparse-oversize cyclic Div/Mod inline               *)
+(*                                                                            *)
+(* #7.7 starts by removing one coarse eligibility proxy rather than tuning it: *)
+(* [block_count <= 6] is not itself a code-size metric.  A CFG with many small  *)
+(* blocks can be cheaper to clone than a dense six-block CFG.  For the already  *)
+(* validated single-natural-loop Div/Mod family, admit >6-block callees only    *)
+(* when their estimated cloned IR footprint fits the SAME 32-unit growth budget *)
+(* used by the unified profitability policy.                                   *)
+(*                                                                            *)
+(* Clone units count every simple instruction plus one unit for every block     *)
+(* terminator.  Thus control-flow structure is not free: an arbitrarily large   *)
+(* graph of empty blocks still consumes budget.  There is deliberately no new   *)
+(* magic block threshold.  Instruction/temp semantic limits remain conservative;*)
+(* Store, nested Call, non-parameter Local loads and void returns stay rejected. *)
+(* The loop shape remains the v13-proven narrow shape: exactly one natural loop, *)
+(* one loop block, one latch and one exit-control.  Div/Mod is cloned literally  *)
+(* and no post-inline DCE/full reoptimization is run.                           *)
+(* -------------------------------------------------------------------------- *)
+
+let item7_cfg_clone_units (blocks : Cfg.block list) =
+  List.fold_left
+    (fun acc (block : Cfg.block) ->
+      acc + List.length block.body + 1)
+    0 blocks
+
+let late_divmod_sparse_oversize_cycle_candidate
+    (f : Cfg.func) : Cfg.func option =
+  if f.ret <> TInt then None
+  else
+    let view =
+      f
+      |> thread_and_prune_func
+      |> simplify_cfg_func
+      |> final_linear_merge_func
+      |> thread_and_prune_func
+    in
+    if not (cfg_targets_valid view) then None
+    else
+      let reachable = reachable_labels view.entry view.blocks in
+      let blocks =
+        List.filter
+          (fun (block : Cfg.block) -> LabelSet.mem block.label reachable)
+          view.blocks
+      in
+      let view = { view with blocks } in
+      let block_count = List.length blocks in
+      let instr_count =
+        List.fold_left
+          (fun acc (block : Cfg.block) -> acc + List.length block.body)
+          0 blocks
+      in
+      let clone_units = item7_cfg_clone_units blocks in
+      let param_ids =
+        List.fold_left
+          (fun acc (param : Tcg.var) -> IntSet.add param.id acc)
+          IntSet.empty view.params
+      in
+      let has_divmod = ref false in
+      let instr_safe = function
+        | Tcg.Move _ | Tcg.Un _ -> true
+        | Tcg.Bin (_, (Div | Mod), _, _) ->
+            has_divmod := true;
+            true
+        | Tcg.Bin _ -> true
+        | Tcg.Load (_, Tcg.Local id) -> IntSet.mem id param_ids
+        | Tcg.Load (_, Tcg.Global _) -> true
+        | Tcg.Store _ | Tcg.Call _ -> false
+      in
+      let term_safe = function
+        | Cfg.Return (Some _)
+        | Cfg.Jump _
+        | Cfg.BranchZero _
+        | Cfg.BranchNonZero _
+        | Cfg.BranchCompare _ ->
+            true
+        | Cfg.Return None -> false
+      in
+      let has_value_return =
+        List.exists
+          (fun (block : Cfg.block) ->
+            match block.term with
+            | Cfg.Return (Some _) -> true
+            | Cfg.Return None
+            | Cfg.Jump _
+            | Cfg.BranchZero _
+            | Cfg.BranchNonZero _
+            | Cfg.BranchCompare _ ->
+                false)
+          blocks
+      in
+      let all_safe =
+        List.for_all
+          (fun (block : Cfg.block) ->
+            List.for_all instr_safe block.body && term_safe block.term)
+          blocks
+      in
+      (* This pass is specifically the >6-block slice.  Existing v13 handles
+         within-size cyclic helpers, so there is no overlap in responsibility. *)
+      if
+        block_count <= late_branch_inline_max_blocks
+        || instr_count > late_branch_inline_max_instrs
+        || clone_units > item7_inline_static_growth_instr_budget
+        || view.temp_count > late_branch_inline_max_temps
+        || not all_safe
+        || not !has_divmod
+        || not has_value_return
+      then None
+      else
+        let ignored = Hashtbl.create 1 in
+        if cfg_acyclic_ignoring_edges view ignored then None
+        else
+          let report = build_loop_simplify_report view in
+          let forest = report.loop_simplify_forest in
+          match forest.loop_forest_headers, forest.loop_forest_roots with
+          | [ header ], [ root ] when header = root ->
+              begin
+                match
+                  Hashtbl.find_opt forest.loop_forest_infos header,
+                  Hashtbl.find_opt report.loop_simplify_infos header
+                with
+                | Some loop_info, Some simplify_info
+                  when LabelSet.cardinal loop_info.loop_info_blocks = 1
+                       && List.length loop_info.loop_info_latches = 1
+                       && List.length loop_info.loop_info_exit_edges = 1
+                       && simplify_info.loop_simplify_single_latch
+                       && simplify_info.loop_simplify_single_exit_control ->
+                    Some view
+                | Some _, Some _ | None, _ | _, None -> None
+              end
+          | _ -> None
+
+let build_late_divmod_sparse_oversize_cycle_table
+    (funcs : Cfg.func list) : (string, Cfg.func) Hashtbl.t =
+  let table = Hashtbl.create (max 8 (List.length funcs)) in
+  List.iter
+    (fun (f : Cfg.func) ->
+      match late_divmod_sparse_oversize_cycle_candidate f with
+      | None -> ()
+      | Some candidate ->
+          Hashtbl.replace table f.label candidate;
+          if Sys.getenv_opt "TOYC_DEBUG_ITEM7_OVERSIZE_CYCLE_INLINE" <> None then
+            Printf.eprintf
+              "item7-oversize-cycle-candidate func=%s blocks=%d instrs=%d clone-units=%d temps=%d params=%d\n%!"
+              f.name (List.length candidate.blocks)
+              (List.fold_left
+                 (fun acc (block : Cfg.block) -> acc + List.length block.body)
+                 0 candidate.blocks)
+              (item7_cfg_clone_units candidate.blocks)
+              candidate.temp_count (List.length candidate.params))
+    funcs;
+  table
+
+type item7_sparse_cycle_growth_metrics = {
+  item7_sparse_repeat_sites : int;
+  item7_sparse_clone_units : int;
+  item7_sparse_static_clone_units : int;
+  item7_sparse_static_temps : int;
+  item7_sparse_in_loop : bool;
+}
+
+let item7_sparse_cycle_growth_metrics
+    (f : Cfg.func)
+    (((_, _, _, callee_label, _, _, callee) as site)
+      : late_store_cfg_inline_site) =
+  let repeat_sites =
+    max 1 (item7_count_direct_calls_to_label_early f callee_label)
+  in
+  let clone_units = item7_cfg_clone_units callee.blocks in
+  {
+    item7_sparse_repeat_sites = repeat_sites;
+    item7_sparse_clone_units = clone_units;
+    item7_sparse_static_clone_units = repeat_sites * clone_units;
+    item7_sparse_static_temps = repeat_sites * callee.temp_count;
+    item7_sparse_in_loop = late_store_cfg_inline_site_in_loop f site;
+  }
+
+let item7_sparse_cycle_growth_profitable
+    (m : item7_sparse_cycle_growth_metrics) =
+  m.item7_sparse_static_clone_units
+    <= item7_inline_static_growth_instr_budget
+  && m.item7_sparse_static_temps
+     <= item7_inline_static_growth_temp_budget
+
+let item7_debug_sparse_cycle_profit_policy
+    (f : Cfg.func)
+    ((site_label, _, _, callee_label, _, _, _) : late_store_cfg_inline_site)
+    (m : item7_sparse_cycle_growth_metrics)
+    decision =
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_PROFIT_POLICY" <> None then
+    Printf.eprintf
+      "item7-profit-policy family=divmod-oversize-cycle caller=%s callee=%s site=%s decision=%s in-loop=%d repeat=%d clone-units=%d static-clone-growth=%d static-temp-growth=%d clone-budget=%d temp-budget=%d\n%!"
+      f.name callee_label site_label decision
+      (if m.item7_sparse_in_loop then 1 else 0)
+      m.item7_sparse_repeat_sites
+      m.item7_sparse_clone_units
+      m.item7_sparse_static_clone_units
+      m.item7_sparse_static_temps
+      item7_inline_static_growth_instr_budget
+      item7_inline_static_growth_temp_budget
+
+let find_item7_sparse_oversize_cycle_profitable_site
+    (table : (string, Cfg.func) Hashtbl.t)
+    (f : Cfg.func) : late_store_cfg_inline_site option =
+  let rec find_in_body block_label rev_prefix = function
+    | [] -> None
+    | (Tcg.Call (dst_opt, callee, args) as instr) :: rest -> (
+        match Hashtbl.find_opt table callee with
+        | Some (candidate : Cfg.func)
+          when callee <> f.label
+               && List.length args = List.length candidate.params ->
+            let site =
+              ( block_label,
+                List.rev rev_prefix,
+                dst_opt,
+                callee,
+                args,
+                rest,
+                candidate )
+            in
+            let metrics = item7_sparse_cycle_growth_metrics f site in
+            let profitable = item7_sparse_cycle_growth_profitable metrics in
+            item7_debug_sparse_cycle_profit_policy f site metrics
+              (if profitable then "allow" else "reject-static-growth");
+            if profitable then Some site
+            else find_in_body block_label (instr :: rev_prefix) rest
+        | Some _ | None ->
+            find_in_body block_label (instr :: rev_prefix) rest)
+    | instr :: rest ->
+        find_in_body block_label (instr :: rev_prefix) rest
+  in
+  let rec find = function
+    | [] -> None
+    | (block : Cfg.block) :: rest -> (
+        match find_in_body block.label [] block.body with
+        | Some _ as site -> site
+        | None -> find rest)
+  in
+  find f.blocks
+
+let inline_late_divmod_sparse_oversize_cycle_calls_func
+    (table : (string, Cfg.func) Hashtbl.t)
+    (f : Cfg.func) =
+  let rec apply serial fuel count current =
+    if fuel = 0 then (current, count)
+    else
+      match find_item7_sparse_oversize_cycle_profitable_site table current with
+      | None -> (current, count)
+      | Some site ->
+          match inline_one_late_store_cfg_call serial current site with
+          | None -> (current, count)
+          | Some next ->
+              apply (serial + 1) (fuel - 1) (count + 1) next
+  in
+  apply 0 late_store_cfg_inline_max_sites_per_func 0 f
+
+let inline_late_divmod_sparse_oversize_cycle_calls_program
+    (funcs : Cfg.func list) =
+  let total_replaced = ref 0 in
+  let rec iterate fuel current =
+    if fuel = 0 then current
+    else
+      let table = build_late_divmod_sparse_oversize_cycle_table current in
+      if Hashtbl.length table = 0 then current
+      else
+        let changed = ref false in
+        let next =
+          List.map
+            (fun (f : Cfg.func) ->
+              let rewritten, count =
+                inline_late_divmod_sparse_oversize_cycle_calls_func table f
+              in
+              if count > 0 then begin
+                changed := true;
+                total_replaced := !total_replaced + count
+              end;
+              rewritten)
+            current
+        in
+        if !changed then iterate (fuel - 1) next else current
+  in
+  let result = iterate 3 funcs in
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_OVERSIZE_CYCLE_INLINE" <> None then
+    Printf.eprintf
+      "item7-oversize-cycle-inline replaced=%d\n%!" !total_replaced;
   result
 
 
@@ -33706,6 +34113,9 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   in
   let optimized_funcs =
     inline_late_divmod_singleblock_cycle_calls_program optimized_funcs
+  in
+  let optimized_funcs =
+    inline_late_divmod_sparse_oversize_cycle_calls_program optimized_funcs
   in
   item7_debug_inline_effect_capability summaries removable_calls globals optimized_funcs;
   { Cfg.funcs = optimized_funcs }
