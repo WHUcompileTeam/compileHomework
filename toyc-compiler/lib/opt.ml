@@ -6212,36 +6212,6 @@ let collect_basic_induction_vars header loop get_block loop_defs multi_defs def_
     let self_vars =
       IntSet.fold
         (fun phi_temp acc ->
-          (* A self-updated IV does not necessarily get an explicit
-             redefinition on every outside edge.  In particular, a second
-             counted loop may continue using the IV value produced by the
-             preceding loop:
-
-                 first_loop ... updates i ...
-                 second_loop:
-                   ... i ...
-                   i = i + 1
-
-             In that case [i] is simply live-through on the outside edge.
-
-             Accept that representation only when this loop contains exactly
-             one definition of [phi_temp].  This excludes shapes that overwrite
-             the temp inside the loop before the apparent self-update. *)
-          let defs_in_loop =
-            LabelSet.fold
-              (fun label count ->
-                let block : Cfg.block = get_block label in
-                List.fold_left
-                  (fun count instr ->
-                    match defs_temp instr with
-                    | Some dst when dst = phi_temp -> count + 1
-                    | Some _
-                    | None -> count)
-                  count
-                  block.body)
-              loop
-              0
-          in
           let outside_inputs =
             List.filter_map
               (fun pred ->
@@ -6250,19 +6220,8 @@ let collect_basic_induction_vars header loop get_block loop_defs multi_defs def_
                     (outside_seed_chain_for_pred pred)
                     phi_temp
                 with
-                | Some _ ->
-                    Some (pred, Tcg.Temp phi_temp)
-                | None when defs_in_loop = 1 ->
-                    if
-                      Sys.getenv_opt "TOYC_DEBUG_COUNTED_SEEDS"
-                      <> None
-                    then
-                      Printf.eprintf
-                        "counted-seed-live-through-iv header=%s temp=%d pred=%s\n%!"
-                        header phi_temp pred;
-                    Some (pred, Tcg.Temp phi_temp)
-                | None ->
-                    None)
+                | Some _ -> Some (pred, Tcg.Temp phi_temp)
+                | None -> None)
               outside_preds
           in
           let steps =
@@ -22540,6 +22499,20 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
          The fast path is runtime-guarded against signed-i32 wrap, preserving
          the monotonic-threshold proof.  Failure of any proof leaves the
          original loop untouched. *)
+    let counted_contains_substring haystack needle =
+      let hlen = String.length haystack in
+      let nlen = String.length needle in
+      let rec search i =
+        if i + nlen > hlen then
+          false
+        else if String.sub haystack i nlen = needle then
+          true
+        else
+          search (i + 1)
+      in
+      nlen = 0 || search 0
+    in
+
     let try_eliminate_single_monotone_state_loop
         header
         loop
@@ -22890,15 +22863,47 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                                     if join_label = info.control_label then
                                       (control.body, true)
                                     else
-                                      ( join_block.body,
-                                        match join_block.term with
-                                        | Cfg.Jump next ->
-                                            next = info.control_label
-                                        | Cfg.BranchZero _
-                                        | Cfg.BranchNonZero _
-                                        | Cfg.BranchCompare _
-                                        | Cfg.Return _ ->
-                                            false )
+                                      match join_block.term with
+                                      | Cfg.Jump next
+                                        when next = info.control_label ->
+                                          (join_block.body, true)
+                                      | Cfg.Jump iv_update_label
+                                        when
+                                          counted_contains_substring
+                                            header "_cfg_inline_"
+                                          && counted_contains_substring
+                                               iv_update_label "_canon_cmp_"
+                                          && counted_contains_substring
+                                               info.control_label
+                                               "_cfg_inline_cont_" ->
+                                          let iv_update_block : Cfg.block =
+                                            get_block iv_update_label
+                                          in
+                                          begin
+                                            match iv_update_block.term with
+                                            | Cfg.Jump next
+                                              when
+                                                next = info.control_label
+                                                && iv_update_block.preds
+                                                   = [ join_label ]
+                                                && control.preds
+                                                   = [ iv_update_label ] ->
+                                                ( join_block.body
+                                                  @ iv_update_block.body,
+                                                  true )
+                                            | Cfg.Jump _
+                                            | Cfg.BranchZero _
+                                            | Cfg.BranchNonZero _
+                                            | Cfg.BranchCompare _
+                                            | Cfg.Return _ ->
+                                                (join_block.body, false)
+                                          end
+                                      | Cfg.Jump _
+                                      | Cfg.BranchZero _
+                                      | Cfg.BranchNonZero _
+                                      | Cfg.BranchCompare _
+                                      | Cfg.Return _ ->
+                                          (join_block.body, false)
                                   in
                                   if
                                     not tail_term_ok
@@ -24098,6 +24103,230 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
       end
       in
 
+    let recover_late_single_monotone_info
+        header
+        loop
+      =
+      (* Local recovery for the late CFG-inline rotated form:
+
+             root
+            /    \
+          arm    arm
+            \    /
+             join
+               |
+          canon_cmp: iv = iv + 1
+               |
+          inline_cont:
+             iv < bound
+             /       \
+           root      exit
+
+         The natural loop has six blocks, but the monotone-state core
+         understood by v81 is the four-block root/arms/join diamond.
+         We prove the two tail blocks explicitly and then pass only that
+         four-block core to v81.
+
+         This does NOT relax the global induction-variable classifier. *)
+      if
+        LabelSet.cardinal loop <> 6
+        || not
+             (counted_contains_substring
+                header "_cfg_inline_")
+      then
+        None
+      else
+        let root : Cfg.block = get_block header in
+        match root.term with
+        | Cfg.BranchCompare
+            ( Lt,
+              _state_lhs,
+              _state_rhs,
+              true_label,
+              false_label )
+          when
+            LabelSet.mem true_label loop
+            && LabelSet.mem false_label loop ->
+            let true_block : Cfg.block =
+              get_block true_label
+            in
+            let false_block : Cfg.block =
+              get_block false_label
+            in
+            begin
+              match
+                true_block.term,
+                false_block.term
+              with
+              | Cfg.Jump true_join,
+                Cfg.Jump false_join
+                when
+                  true_join = false_join
+                  && LabelSet.mem true_join loop ->
+                  let join_label = true_join in
+                  let join_block : Cfg.block =
+                    get_block join_label
+                  in
+                  begin
+                    match join_block.term with
+                    | Cfg.Jump iv_update_label
+                      when
+                        LabelSet.mem iv_update_label loop
+                        && counted_contains_substring
+                             iv_update_label
+                             "_canon_cmp_" ->
+                        let iv_update_block : Cfg.block =
+                          get_block iv_update_label
+                        in
+                        begin
+                          match
+                            iv_update_block.body,
+                            iv_update_block.term
+                          with
+                          | [ Tcg.Bin
+                                ( iv_dst,
+                                  Add,
+                                  Tcg.Temp iv_src,
+                                  Tcg.Imm 1L ) ],
+                            Cfg.Jump control_label
+                          | [ Tcg.Bin
+                                ( iv_dst,
+                                  Add,
+                                  Tcg.Imm 1L,
+                                  Tcg.Temp iv_src ) ],
+                            Cfg.Jump control_label
+                            when
+                              iv_dst = iv_src
+                              && LabelSet.mem
+                                   control_label loop
+                              && counted_contains_substring
+                                   control_label
+                                   "_cfg_inline_cont_" ->
+                              let control_block : Cfg.block =
+                                get_block control_label
+                              in
+                              begin
+                                match
+                                  control_block.body,
+                                  control_block.term
+                                with
+                                | [],
+                                  Cfg.BranchCompare
+                                    ( Lt,
+                                      Tcg.Temp control_iv,
+                                      bound,
+                                      inside_label,
+                                      exit_label )
+                                  when
+                                    control_iv = iv_dst
+                                    && inside_label = header
+                                    && not
+                                         (LabelSet.mem
+                                            exit_label loop)
+                                    && iv_update_block.preds
+                                       = [ join_label ]
+                                    && control_block.preds
+                                       = [ iv_update_label ]
+                                    && true_block.preds
+                                       = [ header ]
+                                    && false_block.preds
+                                       = [ header ]
+                                    && List.length
+                                         join_block.preds = 2
+                                    && List.mem
+                                         true_label
+                                         join_block.preds
+                                    && List.mem
+                                         false_label
+                                         join_block.preds
+                                    && List.length root.preds = 2
+                                    && List.mem
+                                         control_label
+                                         root.preds ->
+                                    let outside_preds =
+                                      List.filter
+                                        (fun pred ->
+                                          pred <> control_label)
+                                        root.preds
+                                    in
+                                    begin
+                                      match outside_preds with
+                                      | [ outside_pred ]
+                                        when
+                                          not
+                                            (LabelSet.mem
+                                               outside_pred
+                                               loop) ->
+                                          let core_loop =
+                                            List.fold_left
+                                              (fun acc label ->
+                                                LabelSet.add
+                                                  label acc)
+                                              LabelSet.empty
+                                              [ header;
+                                                true_label;
+                                                false_label;
+                                                join_label ]
+                                          in
+                                          let recovered_iv :
+                                              basic_induction_var =
+                                            {
+                                              phi_temp =
+                                                control_iv;
+                                              outside_inputs =
+                                                [ ( outside_pred,
+                                                    Tcg.Temp
+                                                      control_iv ) ];
+                                              backedge_preds =
+                                                [ control_label ];
+                                              step = 1L;
+                                              origin = `Semantic;
+                                            }
+                                          in
+                                          let recovered_info :
+                                              counted_loop_info =
+                                            {
+                                              control_iv =
+                                                recovered_iv;
+                                              control_label;
+                                              inside_label =
+                                                header;
+                                              exit_label;
+                                              kind =
+                                                CountUpLt
+                                                  (bound, 0L);
+                                            }
+                                          in
+                                          Some
+                                            ( core_loop,
+                                              recovered_info )
+                                      | _ ->
+                                          None
+                                    end
+                                | _ ->
+                                    None
+                              end
+                          | _ ->
+                              None
+                        end
+                    | Cfg.Jump _
+                    | Cfg.BranchZero _
+                    | Cfg.BranchNonZero _
+                    | Cfg.BranchCompare _
+                    | Cfg.Return _ ->
+                        None
+                  end
+              | _ ->
+                  None
+            end
+        | Cfg.Jump _
+        | Cfg.BranchZero _
+        | Cfg.BranchNonZero _
+        | Cfg.BranchCompare _
+        | Cfg.Return _ ->
+            None
+    in
+
     List.iter
       (fun header ->
         if LabelSet.mem header !suppressed_headers then
@@ -24128,9 +24357,51 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
         in
         match control with
         | None ->
-            debugf "counted-skip func=%s header=%s reason=classify term=%s ivs=%d preds=%d"
-              f.name header (term_kind header_block.term) (List.length ivs)
-              (List.length header_block.preds)
+            let recovered_and_applied =
+              match
+                recover_late_single_monotone_info
+                  header loop
+              with
+              | None ->
+                  false
+              | Some
+                  ( recovered_loop,
+                    recovered_info ) ->
+                  if
+                    try_eliminate_single_monotone_state_loop
+                      header
+                      recovered_loop
+                      recovered_info
+                      effects
+                      loop_defs
+                      multi_defs
+                      def_instrs
+                  then begin
+                    debugf
+                      "counted-local-livethrough-recover-hit func=%s header=%s iv=t%d control=%s natural_blocks=%d core_blocks=%d"
+                      f.name
+                      header
+                      recovered_info.control_iv.phi_temp
+                      recovered_info.control_label
+                      (LabelSet.cardinal loop)
+                      (LabelSet.cardinal
+                         recovered_loop);
+                    true
+                  end else begin
+                    debugf
+                      "counted-local-livethrough-recover-reject func=%s header=%s"
+                      f.name header;
+                    false
+                  end
+            in
+            if not recovered_and_applied then
+              debugf
+                "counted-skip func=%s header=%s reason=classify term=%s ivs=%d preds=%d"
+                f.name
+                header
+                (term_kind header_block.term)
+                (List.length ivs)
+                (List.length header_block.preds)
         | Some info -> (
             let nested_child_groups =
               eligible_child_groups header
