@@ -20955,6 +20955,436 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
             collect terms 0 0 None 0L
       in
 
+      (* v77: one branch-carried scalar followed by one dependent
+         join reduction.
+
+           if (iv < K) x = x + A;
+           else        x = x + B;
+           sum = sum + x;       (* updated x *)
+           iv = iv + 1;
+
+         This is deliberately narrower than a general branch-aware summary:
+         - the ordinary counted-piecewise preconditions still require a
+           five-block, top-tested, unit-step threshold diamond;
+         - exactly one temp is selected by both arms and carried through the
+           join;
+         - both arm updates must be invariant constant/entry-invariant deltas
+           (no iv-dependent delta yet);
+         - exactly one second carried temp is updated in the join as
+             dep' = dep + selected_x'
+           and the join contains no other arithmetic besides that dependent
+           add and the exact iv + 1 update.
+
+         Summarize the two monotone phases sequentially.  Reusing
+         [ReductionCarrierProgression] is important: it already implements the
+         overflow-safe modular progression sum for an updated carrier.
+
+           prefix P:
+             dep += sum_{k=1..P} (x0 + k*A)
+             x   += P*A
+
+           suffix R:
+             dep += sum_{k=1..R} (xP + k*B)
+             x   += R*B
+      *)
+      let try_eliminate_dependent_temp_piecewise_threshold_loop
+          threshold_operand
+          then_label
+          else_label
+        =
+        match match_temp_arm then_label, match_temp_arm else_label with
+        | Some (then_core, then_aliases, then_join),
+          Some (else_core, else_aliases, else_join)
+          when then_join = else_join
+               && LabelSet.mem then_join loop
+               && List.mem then_join control_iv.backedge_preds ->
+            let join_block : Cfg.block = get_block then_join in
+            begin
+              match join_block.term with
+              | Cfg.Jump next when next = header ->
+                  let alias_lookup dst aliases =
+                    List.assoc_opt dst aliases
+                  in
+                  let join_moves =
+                    join_block.body
+                    |> List.filter_map
+                         (function
+                           | Tcg.Move (dst, Tcg.Temp src) ->
+                               Some (dst, src)
+                           | Tcg.Move _
+                           | Tcg.Un _
+                           | Tcg.Bin _
+                           | Tcg.Load _
+                           | Tcg.Store _
+                           | Tcg.Call _ ->
+                               None)
+                  in
+                  let arm_carriers =
+                    join_moves
+                    |> List.filter_map
+                         (fun (target, merge_temp) ->
+                           if target = control_iv.phi_temp then
+                             None
+                           else
+                             match
+                               alias_lookup merge_temp then_aliases,
+                               alias_lookup merge_temp else_aliases
+                             with
+                             | Some then_src, Some else_src ->
+                                 begin
+                                   match
+                                     temp_piecewise_update_of_operand
+                                       target then_core then_src,
+                                     temp_piecewise_update_of_operand
+                                       target else_core else_src
+                                   with
+                                   | Some then_step, Some else_step ->
+                                       Some
+                                         ( target,
+                                           merge_temp,
+                                           then_step,
+                                           else_step )
+                                   | _ ->
+                                       None
+                                 end
+                             | _ ->
+                                 None)
+                  in
+                  begin
+                    match arm_carriers with
+                    | [ (carrier, merge_temp, then_step, else_step) ] ->
+                        let step_expr = function
+                          | None ->
+                              Some zero_summary_expr
+                          | Some (invariant, bias, uses_iv) ->
+                              if uses_iv then
+                                None
+                              else
+                                let invariant_expr =
+                                  match invariant with
+                                  | Tcg.Imm 0L ->
+                                      zero_summary_expr
+                                  | operand ->
+                                      SummaryOperand operand
+                                in
+                                Some
+                                  (summary_expr_add
+                                     invariant_expr
+                                     (SummaryOperand (Tcg.Imm bias)))
+                        in
+                        begin
+                          match step_expr then_step, step_expr else_step with
+                          | Some then_expr, Some else_expr ->
+                              let add_is_dep_of_merge instr =
+                                match instr with
+                                | Tcg.Bin
+                                    ( out,
+                                      Add,
+                                      Tcg.Temp lhs,
+                                      Tcg.Temp rhs ) ->
+                                    if lhs = merge_temp then
+                                      Some (out, rhs)
+                                    else if rhs = merge_temp then
+                                      Some (out, lhs)
+                                    else
+                                      None
+                                | Tcg.Move _
+                                | Tcg.Un _
+                                | Tcg.Bin _
+                                | Tcg.Load _
+                                | Tcg.Store _
+                                | Tcg.Call _ ->
+                                    None
+                              in
+                              let dependent_candidates =
+                                join_block.body
+                                |> List.filter_map
+                                     (fun instr ->
+                                       match add_is_dep_of_merge instr with
+                                       | None ->
+                                           None
+                                       | Some (sum_temp, dep) ->
+                                           if
+                                             dep = carrier
+                                             || dep = control_iv.phi_temp
+                                           then
+                                             None
+                                           else if
+                                             List.exists
+                                               (fun (dst, src) ->
+                                                 dst = dep
+                                                 && src = sum_temp)
+                                               join_moves
+                                           then
+                                             Some (dep, sum_temp)
+                                           else
+                                             None)
+                                |> List.sort_uniq compare
+                              in
+                              let iv_step_temps =
+                                join_block.body
+                                |> List.filter_map
+                                     (function
+                                       | Tcg.Bin
+                                           ( next_temp,
+                                             Add,
+                                             Tcg.Temp src,
+                                             Tcg.Imm 1L )
+                                       | Tcg.Bin
+                                           ( next_temp,
+                                             Add,
+                                             Tcg.Imm 1L,
+                                             Tcg.Temp src )
+                                         when src =
+                                                control_iv.phi_temp ->
+                                           Some next_temp
+                                       | Tcg.Move _
+                                       | Tcg.Un _
+                                       | Tcg.Bin _
+                                       | Tcg.Load _
+                                       | Tcg.Store _
+                                       | Tcg.Call _ ->
+                                           None)
+                                |> List.sort_uniq compare
+                              in
+                              begin
+                                match
+                                  dependent_candidates,
+                                  iv_step_temps
+                                with
+                                | [ (dependent, dependent_next) ],
+                                  [ iv_next ] ->
+                                    let exact_join_instr = function
+                                      | Tcg.Bin
+                                          ( out,
+                                            Add,
+                                            Tcg.Temp lhs,
+                                            Tcg.Temp rhs )
+                                        when
+                                          out = dependent_next
+                                          && ((lhs = dependent
+                                               && rhs = merge_temp)
+                                              || (rhs = dependent
+                                                  && lhs = merge_temp)) ->
+                                          true
+                                      | Tcg.Bin
+                                          ( out,
+                                            Add,
+                                            Tcg.Temp src,
+                                            Tcg.Imm 1L )
+                                      | Tcg.Bin
+                                          ( out,
+                                            Add,
+                                            Tcg.Imm 1L,
+                                            Tcg.Temp src )
+                                        when
+                                          out = iv_next
+                                          && src =
+                                               control_iv.phi_temp ->
+                                          true
+                                      | Tcg.Move
+                                          ( dst,
+                                            Tcg.Temp src )
+                                        when
+                                          (dst = carrier
+                                           && src = merge_temp)
+                                          || (dst = dependent
+                                              && src =
+                                                   dependent_next)
+                                          || (dst =
+                                                control_iv.phi_temp
+                                              && src = iv_next) ->
+                                          true
+                                      | Tcg.Move _
+                                      | Tcg.Un _
+                                      | Tcg.Bin _
+                                      | Tcg.Load _
+                                      | Tcg.Store _
+                                      | Tcg.Call _ ->
+                                          false
+                                    in
+                                    if
+                                      not
+                                        (List.for_all
+                                           exact_join_instr
+                                           join_block.body)
+                                    then
+                                      None
+                                    else
+                                      let total_trip_instrs,
+                                          total_trip =
+                                        build_trip_count_instrs
+                                          fresh_temp
+                                          control_iv.phi_temp
+                                          control_iv.step
+                                          info.kind
+                                      in
+                                      let prefix_diff =
+                                        fresh_temp ()
+                                      in
+                                      let prefix_clamp_instrs,
+                                          prefix_nonnegative =
+                                        clamp_nonnegative_temp
+                                          fresh_temp prefix_diff
+                                      in
+                                      let min_delta =
+                                        fresh_temp ()
+                                      in
+                                      let choose_prefix =
+                                        fresh_temp ()
+                                      in
+                                      let selected_delta =
+                                        fresh_temp ()
+                                      in
+                                      let prefix_trip =
+                                        fresh_temp ()
+                                      in
+                                      let suffix_trip =
+                                        fresh_temp ()
+                                      in
+                                      let prefix_instrs =
+                                        [ simplify_simple_instr
+                                            (Tcg.Bin
+                                               ( prefix_diff,
+                                                 Sub,
+                                                 threshold_operand,
+                                                 Tcg.Temp
+                                                   control_iv.phi_temp )) ]
+                                        @ prefix_clamp_instrs
+                                        @ [ simplify_simple_instr
+                                              (Tcg.Bin
+                                                 ( min_delta,
+                                                   Sub,
+                                                   Tcg.Temp
+                                                     prefix_nonnegative,
+                                                   Tcg.Temp
+                                                     total_trip ));
+                                            simplify_simple_instr
+                                              (Tcg.Bin
+                                                 ( choose_prefix,
+                                                   Lt,
+                                                   Tcg.Temp
+                                                     prefix_nonnegative,
+                                                   Tcg.Temp
+                                                     total_trip ));
+                                            simplify_simple_instr
+                                              (Tcg.Bin
+                                                 ( selected_delta,
+                                                   Mul,
+                                                   Tcg.Temp
+                                                     min_delta,
+                                                   Tcg.Temp
+                                                     choose_prefix ));
+                                            simplify_simple_instr
+                                              (Tcg.Bin
+                                                 ( prefix_trip,
+                                                   Add,
+                                                   Tcg.Temp
+                                                     total_trip,
+                                                   Tcg.Temp
+                                                     selected_delta ));
+                                            simplify_simple_instr
+                                              (Tcg.Bin
+                                                 ( suffix_trip,
+                                                   Sub,
+                                                   Tcg.Temp
+                                                     total_trip,
+                                                   Tcg.Temp
+                                                     prefix_trip )) ]
+                                      in
+                                      let dependent_reduction step =
+                                        {
+                                          target =
+                                            ReductionTempTarget
+                                              dependent;
+                                          subtract = false;
+                                          step =
+                                            ReductionCarrierProgression
+                                              {
+                                                carrier_temp =
+                                                  carrier;
+                                                step_expr = step;
+                                                carrier_subtract =
+                                                  false;
+                                                include_updated =
+                                                  true;
+                                              };
+                                          carrier_temp = None;
+                                          alias_temps = [];
+                                        }
+                                      in
+                                      let carrier_reduction step =
+                                        {
+                                          target =
+                                            ReductionTempTarget
+                                              carrier;
+                                          subtract = false;
+                                          step =
+                                            ReductionInvariant step;
+                                          carrier_temp = None;
+                                          alias_temps = [];
+                                        }
+                                      in
+                                      let phase_updates trip step =
+                                        build_reduction_final_update
+                                          fresh_temp
+                                          trip
+                                          PlaceMap.empty
+                                          (dependent_reduction step)
+                                        @ build_reduction_final_update
+                                            fresh_temp
+                                            trip
+                                            PlaceMap.empty
+                                            (carrier_reduction step)
+                                      in
+                                      let updates =
+                                        phase_updates
+                                          prefix_trip then_expr
+                                        @ phase_updates
+                                            suffix_trip else_expr
+                                        @ build_iv_final_update
+                                            fresh_temp
+                                            total_trip
+                                            control_iv
+                                      in
+                                      if debug_piecewise then
+                                        debugf
+                                          "counted-piecewise-dependent-hit func=%s header=%s carrier=t%d dependent=t%d merge=t%d then=%s else=%s"
+                                          f.name
+                                          header
+                                          carrier
+                                          dependent
+                                          merge_temp
+                                          (string_of_child_summary_expr
+                                             then_expr)
+                                          (string_of_child_summary_expr
+                                             else_expr);
+                                      Some
+                                        ( total_trip_instrs,
+                                          prefix_instrs,
+                                          updates,
+                                          false,
+                                          "temp-dependent" )
+                                | _ ->
+                                    None
+                              end
+                          | _ ->
+                              None
+                        end
+                    | _ ->
+                        None
+                  end
+              | Cfg.Jump _
+              | Cfg.BranchZero _
+              | Cfg.BranchNonZero _
+              | Cfg.BranchCompare _
+              | Cfg.Return _ ->
+                  None
+            end
+        | _ ->
+            None
+      in
+
       let try_eliminate_temp_piecewise_threshold_loop
           threshold_operand
           _threshold_static
@@ -21342,13 +21772,21 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                 debug_piecewise_arm then_label;
                 debug_piecewise_arm else_label;
                 match
-                  try_eliminate_temp_piecewise_threshold_loop
-                    threshold_operand
-                    threshold_static
-                    control_block
-                    inside_block
-                    then_label
-                    else_label
+                  (match
+                     try_eliminate_dependent_temp_piecewise_threshold_loop
+                       threshold_operand
+                       then_label
+                       else_label
+                   with
+                   | Some summary -> Some summary
+                   | None ->
+                       try_eliminate_temp_piecewise_threshold_loop
+                         threshold_operand
+                         threshold_static
+                         control_block
+                         inside_block
+                         then_label
+                         else_label)
                 with
                 | Some
                     ( total_trip_instrs,
@@ -26394,6 +26832,66 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
             name
             (String.concat "," (List.map string_of_lve_operand args))
     in
+    let string_of_runtime_term = function
+      | Cfg.Jump label ->
+          Printf.sprintf "jump(%s)" label
+      | Cfg.BranchZero (operand, zero_label, nonzero_label) ->
+          Printf.sprintf
+            "branch_zero(%s,%s,%s)"
+            (string_of_lve_operand operand)
+            zero_label
+            nonzero_label
+      | Cfg.BranchNonZero (operand, nonzero_label, zero_label) ->
+          Printf.sprintf
+            "branch_nonzero(%s,%s,%s)"
+            (string_of_lve_operand operand)
+            nonzero_label
+            zero_label
+      | Cfg.BranchCompare
+          (op, lhs, rhs, yes_label, no_label) ->
+          Printf.sprintf
+            "branch_cmp(%s,%s,%s,%s,%s)"
+            (string_of_binop op)
+            (string_of_lve_operand lhs)
+            (string_of_lve_operand rhs)
+            yes_label
+            no_label
+      | Cfg.Return value ->
+          Printf.sprintf
+            "return(%s)"
+            (match value with
+             | None -> ""
+             | Some operand -> string_of_lve_operand operand)
+    in
+    let dump_runtime_nonlinear_cfg header loop =
+      if debug then begin
+        Printf.eprintf
+          "lve-runtime-nonlinear-cfg func=%s header=%s blocks=%d loop=[%s]\n%!"
+          f.name
+          header
+          (LabelSet.cardinal loop)
+          (String.concat "," (LabelSet.elements loop));
+        LabelSet.elements loop
+        |> List.iter (fun label ->
+               let block : Cfg.block = get_block label in
+               Printf.eprintf
+                 "lve-runtime-nonlinear-block func=%s header=%s label=%s preds=[%s] succs=[%s] body=[%s] term=%s\n%!"
+                 f.name
+                 header
+                 label
+                 (String.concat "," block.preds)
+                 (String.concat "," block.succs)
+                 (block.body
+                  |> List.mapi
+                       (fun index instr ->
+                         Printf.sprintf
+                           "%d:%s"
+                           index
+                           (string_of_simple_instr instr))
+                  |> String.concat ";")
+                 (string_of_runtime_term block.term))
+      end
+    in
     let reaching_seed_values_on_edge ~header ~pred_label temp =
       match
         reaching_move_cases_on_edge
@@ -26505,6 +27003,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
           in
           (match traced with
            | None ->
+               dump_runtime_nonlinear_cfg control_block.label loop;
                Error
                  (Printf.sprintf
                     "body-chain-not-linear continue=%s control=%s"
