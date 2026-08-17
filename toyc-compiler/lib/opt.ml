@@ -23562,14 +23562,15 @@ let item6_canonical_adoption_audit (f : Cfg.func) =
 
 let algebra_canonicalize_func (f : Cfg.func) =
   let () = item6_canonical_adoption_audit f in
-  (* item6 v4/v5/v6: consume the shared canonical scalar identity only when
+  (* item6 v4/v5/v6/v7: consume the shared canonical scalar identity only when
      it proves an entire operation can collapse.  v4 folds semantic self-ops;
      v5 extends the existing one-level add/sub cancellation matcher to
      canonical-equal operands.  v6 additionally computes the canonical
      remainder of a subtraction, but only materializes it when the whole
      remainder collapses to a single Move (an existing temp or immediate).
-     This deliberately avoids rebuilding/reassociating expression trees, so
-     downstream passes keep their preferred physical IR shapes. *)
+     v7 extends the same collapse-only rule to semantic zero/one identities
+     and branch conditions.  This deliberately avoids rebuilding/reassociating
+     expression trees, so downstream passes keep their preferred physical IR shapes. *)
   let semantic_analyze = make_linear_analyzer f in
   let _, _, def_instrs, multi_defs =
     analyze_temp_defs_of_blocks f.temp_count f.blocks
@@ -23602,6 +23603,17 @@ let algebra_canonicalize_func (f : Cfg.func) =
   let semantic_only_equal lhs rhs =
     not (operand_equal lhs rhs)
     && semantic_operand_equal lhs rhs
+  in
+  (* item6 v7: query semantic constants without forcing their defining IR into
+     a canonical physical shape.  [make_linear_analyzer] follows only unique
+     definitions and leaves multi-definition/call/load values opaque, so an
+     atom-free form is a safe compile-time scalar constant. *)
+  let semantic_operand_constant operand =
+    let form = semantic_analyze operand in
+    if canonical_scalar_is_constant form then
+      Some (i32 form.canonical_scalar_const)
+    else
+      None
   in
   let semantic_sub_remainder_move dst lhs rhs =
     (* Unlike v5's one-level matcher, compare the complete canonical linear
@@ -23779,6 +23791,43 @@ let algebra_canonicalize_func (f : Cfg.func) =
   let semantic_cancellation_rewrites = ref 0 in
   let semantic_remainder_rewrites = ref 0 in
   let semantic_self_rewrites = ref 0 in
+  let semantic_identity_rewrites = ref 0 in
+  let semantic_branch_rewrites = ref 0 in
+  let semantic_identity_fold = function
+    | Tcg.Bin (dst, Add, lhs, rhs) -> (
+        match semantic_operand_constant lhs, semantic_operand_constant rhs with
+        | Some 0L, _ -> Some (Tcg.Move (dst, rhs))
+        | _, Some 0L -> Some (Tcg.Move (dst, lhs))
+        | _ -> None)
+    | Tcg.Bin (dst, Sub, lhs, rhs) -> (
+        match semantic_operand_constant lhs, semantic_operand_constant rhs with
+        | _, Some 0L -> Some (Tcg.Move (dst, lhs))
+        | Some 0L, _ -> Some (Tcg.Un (dst, UMinus, rhs))
+        | _ -> None)
+    | Tcg.Bin (dst, Mul, lhs, rhs) -> (
+        match semantic_operand_constant lhs, semantic_operand_constant rhs with
+        | Some 0L, _ | _, Some 0L -> Some (Tcg.Move (dst, Tcg.Imm 0L))
+        | Some 1L, _ -> Some (Tcg.Move (dst, rhs))
+        | _, Some 1L -> Some (Tcg.Move (dst, lhs))
+        | Some (-1L), _ -> Some (Tcg.Un (dst, UMinus, rhs))
+        | _, Some (-1L) -> Some (Tcg.Un (dst, UMinus, lhs))
+        | _ -> None)
+    | Tcg.Bin (dst, Div, lhs, rhs) -> (
+        match semantic_operand_constant rhs with
+        | Some 1L -> Some (Tcg.Move (dst, lhs))
+        | Some _ | None -> None)
+    | Tcg.Bin (dst, Mod, _lhs, rhs) -> (
+        match semantic_operand_constant rhs with
+        | Some 1L -> Some (Tcg.Move (dst, Tcg.Imm 0L))
+        | Some _ | None -> None)
+    | Tcg.Move _
+    | Tcg.Un _
+    | Tcg.Bin _
+    | Tcg.Load _
+    | Tcg.Store _
+    | Tcg.Call _ ->
+        None
+  in
   let semantic_self_fold = function
     | Tcg.Bin
         ( dst,
@@ -23810,7 +23859,12 @@ let algebra_canonicalize_func (f : Cfg.func) =
       | Some rewritten ->
           incr semantic_self_rewrites;
           rewritten
-      | None ->
+      | None -> (
+          match semantic_identity_fold initial with
+          | Some rewritten when rewritten <> initial ->
+              incr semantic_identity_rewrites;
+              rewritten
+          | Some _ | None ->
           match initial with
       | Tcg.Bin (dst, Add, lhs, rhs) -> (
           match cancel_sub_add dst lhs rhs with
@@ -23876,25 +23930,28 @@ let algebra_canonicalize_func (f : Cfg.func) =
               build_affine dst (base, -sign, neg_i32 bias)
           | Some _ | None -> initial)
       | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ ->
-          initial
+          initial)
     in
     let rewritten = simplify_simple_instr rewritten in
     if rewritten <> instr then incr rewrites;
     rewritten
   in
+  let semantic_rewrite_term term = term in
   let blocks =
     List.map
       (fun (block : Cfg.block) ->
         let body = List.map rewrite_instr block.body in
-        { block with body })
+        let term = semantic_rewrite_term block.term in
+        { block with body; term; succs = Cfg.successors term })
       f.blocks
   in
   if Sys.getenv_opt "TOYC_DEBUG_ALGEBRA" <> None then
     Printf.eprintf
-      "algebra func=%s rewrites=%d cancellations=%d semantic-cancellations=%d semantic-remainders=%d semantic-self=%d\n%!"
+      "algebra func=%s rewrites=%d cancellations=%d semantic-cancellations=%d semantic-remainders=%d semantic-self=%d semantic-identities=%d semantic-branches=%d\n%!"
       f.name !rewrites !cancellation_rewrites
       !semantic_cancellation_rewrites !semantic_remainder_rewrites
-      !semantic_self_rewrites;
+      !semantic_self_rewrites !semantic_identity_rewrites
+      !semantic_branch_rewrites;
   if
     Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" <> None
     && !semantic_self_rewrites > 0
@@ -23916,7 +23973,25 @@ let algebra_canonicalize_func (f : Cfg.func) =
     Printf.eprintf
       "item6-semantic-remainder func=%s rewrites=%d\n%!"
       f.name !semantic_remainder_rewrites;
-  if !rewrites = 0 then f else Cfg.rebuild_edges { f with blocks }
+  if
+    Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" <> None
+    && !semantic_identity_rewrites > 0
+  then
+    Printf.eprintf
+      "item6-semantic-identity func=%s rewrites=%d\n%!"
+      f.name !semantic_identity_rewrites;
+  if
+    Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" <> None
+    && !semantic_branch_rewrites > 0
+  then
+    Printf.eprintf
+      "item6-semantic-branch func=%s rewrites=%d\n%!"
+      f.name !semantic_branch_rewrites;
+  if
+    !rewrites = 0
+    && !semantic_branch_rewrites = 0
+  then f
+  else Cfg.rebuild_edges { f with blocks }
 
 let general_linear_canonicalize_func (f : Cfg.func) =
   let analyze = make_linear_analyzer f in
