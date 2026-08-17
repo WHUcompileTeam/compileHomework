@@ -21055,7 +21055,9 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                 info.control_label loop get_block info.inside_label
             in
             let nested_shape_supported =
-              (not plain_shape_supported)
+              enable_nested_temp_composition
+              && nested_child_groups <> []
+              && (not plain_shape_supported)
               && counted_loop_shape_supported_with_child_bypasses
                    info.control_label loop get_block info.inside_label
                    nested_child_bypasses
@@ -28093,12 +28095,22 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       debug_lcssa_lite_report summaries globals current
     end
   in
-  let early_mem2reg =
-    if Sys.getenv_opt "TOYC_DISABLE_EARLY_OPTIMISTIC_MEM2REG" <> None then
-      mem2reg_func f
-    else
-      mem2reg_func ~optimistic_loop_phi:true f
-  in
+  (* v46 correctness fix: keep the first mem2reg pass conservative.
+
+     Optimistic loop-phi promotion before counted-loop analysis changes the
+     provenance/phase shape of loop-carried values.  Two independent wrong-code
+     regressions demonstrate that the existing counted analysis is not sound on
+     that early optimistic form:
+
+       tailrec_acc_sum        21 -> 15
+       nest3_rect_small       14 -> 95
+
+     The same current pipeline becomes correct when only early optimistic
+     mem2reg is disabled, while disabling early move propagation has no effect.
+     Keep optimistic mem2reg in the already-existing post-counted / late stages,
+     where it cannot change the recurrence facts consumed by the first counted
+     analysis. *)
+  let early_mem2reg = mem2reg_func f in
   let promoted_before_move_cleanup =
     early_mem2reg |> promote_globals_func summaries globals
   in
