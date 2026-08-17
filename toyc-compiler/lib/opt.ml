@@ -32480,34 +32480,155 @@ let late_store_cfg_inline_site_profitable
     f.temp_count + callee.temp_count
     <= late_store_cfg_inline_nonloop_projected_temp_cap
 
+
+(* item7 v15: first production slice of the unified profitability policy.
+   The old v8c rule used the caller's absolute temp_count and rejected a
+   non-loop site once [caller temps + callee temps > 40].  That successfully
+   caught one local regression, but it does not generalize well: a large caller
+   with one tiny leaf is not the same risk as five statically duplicated copies
+   of the same multi-block helper.
+
+   For CFG Store inlining, measure the *incremental static expansion* instead.
+   A single site is still governed by the existing per-callee shape limits.
+   Repeated same-callee sites must fit one ordinary CFG-inline budget in total.
+   This reuses the existing 32-instruction limit instead of introducing another
+   testcase-shaped threshold, and adds the same 32-unit budget for duplicated
+   temp namespace growth.  Hotness is deliberately not used as an escape hatch:
+   several distinct hot-loop call sites still duplicate code statically. *)
+let item7_inline_static_growth_instr_budget =
+  late_store_cfg_inline_max_instrs
+
+let item7_inline_static_growth_temp_budget =
+  late_store_cfg_inline_max_instrs
+
+type item7_store_cfg_growth_metrics = {
+  item7_growth_repeat_sites : int;
+  item7_growth_callee_instrs : int;
+  item7_growth_static_instrs : int;
+  item7_growth_static_temps : int;
+  item7_growth_in_loop : bool;
+}
+
+let item7_count_direct_calls_to_label_early
+    (f : Cfg.func) (callee_label : string) =
+  List.fold_left
+    (fun acc (block : Cfg.block) ->
+      List.fold_left
+        (fun acc -> function
+          | Tcg.Call (_, callee, _) when callee = callee_label -> acc + 1
+          | _ -> acc)
+        acc block.body)
+    0 f.blocks
+
+let item7_store_cfg_growth_metrics
+    (f : Cfg.func)
+    (((_, _, _, callee_label, _, _, callee) as site)
+      : late_store_cfg_inline_site) =
+  let repeat_sites =
+    max 1 (item7_count_direct_calls_to_label_early f callee_label)
+  in
+  let callee_instrs =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        acc + List.length block.body)
+      0 callee.blocks
+  in
+  {
+    item7_growth_repeat_sites = repeat_sites;
+    item7_growth_callee_instrs = callee_instrs;
+    item7_growth_static_instrs = repeat_sites * callee_instrs;
+    item7_growth_static_temps = repeat_sites * callee.temp_count;
+    item7_growth_in_loop = late_store_cfg_inline_site_in_loop f site;
+  }
+
+let item7_store_cfg_growth_profitable
+    (metrics : item7_store_cfg_growth_metrics) =
+  metrics.item7_growth_repeat_sites <= 1
+  ||
+  (metrics.item7_growth_static_instrs
+     <= item7_inline_static_growth_instr_budget
+   && metrics.item7_growth_static_temps
+      <= item7_inline_static_growth_temp_budget)
+
+let item7_debug_store_cfg_profit_policy
+    (f : Cfg.func)
+    ((site_label, _, _, callee_label, _, _, _) : late_store_cfg_inline_site)
+    (metrics : item7_store_cfg_growth_metrics)
+    decision =
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_PROFIT_POLICY" <> None then
+    Printf.eprintf
+      "item7-profit-policy family=store-cfg caller=%s callee=%s site=%s decision=%s in-loop=%d repeat=%d callee-instrs=%d static-instr-growth=%d static-temp-growth=%d instr-budget=%d temp-budget=%d\n%!"
+      f.name callee_label site_label decision
+      (if metrics.item7_growth_in_loop then 1 else 0)
+      metrics.item7_growth_repeat_sites
+      metrics.item7_growth_callee_instrs
+      metrics.item7_growth_static_instrs
+      metrics.item7_growth_static_temps
+      item7_inline_static_growth_instr_budget
+      item7_inline_static_growth_temp_budget
+
+let late_store_cfg_inline_site_profitable_v15
+    (f : Cfg.func) (site : late_store_cfg_inline_site) =
+  let metrics = item7_store_cfg_growth_metrics f site in
+  let profitable = item7_store_cfg_growth_profitable metrics in
+  item7_debug_store_cfg_profit_policy f site metrics
+    (if profitable then "allow" else "reject-static-growth");
+  profitable
+
+(* A profitability rejection must not become head-of-line blocking.  Search past
+   an unprofitable candidate so an unrelated later helper can still inline.
+   This matters for unknown programs such as:
+       large_repeated_helper(); small_profitable_helper();
+   where the first site should not disable optimization of the second one. *)
+let find_late_store_cfg_inline_profitable_site
+    (table : (string, Cfg.func) Hashtbl.t)
+    (f : Cfg.func) : late_store_cfg_inline_site option =
+  let rec find_in_body block_label rev_prefix = function
+    | [] -> None
+    | (Tcg.Call (dst_opt, callee, args) as instr) :: rest -> (
+        match Hashtbl.find_opt table callee with
+        | Some (candidate : Cfg.func)
+          when callee <> f.label
+               && List.length args = List.length candidate.params ->
+            let site =
+              ( block_label,
+                List.rev rev_prefix,
+                dst_opt,
+                callee,
+                args,
+                rest,
+                candidate )
+            in
+            if late_store_cfg_inline_site_profitable_v15 f site then Some site
+            else find_in_body block_label (instr :: rev_prefix) rest
+        | Some _ | None ->
+            find_in_body block_label (instr :: rev_prefix) rest)
+    | instr :: rest ->
+        find_in_body block_label (instr :: rev_prefix) rest
+  in
+  let rec find = function
+    | [] -> None
+    | (block : Cfg.block) :: rest -> (
+        match find_in_body block.label [] block.body with
+        | Some _ as site -> site
+        | None -> find rest)
+  in
+  find f.blocks
+
 let inline_late_store_cfg_calls_func summaries globals
     (table : (string, Cfg.func) Hashtbl.t)
     (f : Cfg.func) =
   let rec apply serial fuel count current =
     if fuel = 0 then (current, count)
     else
-      match find_late_store_cfg_inline_site table current with
+      match find_late_store_cfg_inline_profitable_site table current with
       | None -> (current, count)
       | Some site ->
-          if not (late_store_cfg_inline_site_profitable current site) then begin
-            if Sys.getenv_opt "TOYC_DEBUG_ITEM7_STORE_CFG_GUARD" <> None then begin
-              let
-                (site_label, _, _, callee_label, _, _, callee) = site
-              in
-              Printf.eprintf
-                "item7-store-cfg-guard caller=%s callee=%s site=%s caller-temps=%d callee-temps=%d projected=%d cap=%d reason=nonloop-pressure\n%!"
-                current.name callee_label site_label current.temp_count
-                callee.temp_count (current.temp_count + callee.temp_count)
-                late_store_cfg_inline_nonloop_projected_temp_cap
-            end;
-            (current, count)
-          end else begin
-            item7_debug_store_cfg_site_pressure summaries globals current site;
-            match inline_one_late_store_cfg_call serial current site with
-            | None -> (current, count)
-            | Some next ->
-                apply (serial + 1) (fuel - 1) (count + 1) next
-          end
+          item7_debug_store_cfg_site_pressure summaries globals current site;
+          match inline_one_late_store_cfg_call serial current site with
+          | None -> (current, count)
+          | Some next ->
+              apply (serial + 1) (fuel - 1) (count + 1) next
   in
   apply 0 late_store_cfg_inline_max_sites_per_func 0 f
 
@@ -32978,6 +33099,516 @@ let inline_late_divmod_cfg_calls_program (funcs : Cfg.func list) =
       "item7-divmod-cfg-inline replaced=%d\n%!" !total_replaced;
   result
 
+(* -------------------------------------------------------------------------- *)
+(* item7 v13: within-size single-block-loop Div/Mod inline                    *)
+(*                                                                            *)
+(* v12/v12b showed ten cyclic Div/Mod residual callees.  All ten contain      *)
+(* exactly one natural loop whose loop body is one CFG block, with one latch   *)
+(* and one exiting control block.  Nine are independently oversized (>6 CFG   *)
+(* blocks); exactly one remains within the existing 6-block/32-instr/64-temp   *)
+(* budget.  Its LoopSimplify report is not "ready" because it lacks a unique   *)
+(* preheader and dedicated exits, but those are canonical-form requirements    *)
+(* for loop analyses, not requirements of the generic CFG cloner: the cloner  *)
+(* preserves every block/edge and only redirects Return to a continuation.     *)
+(*                                                                            *)
+(* Therefore v13 relaxes ONLY acyclicity for the narrow shape below: one       *)
+(* natural loop, one loop block, one latch, one exit edge/control, still under *)
+(* the already-proven CFG size limits.  Store/nested Call/non-param Local load *)
+(* remain forbidden.  As in v9/v11 there is no post-inline DCE/full reopt, so  *)
+(* Div/Mod execution is preserved.                                             *)
+(* -------------------------------------------------------------------------- *)
+
+let late_divmod_singleblock_cycle_candidate
+    (f : Cfg.func) : Cfg.func option =
+  if f.ret <> TInt then None
+  else
+    let view =
+      f
+      |> thread_and_prune_func
+      |> simplify_cfg_func
+      |> final_linear_merge_func
+      |> thread_and_prune_func
+    in
+    if not (cfg_targets_valid view) then None
+    else
+      let reachable = reachable_labels view.entry view.blocks in
+      let blocks =
+        List.filter
+          (fun (block : Cfg.block) -> LabelSet.mem block.label reachable)
+          view.blocks
+      in
+      let view = { view with blocks } in
+      let block_count = List.length blocks in
+      let instr_count =
+        List.fold_left
+          (fun acc (block : Cfg.block) -> acc + List.length block.body)
+          0 blocks
+      in
+      let param_ids =
+        List.fold_left
+          (fun acc (param : Tcg.var) -> IntSet.add param.id acc)
+          IntSet.empty view.params
+      in
+      let has_divmod = ref false in
+      let instr_safe = function
+        | Tcg.Move _ | Tcg.Un _ -> true
+        | Tcg.Bin (_, (Div | Mod), _, _) ->
+            has_divmod := true;
+            true
+        | Tcg.Bin _ -> true
+        | Tcg.Load (_, Tcg.Local id) -> IntSet.mem id param_ids
+        | Tcg.Load (_, Tcg.Global _) -> true
+        | Tcg.Store _ | Tcg.Call _ -> false
+      in
+      let term_safe = function
+        | Cfg.Return (Some _)
+        | Cfg.Jump _
+        | Cfg.BranchZero _
+        | Cfg.BranchNonZero _
+        | Cfg.BranchCompare _ ->
+            true
+        | Cfg.Return None -> false
+      in
+      let has_value_return =
+        List.exists
+          (fun (block : Cfg.block) ->
+            match block.term with
+            | Cfg.Return (Some _) -> true
+            | Cfg.Return None
+            | Cfg.Jump _
+            | Cfg.BranchZero _
+            | Cfg.BranchNonZero _
+            | Cfg.BranchCompare _ ->
+                false)
+          blocks
+      in
+      let all_safe =
+        List.for_all
+          (fun (block : Cfg.block) ->
+            List.for_all instr_safe block.body && term_safe block.term)
+          blocks
+      in
+      if
+        block_count < 2
+        || block_count > late_branch_inline_max_blocks
+        || instr_count > late_branch_inline_max_instrs
+        || view.temp_count > late_branch_inline_max_temps
+        || not all_safe
+        || not !has_divmod
+        || not has_value_return
+      then None
+      else
+        let ignored = Hashtbl.create 1 in
+        if cfg_acyclic_ignoring_edges view ignored then None
+        else
+          let report = build_loop_simplify_report view in
+          let forest = report.loop_simplify_forest in
+          match forest.loop_forest_headers, forest.loop_forest_roots with
+          | [ header ], [ root ] when header = root ->
+              begin
+                match
+                  Hashtbl.find_opt forest.loop_forest_infos header,
+                  Hashtbl.find_opt report.loop_simplify_infos header
+                with
+                | Some loop_info, Some simplify_info
+                  when LabelSet.cardinal loop_info.loop_info_blocks = 1
+                       && List.length loop_info.loop_info_latches = 1
+                       && List.length loop_info.loop_info_exit_edges = 1
+                       && simplify_info.loop_simplify_single_latch
+                       && simplify_info.loop_simplify_single_exit_control ->
+                    Some view
+                | Some _, Some _ | None, _ | _, None -> None
+              end
+          | _ -> None
+
+let build_late_divmod_singleblock_cycle_table (funcs : Cfg.func list) :
+    (string, Cfg.func) Hashtbl.t =
+  let table = Hashtbl.create (max 8 (List.length funcs)) in
+  List.iter
+    (fun (f : Cfg.func) ->
+      match late_divmod_singleblock_cycle_candidate f with
+      | None -> ()
+      | Some candidate ->
+          Hashtbl.replace table f.label candidate;
+          if
+            Sys.getenv_opt "TOYC_DEBUG_ITEM7_DIVMOD_CYCLE_INLINE" <> None
+          then
+            Printf.eprintf
+              "item7-divmod-cycle-inline-candidate func=%s blocks=%d instrs=%d temps=%d params=%d\n%!"
+              f.name (List.length candidate.blocks)
+              (List.fold_left
+                 (fun acc (block : Cfg.block) ->
+                   acc + List.length block.body)
+                 0 candidate.blocks)
+              candidate.temp_count (List.length candidate.params))
+    funcs;
+  table
+
+let inline_late_divmod_singleblock_cycle_calls_func
+    (table : (string, Cfg.func) Hashtbl.t)
+    (f : Cfg.func) =
+  let rec apply serial fuel count current =
+    if fuel = 0 then (current, count)
+    else
+      match find_late_store_cfg_inline_site table current with
+      | None -> (current, count)
+      | Some site ->
+          if not (late_store_cfg_inline_site_profitable current site) then begin
+            if
+              Sys.getenv_opt "TOYC_DEBUG_ITEM7_DIVMOD_CYCLE_GUARD" <> None
+            then begin
+              let site_label, _, _, callee_label, _, _, callee = site in
+              Printf.eprintf
+                "item7-divmod-cycle-guard caller=%s callee=%s site=%s caller-temps=%d callee-temps=%d projected=%d cap=%d reason=nonloop-pressure\n%!"
+                current.name callee_label site_label current.temp_count
+                callee.temp_count (current.temp_count + callee.temp_count)
+                late_store_cfg_inline_nonloop_projected_temp_cap
+            end;
+            (current, count)
+          end else
+            match inline_one_late_store_cfg_call serial current site with
+            | None -> (current, count)
+            | Some next ->
+                apply (serial + 1) (fuel - 1) (count + 1) next
+  in
+  apply 0 late_store_cfg_inline_max_sites_per_func 0 f
+
+let inline_late_divmod_singleblock_cycle_calls_program
+    (funcs : Cfg.func list) =
+  let total_replaced = ref 0 in
+  let rec iterate fuel current =
+    if fuel = 0 then current
+    else
+      let table = build_late_divmod_singleblock_cycle_table current in
+      if Hashtbl.length table = 0 then current
+      else
+        let changed = ref false in
+        let next =
+          List.map
+            (fun (f : Cfg.func) ->
+              let rewritten, count =
+                inline_late_divmod_singleblock_cycle_calls_func table f
+              in
+              if count > 0 then begin
+                changed := true;
+                total_replaced := !total_replaced + count
+              end;
+              rewritten)
+            current
+        in
+        if !changed then iterate (fuel - 1) next else current
+  in
+  let result = iterate 3 funcs in
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_DIVMOD_CYCLE_INLINE" <> None then
+    Printf.eprintf
+      "item7-divmod-cycle-inline replaced=%d\n%!" !total_replaced;
+  result
+
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v14: generalized inline-profitability feature audit                  *)
+(*                                                                            *)
+(* The local smoke suite is only a regression sample, not the optimization     *)
+(* target.  Before replacing the current fixed thresholds with a more general  *)
+(* profitability model, collect the same site/callee features for every known  *)
+(* residual direct call at the post-effect-refresh point (before item7's custom *)
+(* Store/DivMod inliners).  This pass is AUDIT ONLY: it does not change IR.     *)
+(*                                                                            *)
+(* Important features:                                                        *)
+(*   - dynamic leverage proxy: caller loop depth / containing loop size        *)
+(*   - register-pressure proxy: live-across, caller/callee/projected temps      *)
+(*   - repeated expansion risk: number of same-callee sites in the caller      *)
+(*   - code-growth shape: blocks/instrs/branches/joins/returns                  *)
+(*   - semantic/effect shape: stores/divmods/nested calls/global effects       *)
+(*   - cyclic shape: natural-loop count / max loop body size                   *)
+(*                                                                            *)
+(* No score is enforced yet.  The purpose of v14 is to calibrate a policy from *)
+(* generic program shapes rather than from individual testcase names.          *)
+(* -------------------------------------------------------------------------- *)
+
+let item7_profitability_view (f : Cfg.func) =
+  let view =
+    f
+    |> thread_and_prune_func
+    |> simplify_cfg_func
+    |> final_linear_merge_func
+    |> thread_and_prune_func
+  in
+  let reachable = reachable_labels view.entry view.blocks in
+  let blocks =
+    List.filter
+      (fun (block : Cfg.block) -> LabelSet.mem block.label reachable)
+      view.blocks
+  in
+  Cfg.rebuild_edges { view with blocks }
+
+let item7_count_calls_by_callee (f : Cfg.func) =
+  let counts = Hashtbl.create 8 in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter
+        (function
+          | Tcg.Call (_, callee, _) ->
+              let old =
+                match Hashtbl.find_opt counts callee with
+                | Some n -> n
+                | None -> 0
+              in
+              Hashtbl.replace counts callee (old + 1)
+          | _ -> ())
+        block.body)
+    f.blocks;
+  counts
+
+let item7_profitability_shape (f : Cfg.func) =
+  let block_count = List.length f.blocks in
+  let instr_count =
+    List.fold_left
+      (fun acc (block : Cfg.block) -> acc + List.length block.body)
+      0 f.blocks
+  in
+  let branch_count =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        match block.term with
+        | Cfg.BranchZero _ | Cfg.BranchNonZero _ | Cfg.BranchCompare _ ->
+            acc + 1
+        | Cfg.Return _ | Cfg.Jump _ -> acc)
+      0 f.blocks
+  in
+  let join_count =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        if List.length block.preds > 1 then acc + 1 else acc)
+      0 f.blocks
+  in
+  let return_count =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        match block.term with
+        | Cfg.Return _ -> acc + 1
+        | Cfg.Jump _
+        | Cfg.BranchZero _
+        | Cfg.BranchNonZero _
+        | Cfg.BranchCompare _ -> acc)
+      0 f.blocks
+  in
+  let stores = ref 0 in
+  let divmods = ref 0 in
+  let nested_calls = ref 0 in
+  let global_loads = ref 0 in
+  let local_loads = ref 0 in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter
+        (function
+          | Tcg.Store _ -> incr stores
+          | Tcg.Bin (_, (Div | Mod), _, _) -> incr divmods
+          | Tcg.Call _ -> incr nested_calls
+          | Tcg.Load (_, Tcg.Global _) -> incr global_loads
+          | Tcg.Load (_, Tcg.Local _) -> incr local_loads
+          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ -> ())
+        block.body)
+    f.blocks;
+  let ignored = Hashtbl.create 1 in
+  let cyclic = not (cfg_acyclic_ignoring_edges f ignored) in
+  let _, loops, headers = discover_natural_loops f in
+  let loop_count = List.length headers in
+  let max_loop_blocks =
+    List.fold_left
+      (fun acc header ->
+        let loop = table_find_or_empty loops header LabelSet.empty in
+        max acc (LabelSet.cardinal loop))
+      0 headers
+  in
+  ( block_count,
+    instr_count,
+    branch_count,
+    join_count,
+    return_count,
+    !stores,
+    !divmods,
+    !nested_calls,
+    !global_loads,
+    !local_loads,
+    cyclic,
+    loop_count,
+    max_loop_blocks )
+
+let item7_debug_profitability_feature_audit globals (funcs : Cfg.func list) =
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_PROFIT_MODEL" <> None then begin
+    let fresh_summaries = compute_func_summaries globals funcs in
+    let views = Hashtbl.create (max 8 (List.length funcs)) in
+    List.iter
+      (fun (f : Cfg.func) ->
+        let view = item7_profitability_view f in
+        Hashtbl.replace views f.label view)
+      funcs;
+    let total = ref 0 in
+    let known = ref 0 in
+    let unknown = ref 0 in
+    let in_loop_total = ref 0 in
+    let repeated_total = ref 0 in
+    let cyclic_total = ref 0 in
+    let oversize_total = ref 0 in
+    List.iter
+      (fun (caller : Cfg.func) ->
+        let caller_view = item7_profitability_view caller in
+        let live_in_t, _ =
+          compute_liveness fresh_summaries globals caller_view
+        in
+        let _, caller_loops, caller_headers =
+          discover_natural_loops caller_view
+        in
+        let same_callee_counts = item7_count_calls_by_callee caller_view in
+        List.iter
+          (fun (block : Cfg.block) ->
+            let loop_sizes =
+              List.filter_map
+                (fun header ->
+                  let loop =
+                    table_find_or_empty caller_loops header LabelSet.empty
+                  in
+                  if LabelSet.mem block.label loop then
+                    Some (LabelSet.cardinal loop)
+                  else None)
+                caller_headers
+            in
+            let loop_depth = List.length loop_sizes in
+            let min_loop_size =
+              match loop_sizes with
+              | [] -> 0
+              | size :: rest -> List.fold_left min size rest
+            in
+            let rec scan rev_prefix = function
+              | [] -> ()
+              | (Tcg.Call (dst_opt, callee_label, args) as instr) :: suffix ->
+                  incr total;
+                  let live_after =
+                    let live =
+                      ref
+                        (add_term_use_temps
+                           (live_out_t live_in_t block)
+                           block.term)
+                    in
+                    List.iter
+                      (fun suffix_instr ->
+                        begin
+                          match defs_temp suffix_instr with
+                          | Some dst -> live := IntSet.remove dst !live
+                          | None -> ()
+                        end;
+                        live := add_instr_use_temps !live suffix_instr)
+                      (List.rev suffix);
+                    !live
+                  in
+                  let result_live =
+                    match dst_opt with
+                    | Some dst when IntSet.mem dst live_after -> 1
+                    | Some _ | None -> 0
+                  in
+                  let live_across =
+                    match dst_opt with
+                    | Some dst -> IntSet.remove dst live_after
+                    | None -> live_after
+                  in
+                  let repeat_sites =
+                    match Hashtbl.find_opt same_callee_counts callee_label with
+                    | Some n -> n
+                    | None -> 1
+                  in
+                  if loop_depth > 0 then incr in_loop_total;
+                  if repeat_sites > 1 then incr repeated_total;
+                  begin
+                    match Hashtbl.find_opt views callee_label with
+                    | None ->
+                        incr unknown;
+                        Printf.eprintf
+                          "item7-profit-site caller=%s callee=%s site=%s known=0 result=%d result-live=%d args=%d in-loop=%d loop-depth=%d loop-size=%d repeat=%d live-across=%d caller-temps=%d\n%!"
+                          caller_view.name callee_label block.label
+                          (match dst_opt with Some _ -> 1 | None -> 0)
+                          result_live (List.length args)
+                          (if loop_depth > 0 then 1 else 0)
+                          loop_depth min_loop_size repeat_sites
+                          (IntSet.cardinal live_across)
+                          caller_view.temp_count
+                    | Some callee ->
+                        incr known;
+                        let
+                          ( blocks,
+                            instrs,
+                            branches,
+                            joins,
+                            returns,
+                            stores,
+                            divmods,
+                            nested_calls,
+                            global_loads,
+                            local_loads,
+                            cyclic,
+                            callee_loops,
+                            max_loop_blocks ) =
+                          item7_profitability_shape callee
+                        in
+                        if cyclic then incr cyclic_total;
+                        let size_ok =
+                          blocks <= late_branch_inline_max_blocks
+                          && instrs <= late_branch_inline_max_instrs
+                          && callee.temp_count <= late_branch_inline_max_temps
+                        in
+                        if not size_ok then incr oversize_total;
+                        let family =
+                          if nested_calls > 0 then "nested"
+                          else if stores > 0 && divmods > 0 then "store-divmod"
+                          else if stores > 0 then "store"
+                          else if divmods > 0 then "divmod"
+                          else "other"
+                        in
+                        let projected_once =
+                          caller_view.temp_count + callee.temp_count
+                        in
+                        let projected_repeat =
+                          caller_view.temp_count
+                          + (repeat_sites * callee.temp_count)
+                        in
+                        let read_globals, written_globals =
+                          match Hashtbl.find_opt fresh_summaries callee_label with
+                          | Some summary ->
+                              ( PlaceSet.cardinal summary.read_globals,
+                                PlaceSet.cardinal summary.written_globals )
+                          | None -> (0, 0)
+                        in
+                        Printf.eprintf
+                          "item7-profit-site caller=%s callee=%s site=%s known=1 family=%s result=%d result-live=%d args=%d in-loop=%d loop-depth=%d loop-size=%d repeat=%d live-across=%d caller-temps=%d callee-blocks=%d callee-instrs=%d callee-temps=%d projected-once=%d projected-repeat=%d branches=%d joins=%d returns=%d cyclic=%d callee-loops=%d max-loop-blocks=%d stores=%d divmods=%d nested-calls=%d global-loads=%d local-loads=%d read-globals=%d written-globals=%d size-ok=%d cap40=%d\n%!"
+                          caller_view.name callee.name block.label family
+                          (match dst_opt with Some _ -> 1 | None -> 0)
+                          result_live (List.length args)
+                          (if loop_depth > 0 then 1 else 0)
+                          loop_depth min_loop_size repeat_sites
+                          (IntSet.cardinal live_across)
+                          caller_view.temp_count blocks instrs callee.temp_count
+                          projected_once projected_repeat branches joins returns
+                          (if cyclic then 1 else 0) callee_loops max_loop_blocks
+                          stores divmods nested_calls global_loads local_loads
+                          read_globals written_globals
+                          (if size_ok then 1 else 0)
+                          (if loop_depth > 0
+                              || projected_once
+                                 <= late_store_cfg_inline_nonloop_projected_temp_cap
+                           then 1 else 0)
+                  end;
+                  scan (instr :: rev_prefix) suffix
+              | instr :: suffix -> scan (instr :: rev_prefix) suffix
+            in
+            scan [] block.body)
+          caller_view.blocks)
+      funcs;
+    Printf.eprintf
+      "item7-profit-summary calls=%d known=%d unknown=%d in-loop=%d repeated=%d cyclic=%d oversize=%d\n%!"
+      !total !known !unknown !in_loop_total !repeated_total !cyclic_total
+      !oversize_total
+  end
+
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
   last_liveness_cache := None;
@@ -33058,6 +33689,9 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let optimized_funcs =
     refresh_final_effect_sets_dce_program summaries globals optimized_funcs
   in
+  let () =
+    item7_debug_profitability_feature_audit globals optimized_funcs
+  in
   let optimized_funcs =
     inline_late_store_scalar_calls_program globals optimized_funcs
   in
@@ -33069,6 +33703,9 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   in
   let optimized_funcs =
     inline_late_divmod_cfg_calls_program optimized_funcs
+  in
+  let optimized_funcs =
+    inline_late_divmod_singleblock_cycle_calls_program optimized_funcs
   in
   item7_debug_inline_effect_capability summaries removable_calls globals optimized_funcs;
   { Cfg.funcs = optimized_funcs }
