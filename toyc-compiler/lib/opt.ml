@@ -2768,6 +2768,192 @@ let compact_temp_ids_func ?(debug_tag = "") (f : Cfg.func) =
       { f with temp_count = used_count; blocks }
   end
 
+(* Conservative post-mem2reg copy propagation.
+
+   We intentionally do NOT propagate from a multi-definition source temp.
+   Edge-copy phi temps are multi-definition by construction; replacing a
+   point-in-time snapshot [dst = phi_temp] with [phi_temp] globally could
+   change the program-point value seen by later uses across loop iterations.
+
+   Therefore a move is eligible only when:
+     - its destination has exactly one definition in the whole function; and
+     - its source is an immediate, or a temp that also has exactly one
+       definition in the whole function.
+
+   This preserves the loop-carried/multi-def boundary while removing ordinary
+   SSA-like copy chains introduced around mem2reg/global promotion. *)
+let propagate_singledef_moves_func (f : Cfg.func) =
+  let def_counts = Array.make f.temp_count 0 in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter
+        (fun instr ->
+          match defs_temp instr with
+          | Some temp
+            when temp >= 0 && temp < f.temp_count ->
+              def_counts.(temp) <- def_counts.(temp) + 1
+          | Some _
+          | None ->
+              ())
+        block.body)
+    f.blocks;
+  let raw_subst = Hashtbl.create 32 in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter
+        (function
+          | Tcg.Move (dst, source)
+            when dst >= 0
+                 && dst < f.temp_count
+                 && def_counts.(dst) = 1 ->
+              begin
+                match source with
+                | Tcg.Imm _ ->
+                    Hashtbl.replace raw_subst dst source
+                | Tcg.Temp src
+                  when src >= 0
+                       && src < f.temp_count
+                       && def_counts.(src) = 1
+                       && src <> dst ->
+                    Hashtbl.replace raw_subst dst source
+                | Tcg.Temp _ ->
+                    ()
+              end
+          | Tcg.Move _
+          | Tcg.Un _
+          | Tcg.Bin _
+          | Tcg.Load _
+          | Tcg.Store _
+          | Tcg.Call _ ->
+              ())
+        block.body)
+    f.blocks;
+  let rec resolve seen = function
+    | Tcg.Imm _ as operand ->
+        Some operand
+    | Tcg.Temp temp as operand ->
+        if IntSet.mem temp seen then
+          None
+        else
+          match Hashtbl.find_opt raw_subst temp with
+          | None ->
+              Some operand
+          | Some next ->
+              resolve (IntSet.add temp seen) next
+  in
+  let subst = Hashtbl.create (max 8 (Hashtbl.length raw_subst)) in
+  Hashtbl.iter
+    (fun dst source ->
+      match resolve (IntSet.singleton dst) source with
+      | Some resolved
+        when resolved <> Tcg.Temp dst ->
+          begin
+            match resolved with
+            | Tcg.Imm _ ->
+                Hashtbl.replace subst dst resolved
+            | Tcg.Temp src
+              when src >= 0
+                   && src < f.temp_count
+                   && def_counts.(src) = 1 ->
+                Hashtbl.replace subst dst resolved
+            | Tcg.Temp _ ->
+                ()
+          end
+      | Some _
+      | None ->
+          ())
+    raw_subst;
+  if Hashtbl.length subst = 0 then begin
+    if Sys.getenv_opt "TOYC_DEBUG_EARLY_MEM2REG_MOVE_PROP" <> None then
+      Printf.eprintf
+        "early-mem2reg-move-prop func=%s candidates=%d resolved=0 rewritten-uses=0\n%!"
+        f.name (Hashtbl.length raw_subst);
+    f
+  end else begin
+    let rewritten_uses = ref 0 in
+    let rewrite_operand operand =
+      let rec go seen operand =
+        match operand with
+        | Tcg.Imm _ ->
+            operand
+        | Tcg.Temp temp ->
+            if IntSet.mem temp seen then
+              operand
+            else
+              match Hashtbl.find_opt subst temp with
+              | None ->
+                  operand
+              | Some replacement ->
+                  incr rewritten_uses;
+                  go (IntSet.add temp seen) replacement
+      in
+      go IntSet.empty operand
+    in
+    let rewrite_instr = function
+      | Tcg.Move (dst, src) ->
+          Tcg.Move (dst, rewrite_operand src)
+      | Tcg.Un (dst, op, src) ->
+          Tcg.Un (dst, op, rewrite_operand src)
+      | Tcg.Bin (dst, op, lhs, rhs) ->
+          Tcg.Bin
+            ( dst,
+              op,
+              rewrite_operand lhs,
+              rewrite_operand rhs )
+      | Tcg.Load _ as instr ->
+          instr
+      | Tcg.Store (place, value) ->
+          Tcg.Store (place, rewrite_operand value)
+      | Tcg.Call (dst, callee, args) ->
+          Tcg.Call
+            ( dst,
+              callee,
+              List.map rewrite_operand args )
+    in
+    let rewrite_term = function
+      | Cfg.Jump _ as term ->
+          term
+      | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
+          Cfg.BranchZero
+            (rewrite_operand cond, if_zero, if_nonzero)
+      | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
+          Cfg.BranchNonZero
+            (rewrite_operand cond, if_nonzero, if_zero)
+      | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
+          Cfg.BranchCompare
+            ( op,
+              rewrite_operand lhs,
+              rewrite_operand rhs,
+              if_true,
+              if_false )
+      | Cfg.Return None ->
+          Cfg.Return None
+      | Cfg.Return (Some value) ->
+          Cfg.Return (Some (rewrite_operand value))
+    in
+    let blocks =
+      List.map
+        (fun (block : Cfg.block) ->
+          let body = List.map rewrite_instr block.body in
+          let term = rewrite_term block.term in
+          {
+            block with
+            body;
+            term;
+            succs = Cfg.successors term;
+          })
+        f.blocks
+    in
+    if Sys.getenv_opt "TOYC_DEBUG_EARLY_MEM2REG_MOVE_PROP" <> None then
+      Printf.eprintf
+        "early-mem2reg-move-prop func=%s candidates=%d resolved=%d rewritten-uses=%d\n%!"
+        f.name
+        (Hashtbl.length raw_subst)
+        (Hashtbl.length subst)
+        !rewritten_uses;
+    Cfg.rebuild_edges { f with blocks }
+  end
+
 let copy_coalesce_func summaries globals (f : Cfg.func) =
   let debug_coalesce = Sys.getenv_opt "TOYC_DEBUG_COALESCE" <> None in
   if f.temp_count <= 1 then begin
@@ -3324,6 +3510,27 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
   let rec attempt (current : Cfg.func) candidates =
     if IntSet.is_empty candidates then current
     else begin
+      let reachable =
+        reachable_labels current.entry current.blocks
+      in
+      let reachable_blocks =
+        List.filter
+          (fun (block : Cfg.block) ->
+            LabelSet.mem block.label reachable)
+          current.blocks
+      in
+      let reachable_preds (block : Cfg.block) =
+        List.filter
+          (fun pred -> LabelSet.mem pred reachable)
+          block.preds
+      in
+      if Sys.getenv_opt "TOYC_DEBUG_MEM2REG_REACHABLE" <> None then
+        Printf.eprintf
+          "mem2reg-reachable func=%s blocks=%d reachable=%d ignored=%d\n%!"
+          current.name
+          (List.length current.blocks)
+          (List.length reachable_blocks)
+          (List.length current.blocks - List.length reachable_blocks);
       let next_temp = ref current.temp_count in
       let fresh_temp () =
         let temp = !next_temp in
@@ -3383,7 +3590,7 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
             block.body;
           Hashtbl.replace local_use block.label !uses;
           Hashtbl.replace local_def block.label !defs)
-        current.blocks;
+        reachable_blocks;
       let local_live_in = Hashtbl.create (List.length current.blocks) in
       let local_live_out = Hashtbl.create (List.length current.blocks) in
       let get_local_set table label =
@@ -3415,7 +3622,7 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
               Hashtbl.replace local_live_in block.label in_set;
               live_changed := true
             end)
-          (List.rev current.blocks)
+          (List.rev reachable_blocks)
       done;
       let local_is_live_in label local_id =
         IntSet.mem local_id (get_local_set local_live_in label)
@@ -3432,7 +3639,7 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
             Printf.eprintf
               "mem2reg-livein func=%s label=%s locals={%s}\n%!"
               current.name block.label live)
-          current.blocks;
+          reachable_blocks;
       let compute_in_env get_out (block : Cfg.block) =
         if block.label = current.entry then seed_env
         else
@@ -3446,7 +3653,7 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
                   else merge_incoming_operand
                 in
                 let keep_value =
-                  merge block.preds
+                  merge (reachable_preds block)
                     (fun pred -> IntMap.find_opt local_id (get_out pred))
                     (fun () -> get_phi_temp block.label local_id)
                 in
@@ -3464,7 +3671,7 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
           env block.body
       in
       let in_envs, out_envs, get_env =
-        solve_forward_envs current.blocks ~empty_env:IntMap.empty
+        solve_forward_envs reachable_blocks ~empty_env:IntMap.empty
           ~equal_env:equal_operand_map ~compute_in_env ~transfer_env
       in
       let failed = ref IntSet.empty in
@@ -3491,10 +3698,10 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
                       (fun pred ->
                         if not (IntMap.mem local_id (get_env out_envs pred)) then
                           failed := IntSet.add local_id !failed)
-                      block.preds
+                      (reachable_preds block)
                 | _ -> ())
             phi_temps)
-        current.blocks;
+        reachable_blocks;
       let succeeded = IntSet.diff candidates !failed in
       if Sys.getenv_opt "TOYC_DEBUG_MEM2REG_LOOP_PHI" <> None then
         Printf.eprintf
@@ -3539,7 +3746,21 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
           in
           { block with body }
         in
-        let promoted_blocks = List.map rewrite_block current.blocks in
+        let promoted_blocks =
+          List.map
+            (fun (block : Cfg.block) ->
+              if LabelSet.mem block.label reachable then
+                rewrite_block block
+              else
+                block)
+            current.blocks
+        in
+        let promoted_reachable_blocks =
+          List.filter
+            (fun (block : Cfg.block) ->
+              LabelSet.mem block.label reachable)
+            promoted_blocks
+        in
         let edge_id = ref 0 in
         let fresh_edge_label () =
           let id = !edge_id in
@@ -3644,8 +3865,8 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
                         + max 0 (List.length body - List.length copies);
                       edge_copies_rev :=
                         (pred, succ_block.label, body) :: !edge_copies_rev)
-                succ_block.preds)
-          promoted_blocks;
+                (reachable_preds succ_block))
+          promoted_reachable_blocks;
         let edge_copies = List.rev !edge_copies_rev in
         let blocks =
           place_edge_copies fresh_edge_label promoted_blocks edge_copies
@@ -3655,19 +3876,20 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
             { current with temp_count = !next_temp; blocks }
         in
         let promoted_block_map =
-          Hashtbl.create (max 8 (List.length promoted_blocks))
+          Hashtbl.create
+            (max 8 (List.length promoted_reachable_blocks))
         in
         List.iter
           (fun (block : Cfg.block) ->
             Hashtbl.replace
               promoted_block_map block.label block)
-          promoted_blocks;
+          promoted_reachable_blocks;
         let promoted_doms =
           mem2reg_local_dominators
-            current.entry promoted_blocks
+            current.entry promoted_reachable_blocks
         in
         let promoted_defs =
-          mem2reg_temp_def_blocks promoted_blocks
+          mem2reg_temp_def_blocks promoted_reachable_blocks
         in
         let loop_cache = Hashtbl.create 8 in
         let natural_loop header =
@@ -3788,8 +4010,20 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
               (List.length before_compact.blocks
                - List.length promoted_blocks)
           in
+          let ignored_pred_edges =
+            List.fold_left
+              (fun count (block : Cfg.block) ->
+                count
+                + List.fold_left
+                    (fun count pred ->
+                      if LabelSet.mem pred reachable
+                      then count
+                      else count + 1)
+                    0 block.preds)
+              0 reachable_blocks
+          in
           Printf.eprintf
-            "mem2reg-edge-copy func=%s actual-phis=%d raw-copies=%d scheduled-moves=%d cycle-snapshots=%d edge-sites=%d critical-edge-blocks=%d exact-same-source=%d self-trivial=%d self-trivial-safe=%d self-trivial-eliminated=%d dead-phis=%d temps=%d\n%!"
+            "mem2reg-edge-copy func=%s actual-phis=%d raw-copies=%d scheduled-moves=%d cycle-snapshots=%d edge-sites=%d critical-edge-blocks=%d ignored-unreachable-pred-edges=%d exact-same-source=%d self-trivial=%d self-trivial-safe=%d self-trivial-eliminated=%d dead-phis=%d temps=%d\n%!"
             current.name
             (IntSet.cardinal !actual_phi_temps)
             !raw_copy_pairs
@@ -3797,6 +4031,7 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
             !cycle_snapshot_instrs
             (List.length edge_copies)
             critical_edge_blocks
+            ignored_pred_edges
             !exact_same_source_phis
             !self_recursive_trivial_phis
             (List.length safe_self_trivial)
@@ -25961,9 +26196,30 @@ let optimize_func global_init summaries globals return_globals removable_calls (
     else
       mem2reg_func ~optimistic_loop_phi:true f
   in
-  let promoted =
+  let promoted_before_move_cleanup =
     early_mem2reg |> promote_globals_func summaries globals
   in
+  let promoted =
+    if Sys.getenv_opt "TOYC_DISABLE_EARLY_MEM2REG_MOVE_PROP" <> None then
+      promoted_before_move_cleanup
+    else
+      promoted_before_move_cleanup
+      |> propagate_singledef_moves_func
+      |> eliminate_dead_code_func
+           ~removable_calls summaries globals return_globals
+      |> compact_temp_ids_func
+           ~debug_tag:"early-post-mem2reg-move-prop"
+  in
+  if Sys.getenv_opt "TOYC_DEBUG_EARLY_MEM2REG_MOVE_PROP" <> None then begin
+    let before = metrics_of_func promoted_before_move_cleanup in
+    let after = metrics_of_func promoted in
+    Printf.eprintf
+      "early-mem2reg-move-cleanup func=%s instrs=%d->%d blocks=%d->%d temps=%d->%d\n%!"
+      promoted.name
+      before.instr_count after.instr_count
+      before.block_count after.block_count
+      promoted_before_move_cleanup.temp_count promoted.temp_count
+  end;
   let () = debug_lcssa_stage "promoted" promoted in
   let canonical =
     loop_canonicalize_func summaries globals promoted
