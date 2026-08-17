@@ -22430,6 +22430,893 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
             false
       in
 
+    (* v78: summarize one rotated, pure scalar "state-machine" loop whose
+       outer IV threshold selects between two monotone threshold transfers.
+
+       Canonical late shape:
+
+         control/header:
+           if iv < bound -> body else exit
+
+         body:
+           if iv < K -> phase_a_root else phase_b_root
+
+         phase_a_root:
+           cmp = x + ca;
+           if cmp < La -> a_true else a_false
+           ...
+           xa = x + Sa_low / x + Sa_high
+           -> a_join
+
+         phase_b_root:
+           cmp = x + cb;
+           if cmp < Lb -> b_true else b_false
+           ...
+           xb = x + Sb_low / x + Sb_high
+           -> b_join
+
+         a_join/b_join -> join
+         join:
+           iv = iv + 1;
+           x = selected_x;
+           -> control
+
+       Each inner condition is equivalent to [x < C], where
+         C = L - c.
+       With positive low-side step and nonnegative high-side step, and in the
+       absence of i32 wrap, each transfer changes side at most once.  The
+       remaining loop therefore has at most four arithmetic phases.
+
+       Correctness guard:
+       ToyC arithmetic is i32.  Wrap could destroy monotonicity and make a
+       threshold become true again.  Do NOT assume no overflow.  Redirect the
+       control's loop-back edge through a runtime guard.  The fast summary is
+       used only when
+         - iv, bound, outer K, and x are nonnegative;
+         - x stays below INT32_MAX - max(compare_bias) for every remaining
+           iteration.
+       Otherwise jump back to the original body and execute the source loop.
+       All guard arithmetic itself is non-trapping; division uses a positive
+       compile-time constant. *)
+    let try_eliminate_monotone_state_piecewise_loop
+        header
+        loop
+        (info : counted_loop_info)
+        effects
+        loop_defs
+        multi_defs
+        def_instrs
+      =
+      let debug_hit fmt =
+        if debug_counted then
+          Printf.ksprintf
+            (fun msg -> debugf "%s" msg)
+            fmt
+        else
+          Printf.ksprintf (fun _ -> ()) fmt
+      in
+      let int32_max = 2_147_483_647L in
+
+      let resolved_before_loop operand =
+        resolve_operand_before_loop
+          loop_defs multi_defs def_instrs operand
+      in
+
+      (* v79: resolve one path as [carrier + constant] by scanning
+         instructions in program order.  This deliberately supports both the
+         PHI-lowered early form (add -> move -> merge) and the late
+         copy-coalesced form (direct carrier update / compare-temp reuse). *)
+      let constant_delta_after carrier instrs result_operand =
+        let value_of_operand env = function
+          | Tcg.Imm value ->
+              Some (0, i32 value)
+          | Tcg.Temp temp ->
+              begin
+                match IntMap.find_opt temp env with
+                | Some value -> Some value
+                | None when temp = carrier -> Some (1, 0L)
+                | None -> None
+              end
+        in
+        let rec scan env = function
+          | [] ->
+              begin
+                match value_of_operand env result_operand with
+                | Some (1, bias) -> Some bias
+                | Some _
+                | None -> None
+              end
+          | instr :: rest ->
+              begin
+                match instr with
+                | Tcg.Move (dst, src) ->
+                    begin
+                      match value_of_operand env src with
+                      | Some value ->
+                          scan (IntMap.add dst value env) rest
+                      | None ->
+                          None
+                    end
+                | Tcg.Bin (dst, Add, lhs, rhs) ->
+                    begin
+                      match
+                        value_of_operand env lhs,
+                        value_of_operand env rhs
+                      with
+                      | Some (lc, lb), Some (rc, rb) ->
+                          scan
+                            (IntMap.add
+                               dst
+                               ( lc + rc,
+                                 i32 (Int64.add lb rb) )
+                               env)
+                            rest
+                      | _ ->
+                          None
+                    end
+                | Tcg.Un _
+                | Tcg.Bin _
+                | Tcg.Load _
+                | Tcg.Store _
+                | Tcg.Call _ ->
+                    None
+              end
+        in
+        scan IntMap.empty instrs
+      in
+
+      let parse_inner_transfer root_label =
+        if not (LabelSet.mem root_label loop) then
+          None
+        else
+          let root : Cfg.block = get_block root_label in
+          match root.body, root.term with
+          | [ cmp_instr ],
+            Cfg.BranchCompare
+              ( Lt,
+                Tcg.Temp branch_cmp_temp,
+                Tcg.Imm raw_limit,
+                true_label,
+                false_label ) ->
+              begin
+                match cmp_instr with
+                | Tcg.Bin
+                    ( cmp_temp,
+                      Add,
+                      Tcg.Temp carrier,
+                      Tcg.Imm raw_bias )
+                | Tcg.Bin
+                    ( cmp_temp,
+                      Add,
+                      Tcg.Imm raw_bias,
+                      Tcg.Temp carrier )
+                  when cmp_temp = branch_cmp_temp ->
+                    let cmp_bias = i32 raw_bias in
+                    let limit = i32 raw_limit in
+                    let threshold = Int64.sub limit cmp_bias in
+                    if
+                      cmp_bias < 0L
+                      || threshold < 0L
+                      || threshold > int32_max
+                      || not (LabelSet.mem true_label loop)
+                      || not (LabelSet.mem false_label loop)
+                    then
+                      None
+                    else
+                      let parse_child child_label =
+                        let child : Cfg.block =
+                          get_block child_label
+                        in
+                        match child.term with
+                        | Cfg.Jump join_label ->
+                            Some (child.body, join_label)
+                        | Cfg.BranchZero _
+                        | Cfg.BranchNonZero _
+                        | Cfg.BranchCompare _
+                        | Cfg.Return _ ->
+                            None
+                      in
+                      begin
+                        match
+                          parse_child true_label,
+                          parse_child false_label
+                        with
+                        | Some (true_body, true_join),
+                          Some (false_body, false_join)
+                          when true_join = false_join ->
+                            let inner_join : Cfg.block =
+                              get_block true_join
+                            in
+                            let selected_operand,
+                                result_temp,
+                                outer_join_opt =
+                              match
+                                inner_join.body,
+                                inner_join.term
+                              with
+                              | [], Cfg.Jump outer_join ->
+                                  ( Tcg.Temp carrier,
+                                    carrier,
+                                    Some outer_join )
+                              | [ Tcg.Move
+                                    ( final_temp,
+                                      Tcg.Temp selected_temp ) ],
+                                Cfg.Jump outer_join ->
+                                  ( Tcg.Temp selected_temp,
+                                    final_temp,
+                                    Some outer_join )
+                              | _ ->
+                                  (Tcg.Temp carrier, carrier, None)
+                            in
+                            begin
+                              match outer_join_opt with
+                              | None -> None
+                              | Some outer_join ->
+                                  begin
+                                    match
+                                      constant_delta_after
+                                        carrier
+                                        (root.body @ true_body)
+                                        selected_operand,
+                                      constant_delta_after
+                                        carrier
+                                        (root.body @ false_body)
+                                        selected_operand
+                                    with
+                                    | Some low_step,
+                                      Some high_step
+                                      when
+                                        low_step > 0L
+                                        && high_step >= 0L ->
+                                        Some
+                                          ( carrier,
+                                            result_temp,
+                                            true_join,
+                                            outer_join,
+                                            threshold,
+                                            low_step,
+                                            high_step,
+                                            cmp_bias )
+                                    | _ ->
+                                        None
+                                  end
+                            end
+                        | _ ->
+                            None
+                      end
+                | Tcg.Move _
+                | Tcg.Un _
+                | Tcg.Bin _
+                | Tcg.Load _
+                | Tcg.Store _
+                | Tcg.Call _ ->
+                    None
+              end
+          | _ ->
+              None
+      in
+
+      let exact_outer_join
+          outer_join
+          carrier
+          result_temp
+        =
+        let block : Cfg.block = get_block outer_join in
+        match block.term with
+        | Cfg.Jump next
+          when next = info.control_label
+               && List.mem outer_join
+                    info.control_iv.backedge_preds ->
+            let direct_iv_updates = ref 0 in
+            let staged_iv_defs = ref [] in
+            let iv_copy_sources = ref [] in
+            let carrier_copies = ref 0 in
+            let recognized =
+              List.for_all
+                (function
+                  | Tcg.Bin
+                      ( dst,
+                        Add,
+                        Tcg.Temp src,
+                        Tcg.Imm 1L )
+                  | Tcg.Bin
+                      ( dst,
+                        Add,
+                        Tcg.Imm 1L,
+                        Tcg.Temp src )
+                    when src = info.control_iv.phi_temp ->
+                      if dst = info.control_iv.phi_temp then
+                        incr direct_iv_updates
+                      else
+                        staged_iv_defs := dst :: !staged_iv_defs;
+                      true
+                  | Tcg.Move
+                      (dst, Tcg.Temp src)
+                    when dst = info.control_iv.phi_temp ->
+                      iv_copy_sources :=
+                        src :: !iv_copy_sources;
+                      true
+                  | Tcg.Move
+                      (dst, Tcg.Temp src)
+                    when
+                      dst = carrier
+                      && src = result_temp ->
+                      incr carrier_copies;
+                      true
+                  | Tcg.Move _
+                  | Tcg.Un _
+                  | Tcg.Bin _
+                  | Tcg.Load _
+                  | Tcg.Store _
+                  | Tcg.Call _ ->
+                      false)
+                block.body
+            in
+            if not recognized then
+              false
+            else
+              let iv_ok =
+                match
+                  !direct_iv_updates,
+                  List.sort_uniq compare !staged_iv_defs,
+                  List.sort_uniq compare !iv_copy_sources
+                with
+                | 1, [], [] ->
+                    true
+                | 0, [ next_temp ], [ copied_temp ] ->
+                    next_temp = copied_temp
+                | _ ->
+                    false
+              in
+              let carrier_ok =
+                if result_temp = carrier then
+                  !carrier_copies = 0
+                else
+                  !carrier_copies = 1
+              in
+              iv_ok && carrier_ok
+        | Cfg.Jump _
+        | Cfg.BranchZero _
+        | Cfg.BranchNonZero _
+        | Cfg.BranchCompare _
+        | Cfg.Return _ ->
+            false
+      in
+
+      let emit_min_nonnegative lhs rhs =
+        let delta = fresh_temp () in
+        let choose_lhs = fresh_temp () in
+        let selected_delta = fresh_temp () in
+        let result = fresh_temp () in
+        ( [ simplify_simple_instr
+              (Tcg.Bin
+                 ( delta,
+                   Sub,
+                   Tcg.Temp lhs,
+                   Tcg.Temp rhs ));
+            simplify_simple_instr
+              (Tcg.Bin
+                 ( choose_lhs,
+                   Lt,
+                   Tcg.Temp lhs,
+                   Tcg.Temp rhs ));
+            simplify_simple_instr
+              (Tcg.Bin
+                 ( selected_delta,
+                   Mul,
+                   Tcg.Temp delta,
+                   Tcg.Temp choose_lhs ));
+            simplify_simple_instr
+              (Tcg.Bin
+                 ( result,
+                   Add,
+                   Tcg.Temp rhs,
+                   Tcg.Temp selected_delta )) ],
+          result )
+      in
+
+      let emit_const_delta trip_temp amount =
+        let amount = i32 amount in
+        if amount = 0L then
+          ([], Tcg.Imm 0L)
+        else if amount = 1L then
+          ([], Tcg.Temp trip_temp)
+        else
+          let delta = fresh_temp () in
+          ( [ simplify_simple_instr
+                (Tcg.Bin
+                   ( delta,
+                     Mul,
+                     Tcg.Temp trip_temp,
+                     Tcg.Imm amount )) ],
+            Tcg.Temp delta )
+      in
+
+      let emit_state_transfer
+          trip_temp
+          carrier
+          threshold
+          low_step
+          high_step
+        =
+        let threshold_diff = fresh_temp () in
+        let clamp_instrs, positive_diff =
+          clamp_nonnegative_temp
+            fresh_temp threshold_diff
+        in
+        let cross_instrs, cross_trip =
+          build_nonnegative_ceil_div
+            fresh_temp positive_diff low_step
+        in
+        let min_instrs, low_trip =
+          emit_min_nonnegative
+            trip_temp cross_trip
+        in
+        let high_trip = fresh_temp () in
+        let low_delta_instrs, low_delta =
+          emit_const_delta low_trip low_step
+        in
+        let low_update =
+          match low_delta with
+          | Tcg.Imm 0L -> []
+          | _ ->
+              [ simplify_simple_instr
+                  (Tcg.Bin
+                     ( carrier,
+                       Add,
+                       Tcg.Temp carrier,
+                       low_delta )) ]
+        in
+        let high_delta_instrs, high_delta =
+          emit_const_delta high_trip high_step
+        in
+        let high_update =
+          match high_delta with
+          | Tcg.Imm 0L -> []
+          | _ ->
+              [ simplify_simple_instr
+                  (Tcg.Bin
+                     ( carrier,
+                       Add,
+                       Tcg.Temp carrier,
+                       high_delta )) ]
+        in
+        [ simplify_simple_instr
+            (Tcg.Bin
+               ( threshold_diff,
+                 Sub,
+                 Tcg.Imm threshold,
+                 Tcg.Temp carrier )) ]
+        @ clamp_instrs
+        @ cross_instrs
+        @ min_instrs
+        @ [ simplify_simple_instr
+              (Tcg.Bin
+                 ( high_trip,
+                   Sub,
+                   Tcg.Temp trip_temp,
+                   Tcg.Temp low_trip )) ]
+        @ low_delta_instrs
+        @ low_update
+        @ high_delta_instrs
+        @ high_update
+      in
+
+      let emit_and lhs rhs =
+        let dst = fresh_temp () in
+        ( [ simplify_simple_instr
+              (Tcg.Bin
+                 ( dst,
+                   Mul,
+                   Tcg.Temp lhs,
+                   Tcg.Temp rhs )) ],
+          dst )
+      in
+
+      let modified_globals =
+        global_places effects.modified_places
+      in
+      if
+        effects.has_call
+        || not (PlaceSet.is_empty modified_globals)
+        || not (PlaceSet.is_empty effects.modified_places)
+        || info.control_iv.step <> 1L
+        || LabelSet.cardinal loop <> 11
+      then begin
+        if debug_counted then
+          debugf
+            "counted-monotone-state-piecewise-reject func=%s header=%s reason=precond calls=%b places=%d step=%Ld control=%s blocks=%d"
+            f.name
+            header
+            effects.has_call
+            (PlaceSet.cardinal effects.modified_places)
+            info.control_iv.step
+            info.control_label
+            (LabelSet.cardinal loop);
+        false
+      end
+      else begin
+        if debug_counted then
+          debugf
+            "counted-monotone-state-piecewise-probe func=%s header=%s control=%s control_is_header=%b inside=%s blocks=%d"
+            f.name
+            header
+            info.control_label
+            (info.control_label = header)
+            info.inside_label
+            (LabelSet.cardinal loop);
+        match info.kind with
+        | CountUpLt (raw_bound, 0L) ->
+            begin
+              match resolved_before_loop raw_bound with
+              | None ->
+                  false
+              | Some bound_operand ->
+                  let control_block : Cfg.block =
+                    get_block info.control_label
+                  in
+                  let inside_block : Cfg.block =
+                    get_block info.inside_label
+                  in
+                  begin
+                    match
+                      control_block.body,
+                      inside_block.body,
+                      inside_block.term
+                    with
+                    | [],
+                      [],
+                      Cfg.BranchCompare
+                        ( Lt,
+                          Tcg.Temp outer_iv,
+                          raw_outer_threshold,
+                          first_root,
+                          second_root )
+                      when
+                        outer_iv =
+                          info.control_iv.phi_temp
+                        && LabelSet.mem first_root loop
+                        && LabelSet.mem second_root loop ->
+                        begin
+                          let resolved_outer =
+                            resolved_before_loop
+                              raw_outer_threshold
+                          in
+                          let first_transfer =
+                            parse_inner_transfer first_root
+                          in
+                          let second_transfer =
+                            parse_inner_transfer second_root
+                          in
+                          if debug_counted then
+                            debugf
+                              "counted-monotone-state-piecewise-shape func=%s header=%s outer=%b first=%b second=%b first_root=%s second_root=%s"
+                              f.name
+                              header
+                              (Option.is_some resolved_outer)
+                              (Option.is_some first_transfer)
+                              (Option.is_some second_transfer)
+                              first_root
+                              second_root;
+                          match
+                            resolved_outer,
+                            first_transfer,
+                            second_transfer
+                          with
+                          | Some outer_threshold,
+                            Some
+                              ( carrier_a,
+                                result_a,
+                                _inner_join_a,
+                                outer_join_a,
+                                threshold_a,
+                                low_a,
+                                high_a,
+                                cmp_bias_a ),
+                            Some
+                              ( carrier_b,
+                                result_b,
+                                _inner_join_b,
+                                outer_join_b,
+                                threshold_b,
+                                low_b,
+                                high_b,
+                                cmp_bias_b )
+                            when
+                              carrier_a = carrier_b
+                              && result_a = result_b
+                              && outer_join_a = outer_join_b
+                              && exact_outer_join
+                                   outer_join_a
+                                   carrier_a
+                                   result_a ->
+                              let carrier = carrier_a in
+                              let max_step =
+                                List.fold_left
+                                  Int64.max
+                                  1L
+                                  [ low_a;
+                                    high_a;
+                                    low_b;
+                                    high_b ]
+                              in
+                              let max_cmp_bias =
+                                Int64.max
+                                  cmp_bias_a
+                                  cmp_bias_b
+                              in
+                              let safe_top =
+                                Int64.sub
+                                  int32_max
+                                  max_cmp_bias
+                              in
+                              if
+                                safe_top < 0L
+                                || max_step <= 0L
+                              then
+                                false
+                              else
+                                let total_instrs, total_trip =
+                                  build_trip_count_instrs
+                                    fresh_temp
+                                    info.control_iv.phi_temp
+                                    info.control_iv.step
+                                    info.kind
+                                in
+
+                                (* prefix =
+                                     min(total,
+                                         max(K - iv, 0)) *)
+                                let prefix_diff =
+                                  fresh_temp ()
+                                in
+                                let prefix_clamp_instrs,
+                                    prefix_nonnegative =
+                                  clamp_nonnegative_temp
+                                    fresh_temp prefix_diff
+                                in
+                                let prefix_min_instrs,
+                                    prefix_trip =
+                                  emit_min_nonnegative
+                                    total_trip
+                                    prefix_nonnegative
+                                in
+                                let suffix_trip =
+                                  fresh_temp ()
+                                in
+                                let prefix_instrs =
+                                  [ simplify_simple_instr
+                                      (Tcg.Bin
+                                         ( prefix_diff,
+                                           Sub,
+                                           outer_threshold,
+                                           Tcg.Temp
+                                             info.control_iv.phi_temp )) ]
+                                  @ prefix_clamp_instrs
+                                  @ prefix_min_instrs
+                                  @ [ simplify_simple_instr
+                                        (Tcg.Bin
+                                           ( suffix_trip,
+                                             Sub,
+                                             Tcg.Temp total_trip,
+                                             Tcg.Temp prefix_trip )) ]
+                                in
+
+                                (* Fast-path monotonicity / no-wrap proof. *)
+                                let iv_nonneg =
+                                  fresh_temp ()
+                                in
+                                let bound_nonneg =
+                                  fresh_temp ()
+                                in
+                                let outer_nonneg =
+                                  fresh_temp ()
+                                in
+                                let carrier_nonneg =
+                                  fresh_temp ()
+                                in
+                                let carrier_below_safe_top =
+                                  fresh_temp ()
+                                in
+                                let capacity =
+                                  fresh_temp ()
+                                in
+                                let allowed_iters =
+                                  fresh_temp ()
+                                in
+                                let trip_safe =
+                                  fresh_temp ()
+                                in
+                                let guard_instrs0 =
+                                  [ simplify_simple_instr
+                                      (Tcg.Bin
+                                         ( iv_nonneg,
+                                           Ge,
+                                           Tcg.Temp
+                                             info.control_iv.phi_temp,
+                                           Tcg.Imm 0L ));
+                                    simplify_simple_instr
+                                      (Tcg.Bin
+                                         ( bound_nonneg,
+                                           Ge,
+                                           bound_operand,
+                                           Tcg.Imm 0L ));
+                                    simplify_simple_instr
+                                      (Tcg.Bin
+                                         ( outer_nonneg,
+                                           Ge,
+                                           outer_threshold,
+                                           Tcg.Imm 0L ));
+                                    simplify_simple_instr
+                                      (Tcg.Bin
+                                         ( carrier_nonneg,
+                                           Ge,
+                                           Tcg.Temp carrier,
+                                           Tcg.Imm 0L ));
+                                    simplify_simple_instr
+                                      (Tcg.Bin
+                                         ( carrier_below_safe_top,
+                                           Le,
+                                           Tcg.Temp carrier,
+                                           Tcg.Imm safe_top ));
+                                    simplify_simple_instr
+                                      (Tcg.Bin
+                                         ( capacity,
+                                           Sub,
+                                           Tcg.Imm safe_top,
+                                           Tcg.Temp carrier ));
+                                    simplify_simple_instr
+                                      (Tcg.Bin
+                                         ( allowed_iters,
+                                           Div,
+                                           Tcg.Temp capacity,
+                                           Tcg.Imm max_step ));
+                                    simplify_simple_instr
+                                      (Tcg.Bin
+                                         ( trip_safe,
+                                           Le,
+                                           Tcg.Temp total_trip,
+                                           Tcg.Temp allowed_iters )) ]
+                                in
+                                let and1_instrs, and1 =
+                                  emit_and iv_nonneg
+                                    bound_nonneg
+                                in
+                                let and2_instrs, and2 =
+                                  emit_and outer_nonneg
+                                    carrier_nonneg
+                                in
+                                let and3_instrs, and3 =
+                                  emit_and
+                                    carrier_below_safe_top
+                                    trip_safe
+                                in
+                                let and4_instrs, and4 =
+                                  emit_and and1 and2
+                                in
+                                let and5_instrs, guard_temp =
+                                  emit_and and4 and3
+                                in
+                                let guard_instrs =
+                                  total_instrs
+                                  @ guard_instrs0
+                                  @ and1_instrs
+                                  @ and2_instrs
+                                  @ and3_instrs
+                                  @ and4_instrs
+                                  @ and5_instrs
+                                in
+
+                                let summary_instrs =
+                                  prefix_instrs
+                                  @ emit_state_transfer
+                                      prefix_trip
+                                      carrier
+                                      threshold_a
+                                      low_a
+                                      high_a
+                                  @ emit_state_transfer
+                                      suffix_trip
+                                      carrier
+                                      threshold_b
+                                      low_b
+                                      high_b
+                                  @ build_iv_final_update
+                                      fresh_temp
+                                      total_trip
+                                      info.control_iv
+                                in
+                                let guard_label =
+                                  fresh_summary_label ()
+                                in
+                                let summary_label =
+                                  fresh_summary_label ()
+                                in
+                                let rewritten_term =
+                                  rewrite_term_successor
+                                    control_block.term
+                                    ~from_label:info.inside_label
+                                    ~to_label:guard_label
+                                in
+                                update_block
+                                  {
+                                    control_block with
+                                    term = rewritten_term;
+                                    succs =
+                                      Cfg.successors
+                                        rewritten_term;
+                                  };
+                                Hashtbl.add
+                                  current_blocks
+                                  guard_label
+                                  {
+                                    Cfg.label = guard_label;
+                                    body = guard_instrs;
+                                    term =
+                                      Cfg.BranchNonZero
+                                        ( Tcg.Temp guard_temp,
+                                          summary_label,
+                                          info.inside_label );
+                                    preds = [];
+                                    succs =
+                                      [ summary_label;
+                                        info.inside_label ];
+                                  };
+                                Hashtbl.add
+                                  current_blocks
+                                  summary_label
+                                  {
+                                    Cfg.label = summary_label;
+                                    body = summary_instrs;
+                                    term =
+                                      Cfg.Jump info.exit_label;
+                                    preds = [];
+                                    succs =
+                                      [ info.exit_label ];
+                                  };
+                                new_blocks_rev :=
+                                  summary_label
+                                  :: guard_label
+                                  :: !new_blocks_rev;
+                                changed := true;
+                                debug_hit
+                                  "counted-monotone-state-piecewise-hit func=%s header=%s control=%s carrier=t%d outer=%s bound=%s phase1=(C=%Ld,low=%Ld,high=%Ld) phase2=(C=%Ld,low=%Ld,high=%Ld) guard=%s summary=%s"
+                                  f.name
+                                  header
+                                  info.control_label
+                                  carrier
+                                  (string_of_operand
+                                     outer_threshold)
+                                  (string_of_operand
+                                     bound_operand)
+                                  threshold_a
+                                  low_a
+                                  high_a
+                                  threshold_b
+                                  low_b
+                                  high_b
+                                  guard_label
+                                  summary_label;
+                                true
+                          | _ ->
+                              false
+                        end
+                    | _ ->
+                        false
+                  end
+            end
+        | CountUpLt _
+        | CountUpLe _
+        | CountDownGt _
+        | CountDownGe _
+        | CountUpLtScaled _
+        | CountUpLeScaled _
+        | CountDownGtScaled _
+        | CountDownGeScaled _ ->
+            false
+      end
+      in
+
     List.iter
       (fun header ->
         if LabelSet.mem header !suppressed_headers then
@@ -22490,14 +23377,26 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                 "counted-nested-temp-shape-hit func=%s header=%s children=%d"
                 f.name header (List.length nested_child_groups);
             let piecewise_threshold_applied =
-              try_eliminate_piecewise_threshold_loop
-                header
-                loop
-                info
-                effects
-                loop_defs
-                multi_defs
-                def_instrs
+              if
+                try_eliminate_monotone_state_piecewise_loop
+                  header
+                  loop
+                  info
+                  effects
+                  loop_defs
+                  multi_defs
+                  def_instrs
+              then
+                true
+              else
+                try_eliminate_piecewise_threshold_loop
+                  header
+                  loop
+                  info
+                  effects
+                  loop_defs
+                  multi_defs
+                  def_instrs
             in
             match (piecewise_threshold_applied, plain_shape_supported || nested_shape_supported) with
             | true, _ ->
