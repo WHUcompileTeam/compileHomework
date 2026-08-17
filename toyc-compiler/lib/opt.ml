@@ -28438,6 +28438,90 @@ let optimize_func global_init summaries globals return_globals removable_calls (
          loop-header phis can now bootstrap loop-carried locals without feeding
          the new phi/edge-copy CFG back into rotate/split/unroll passes. *)
       let late_promoted = mem2reg_func ~optimistic_loop_phi:true optimized in
+
+      (* v47 experimental post-summary counted retry.
+
+         v46 deliberately keeps the *early* mem2reg conservative because an
+         optimistic loop-phi view before any trusted loop summary is known to
+         lose value-phase/provenance information (tailrec 21->15 and
+         nest3_rect_small 14->95).
+
+         The other side of that safety fix is performance: after the normal
+         rounds have safely removed at least one natural-loop layer, the final
+         optimistic mem2reg may expose the enclosing loop-carried locals, but
+         the old late pipeline never gives counted-loop elimination another
+         chance.
+
+         Retry counted elimination only when:
+           1. explicitly enabled for rollout testing;
+           2. the conservative normal rounds have already reduced the natural
+              loop count, proving that this is genuinely a *post-summary*
+              promotion rather than the unsafe original optimistic view;
+           3. at least one natural loop remains.
+
+         The promoted/canonicalized form is still analysis-bridge state: if the
+         retry does not eliminate anything, keep [late_promoted] unchanged. *)
+      let natural_loop_count (func : Cfg.func) =
+        let _, _, headers = discover_natural_loops func in
+        List.length headers
+      in
+      let canonical_loop_count = natural_loop_count canonical in
+      let optimized_loop_count = natural_loop_count optimized in
+      let enable_post_summary_counted_retry =
+        Sys.getenv_opt "TOYC_ENABLE_POST_SUMMARY_COUNTED_RETRY" <> None
+      in
+      let post_summary_counted_retry_eligible =
+        enable_post_summary_counted_retry
+        && optimized_loop_count > 0
+        && optimized_loop_count < canonical_loop_count
+      in
+      let late_counted =
+        if not post_summary_counted_retry_eligible then
+          late_promoted
+        else
+          let retry_seed =
+            late_promoted
+            |> loop_canonicalize_func summaries globals
+            |> const_propagate_func global_init summaries globals
+            |> thread_and_prune_func
+            |> simplify_cfg_func
+            |> algebra_canonicalize_func
+            |> general_linear_canonicalize_func
+            |> factor_common_mul_func
+            |> eliminate_dead_code_func
+                 ~removable_calls summaries globals return_globals
+          in
+          let retry_candidate =
+            eliminate_counted_loops_func
+              global_init summaries globals retry_seed
+          in
+          if retry_candidate = retry_seed then begin
+            if Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None then
+              Printf.eprintf
+                "counted-post-summary-retry func=%s result=no-followup loops=%d->%d\n%!"
+                optimized.name canonical_loop_count optimized_loop_count;
+            late_promoted
+          end else begin
+            let cleaned =
+              retry_candidate
+              |> thread_and_prune_func
+              |> simplify_cfg_func
+              |> const_propagate_func global_init summaries globals
+              |> eliminate_dead_code_func
+                   ~removable_calls summaries globals return_globals
+            in
+            if Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None then
+              Printf.eprintf
+                "counted-post-summary-retry func=%s result=applied loops=%d->%d->%d blocks=%d->%d\n%!"
+                optimized.name
+                canonical_loop_count
+                optimized_loop_count
+                (natural_loop_count cleaned)
+                (List.length late_promoted.blocks)
+                (List.length cleaned.blocks);
+            cleaned
+          end
+      in
       if Sys.getenv_opt "TOYC_DEBUG_LATE_MEM2REG" <> None then begin
         let count_local_accesses (func : Cfg.func) =
           List.fold_left
@@ -28461,12 +28545,16 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       let () =
         debug_lcssa_stage "late-mem2reg" late_promoted
       in
+      let () =
+        if late_counted <> late_promoted then
+          debug_lcssa_stage "post-summary-counted-retry" late_counted
+      in
       (* IMPORTANT: run late algebra BEFORE copy coalescing.  Late mem2reg
          deliberately creates fresh, mostly single-definition/single-use temp
          chains.  [algebra_canonicalize_func] can safely follow those chains,
          but coalescing first can merge unrelated definitions onto one temp and
          make the canonicalizer reject them as multi-def/use-heavy. *)
-      let late_algebra = algebra_canonicalize_func late_promoted in
+      let late_algebra = algebra_canonicalize_func late_counted in
       let late_linear = general_linear_canonicalize_func late_algebra in
       let late_factor = factor_common_mul_func late_linear in
       let late_pre_summary_input =
