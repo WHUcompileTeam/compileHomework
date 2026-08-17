@@ -3505,24 +3505,43 @@ let mem2reg_eliminate_trivial_phi_temps
     Cfg.rebuild_edges { f with blocks }
   end
 
-let mem2reg_func ?(optimistic_loop_phi = false) ?(preserve_loop_phi_shape = false) (f : Cfg.func) =
+let mem2reg_func ?(optimistic_loop_phi = false) ?(preserve_loop_phi_shape = false) ?(legacy_all_block_scope = false) (f : Cfg.func) =
   let all_candidates = collect_local_ids f in
   let rec attempt (current : Cfg.func) candidates =
     if IntSet.is_empty candidates then current
     else begin
+      (* v52 early-scope A/B.
+         Pre-item4 mem2reg solved local liveness/forward environments over the
+         complete current CFG and all recorded predecessor edges.  Item4
+         changed that to entry-reachable blocks only.  Keep the modern
+         reachable-only behavior by default, but allow the first analysis pass
+         to reproduce the old scope without affecting later/cascade mem2reg. *)
       let reachable =
-        reachable_labels current.entry current.blocks
+        if legacy_all_block_scope then
+          List.fold_left
+            (fun acc (block : Cfg.block) ->
+              LabelSet.add block.label acc)
+            LabelSet.empty
+            current.blocks
+        else
+          reachable_labels current.entry current.blocks
       in
       let reachable_blocks =
-        List.filter
-          (fun (block : Cfg.block) ->
-            LabelSet.mem block.label reachable)
+        if legacy_all_block_scope then
           current.blocks
+        else
+          List.filter
+            (fun (block : Cfg.block) ->
+              LabelSet.mem block.label reachable)
+            current.blocks
       in
       let reachable_preds (block : Cfg.block) =
-        List.filter
-          (fun pred -> LabelSet.mem pred reachable)
+        if legacy_all_block_scope then
           block.preds
+        else
+          List.filter
+            (fun pred -> LabelSet.mem pred reachable)
+            block.preds
       in
       if Sys.getenv_opt "TOYC_DEBUG_MEM2REG_REACHABLE" <> None then
         Printf.eprintf
@@ -28120,14 +28139,17 @@ let optimize_func global_init summaries globals return_globals removable_calls (
 
      Later/cascade mem2reg passes keep the normal aggressive cleanup. *)
   let early_mem2reg =
-    mem2reg_func ~preserve_loop_phi_shape:true f
+    mem2reg_func
+      ~preserve_loop_phi_shape:true
+      ~legacy_all_block_scope:true
+      f
   in
   if
     Sys.getenv_opt "TOYC_DEBUG_EARLY_MEM2REG_MODE" <> None
     || Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None
   then
     Printf.eprintf
-      "early-mem2reg-mode func=%s mode=conservative-preserve-shape loops=%d\n%!"
+      "early-mem2reg-mode func=%s mode=conservative-preserve-shape-legacy-scope loops=%d\n%!"
       f.name
       (let _, _, headers = discover_natural_loops f in List.length headers);
   let promoted_before_move_cleanup =
