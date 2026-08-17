@@ -32807,6 +32807,177 @@ let inline_late_divmod_scalar_calls_program (funcs : Cfg.func list) =
       "item7-divmod-inline replaced=%d\n%!" !total_replaced;
   result
 
+(* -------------------------------------------------------------------------- *)
+(* item7 v11: multi-block acyclic Div/Mod inline                              *)
+(*                                                                            *)
+(* v10 residual audit showed four remaining Div/Mod call sites whose only      *)
+(* blocker is CFG shape: 2..6 reachable blocks, acyclic, value-returning, with  *)
+(* no Store/nested Call/non-parameter Local load.  Reuse the already validated  *)
+(* late CFG cloning machinery from the global-store inliner, but admit Div/Mod  *)
+(* and reject every Store.  Crucially, there is NO post-inline DCE or full       *)
+(* optimize_func rerun: all Div/Mod instructions cloned from the callee remain   *)
+(* executed on exactly the same paths as before.                                *)
+(* -------------------------------------------------------------------------- *)
+
+let late_divmod_cfg_inline_candidate (f : Cfg.func) : Cfg.func option =
+  if f.ret <> TInt then None
+  else
+    let view =
+      f
+      |> thread_and_prune_func
+      |> simplify_cfg_func
+      |> final_linear_merge_func
+      |> thread_and_prune_func
+    in
+    if not (cfg_targets_valid view) then None
+    else
+      let reachable = reachable_labels view.entry view.blocks in
+      let blocks =
+        List.filter
+          (fun (block : Cfg.block) -> LabelSet.mem block.label reachable)
+          view.blocks
+      in
+      let block_count = List.length blocks in
+      let instr_count =
+        List.fold_left
+          (fun acc (block : Cfg.block) -> acc + List.length block.body)
+          0 blocks
+      in
+      let param_ids =
+        List.fold_left
+          (fun acc (param : Tcg.var) -> IntSet.add param.id acc)
+          IntSet.empty view.params
+      in
+      let has_divmod = ref false in
+      let instr_safe = function
+        | Tcg.Move _ | Tcg.Un _ -> true
+        | Tcg.Bin (_, (Div | Mod), _, _) ->
+            has_divmod := true;
+            true
+        | Tcg.Bin _ -> true
+        | Tcg.Load (_, Tcg.Local id) -> IntSet.mem id param_ids
+        | Tcg.Load (_, Tcg.Global _) -> true
+        | Tcg.Store _ | Tcg.Call _ -> false
+      in
+      let term_safe = function
+        | Cfg.Return (Some _)
+        | Cfg.Jump _
+        | Cfg.BranchZero _
+        | Cfg.BranchNonZero _
+        | Cfg.BranchCompare _ ->
+            true
+        | Cfg.Return None -> false
+      in
+      let has_value_return =
+        List.exists
+          (fun (block : Cfg.block) ->
+            match block.term with
+            | Cfg.Return (Some _) -> true
+            | Cfg.Return None
+            | Cfg.Jump _
+            | Cfg.BranchZero _
+            | Cfg.BranchNonZero _
+            | Cfg.BranchCompare _ ->
+                false)
+          blocks
+      in
+      let all_safe =
+        List.for_all
+          (fun (block : Cfg.block) ->
+            List.for_all instr_safe block.body && term_safe block.term)
+          blocks
+      in
+      let ignored = Hashtbl.create 1 in
+      if
+        block_count >= 2
+        && block_count <= late_branch_inline_max_blocks
+        && instr_count <= late_branch_inline_max_instrs
+        && view.temp_count <= late_branch_inline_max_temps
+        && all_safe
+        && !has_divmod
+        && has_value_return
+        && cfg_acyclic_ignoring_edges view ignored
+      then Some { view with blocks }
+      else None
+
+let build_late_divmod_cfg_inline_table (funcs : Cfg.func list) :
+    (string, Cfg.func) Hashtbl.t =
+  let table = Hashtbl.create (max 8 (List.length funcs)) in
+  List.iter
+    (fun (f : Cfg.func) ->
+      match late_divmod_cfg_inline_candidate f with
+      | None -> ()
+      | Some candidate ->
+          Hashtbl.replace table f.label candidate;
+          if Sys.getenv_opt "TOYC_DEBUG_ITEM7_DIVMOD_CFG_INLINE" <> None then
+            Printf.eprintf
+              "item7-divmod-cfg-candidate func=%s blocks=%d instrs=%d temps=%d params=%d\n%!"
+              f.name (List.length candidate.blocks)
+              (List.fold_left
+                 (fun acc (block : Cfg.block) ->
+                   acc + List.length block.body)
+                 0 candidate.blocks)
+              candidate.temp_count (List.length candidate.params))
+    funcs;
+  table
+
+let inline_late_divmod_cfg_calls_func
+    (table : (string, Cfg.func) Hashtbl.t)
+    (f : Cfg.func) =
+  let rec apply serial fuel count current =
+    if fuel = 0 then (current, count)
+    else
+      match find_late_store_cfg_inline_site table current with
+      | None -> (current, count)
+      | Some site ->
+          if not (late_store_cfg_inline_site_profitable current site) then begin
+            if Sys.getenv_opt "TOYC_DEBUG_ITEM7_DIVMOD_CFG_GUARD" <> None then begin
+              let site_label, _, _, callee_label, _, _, callee = site in
+              Printf.eprintf
+                "item7-divmod-cfg-guard caller=%s callee=%s site=%s caller-temps=%d callee-temps=%d projected=%d cap=%d reason=nonloop-pressure\n%!"
+                current.name callee_label site_label current.temp_count
+                callee.temp_count (current.temp_count + callee.temp_count)
+                late_store_cfg_inline_nonloop_projected_temp_cap
+            end;
+            (current, count)
+          end else
+            match inline_one_late_store_cfg_call serial current site with
+            | None -> (current, count)
+            | Some next ->
+                apply (serial + 1) (fuel - 1) (count + 1) next
+  in
+  apply 0 late_store_cfg_inline_max_sites_per_func 0 f
+
+let inline_late_divmod_cfg_calls_program (funcs : Cfg.func list) =
+  let total_replaced = ref 0 in
+  let rec iterate fuel current =
+    if fuel = 0 then current
+    else
+      let table = build_late_divmod_cfg_inline_table current in
+      if Hashtbl.length table = 0 then current
+      else
+        let changed = ref false in
+        let next =
+          List.map
+            (fun (f : Cfg.func) ->
+              let rewritten, count =
+                inline_late_divmod_cfg_calls_func table f
+              in
+              if count > 0 then begin
+                changed := true;
+                total_replaced := !total_replaced + count
+              end;
+              rewritten)
+            current
+        in
+        if !changed then iterate (fuel - 1) next else current
+  in
+  let result = iterate 3 funcs in
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_DIVMOD_CFG_INLINE" <> None then
+    Printf.eprintf
+      "item7-divmod-cfg-inline replaced=%d\n%!" !total_replaced;
+  result
+
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
   last_liveness_cache := None;
@@ -32895,6 +33066,9 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   in
   let optimized_funcs =
     inline_late_divmod_scalar_calls_program optimized_funcs
+  in
+  let optimized_funcs =
+    inline_late_divmod_cfg_calls_program optimized_funcs
   in
   item7_debug_inline_effect_capability summaries removable_calls globals optimized_funcs;
   { Cfg.funcs = optimized_funcs }
