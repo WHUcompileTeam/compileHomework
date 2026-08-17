@@ -2639,17 +2639,55 @@ let rewrite_term_temps rename = function
   | Cfg.Return None -> Cfg.Return None
   | Cfg.Return (Some value) -> Cfg.Return (Some (rewrite_operand_temp rename value))
 
-(* Remove temp-id holes left by speculative/provisional analyses.
-
-   In particular, optimistic mem2reg may allocate a phi temp while solving the
-   forward fixed point, then discover that the final incoming values are all
-   equal and therefore emit no phi edge copies at all.  The temp is absent from
-   the final IR but still contributes to [temp_count].
+(* Remove temp-id holes left after CFG simplification, speculative analyses,
+   and transformations that delete instructions while retaining the old
+   [temp_count] upper bound.
 
    This pass does NOT coalesce values and does NOT change def/use structure: it
    merely renumbers every temp that actually occurs in the CFG to a dense
    0..N-1 range.  That makes it safe to run immediately after mem2reg without
    turning edge-copy SSA into multi-definition temps. *)
+let temp_use_counts (f : Cfg.func) =
+  let counts = Array.make f.temp_count 0 in
+  let note_operand = function
+    | Tcg.Imm _ -> ()
+    | Tcg.Temp temp ->
+        if temp >= 0 && temp < Array.length counts then
+          counts.(temp) <- counts.(temp) + 1
+  in
+  let note_instr = function
+    | Tcg.Move (_, src)
+    | Tcg.Un (_, _, src) ->
+        note_operand src
+    | Tcg.Bin (_, _, lhs, rhs) ->
+        note_operand lhs;
+        note_operand rhs
+    | Tcg.Load _ ->
+        ()
+    | Tcg.Store (_, value) ->
+        note_operand value
+    | Tcg.Call (_, _, args) ->
+        List.iter note_operand args
+  in
+  let note_term = function
+    | Cfg.Jump _
+    | Cfg.Return None ->
+        ()
+    | Cfg.BranchZero (cond, _, _)
+    | Cfg.BranchNonZero (cond, _, _)
+    | Cfg.Return (Some cond) ->
+        note_operand cond
+    | Cfg.BranchCompare (_, lhs, rhs, _, _) ->
+        note_operand lhs;
+        note_operand rhs
+  in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter note_instr block.body;
+      note_term block.term)
+    f.blocks;
+  counts
+
 let compact_temp_ids_func ?(debug_tag = "") (f : Cfg.func) =
   let used = ref IntSet.empty in
   let note_operand = function
@@ -3029,6 +3067,258 @@ let place_edge_copies fresh_edge_label blocks edge_copies =
     blocks
   @ List.rev !edge_blocks_rev
 
+let mem2reg_local_dominators entry (blocks : Cfg.block list) =
+  let reachable = reachable_labels entry blocks in
+  let reachable_blocks =
+    List.filter
+      (fun (block : Cfg.block) ->
+        LabelSet.mem block.label reachable)
+      blocks
+  in
+  let all_labels =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        LabelSet.add block.label acc)
+      LabelSet.empty reachable_blocks
+  in
+  let doms =
+    Hashtbl.create (max 8 (List.length reachable_blocks))
+  in
+  List.iter
+    (fun (block : Cfg.block) ->
+      Hashtbl.replace doms block.label
+        (if block.label = entry
+         then LabelSet.singleton block.label
+         else all_labels))
+    reachable_blocks;
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter
+      (fun (block : Cfg.block) ->
+        if block.label <> entry then begin
+          let pred_doms =
+            block.preds
+            |> List.filter
+                 (fun pred -> LabelSet.mem pred reachable)
+            |> List.map
+                 (fun pred ->
+                   table_find_or_empty
+                     doms pred all_labels)
+          in
+          let merged =
+            match pred_doms with
+            | [] ->
+                all_labels
+            | first :: rest ->
+                List.fold_left LabelSet.inter first rest
+          in
+          let next_dom =
+            LabelSet.add block.label merged
+          in
+          let previous =
+            table_find_or_empty
+              doms block.label LabelSet.empty
+          in
+          if not (LabelSet.equal next_dom previous) then begin
+            Hashtbl.replace doms block.label next_dom;
+            changed := true
+          end
+        end)
+      reachable_blocks
+  done;
+  doms
+
+let mem2reg_natural_loop_for_header
+    block_map doms header =
+  match Hashtbl.find_opt block_map header with
+  | None ->
+      LabelSet.empty
+  | Some (header_block : Cfg.block) ->
+      let header_dominates label =
+        LabelSet.mem header
+          (table_find_or_empty
+             doms label LabelSet.empty)
+      in
+      let backedge_preds =
+        List.filter header_dominates header_block.preds
+      in
+      if backedge_preds = [] then
+        LabelSet.empty
+      else begin
+        let loop =
+          ref
+            (List.fold_left
+               (fun acc pred -> LabelSet.add pred acc)
+               (LabelSet.singleton header)
+               backedge_preds)
+        in
+        let work = Queue.create () in
+        List.iter (fun pred -> Queue.add pred work) backedge_preds;
+        while not (Queue.is_empty work) do
+          let label = Queue.take work in
+          match Hashtbl.find_opt block_map label with
+          | None ->
+              ()
+          | Some (block : Cfg.block) ->
+              List.iter
+                (fun pred ->
+                  if not (LabelSet.mem pred !loop) then begin
+                    loop := LabelSet.add pred !loop;
+                    if pred <> header then
+                      Queue.add pred work
+                  end)
+                block.preds
+        done;
+        !loop
+      end
+
+let mem2reg_temp_def_blocks (blocks : Cfg.block list) =
+  let defs = Hashtbl.create 32 in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter
+        (fun instr ->
+          match defs_temp instr with
+          | None ->
+              ()
+          | Some temp ->
+              let previous =
+                table_find_or_empty
+                  defs temp LabelSet.empty
+              in
+              Hashtbl.replace
+                defs temp
+                (LabelSet.add block.label previous))
+        block.body)
+    blocks;
+  defs
+
+let mem2reg_rewrite_operand subst =
+  let rec resolve seen = function
+    | Tcg.Imm _ as operand ->
+        operand
+    | Tcg.Temp temp as operand ->
+        if IntSet.mem temp seen then
+          operand
+        else
+          match Hashtbl.find_opt subst temp with
+          | None ->
+              operand
+          | Some replacement ->
+              resolve
+                (IntSet.add temp seen)
+                replacement
+  in
+  resolve IntSet.empty
+
+let mem2reg_eliminate_trivial_phi_temps
+    ?(debug = false)
+    (f : Cfg.func)
+    substitutions =
+  if substitutions = [] then
+    f
+  else begin
+    let subst = Hashtbl.create (max 8 (List.length substitutions)) in
+    List.iter
+      (fun (temp, operand) ->
+        Hashtbl.replace subst temp operand)
+      substitutions;
+    let eliminated =
+      List.fold_left
+        (fun acc (temp, _) -> IntSet.add temp acc)
+        IntSet.empty substitutions
+    in
+    let rewrite_operand =
+      mem2reg_rewrite_operand subst
+    in
+    let rewrite_instr instr =
+      match defs_temp instr with
+      | Some temp when IntSet.mem temp eliminated ->
+          None
+      | Some _
+      | None ->
+          let rewritten =
+            match instr with
+            | Tcg.Move (dst, src) ->
+                Tcg.Move (dst, rewrite_operand src)
+            | Tcg.Un (dst, op, src) ->
+                Tcg.Un (dst, op, rewrite_operand src)
+            | Tcg.Bin (dst, op, lhs, rhs) ->
+                Tcg.Bin
+                  ( dst,
+                    op,
+                    rewrite_operand lhs,
+                    rewrite_operand rhs )
+            | Tcg.Load _ ->
+                instr
+            | Tcg.Store (place, value) ->
+                Tcg.Store (place, rewrite_operand value)
+            | Tcg.Call (dst, callee, args) ->
+                Tcg.Call
+                  ( dst,
+                    callee,
+                    List.map rewrite_operand args )
+          in
+          begin
+            match rewritten with
+            | Tcg.Move (dst, Tcg.Temp src)
+              when dst = src ->
+                None
+            | _ ->
+                Some rewritten
+          end
+    in
+    let rewrite_term = function
+      | Cfg.Jump _ as term ->
+          term
+      | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
+          Cfg.BranchZero
+            ( rewrite_operand cond,
+              if_zero,
+              if_nonzero )
+      | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
+          Cfg.BranchNonZero
+            ( rewrite_operand cond,
+              if_nonzero,
+              if_zero )
+      | Cfg.BranchCompare
+          (op, lhs, rhs, if_true, if_false) ->
+          Cfg.BranchCompare
+            ( op,
+              rewrite_operand lhs,
+              rewrite_operand rhs,
+              if_true,
+              if_false )
+      | Cfg.Return None ->
+          Cfg.Return None
+      | Cfg.Return (Some value) ->
+          Cfg.Return (Some (rewrite_operand value))
+    in
+    let blocks =
+      List.map
+        (fun (block : Cfg.block) ->
+          let body =
+            List.filter_map rewrite_instr block.body
+          in
+          let term = rewrite_term block.term in
+          {
+            block with
+            body;
+            term;
+            succs = Cfg.successors term;
+          })
+        f.blocks
+    in
+    if debug then
+      Printf.eprintf
+        "mem2reg-self-trivial-elim func=%s eliminated=%d temps-before=%d\n%!"
+        f.name
+        (IntSet.cardinal eliminated)
+        f.temp_count;
+    Cfg.rebuild_edges { f with blocks }
+  end
+
 let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
   let all_candidates = collect_local_ids f in
   let rec attempt (current : Cfg.func) candidates =
@@ -3257,6 +3547,14 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
           Printf.sprintf ".L%s_mem2reg_edge_%d" current.label id
         in
         let edge_copies_rev = ref [] in
+        let actual_phi_temps = ref IntSet.empty in
+        let raw_copy_pairs = ref 0 in
+        let scheduled_copy_instrs = ref 0 in
+        let cycle_snapshot_instrs = ref 0 in
+        let self_recursive_trivial_phis = ref 0 in
+        let exact_same_source_phis = ref 0 in
+        let self_trivial_candidates_rev = ref [] in
+        let phi_header_by_temp = Hashtbl.create 16 in
         List.iter
           (fun (succ_block : Cfg.block) ->
             let phi_copies =
@@ -3270,11 +3568,56 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
                          fixed-point in-env actually uses this phi. *)
                       match IntMap.find_opt local_id (get_env in_envs succ_block.label) with
                       | Some (Tcg.Temp temp) when temp = phi_temp ->
+                          actual_phi_temps :=
+                            IntSet.add phi_temp !actual_phi_temps;
+                          Hashtbl.replace
+                            phi_header_by_temp
+                            phi_temp
+                            succ_block.label;
                           (local_id, phi_temp) :: acc
                       | Some _ | None -> acc)
                   | None -> acc)
                 succeeded []
             in
+            List.iter
+              (fun (local_id, phi_temp) ->
+                let incoming =
+                  succ_block.preds
+                  |> List.filter_map
+                       (fun pred ->
+                         IntMap.find_opt local_id
+                           (get_env out_envs pred))
+                in
+                begin
+                  match all_same_operand incoming with
+                  | Some _ ->
+                      incr exact_same_source_phis
+                  | None ->
+                      ()
+                end;
+                let nonself =
+                  List.filter
+                    (fun source ->
+                      source <> Tcg.Temp phi_temp)
+                    incoming
+                in
+                match all_same_operand nonself with
+                | Some source
+                  when
+                    nonself <> []
+                    && List.for_all
+                         (fun incoming_source ->
+                           incoming_source = Tcg.Temp phi_temp
+                           || incoming_source = source)
+                         incoming ->
+                    incr self_recursive_trivial_phis;
+                    self_trivial_candidates_rev :=
+                      (phi_temp, succ_block.label, source)
+                      :: !self_trivial_candidates_rev
+                | Some _
+                | None ->
+                    ())
+              phi_copies;
             if phi_copies <> [] then
               List.iter
                 (fun pred ->
@@ -3288,19 +3631,181 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
                         | Some _ | None -> acc)
                       [] phi_copies
                   in
-                  match build_parallel_copies fresh_temp (List.rev copies) with
+                  let copies = List.rev copies in
+                  raw_copy_pairs :=
+                    !raw_copy_pairs + List.length copies;
+                  match build_parallel_copies fresh_temp copies with
                   | [] -> ()
                   | body ->
+                      scheduled_copy_instrs :=
+                        !scheduled_copy_instrs + List.length body;
+                      cycle_snapshot_instrs :=
+                        !cycle_snapshot_instrs
+                        + max 0 (List.length body - List.length copies);
                       edge_copies_rev :=
                         (pred, succ_block.label, body) :: !edge_copies_rev)
                 succ_block.preds)
           promoted_blocks;
+        let edge_copies = List.rev !edge_copies_rev in
         let blocks =
-          place_edge_copies fresh_edge_label promoted_blocks (List.rev !edge_copies_rev)
+          place_edge_copies fresh_edge_label promoted_blocks edge_copies
         in
-        let promoted =
+        let before_phi_elim =
           Cfg.rebuild_edges
             { current with temp_count = !next_temp; blocks }
+        in
+        let promoted_block_map =
+          Hashtbl.create (max 8 (List.length promoted_blocks))
+        in
+        List.iter
+          (fun (block : Cfg.block) ->
+            Hashtbl.replace
+              promoted_block_map block.label block)
+          promoted_blocks;
+        let promoted_doms =
+          mem2reg_local_dominators
+            current.entry promoted_blocks
+        in
+        let promoted_defs =
+          mem2reg_temp_def_blocks promoted_blocks
+        in
+        let loop_cache = Hashtbl.create 8 in
+        let natural_loop header =
+          match Hashtbl.find_opt loop_cache header with
+          | Some loop ->
+              loop
+          | None ->
+              let loop =
+                mem2reg_natural_loop_for_header
+                  promoted_block_map promoted_doms header
+              in
+              Hashtbl.replace loop_cache header loop;
+              loop
+        in
+        let source_is_loop_invariant header source =
+          let loop = natural_loop header in
+          if LabelSet.is_empty loop then
+            false
+          else
+            match source with
+            | Tcg.Imm _ ->
+                true
+            | Tcg.Temp source_temp ->
+                begin
+                  match
+                    Hashtbl.find_opt
+                      phi_header_by_temp source_temp
+                  with
+                  | Some source_header ->
+                      not (LabelSet.mem source_header loop)
+                  | None ->
+                      let def_blocks =
+                        table_find_or_empty
+                          promoted_defs
+                          source_temp
+                          LabelSet.empty
+                      in
+                      not (LabelSet.is_empty def_blocks)
+                      &&
+                      LabelSet.is_empty
+                        (LabelSet.inter loop def_blocks)
+                end
+        in
+        let safe_self_trivial =
+          !self_trivial_candidates_rev
+          |> List.rev
+          |> List.filter
+               (fun (_, header, source) ->
+                 source_is_loop_invariant header source)
+        in
+        let candidate_subst =
+          Hashtbl.create (max 8 (List.length safe_self_trivial))
+        in
+        List.iter
+          (fun (phi_temp, _, source) ->
+            Hashtbl.replace candidate_subst phi_temp source)
+          safe_self_trivial;
+        let rec resolve_candidate seen temp =
+          if IntSet.mem temp seen then
+            None
+          else
+            match Hashtbl.find_opt candidate_subst temp with
+            | None ->
+                Some (Tcg.Temp temp)
+            | Some (Tcg.Imm _ as imm) ->
+                Some imm
+            | Some (Tcg.Temp source_temp) ->
+                if Hashtbl.mem candidate_subst source_temp then
+                  resolve_candidate
+                    (IntSet.add temp seen)
+                    source_temp
+                else
+                  Some (Tcg.Temp source_temp)
+        in
+        let safe_substitutions =
+          safe_self_trivial
+          |> List.filter_map
+               (fun (phi_temp, _, source) ->
+                 match source with
+                 | Tcg.Imm _ ->
+                     Some (phi_temp, source)
+                 | Tcg.Temp source_temp ->
+                     begin
+                       match
+                         resolve_candidate
+                           (IntSet.singleton phi_temp)
+                           source_temp
+                       with
+                       | Some resolved ->
+                           Some (phi_temp, resolved)
+                       | None ->
+                           None
+                     end)
+        in
+        let debug_phi =
+          Sys.getenv_opt "TOYC_DEBUG_MEM2REG_EDGE_COPY" <> None
+        in
+        let before_compact =
+          mem2reg_eliminate_trivial_phi_temps
+            ~debug:debug_phi
+            before_phi_elim
+            safe_substitutions
+        in
+        if debug_phi then begin
+          let uses = temp_use_counts before_compact in
+          let dead_phi_temps =
+            IntSet.fold
+              (fun temp count ->
+                if temp >= 0
+                   && temp < Array.length uses
+                   && uses.(temp) = 0
+                then count + 1
+                else count)
+              !actual_phi_temps 0
+          in
+          let critical_edge_blocks =
+            max 0
+              (List.length before_compact.blocks
+               - List.length promoted_blocks)
+          in
+          Printf.eprintf
+            "mem2reg-edge-copy func=%s actual-phis=%d raw-copies=%d scheduled-moves=%d cycle-snapshots=%d edge-sites=%d critical-edge-blocks=%d exact-same-source=%d self-trivial=%d self-trivial-safe=%d self-trivial-eliminated=%d dead-phis=%d temps=%d\n%!"
+            current.name
+            (IntSet.cardinal !actual_phi_temps)
+            !raw_copy_pairs
+            !scheduled_copy_instrs
+            !cycle_snapshot_instrs
+            (List.length edge_copies)
+            critical_edge_blocks
+            !exact_same_source_phis
+            !self_recursive_trivial_phis
+            (List.length safe_self_trivial)
+            (List.length safe_substitutions)
+            dead_phi_temps
+            before_phi_elim.temp_count
+        end;
+        let promoted =
+          before_compact
           |> compact_temp_ids_func ~debug_tag:"mem2reg"
         in
         if IntSet.is_empty !failed then promoted else attempt promoted !failed
