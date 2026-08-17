@@ -5012,7 +5012,7 @@ let tailrec_elim_func (f : Cfg.func) =
     Cfg.rebuild_edges { f with entry = new_entry; temp_count = !next_temp; blocks }
   else f
 
-let loop_canonicalize_func summaries globals (f : Cfg.func) =
+let loop_canonicalize_func _summaries _globals (f : Cfg.func) =
   let next_preheader_id = ref 0 in
   let fresh_preheader_label () =
     let id = !next_preheader_id in
@@ -5032,7 +5032,6 @@ let loop_canonicalize_func summaries globals (f : Cfg.func) =
     Printf.sprintf ".L%s_canon_cmp_%d" f.label id
   in
   let rec apply (current : Cfg.func) =
-    let live_in_t, live_in_p = compute_liveness summaries globals current in
     let _, loops, headers = discover_natural_loops current in
     if headers = [] then current
     else
@@ -5072,31 +5071,6 @@ let loop_canonicalize_func summaries globals (f : Cfg.func) =
             Cfg.BranchCompare (op, lhs, rhs, if_true, if_false)
         | Cfg.Jump _ | Cfg.Return _ -> term
       in
-      let prune_jump_body (block : Cfg.block) next_label =
-        let live_t =
-          match Hashtbl.find_opt live_in_t next_label with
-          | Some live -> live
-          | None -> IntSet.empty
-        in
-        let live_p =
-          match Hashtbl.find_opt live_in_p next_label with
-          | Some live -> live
-          | None -> PlaceSet.empty
-        in
-        let kept_rev, _, _ =
-          List.fold_left
-            (fun (acc, live_t, live_p) instr ->
-              let kept, live_t, live_p = scan_simple_instr summaries globals instr live_t live_p in
-              let acc =
-                match kept with
-                | Some instr -> instr :: acc
-                | None -> acc
-              in
-              (acc, live_t, live_p))
-            ([], live_t, live_p) (List.rev block.body)
-        in
-        List.rev kept_rev
-      in
       let rec equivalent_linear_jump_chains seen_pairs a b =
         if a = b then Some a
         else if List.mem (a, b) seen_pairs || List.mem (b, a) seen_pairs then None
@@ -5105,11 +5079,22 @@ let loop_canonicalize_func summaries globals (f : Cfg.func) =
           let b_block : Cfg.block = get_block b in
           match (a_block.term, b_block.term) with
           | Cfg.Jump next_a, Cfg.Jump next_b ->
-              let a_body = prune_jump_body a_block next_a in
-              let b_body = prune_jump_body b_block next_b in
-              if a_body <> b_body then None
+              (* Path equivalence must be proved from the actual instruction
+                 streams, not from liveness-pruned bodies.
+
+                 In particular, promoted global/phi state may be carried through
+                 successor edges in ways that a local dead-code view does not
+                 faithfully capture.  Pruning the two arms independently before
+                 comparison can therefore erase distinct state updates and
+                 incorrectly fold a real conditional into one successor.
+
+                 Keep this transform deliberately conservative: only syntactically
+                 identical jump-chain bodies are equivalent. *)
+              if a_block.body <> b_block.body then None
               else if next_a = next_b then Some a
-              else equivalent_linear_jump_chains ((a, b) :: seen_pairs) next_a next_b
+              else
+                equivalent_linear_jump_chains
+                  ((a, b) :: seen_pairs) next_a next_b
           | _ -> None
       in
       let is_small_pure_control_body body =
@@ -5235,7 +5220,10 @@ let loop_canonicalize_func summaries globals (f : Cfg.func) =
                 if label = !current_entry then current_entry := prep_label
               end)
             loop;
-          LabelSet.iter
+          if
+            Sys.getenv_opt "TOYC_DISABLE_CANON_EQUIV_CHAINS" = None
+          then begin
+            LabelSet.iter
             (fun label ->
               let block : Cfg.block = get_block label in
               match branch_targets block.term with
@@ -5250,7 +5238,8 @@ let loop_canonicalize_func summaries globals (f : Cfg.func) =
                       update_block { block with term; succs = Cfg.successors term }
                   | None -> ())
               | Some _ | None -> ())
-            loop)
+            loop
+          end)
         headers;
       if !changed then
         let blocks = List.map get_block !block_order in
@@ -33338,8 +33327,8 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       let final_candidate =
         if
           Sys.getenv_opt
-            "TOYC_ENABLE_EXPERIMENTAL_FINAL_INLINE_COUNTED_RETRY"
-          = None
+            "TOYC_DISABLE_FINAL_INLINE_COUNTED_RETRY"
+          <> None
           || not has_cfg_inline_blocks
         then
           final_candidate0
@@ -34379,13 +34368,21 @@ let small_leaf_inline_candidate (f : Cfg.func) : Cfg.func option =
           (fun acc (param : Tcg.var) -> IntSet.add param.id acc)
           IntSet.empty f.params
       in
+      let allow_effectful_globals =
+        Sys.getenv_opt "TOYC_DISABLE_EFFECTFUL_HOT_INLINE" = None
+      in
       let instr_safe = function
         | Tcg.Move _ | Tcg.Un _ -> true
         | Tcg.Bin (_, (Div | Mod), _, _) -> false
         | Tcg.Bin _ -> true
         | Tcg.Load (_, Tcg.Local id) -> IntSet.mem id param_ids
-        | Tcg.Load (_, Tcg.Global _) -> false
-        | Tcg.Store _ | Tcg.Call _ -> false
+        | Tcg.Load (_, Tcg.Global _) ->
+            allow_effectful_globals
+        | Tcg.Store (Tcg.Global _, _) ->
+            allow_effectful_globals
+        | Tcg.Store (Tcg.Local _, _)
+        | Tcg.Call _ ->
+            false
       in
       let term_safe = function
         | Cfg.Return (Some _) -> true
@@ -34661,9 +34658,28 @@ let inline_small_hot_calls_program
           let before = metrics_of_func f in
           let expanded = metrics_of_func inlined in
           let cleaned =
-            optimize_func
-              global_init summaries globals return_globals removable_calls
-              inlined
+            match Sys.getenv_opt "TOYC_EFFECT_INLINE_CLEANUP_STAGE" with
+            | Some "raw" ->
+                inlined
+            | Some "mem2reg" ->
+                mem2reg_func inlined
+            | Some "gprom" ->
+                inlined
+                |> mem2reg_func
+                |> promote_globals_func summaries globals
+            | Some "canonical" ->
+                inlined
+                |> mem2reg_func
+                |> promote_globals_func summaries globals
+                |> loop_canonicalize_func summaries globals
+            | Some "full"
+            | None ->
+                optimize_func
+                  global_init summaries globals return_globals removable_calls
+                  inlined
+            | Some mode ->
+                failwith
+                  ("unknown TOYC_EFFECT_INLINE_CLEANUP_STAGE=" ^ mode)
           in
           if cfg_targets_valid cleaned then begin
             if Sys.getenv_opt "TOYC_DEBUG_CFG_INLINE" <> None then
@@ -35648,6 +35664,17 @@ let fold_constant_calls_program
 let late_whole_program_constantization_enabled () =
   Sys.getenv_opt "TOYC_ENABLE_LATE_CONST_WHOLE_PROGRAM" <> None
 
+
+(* -------------------------------------------------------------------------- *)
+(* Experimental zero-argument whole-function constant evaluation              *)
+(*                                                                            *)
+(* After late inlining/promotion a formerly effectful-looking function may    *)
+(* become a completely local deterministic CFG.  Reuse [constant_eval_func]   *)
+(* rather than trying to symbolically summarize branches/loops.               *)
+(*                                                                            *)
+(* Safety is inherited from [constant_eval_func]: executed global accesses,   *)
+(* nested calls, unsupported/trapping operations, unknown values, or budget   *)
+(* exhaustion all return [None], leaving the function unchanged.              *)
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
   last_liveness_cache := None;
@@ -35718,6 +35745,47 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let optimized_funcs =
     fold_trivial_calls_program
       global_init summaries globals return_global_demands removable_calls
+      optimized_funcs
+  in
+  let optimized_funcs =
+    if Sys.getenv_opt "TOYC_DISABLE_ZERO_ARG_CONST_EVAL" = None then
+      let debug =
+        Sys.getenv_opt "TOYC_DEBUG_ZERO_ARG_CONST_EVAL" <> None
+      in
+      List.map
+        (fun (f : Cfg.func) ->
+          if f.ret <> TInt || f.params <> [] then
+            f
+          else
+            match constant_eval_func f [] with
+            | None ->
+                f
+            | Some value ->
+                let value = i32 value in
+                let folded_block =
+                  {
+                    Cfg.label = f.entry;
+                    body = [];
+                    term = Cfg.Return (Some (Tcg.Imm value));
+                    preds = [];
+                    succs = [];
+                  }
+                in
+                let folded =
+                  Cfg.rebuild_edges
+                    {
+                      f with
+                      temp_count = 0;
+                      blocks = [ folded_block ];
+                    }
+                in
+                if debug then
+                  Printf.eprintf
+                    "zero-arg-const-eval func=%s value=%Ld blocks=%d->1\n%!"
+                    f.name value (List.length f.blocks);
+                folded)
+        optimized_funcs
+    else
       optimized_funcs
   in
   { Cfg.funcs = optimized_funcs }
