@@ -27348,6 +27348,77 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                 (fun (_, dst, _) -> dst <> iv_temp)
                                 self_adds
                             in
+                            let () =
+                              if debug then begin
+                                let live_exit_diag =
+                                  table_find_or_empty
+                                    live_in_t exit_label IntSet.empty
+                                in
+                                let loop_live_defs_diag =
+                                  IntSet.inter loop_defs live_exit_diag
+                                in
+                                let body_string =
+                                  body_indexed
+                                  |> List.map
+                                       (fun (index, instr) ->
+                                         Printf.sprintf
+                                           "%d:%s"
+                                           index
+                                           (string_of_simple_instr instr))
+                                  |> String.concat ";"
+                                in
+                                Printf.eprintf
+                                  "lve-runtime-body func=%s header=%s iv=t%d live-out={%s} instrs=[%s]\n%!"
+                                  f.name header iv_temp
+                                  (String.concat ","
+                                     (List.map string_of_int
+                                        (IntSet.elements
+                                           loop_live_defs_diag)))
+                                  body_string;
+                                IntSet.iter
+                                  (fun temp ->
+                                    let defs =
+                                      body_indexed
+                                      |> List.filter_map
+                                           (fun (index, instr) ->
+                                             match defs_temp instr with
+                                             | Some dst when dst = temp ->
+                                                 Some
+                                                   (Printf.sprintf
+                                                      "%d:%s"
+                                                      index
+                                                      (string_of_simple_instr
+                                                         instr))
+                                             | Some _
+                                             | None ->
+                                                 None)
+                                      |> String.concat ";"
+                                    in
+                                    Printf.eprintf
+                                      "lve-runtime-live-def func=%s header=%s temp=t%d multi=%b defs=[%s]\n%!"
+                                      f.name header temp
+                                      (IntSet.mem temp multi_defs)
+                                      defs)
+                                  loop_live_defs_diag
+                              end
+                            in
+                            let () =
+                              if debug then begin
+                                let show_one (index, dst, operand) =
+                                  Printf.sprintf
+                                    "%d:t%d+=%s"
+                                    index dst
+                                    (string_of_lve_operand operand)
+                                in
+                                Printf.eprintf
+                                  "lve-runtime-reduction-shape func=%s header=%s iv=t%d self-adds=[%s] non-iv=[%s]\n%!"
+                                  f.name header iv_temp
+                                  (String.concat ";"
+                                     (List.map show_one self_adds))
+                                  (String.concat ";"
+                                     (List.map show_one non_iv))
+                              end
+                            in
 
                             (* Phase-aware direct affine reduction analysis.
 
@@ -27611,40 +27682,96 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                   None
                             in
 
-                            let match_direct_reduction () =
-                              match non_iv with
-                              | [ (acc_index, acc_temp, delta_operand) ]
-                                when acc_temp <> iv_temp ->
-                                  Option.bind
-                                    (direct_delta_affine_of_operand
-                                       acc_index IntSet.empty delta_operand)
-                                    (fun (delta_scale, delta_bias) ->
-                                      let delta_scale =
-                                        normalize_loop_inv_expr delta_scale
-                                      in
-                                      let delta_bias =
-                                        normalize_loop_inv_expr delta_bias
-                                      in
-                                      let scale_available =
-                                        lve_expr_available_before_preds
-                                          doms def_blocks multi_defs
-                                          [ preheader_label ] delta_scale
-                                      in
-                                      let bias_available =
-                                        lve_expr_available_before_preds
-                                          doms def_blocks multi_defs
-                                          [ preheader_label ] delta_bias
-                                      in
-                                      if scale_available && bias_available then
-                                        Some
-                                          (`DirectAffine
-                                            ( acc_temp,
-                                              delta_scale,
-                                              delta_bias ))
-                                      else
-                                        None)
-                              | _ ->
-                                  None
+                            let match_direct_reductions () =
+                              let rec collect seen_accs acc = function
+                                | [] ->
+                                    if acc = [] then None
+                                    else Some (List.rev acc)
+                                | (acc_index, acc_temp, delta_operand) :: rest ->
+                                    if acc_temp = iv_temp then begin
+                                      if debug then
+                                        Printf.eprintf
+                                          "lve-runtime-multi-reduction-reject func=%s header=%s acc=t%d reason=is-control-iv\n%!"
+                                          f.name header acc_temp;
+                                      None
+                                    end
+                                    else if IntSet.mem acc_temp seen_accs then begin
+                                      if debug then
+                                        Printf.eprintf
+                                          "lve-runtime-multi-reduction-reject func=%s header=%s acc=t%d reason=duplicate-accumulator\n%!"
+                                          f.name header acc_temp;
+                                      None
+                                    end
+                                    else
+                                      match
+                                        direct_delta_affine_of_operand
+                                          acc_index IntSet.empty
+                                          delta_operand
+                                      with
+                                      | None ->
+                                          if debug then
+                                            Printf.eprintf
+                                              "lve-runtime-multi-reduction-reject func=%s header=%s acc=t%d index=%d delta=%s reason=delta-not-affine\n%!"
+                                              f.name header acc_temp acc_index
+                                              (string_of_lve_operand
+                                                 delta_operand);
+                                          None
+                                      | Some (delta_scale, delta_bias) ->
+                                          let delta_scale =
+                                            normalize_loop_inv_expr delta_scale
+                                          in
+                                          let delta_bias =
+                                            normalize_loop_inv_expr delta_bias
+                                          in
+                                          let scale_available =
+                                            lve_expr_available_before_preds
+                                              doms def_blocks multi_defs
+                                              [ preheader_label ] delta_scale
+                                          in
+                                          let bias_available =
+                                            lve_expr_available_before_preds
+                                              doms def_blocks multi_defs
+                                              [ preheader_label ] delta_bias
+                                          in
+                                          if
+                                            not scale_available
+                                            || not bias_available
+                                          then begin
+                                            if debug then
+                                              Printf.eprintf
+                                                "lve-runtime-multi-reduction-reject func=%s header=%s acc=t%d index=%d delta=%s reason=operand-unavailable scale=%s scale-ok=%b bias=%s bias-ok=%b\n%!"
+                                                f.name header acc_temp acc_index
+                                                (string_of_lve_operand
+                                                   delta_operand)
+                                                (string_of_loop_inv_expr
+                                                   delta_scale)
+                                                scale_available
+                                                (string_of_loop_inv_expr
+                                                   delta_bias)
+                                                bias_available;
+                                            None
+                                          end
+                                          else begin
+                                            if debug then
+                                              Printf.eprintf
+                                                "lve-runtime-multi-reduction-hit func=%s header=%s acc=t%d index=%d delta=%s scale=%s bias=%s\n%!"
+                                                f.name header acc_temp acc_index
+                                                (string_of_lve_operand
+                                                   delta_operand)
+                                                (string_of_loop_inv_expr
+                                                   delta_scale)
+                                                (string_of_loop_inv_expr
+                                                   delta_bias);
+                                            collect
+                                              (IntSet.add acc_temp seen_accs)
+                                              ( ( acc_temp,
+                                                  delta_scale,
+                                                  delta_bias )
+                                                :: acc )
+                                              rest
+                                          end
+                              in
+                              collect IntSet.empty [] non_iv
                             in
 
                             let match_move_accumulator_carrier () =
@@ -27765,6 +27892,277 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                  (i1, dst1, other1))
                                       | _ -> None
                                     in
+                            (* v71: recover affine live recurrences from
+                               the final write to a live-out temp, even when
+                               temporary SSA-like values hide the self-add.
+
+                               For one chosen live temp [acc], recursively expand
+                               only definitions earlier in the same linear body
+                               and represent the RHS as
+
+                                 c_acc * acc_old
+                                 + scale * iv_pre
+                                 + bias.
+
+                               Other loop-live temps are never expanded, which
+                               rejects coupled recurrences.  Add/Sub and unary
+                               +/- are allowed; multiplication is deliberately
+                               not accepted in this fallback.  A live temp is
+                               summarized only as either
+
+                                 acc' = acc + scale * iv + bias
+
+                               or, on a compiler-generated rotated split loop
+                               where the fast summary path executes at least one
+                               source iteration,
+
+                                 live' = loop-invariant-value.
+
+                               This directly covers the observed two_live IR:
+                                 post: t3' = t3 + t4 + 2
+                                 pre : t1' = t1 + t4 + 1; t3' = 0. *)
+                            let hidden_live_exit =
+                              table_find_or_empty
+                                live_in_t exit_label IntSet.empty
+                            in
+                            let hidden_loop_live_defs =
+                              IntSet.inter loop_defs hidden_live_exit
+                            in
+                            let hidden_add
+                                (lhs_acc, lhs_scale, lhs_bias)
+                                (rhs_acc, rhs_scale, rhs_bias) =
+                              ( Int64.add lhs_acc rhs_acc,
+                                normalize_loop_inv_expr
+                                  (LveAdd (lhs_scale, rhs_scale)),
+                                normalize_loop_inv_expr
+                                  (LveAdd (lhs_bias, rhs_bias)) )
+                            in
+                            let hidden_neg (acc_coeff, scale, bias) =
+                              ( Int64.neg acc_coeff,
+                                normalize_loop_inv_expr (LveNeg scale),
+                                normalize_loop_inv_expr (LveNeg bias) )
+                            in
+                            let hidden_sub lhs rhs =
+                              hidden_add lhs (hidden_neg rhs)
+                            in
+                            let rec hidden_live_affine_of_operand
+                                target use_index seen operand =
+                              match operand with
+                              | Tcg.Imm value ->
+                                  Some
+                                    ( 0L,
+                                      LveConst 0L,
+                                      LveConst value )
+                              | Tcg.Temp temp when temp = target ->
+                                  Some
+                                    ( 1L,
+                                      LveConst 0L,
+                                      LveConst 0L )
+                              | Tcg.Temp temp when temp = iv_temp ->
+                                  let phase_bias =
+                                    if use_index > iv_update_index then
+                                      step_expr
+                                    else
+                                      LveConst 0L
+                                  in
+                                  Some
+                                    ( 0L,
+                                      LveConst 1L,
+                                      normalize_loop_inv_expr phase_bias )
+                              | Tcg.Temp temp as operand ->
+                                  if
+                                    IntSet.mem temp hidden_loop_live_defs
+                                  then
+                                    None
+                                  else
+                                    match
+                                      lve_invariant_expr_of_operand
+                                        loop_defs multi_defs def_instrs operand
+                                    with
+                                    | Some invariant ->
+                                        Some
+                                          ( 0L,
+                                            LveConst 0L,
+                                            normalize_loop_inv_expr invariant )
+                                    | None ->
+                                        if IntSet.mem temp seen then
+                                          None
+                                        else
+                                          match
+                                            last_body_def_before
+                                              use_index temp
+                                          with
+                                          | Some (def_index, instr) ->
+                                              hidden_live_affine_of_instr
+                                                target def_index
+                                                (IntSet.add temp seen)
+                                                instr
+                                          | None ->
+                                              None
+                            and hidden_live_affine_of_instr
+                                target def_index seen = function
+                              | Tcg.Move (_, src)
+                              | Tcg.Un (_, UPlus, src) ->
+                                  hidden_live_affine_of_operand
+                                    target def_index seen src
+                              | Tcg.Un (_, UMinus, src) ->
+                                  Option.map
+                                    hidden_neg
+                                    (hidden_live_affine_of_operand
+                                       target def_index seen src)
+                              | Tcg.Bin (_, Add, lhs, rhs) ->
+                                  Option.bind
+                                    (hidden_live_affine_of_operand
+                                       target def_index seen lhs)
+                                    (fun lhs_form ->
+                                      Option.map
+                                        (hidden_add lhs_form)
+                                        (hidden_live_affine_of_operand
+                                           target def_index seen rhs))
+                              | Tcg.Bin (_, Sub, lhs, rhs) ->
+                                  Option.bind
+                                    (hidden_live_affine_of_operand
+                                       target def_index seen lhs)
+                                    (fun lhs_form ->
+                                      Option.map
+                                        (hidden_sub lhs_form)
+                                        (hidden_live_affine_of_operand
+                                           target def_index seen rhs))
+                              | Tcg.Un (_, UNot, _)
+                              | Tcg.Bin
+                                  (_,
+                                   (Mul | Div | Mod | Lt | Le | Gt | Ge
+                                   | Eq | Ne | LAnd | LOr),
+                                   _, _)
+                              | Tcg.Load _
+                              | Tcg.Store _
+                              | Tcg.Call _ ->
+                                  None
+                            in
+                            let hidden_single_body_def temp =
+                              body_indexed
+                              |> List.filter_map
+                                   (fun (index, instr) ->
+                                     match defs_temp instr with
+                                     | Some dst when dst = temp ->
+                                         Some (index, instr)
+                                     | Some _
+                                     | None ->
+                                         None)
+                              |> function
+                                   | [ one ] -> Some one
+                                   | []
+                                   | _ :: _ :: _ -> None
+                            in
+                            let hidden_fast_path_executes_body =
+                              contains_substring header "_split_"
+                              && loop_inv_expr_equal
+                                   control_scale scalar_inv_one
+                              && loop_inv_expr_equal
+                                   control_bias step_expr
+                              &&
+                              match loop_inv_expr_const_opt step_expr with
+                              | Some step -> step > 0L
+                              | None -> false
+                            in
+                            let match_hidden_live_affines () =
+                              let targets =
+                                hidden_loop_live_defs
+                                |> IntSet.remove iv_temp
+                                |> IntSet.elements
+                              in
+                              let rec collect reductions overwrites = function
+                                | [] ->
+                                    if reductions = [] then None
+                                    else
+                                      Some
+                                        ( List.rev reductions,
+                                          List.rev overwrites )
+                                | target :: rest ->
+                                    begin
+                                      match hidden_single_body_def target with
+                                      | None ->
+                                          None
+                                      | Some (def_index, instr) ->
+                                          begin
+                                            match
+                                              hidden_live_affine_of_instr
+                                                target def_index
+                                                IntSet.empty instr
+                                            with
+                                            | None ->
+                                                None
+                                            | Some
+                                                ( acc_coeff,
+                                                  delta_scale,
+                                                  delta_bias ) ->
+                                                let delta_scale =
+                                                  normalize_loop_inv_expr
+                                                    delta_scale
+                                                in
+                                                let delta_bias =
+                                                  normalize_loop_inv_expr
+                                                    delta_bias
+                                                in
+                                                let scale_available =
+                                                  lve_expr_available_before_preds
+                                                    doms def_blocks multi_defs
+                                                    [ preheader_label ]
+                                                    delta_scale
+                                                in
+                                                let bias_available =
+                                                  lve_expr_available_before_preds
+                                                    doms def_blocks multi_defs
+                                                    [ preheader_label ]
+                                                    delta_bias
+                                                in
+                                                if
+                                                  Int64.equal acc_coeff 1L
+                                                  && scale_available
+                                                  && bias_available
+                                                then begin
+                                                  if debug then
+                                                    Printf.eprintf
+                                                      "lve-runtime-hidden-affine-reduction func=%s header=%s iv=t%d acc=t%d scale=%s bias=%s\n%!"
+                                                      f.name header iv_temp target
+                                                      (string_of_loop_inv_expr
+                                                         delta_scale)
+                                                      (string_of_loop_inv_expr
+                                                         delta_bias);
+                                                  collect
+                                                    ( ( target,
+                                                        delta_scale,
+                                                        delta_bias )
+                                                      :: reductions )
+                                                    overwrites rest
+                                                end
+                                                else if
+                                                  Int64.equal acc_coeff 0L
+                                                  && loop_inv_expr_equal
+                                                       delta_scale
+                                                       scalar_inv_zero
+                                                  && bias_available
+                                                  && hidden_fast_path_executes_body
+                                                then begin
+                                                  if debug then
+                                                    Printf.eprintf
+                                                      "lve-runtime-hidden-invariant-overwrite func=%s header=%s temp=t%d value=%s\n%!"
+                                                      f.name header target
+                                                      (string_of_loop_inv_expr
+                                                         delta_bias);
+                                                  collect reductions
+                                                    ((target, delta_bias)
+                                                     :: overwrites)
+                                                    rest
+                                                end
+                                                else
+                                                  None
+                                          end
+                                    end
+                              in
+                              collect [] [] targets
+                            in
+
                             let reduction_shape =
                               match match_move_accumulator_carrier () with
                               | Some (acc_temp, derived_temp, delta_operand) ->
@@ -27774,9 +28172,9 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                         derived_temp,
                                         delta_operand ))
                               | None ->
-                                  (match match_direct_reduction () with
-                                   | Some _ as direct ->
-                                       direct
+                                  (match match_direct_reductions () with
+                                   | Some reductions ->
+                                       Some (`DirectAffines reductions)
                                    | None ->
                                        (match match_pair () with
                                         | Some
@@ -27787,7 +28185,11 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                   derived_temp,
                                                   delta_operand ))
                                         | None ->
-                                            None))
+                                            Option.map
+                                              (fun (reductions, overwrites) ->
+                                                `LiveAffines
+                                                  (reductions, overwrites))
+                                              (match_hidden_live_affines ())))
                             in
                             match reduction_shape with
                             | None ->
@@ -27795,21 +28197,51 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                   "no-runtime-affine-reduction"
                             | Some reduction_shape ->
                                 (match reduction_shape with
-                                 | `DirectAffine (acc, scale, bias) when debug ->
-                                     Printf.eprintf
-                                        "lve-runtime-direct-affine-reduction func=%s header=%s iv=t%d acc=t%d scale=%s bias=%s step=%s\n%!"
-                                        f.name header iv_temp acc
-                                        (string_of_loop_inv_expr scale)
-                                        (string_of_loop_inv_expr bias)
-                                        (string_of_lve_operand step_operand)
-                                 | `DirectAffine _
+                                 | `DirectAffines reductions when debug ->
+                                     List.iter
+                                       (fun (acc, scale, bias) ->
+                                         Printf.eprintf
+                                           "lve-runtime-direct-affine-reduction func=%s header=%s iv=t%d acc=t%d scale=%s bias=%s step=%s\n%!"
+                                           f.name header iv_temp acc
+                                           (string_of_loop_inv_expr scale)
+                                           (string_of_loop_inv_expr bias)
+                                           (string_of_lve_operand step_operand))
+                                       reductions
+                                 | `LiveAffines
+                                     (reductions, overwrites) when debug ->
+                                     List.iter
+                                       (fun (acc, scale, bias) ->
+                                         Printf.eprintf
+                                           "lve-runtime-hidden-affine-summary-reduction func=%s header=%s iv=t%d acc=t%d scale=%s bias=%s step=%s\n%!"
+                                           f.name header iv_temp acc
+                                           (string_of_loop_inv_expr scale)
+                                           (string_of_loop_inv_expr bias)
+                                           (string_of_lve_operand step_operand))
+                                       reductions;
+                                     List.iter
+                                       (fun (temp, value) ->
+                                         Printf.eprintf
+                                           "lve-runtime-hidden-overwrite-summary func=%s header=%s temp=t%d value=%s\n%!"
+                                           f.name header temp
+                                           (string_of_loop_inv_expr value))
+                                       overwrites
+                                 | `DirectAffines _
+                                 | `LiveAffines _
                                  | `Carrier _ ->
                                      ());
-                                let acc_temp =
+                                let acc_temps =
                                   match reduction_shape with
-                                  | `Carrier (acc, _, _)
-                                  | `DirectAffine (acc, _, _) ->
-                                      acc
+                                  | `Carrier (acc, _, _) ->
+                                      [ acc ]
+                                  | `DirectAffines reductions ->
+                                      List.map
+                                        (fun (acc, _, _) -> acc)
+                                        reductions
+                                  | `LiveAffines (reductions, overwrites) ->
+                                      (List.map
+                                         (fun (acc, _, _) -> acc)
+                                         reductions)
+                                      @ (List.map fst overwrites)
                                 in
                                 let live_exit =
                                   table_find_or_empty
@@ -27819,7 +28251,11 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                   IntSet.inter loop_defs live_exit
                                 in
                                 let supported_live_temps =
-                                  IntSet.add iv_temp (IntSet.singleton acc_temp)
+                                  List.fold_left
+                                    (fun supported acc ->
+                                      IntSet.add acc supported)
+                                    (IntSet.singleton iv_temp)
+                                    acc_temps
                                 in
                                 let supported_live_temps,
                                     reconstruction_order,
@@ -27934,7 +28370,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                 in
                                                 match reduction_shape with
                                                 | `Carrier
-                                                    ( _,
+                                                    ( acc_temp,
                                                       derived_temp,
                                                       delta_operand ) ->
                                                     let
@@ -27986,24 +28422,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                                 Tcg.Temp
                                                                   total_delta )) ]
                                                     @ reconstruction_instrs
-                                                | `DirectAffine
-                                                    ( _,
-                                                      delta_scale,
-                                                      delta_bias ) ->
-                                                    let
-                                                      scale_prep,
-                                                      scale_operand
-                                                    =
-                                                      materialize_summary_inv_expr
-                                                        delta_scale
-                                                    in
-                                                    let
-                                                      bias_prep,
-                                                      bias_operand
-                                                    =
-                                                      materialize_summary_inv_expr
-                                                        delta_bias
-                                                    in
+                                                | `DirectAffines reductions ->
                                                     let
                                                       start_prep,
                                                       start_operand
@@ -28018,80 +28437,294 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                       build_triangle_number_instrs
                                                         fresh_temp summary_trip
                                                     in
-                                                    let start_scaled =
-                                                      fresh_temp ()
-                                                    in
-                                                    let effective_bias =
-                                                      fresh_temp ()
-                                                    in
-                                                    let step_triangle =
-                                                      fresh_temp ()
-                                                    in
-                                                    let series_delta =
-                                                      fresh_temp ()
-                                                    in
-                                                    let base_delta =
-                                                      fresh_temp ()
-                                                    in
-                                                    let total_delta =
-                                                      fresh_temp ()
+                                                    let
+                                                      build_one
+                                                        ( acc_temp,
+                                                          delta_scale,
+                                                          delta_bias )
+                                                      =
+                                                      let
+                                                        scale_prep,
+                                                        scale_operand
+                                                      =
+                                                        materialize_summary_inv_expr
+                                                          delta_scale
+                                                      in
+                                                      let
+                                                        bias_prep,
+                                                        bias_operand
+                                                      =
+                                                        materialize_summary_inv_expr
+                                                          delta_bias
+                                                      in
+                                                      let start_scaled =
+                                                        fresh_temp ()
+                                                      in
+                                                      let effective_bias =
+                                                        fresh_temp ()
+                                                      in
+                                                      let step_triangle =
+                                                        fresh_temp ()
+                                                      in
+                                                      let series_delta =
+                                                        fresh_temp ()
+                                                      in
+                                                      let base_delta =
+                                                        fresh_temp ()
+                                                      in
+                                                      let total_delta =
+                                                        fresh_temp ()
+                                                      in
+                                                      scale_prep
+                                                      @ bias_prep
+                                                      @ [ simplify_simple_instr
+                                                            (Tcg.Bin
+                                                               ( start_scaled,
+                                                                 Mul,
+                                                                 start_operand,
+                                                                 scale_operand ));
+                                                          simplify_simple_instr
+                                                            (Tcg.Bin
+                                                               ( effective_bias,
+                                                                 Add,
+                                                                 Tcg.Temp
+                                                                   start_scaled,
+                                                                 bias_operand ));
+                                                          simplify_simple_instr
+                                                            (Tcg.Bin
+                                                               ( step_triangle,
+                                                                 Mul,
+                                                                 Tcg.Temp
+                                                                   triangle,
+                                                                 step_operand ));
+                                                          simplify_simple_instr
+                                                            (Tcg.Bin
+                                                               ( series_delta,
+                                                                 Mul,
+                                                                 Tcg.Temp
+                                                                   step_triangle,
+                                                                 scale_operand ));
+                                                          simplify_simple_instr
+                                                            (Tcg.Bin
+                                                               ( base_delta,
+                                                                 Mul,
+                                                                 Tcg.Temp
+                                                                   summary_trip,
+                                                                 Tcg.Temp
+                                                                   effective_bias ));
+                                                          simplify_simple_instr
+                                                            (Tcg.Bin
+                                                               ( total_delta,
+                                                                 Add,
+                                                                 Tcg.Temp
+                                                                   base_delta,
+                                                                 Tcg.Temp
+                                                                   series_delta ));
+                                                          simplify_simple_instr
+                                                            (Tcg.Bin
+                                                               ( acc_temp,
+                                                                 Add,
+                                                                 Tcg.Temp
+                                                                   acc_temp,
+                                                                 Tcg.Temp
+                                                                   total_delta )) ]
                                                     in
                                                     iv_update_instrs
-                                                    @ scale_prep
-                                                    @ bias_prep
                                                     @ start_prep
                                                     @ triangle_instrs
-                                                    @ [ simplify_simple_instr
-                                                          (Tcg.Bin
-                                                             ( start_scaled,
-                                                               Mul,
-                                                               start_operand,
-                                                               scale_operand ));
-                                                        simplify_simple_instr
-                                                          (Tcg.Bin
-                                                             ( effective_bias,
-                                                               Add,
-                                                               Tcg.Temp
-                                                                 start_scaled,
-                                                               bias_operand ));
-                                                        simplify_simple_instr
-                                                          (Tcg.Bin
-                                                             ( step_triangle,
-                                                               Mul,
-                                                               Tcg.Temp
-                                                                 triangle,
-                                                               step_operand ));
-                                                        simplify_simple_instr
-                                                          (Tcg.Bin
-                                                             ( series_delta,
-                                                               Mul,
-                                                               Tcg.Temp
-                                                                 step_triangle,
-                                                               scale_operand ));
-                                                        simplify_simple_instr
-                                                          (Tcg.Bin
-                                                              ( base_delta,
-                                                                Mul,
-                                                                Tcg.Temp summary_trip,
-                                                                Tcg.Temp
-                                                                  effective_bias ));
-                                                        simplify_simple_instr
-                                                          (Tcg.Bin
-                                                             ( total_delta,
-                                                               Add,
-                                                               Tcg.Temp
-                                                                 base_delta,
-                                                               Tcg.Temp
-                                                                 series_delta ));
-                                                         simplify_simple_instr
-                                                           (Tcg.Bin
-                                                              ( acc_temp,
-                                                                Add,
-                                                                Tcg.Temp
-                                                                  acc_temp,
-                                                                Tcg.Temp
-                                                                  total_delta )) ]
+                                                    @ List.concat_map
+                                                        build_one reductions
                                                     @ reconstruction_instrs
+                                                | `LiveAffines
+                                                    (reductions, overwrites) ->
+                                                    let
+                                                      start_prep,
+                                                      start_operand
+                                                    =
+                                                      materialize_summary_inv_expr
+                                                        summary_start_expr
+                                                    in
+                                                    let
+                                                      triangle_instrs,
+                                                      triangle
+                                                    =
+                                                      build_triangle_number_instrs
+                                                        fresh_temp summary_trip
+                                                    in
+                                                    let
+                                                      build_one
+                                                        ( acc_temp,
+                                                          delta_scale,
+                                                          delta_bias )
+                                                      =
+                                                      let
+                                                        scale_prep,
+                                                        scale_operand
+                                                      =
+                                                        materialize_summary_inv_expr
+                                                          delta_scale
+                                                      in
+                                                      let
+                                                        bias_prep,
+                                                        bias_operand
+                                                      =
+                                                        materialize_summary_inv_expr
+                                                          delta_bias
+                                                      in
+                                                      let start_scaled =
+                                                        fresh_temp ()
+                                                      in
+                                                      let effective_bias =
+                                                        fresh_temp ()
+                                                      in
+                                                      let step_triangle =
+                                                        fresh_temp ()
+                                                      in
+                                                      let series_delta =
+                                                        fresh_temp ()
+                                                      in
+                                                      let base_delta =
+                                                        fresh_temp ()
+                                                      in
+                                                      let total_delta =
+                                                        fresh_temp ()
+                                                      in
+                                                      scale_prep
+                                                      @ bias_prep
+                                                      @ [ simplify_simple_instr
+                                                            (Tcg.Bin
+                                                               ( start_scaled,
+                                                                 Mul,
+                                                                 start_operand,
+                                                                 scale_operand ));
+                                                          simplify_simple_instr
+                                                            (Tcg.Bin
+                                                               ( effective_bias,
+                                                                 Add,
+                                                                 Tcg.Temp
+                                                                   start_scaled,
+                                                                 bias_operand ));
+                                                          simplify_simple_instr
+                                                            (Tcg.Bin
+                                                               ( step_triangle,
+                                                                 Mul,
+                                                                 Tcg.Temp
+                                                                   triangle,
+                                                                 step_operand ));
+                                                          simplify_simple_instr
+                                                            (Tcg.Bin
+                                                               ( series_delta,
+                                                                 Mul,
+                                                                 Tcg.Temp
+                                                                   step_triangle,
+                                                                 scale_operand ));
+                                                          simplify_simple_instr
+                                                            (Tcg.Bin
+                                                               ( base_delta,
+                                                                 Mul,
+                                                                 Tcg.Temp
+                                                                   summary_trip,
+                                                                 Tcg.Temp
+                                                                   effective_bias ));
+                                                          simplify_simple_instr
+                                                            (Tcg.Bin
+                                                               ( total_delta,
+                                                                 Add,
+                                                                 Tcg.Temp
+                                                                   base_delta,
+                                                                 Tcg.Temp
+                                                                   series_delta ));
+                                                          simplify_simple_instr
+                                                            (Tcg.Bin
+                                                               ( acc_temp,
+                                                                 Add,
+                                                                 Tcg.Temp
+                                                                   acc_temp,
+                                                                 Tcg.Temp
+                                                                   total_delta )) ]
+                                                    in
+                                                    let
+                                                      build_overwrite
+                                                        (temp, value)
+                                                      =
+                                                      let prep, operand =
+                                                        materialize_summary_inv_expr
+                                                          value
+                                                      in
+                                                      prep
+                                                      @ [ simplify_simple_instr
+                                                            (Tcg.Move
+                                                               (temp, operand)) ]
+                                                    in
+                                                    iv_update_instrs
+                                                    @ start_prep
+                                                    @ triangle_instrs
+                                                    @ List.concat_map
+                                                        build_one reductions
+                                                    @ List.concat_map
+                                                        build_overwrite
+                                                        overwrites
+                                                    @ reconstruction_instrs
+                                              in
+                                              let reduction_accs_string =
+                                                String.concat ","
+                                                  (List.map string_of_int
+                                                     acc_temps)
+                                              in
+                                              let reduction_shape_string =
+                                                match reduction_shape with
+                                                | `Carrier
+                                                    (_, derived, delta) ->
+                                                    Printf.sprintf
+                                                      "carrier:t%d+=%s"
+                                                      derived
+                                                      (string_of_lve_operand
+                                                         delta)
+                                                | `DirectAffines reductions ->
+                                                    reductions
+                                                    |> List.map
+                                                         (fun (acc, scale, bias) ->
+                                                           Printf.sprintf
+                                                             "t%d:scale=%s,bias=%s"
+                                                             acc
+                                                             (string_of_loop_inv_expr
+                                                                scale)
+                                                             (string_of_loop_inv_expr
+                                                                bias))
+                                                    |> String.concat ";"
+                                                    |> Printf.sprintf
+                                                         "direct-affines:[%s]"
+                                                | `LiveAffines
+                                                    (reductions, overwrites) ->
+                                                    let reduction_text =
+                                                      reductions
+                                                      |> List.map
+                                                           (fun
+                                                             (acc, scale, bias) ->
+                                                             Printf.sprintf
+                                                               "t%d:scale=%s,bias=%s"
+                                                               acc
+                                                               (string_of_loop_inv_expr
+                                                                  scale)
+                                                               (string_of_loop_inv_expr
+                                                                  bias))
+                                                      |> String.concat ";"
+                                                    in
+                                                    let overwrite_text =
+                                                      overwrites
+                                                      |> List.map
+                                                           (fun (temp, value) ->
+                                                             Printf.sprintf
+                                                               "t%d:=%s"
+                                                               temp
+                                                               (string_of_loop_inv_expr
+                                                                  value))
+                                                      |> String.concat ";"
+                                                    in
+                                                    Printf.sprintf
+                                                      "live-affines:[%s]|overwrite:[%s]"
+                                                      reduction_text
+                                                      overwrite_text
                                               in
                                               let use_affine_runtime_proof =
                                                 match symbolic_trip_family with
@@ -28501,7 +29134,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                               changed := true;
                                               if debug then
                                                 Printf.eprintf
-                                                  "lve-runtime-invariant-affine-summary func=%s header=%s iv=t%d scale=%s bias=%s control-start=%s acc=t%d reduction=%s step=%s bound=%s fallback=%s\n%!"
+                                                  "lve-runtime-invariant-affine-summary func=%s header=%s iv=t%d scale=%s bias=%s control-start=%s accs={%s} reduction=%s step=%s bound=%s fallback=%s\n%!"
                                                   f.name header iv_temp
                                                   (string_of_loop_inv_expr
                                                      control_scale)
@@ -28509,28 +29142,12 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                      control_bias)
                                                   (string_of_loop_inv_expr
                                                      proof_control_start_expr)
-                                                  acc_temp
-                                                  (match reduction_shape with
-                                                   | `Carrier
-                                                       (_, derived, delta) ->
-                                                       Printf.sprintf
-                                                         "carrier:t%d+=%s"
-                                                         derived
-                                                         (string_of_lve_operand
-                                                            delta)
-                                                   | `DirectAffine
-                                                        (_, scale, bias) ->
-                                                        Printf.sprintf
-                                                          "direct-affine:scale=%s,bias=%s"
-                                                          (string_of_loop_inv_expr
-                                                             scale)
-                                                          (string_of_loop_inv_expr
-                                                             bias)
-                                                  )
-                                                   (string_of_lve_operand
-                                                      step_operand)
-                                                   (string_of_lve_operand
-                                                      bound_operand)
+                                                  reduction_accs_string
+                                                  reduction_shape_string
+                                                  (string_of_lve_operand
+                                                     step_operand)
+                                                  (string_of_lve_operand
+                                                     bound_operand)
                                                   header
                                             end else begin
                                               (if scev_debug then
@@ -28685,31 +29302,15 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                               changed := true;
                                               if debug then
                                                 Printf.eprintf
-                                                  "lve-runtime-summary func=%s header=%s blocks=%d iv=t%d acc=t%d reduction=%s step=%s bound=%s fallback=%s\n%!"
+                                                  "lve-runtime-summary func=%s header=%s blocks=%d iv=t%d accs={%s} reduction=%s step=%s bound=%s fallback=%s\n%!"
                                                   f.name header
                                                   (LabelSet.cardinal loop)
                                                   iv_temp
-                                                  acc_temp
-                                                  (match reduction_shape with
-                                                   | `Carrier
-                                                       (_, derived, delta) ->
-                                                       Printf.sprintf
-                                                         "carrier:t%d+=%s"
-                                                         derived
-                                                         (string_of_lve_operand
-                                                            delta)
-                                                   | `DirectAffine
-                                                        (_, scale, bias) ->
-                                                        Printf.sprintf
-                                                          "direct-affine:scale=%s,bias=%s"
-                                                          (string_of_loop_inv_expr
-                                                             scale)
-                                                          (string_of_loop_inv_expr
-                                                             bias)
-                                                  )
-                                                   (string_of_lve_operand step_operand)
-                                                   (string_of_lve_operand bound_operand)
-                                                   header
+                                                  reduction_accs_string
+                                                  reduction_shape_string
+                                                  (string_of_lve_operand step_operand)
+                                                  (string_of_lve_operand bound_operand)
+                                                  header
                                              end)
       | _ -> reject header "outside-predecessor-count")
       headers;
