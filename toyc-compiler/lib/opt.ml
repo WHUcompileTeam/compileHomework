@@ -31453,6 +31453,384 @@ let fold_constant_calls_program
 let late_whole_program_constantization_enabled () =
   Sys.getenv_opt "TOYC_ENABLE_LATE_CONST_WHOLE_PROGRAM" <> None
 
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v1: inline / effect capability audit                                 *)
+(*                                                                            *)
+(* Audit only: no optimization semantics change.  The optimizer computes       *)
+(* interprocedural effect/removability summaries before the intraprocedural    *)
+(* and late whole-program cleanup pipeline.  By the end of that pipeline a     *)
+(* helper may have lost stores/calls or become a much smaller inline shape.    *)
+(* Compare the original summaries against summaries recomputed from the final   *)
+(* CFG, then classify every residual direct call site against the existing      *)
+(* scalar/branch/hot inline consumers.                                          *)
+(* -------------------------------------------------------------------------- *)
+
+type item7_inline_shape = {
+  item7_blocks : int;
+  item7_instrs : int;
+  item7_temps : int;
+  item7_nested_calls : int;
+  item7_stores : int;
+  item7_global_loads : int;
+  item7_divmods : int;
+  item7_nonparam_local_loads : int;
+  item7_void_returns : int;
+  item7_acyclic : bool;
+}
+
+let item7_inline_shape_of_func (f : Cfg.func) =
+  let view =
+    f
+    |> thread_and_prune_func
+    |> simplify_cfg_func
+    |> final_linear_merge_func
+    |> thread_and_prune_func
+  in
+  let reachable = reachable_labels view.entry view.blocks in
+  let blocks =
+    List.filter
+      (fun (block : Cfg.block) -> LabelSet.mem block.label reachable)
+      view.blocks
+  in
+  let param_ids =
+    List.fold_left
+      (fun acc (param : Tcg.var) -> IntSet.add param.id acc)
+      IntSet.empty view.params
+  in
+  let instrs = ref 0 in
+  let nested_calls = ref 0 in
+  let stores = ref 0 in
+  let global_loads = ref 0 in
+  let divmods = ref 0 in
+  let nonparam_local_loads = ref 0 in
+  let void_returns = ref 0 in
+  List.iter
+    (fun (block : Cfg.block) ->
+      instrs := !instrs + List.length block.body;
+      List.iter
+        (function
+          | Tcg.Call _ -> incr nested_calls
+          | Tcg.Store _ -> incr stores
+          | Tcg.Load (_, Tcg.Global _) -> incr global_loads
+          | Tcg.Load (_, Tcg.Local id) when not (IntSet.mem id param_ids) ->
+              incr nonparam_local_loads
+          | Tcg.Bin (_, (Div | Mod), _, _) -> incr divmods
+          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ -> ())
+        block.body;
+      match block.term with
+      | Cfg.Return None -> incr void_returns
+      | Cfg.Return (Some _)
+      | Cfg.Jump _
+      | Cfg.BranchZero _
+      | Cfg.BranchNonZero _
+      | Cfg.BranchCompare _ -> ())
+    blocks;
+  let ignored = Hashtbl.create 1 in
+  {
+    item7_blocks = List.length blocks;
+    item7_instrs = !instrs;
+    item7_temps = view.temp_count;
+    item7_nested_calls = !nested_calls;
+    item7_stores = !stores;
+    item7_global_loads = !global_loads;
+    item7_divmods = !divmods;
+    item7_nonparam_local_loads = !nonparam_local_loads;
+    item7_void_returns = !void_returns;
+    item7_acyclic = cfg_acyclic_ignoring_edges view ignored;
+  }
+
+let item7_bool01 value = if value then 1 else 0
+
+let item7_debug_inline_effect_capability
+    initial_summaries initial_removable globals
+    (funcs : Cfg.func list) =
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_CAPABILITY" <> None then begin
+    let final_summaries = compute_func_summaries globals funcs in
+    let final_removable =
+      compute_dead_call_removable_funcs final_summaries globals funcs
+    in
+    let by_label = Hashtbl.create (max 8 (List.length funcs)) in
+    List.iter (fun (f : Cfg.func) -> Hashtbl.replace by_label f.label f) funcs;
+
+    List.iter
+      (fun (f : Cfg.func) ->
+        let initial_effect = call_effect_summary initial_summaries globals f.label in
+        let final_effect = call_effect_summary final_summaries globals f.label in
+        let initial_can_remove =
+          match Hashtbl.find_opt initial_removable f.label with
+          | Some value -> value
+          | None -> false
+        in
+        let final_can_remove =
+          match Hashtbl.find_opt final_removable f.label with
+          | Some value -> value
+          | None -> false
+        in
+        let read_shrunk =
+          PlaceSet.subset final_effect.read_globals initial_effect.read_globals
+          && not (PlaceSet.equal final_effect.read_globals initial_effect.read_globals)
+        in
+        let write_shrunk =
+          PlaceSet.subset final_effect.written_globals initial_effect.written_globals
+          && not (PlaceSet.equal final_effect.written_globals initial_effect.written_globals)
+        in
+        if read_shrunk || write_shrunk || initial_can_remove <> final_can_remove then
+          Printf.eprintf
+            "item7-effect func=%s init-r=%d init-w=%d final-r=%d final-w=%d read-shrink=%d write-shrink=%d init-rem=%d final-rem=%d\n%!"
+            f.name
+            (PlaceSet.cardinal initial_effect.read_globals)
+            (PlaceSet.cardinal initial_effect.written_globals)
+            (PlaceSet.cardinal final_effect.read_globals)
+            (PlaceSet.cardinal final_effect.written_globals)
+            (item7_bool01 read_shrunk) (item7_bool01 write_shrunk)
+            (item7_bool01 initial_can_remove) (item7_bool01 final_can_remove))
+      funcs;
+
+    let total_calls = ref 0 in
+    let stale_write_calls = ref 0 in
+    let stale_read_calls = ref 0 in
+    let newly_removable_calls = ref 0 in
+    let scalar_candidate_calls = ref 0 in
+    let branch_candidate_calls = ref 0 in
+    let hot_candidate_calls = ref 0 in
+    let no_candidate_calls = ref 0 in
+    List.iter
+      (fun (caller : Cfg.func) ->
+        let hot_labels = hot_loop_labels_of_func caller in
+        List.iter
+          (fun (block : Cfg.block) ->
+            List.iter
+              (function
+                | Tcg.Call (dst, callee, args) ->
+                    incr total_calls;
+                    begin
+                      match Hashtbl.find_opt by_label callee with
+                      | None ->
+                          Printf.eprintf
+                            "item7-call caller=%s callee=%s site=%s known=0 hot=%d result=%d args=%d\n%!"
+                            caller.name callee block.label
+                            (item7_bool01 (LabelSet.mem block.label hot_labels))
+                            (item7_bool01 (match dst with Some _ -> true | None -> false)) (List.length args)
+                      | Some callee_func ->
+                          let initial_effect =
+                            call_effect_summary initial_summaries globals callee
+                          in
+                          let final_effect =
+                            call_effect_summary final_summaries globals callee
+                          in
+                          let stale_read =
+                            PlaceSet.subset final_effect.read_globals initial_effect.read_globals
+                            && not (PlaceSet.equal final_effect.read_globals initial_effect.read_globals)
+                          in
+                          let stale_write =
+                            PlaceSet.subset final_effect.written_globals initial_effect.written_globals
+                            && not (PlaceSet.equal final_effect.written_globals initial_effect.written_globals)
+                          in
+                          let initial_can_remove =
+                            match Hashtbl.find_opt initial_removable callee with
+                            | Some value -> value
+                            | None -> false
+                          in
+                          let final_can_remove =
+                            match Hashtbl.find_opt final_removable callee with
+                            | Some value -> value
+                            | None -> false
+                          in
+                          if stale_read then incr stale_read_calls;
+                          if stale_write then incr stale_write_calls;
+                          if (not initial_can_remove) && final_can_remove then
+                            incr newly_removable_calls;
+                          let scalar_candidate =
+                            (match late_scalar_inline_candidate_of_func callee_func with Some _ -> true | None -> false)
+                          in
+                          let branch_candidate =
+                            (match late_branch_inline_candidate callee_func with Some _ -> true | None -> false)
+                          in
+                          let hot_candidate =
+                            (match small_leaf_inline_candidate callee_func with Some _ -> true | None -> false)
+                          in
+                          if scalar_candidate then incr scalar_candidate_calls;
+                          if branch_candidate then incr branch_candidate_calls;
+                          if hot_candidate && LabelSet.mem block.label hot_labels then
+                            incr hot_candidate_calls;
+                          if not scalar_candidate && not branch_candidate
+                             && not (hot_candidate && LabelSet.mem block.label hot_labels)
+                          then incr no_candidate_calls;
+                          let shape = item7_inline_shape_of_func callee_func in
+                          Printf.eprintf
+                            "item7-call caller=%s callee=%s site=%s known=1 hot=%d result=%d args=%d init-r=%d init-w=%d final-r=%d final-w=%d stale-r=%d stale-w=%d init-rem=%d final-rem=%d scalar=%d branch=%d hotcand=%d blocks=%d instrs=%d temps=%d calls=%d stores=%d gloads=%d divmod=%d local-loads=%d void-ret=%d acyclic=%d\n%!"
+                            caller.name callee_func.name block.label
+                            (item7_bool01 (LabelSet.mem block.label hot_labels))
+                            (item7_bool01 (match dst with Some _ -> true | None -> false)) (List.length args)
+                            (PlaceSet.cardinal initial_effect.read_globals)
+                            (PlaceSet.cardinal initial_effect.written_globals)
+                            (PlaceSet.cardinal final_effect.read_globals)
+                            (PlaceSet.cardinal final_effect.written_globals)
+                            (item7_bool01 stale_read) (item7_bool01 stale_write)
+                            (item7_bool01 initial_can_remove)
+                            (item7_bool01 final_can_remove)
+                            (item7_bool01 scalar_candidate)
+                            (item7_bool01 branch_candidate)
+                            (item7_bool01 hot_candidate)
+                            shape.item7_blocks shape.item7_instrs shape.item7_temps
+                            shape.item7_nested_calls shape.item7_stores
+                            shape.item7_global_loads shape.item7_divmods
+                            shape.item7_nonparam_local_loads shape.item7_void_returns
+                            (item7_bool01 shape.item7_acyclic)
+                    end
+                | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> ())
+              block.body)
+          caller.blocks)
+      funcs;
+    Printf.eprintf
+      "item7-summary calls=%d stale-read-calls=%d stale-write-calls=%d newly-removable-calls=%d scalar-candidate-calls=%d branch-candidate-calls=%d hot-candidate-calls=%d no-candidate-calls=%d\n%!"
+      !total_calls !stale_read_calls !stale_write_calls !newly_removable_calls
+      !scalar_candidate_calls !branch_candidate_calls !hot_candidate_calls
+      !no_candidate_calls
+  end
+
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v2: refresh newly-removable dead calls                               *)
+(*                                                                            *)
+(* Effect/removability summaries are intentionally recomputed only after the   *)
+(* existing whole-program pipeline has finished.  To keep this experiment      *)
+(* narrow, the refreshed summaries are used ONLY to identify callees that were *)
+(* not removable in the original summary but are removable in the final IR.    *)
+(*                                                                            *)
+(* v1 showed that all observed newly-removable residual calls have no result    *)
+(* destination.  We therefore remove only [Call (None, ...)] here.  A normal    *)
+(* DCE pass, still using the original effect summaries/removability table, then *)
+(* cleans argument computations made dead by removing the call.  This avoids    *)
+(* letting refreshed read/write sets change unrelated memory-liveness decisions *)
+(* in this first #7 transformation.                                            *)
+(* -------------------------------------------------------------------------- *)
+
+let remove_newly_removable_resultless_calls_program
+    global_init summaries globals return_global_demands initial_removable funcs =
+  let fresh_summaries = compute_func_summaries globals funcs in
+  let fresh_removable =
+    compute_dead_call_removable_funcs fresh_summaries globals funcs
+  in
+  let newly_removable callee =
+    let initial =
+      match Hashtbl.find_opt initial_removable callee with
+      | Some value -> value
+      | None -> false
+    in
+    let fresh =
+      match Hashtbl.find_opt fresh_removable callee with
+      | Some value -> value
+      | None -> false
+    in
+    fresh && not initial
+  in
+  let removed = ref 0 in
+  let strip_calls (f : Cfg.func) =
+    let blocks =
+      List.map
+        (fun (block : Cfg.block) ->
+          let body =
+            List.filter
+              (function
+                | Tcg.Call (None, callee, _) when newly_removable callee ->
+                    incr removed;
+                    false
+                | Tcg.Call _
+                | Tcg.Move _
+                | Tcg.Un _
+                | Tcg.Bin _
+                | Tcg.Load _
+                | Tcg.Store _ ->
+                    true)
+              block.body
+          in
+          { block with body })
+        f.blocks
+    in
+    Cfg.rebuild_edges { f with blocks }
+  in
+  let stripped = List.map strip_calls funcs in
+  let cleaned =
+    List.map
+      (fun (f : Cfg.func) ->
+        let return_globals =
+          match Hashtbl.find_opt return_global_demands f.label with
+          | Some return_globals -> return_globals
+          | None -> globals
+        in
+        eliminate_dead_code_func
+          ~removable_calls:initial_removable
+          summaries globals return_globals f)
+      stripped
+  in
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_REFRESH" <> None then
+    Printf.eprintf
+      "item7-refresh newly-removable-resultless-calls=%d\n%!" !removed;
+  ignore global_init;
+  cleaned
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v3: refresh final effect sets for one isolated DCE pass              *)
+(*                                                                            *)
+(* v2 proved that stale removability hides dead resultless calls.  This pass   *)
+(* isolates the second capability gap from the v1 audit: stale read/write      *)
+(* sets.  After the existing pipeline plus v2 call removal, recompute effect   *)
+(* summaries and return-global demands from the current IR, then run exactly   *)
+(* one DCE pass per function using those fresh effect sets.                     *)
+(*                                                                            *)
+(* Deliberately do NOT pass a freshly-computed removable-calls table here.      *)
+(* Therefore any additional gain is attributable to more precise call          *)
+(* read/write memory effects (and scalar computations made dead by resulting   *)
+(* store elimination), rather than a second round of fresh dead-call removal.  *)
+(* -------------------------------------------------------------------------- *)
+
+let item7_count_global_stores (f : Cfg.func) =
+  List.fold_left
+    (fun count (block : Cfg.block) ->
+      List.fold_left
+        (fun count instr ->
+          match instr with
+          | Tcg.Store (Tcg.Global _, _) -> count + 1
+          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _
+          | Tcg.Store _ | Tcg.Call _ -> count)
+        count block.body)
+    0 f.blocks
+
+let refresh_final_effect_sets_dce_program summaries globals funcs =
+  let fresh_summaries = compute_func_summaries globals funcs in
+  let fresh_return_global_demands =
+    compute_return_global_demands fresh_summaries globals funcs
+  in
+  let changed_funcs = ref 0 in
+  let stores_removed = ref 0 in
+  let result =
+    List.map
+      (fun (f : Cfg.func) ->
+        let before_stores = item7_count_global_stores f in
+        let return_globals =
+          match Hashtbl.find_opt fresh_return_global_demands f.label with
+          | Some return_globals -> return_globals
+          | None -> globals
+        in
+        (* No [~removable_calls] on purpose: v3 is an effect-set experiment. *)
+        let next =
+          eliminate_dead_code_func fresh_summaries globals return_globals f
+        in
+        let after_stores = item7_count_global_stores next in
+        if next.blocks <> f.blocks then incr changed_funcs;
+        stores_removed := !stores_removed + max 0 (before_stores - after_stores);
+        next)
+      funcs
+  in
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_EFFECT_REFRESH" <> None then
+    Printf.eprintf
+      "item7-effect-refresh changed-funcs=%d global-stores-removed=%d\n%!"
+      !changed_funcs !stores_removed;
+  ignore summaries;
+  result
+
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
   last_liveness_cache := None;
@@ -31525,4 +31903,13 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
       global_init summaries globals return_global_demands removable_calls
       optimized_funcs
   in
+  let optimized_funcs =
+    remove_newly_removable_resultless_calls_program
+      global_init summaries globals return_global_demands removable_calls
+      optimized_funcs
+  in
+  let optimized_funcs =
+    refresh_final_effect_sets_dce_program summaries globals optimized_funcs
+  in
+  item7_debug_inline_effect_capability summaries removable_calls globals optimized_funcs;
   { Cfg.funcs = optimized_funcs }
