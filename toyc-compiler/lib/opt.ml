@@ -32076,6 +32076,737 @@ let inline_late_store_scalar_calls_program globals (funcs : Cfg.func list) =
   result
 
 
+(* -------------------------------------------------------------------------- *)
+(* item7 v8: multi-block acyclic global-store inline                           *)
+(*                                                                            *)
+(* v7's residual audit showed that every Store-only opportunity left after     *)
+(* the v6 scalar-store pass is a 2..6 block acyclic helper containing only     *)
+(* Global Stores (28 residual sites in the current smoke corpus).  Extend the  *)
+(* same late, store-preserving expansion to those CFGs without reopening any    *)
+(* other blocker: nested Call, Div/Mod, non-parameter Local loads, Local Store, *)
+(* cycles, oversized CFGs, and void returns remain rejected.                   *)
+(*                                                                            *)
+(* This reuses the proven CFG-cloning shape of the existing branch/hot inliner  *)
+(* but accepts [Call None] as well as [Call (Some dst, ...)].  A callee return  *)
+(* value is copied only when the caller actually uses it.  Global Stores remain *)
+(* in their original path/order inside the cloned CFG.  Cleanup is deliberately *)
+(* limited to fresh-effect DCE; do not re-enter the full non-idempotent loop     *)
+(* optimizer on an already transformed CFG.                                    *)
+(* -------------------------------------------------------------------------- *)
+
+let late_store_cfg_inline_max_blocks = late_branch_inline_max_blocks
+let late_store_cfg_inline_max_instrs = late_branch_inline_max_instrs
+let late_store_cfg_inline_max_temps = late_branch_inline_max_temps
+let late_store_cfg_inline_max_sites_per_func = 4
+
+let late_store_cfg_inline_candidate (f : Cfg.func) : Cfg.func option =
+  if f.ret <> TInt then None
+  else
+    let view =
+      f
+      |> thread_and_prune_func
+      |> simplify_cfg_func
+      |> final_linear_merge_func
+      |> thread_and_prune_func
+    in
+    if not (cfg_targets_valid view) then None
+    else
+      let reachable = reachable_labels view.entry view.blocks in
+      let blocks =
+        List.filter
+          (fun (block : Cfg.block) -> LabelSet.mem block.label reachable)
+          view.blocks
+      in
+      let block_count = List.length blocks in
+      let instr_count =
+        List.fold_left
+          (fun acc (block : Cfg.block) -> acc + List.length block.body)
+          0 blocks
+      in
+      let param_ids =
+        List.fold_left
+          (fun acc (param : Tcg.var) -> IntSet.add param.id acc)
+          IntSet.empty view.params
+      in
+      let has_global_store = ref false in
+      let instr_safe = function
+        | Tcg.Move _ | Tcg.Un _ -> true
+        | Tcg.Bin (_, (Div | Mod), _, _) -> false
+        | Tcg.Bin _ -> true
+        | Tcg.Load (_, Tcg.Local id) -> IntSet.mem id param_ids
+        | Tcg.Load (_, Tcg.Global _) -> true
+        | Tcg.Store (Tcg.Global _, _) ->
+            has_global_store := true;
+            true
+        | Tcg.Store (Tcg.Local _, _) -> false
+        | Tcg.Call _ -> false
+      in
+      let term_safe = function
+        | Cfg.Return (Some _) -> true
+        | Cfg.Jump _
+        | Cfg.BranchZero _
+        | Cfg.BranchNonZero _
+        | Cfg.BranchCompare _ ->
+            true
+        | Cfg.Return None -> false
+      in
+      let has_value_return =
+        List.exists
+          (fun (block : Cfg.block) ->
+            match block.term with
+            | Cfg.Return (Some _) -> true
+            | Cfg.Return None
+            | Cfg.Jump _
+            | Cfg.BranchZero _
+            | Cfg.BranchNonZero _
+            | Cfg.BranchCompare _ ->
+                false)
+          blocks
+      in
+      (* Scan the bodies before consulting [has_global_store].  [instr_safe]
+         records whether a Global Store is present as a side effect; checking the
+         ref before this traversal would short-circuit every candidate. *)
+      let all_instrs_and_terms_safe =
+        List.for_all
+          (fun (block : Cfg.block) ->
+            List.for_all instr_safe block.body && term_safe block.term)
+          blocks
+      in
+      let ignored = Hashtbl.create 1 in
+      if
+        block_count >= 2
+        && block_count <= late_store_cfg_inline_max_blocks
+        && instr_count <= late_store_cfg_inline_max_instrs
+        && view.temp_count <= late_store_cfg_inline_max_temps
+        && all_instrs_and_terms_safe
+        && !has_global_store
+        && has_value_return
+        && cfg_acyclic_ignoring_edges view ignored
+      then Some { view with blocks }
+      else None
+
+let build_late_store_cfg_inline_table (funcs : Cfg.func list) :
+    (string, Cfg.func) Hashtbl.t =
+  let table = Hashtbl.create (max 8 (List.length funcs)) in
+  List.iter
+    (fun (f : Cfg.func) ->
+      match late_store_cfg_inline_candidate f with
+      | None -> ()
+      | Some candidate ->
+          Hashtbl.replace table f.label candidate;
+          if Sys.getenv_opt "TOYC_DEBUG_ITEM7_STORE_CFG_INLINE" <> None then
+            Printf.eprintf
+              "item7-store-cfg-candidate func=%s blocks=%d instrs=%d temps=%d params=%d\n%!"
+              f.name (List.length candidate.blocks)
+              (List.fold_left
+                 (fun acc (block : Cfg.block) ->
+                   acc + List.length block.body)
+                 0 candidate.blocks)
+              candidate.temp_count (List.length candidate.params))
+    funcs;
+  table
+
+type late_store_cfg_inline_site =
+  Tcg.label
+  * Tcg.simple_instr list
+  * Tcg.temp option
+  * string
+  * Tcg.operand list
+  * Tcg.simple_instr list
+  * Cfg.func
+
+let find_late_store_cfg_inline_site
+    (table : (string, Cfg.func) Hashtbl.t)
+    (f : Cfg.func) : late_store_cfg_inline_site option =
+  let rec find_in_body block_label rev_prefix = function
+    | [] -> None
+    | (Tcg.Call (dst_opt, callee, args) as instr) :: rest -> (
+        match Hashtbl.find_opt table callee with
+        | Some (candidate : Cfg.func)
+          when callee <> f.label
+               && List.length args = List.length candidate.params ->
+            Some
+              ( block_label,
+                List.rev rev_prefix,
+                dst_opt,
+                callee,
+                args,
+                rest,
+                candidate )
+        | Some _ | None ->
+            find_in_body block_label (instr :: rev_prefix) rest)
+    | instr :: rest ->
+        find_in_body block_label (instr :: rev_prefix) rest
+  in
+  let rec find = function
+    | [] -> None
+    | (block : Cfg.block) :: rest -> (
+        match find_in_body block.label [] block.body with
+        | Some _ as site -> site
+        | None -> find rest)
+  in
+  find f.blocks
+
+let inline_one_late_store_cfg_call serial
+    (f : Cfg.func)
+    ((site_label, prefix, call_dst_opt, callee_label, args, suffix, callee)
+      : late_store_cfg_inline_site) =
+  let temp_base = f.temp_count in
+  let rename_temp temp = temp_base + temp in
+  let rename_operand = rewrite_operand_temp rename_temp in
+  let param_args = Hashtbl.create (max 4 (List.length callee.params)) in
+  List.iter2
+    (fun (param : Tcg.var) arg -> Hashtbl.replace param_args param.id arg)
+    callee.params args;
+
+  let used_labels =
+    List.fold_left
+      (fun acc (block : Cfg.block) -> LabelSet.add block.label acc)
+      LabelSet.empty f.blocks
+    |> ref
+  in
+  let fresh_label base =
+    let rec choose attempt =
+      let label =
+        if attempt = 0 then base else Printf.sprintf "%s_%d" base attempt
+      in
+      if LabelSet.mem label !used_labels then choose (attempt + 1)
+      else begin
+        used_labels := LabelSet.add label !used_labels;
+        label
+      end
+    in
+    choose 0
+  in
+  let continuation_label =
+    fresh_label
+      (Printf.sprintf ".L%s_item7_store_cfg_cont_%d" f.label serial)
+  in
+  let label_map = Hashtbl.create (List.length callee.blocks) in
+  List.iteri
+    (fun index (block : Cfg.block) ->
+      let label =
+        fresh_label
+          (Printf.sprintf ".L%s_item7_store_cfg_%d_%d" f.label serial index)
+      in
+      Hashtbl.replace label_map block.label label)
+    callee.blocks;
+  let rename_label label =
+    match Hashtbl.find_opt label_map label with
+    | Some renamed -> renamed
+    | None -> label
+  in
+  let clone_instr = function
+    | Tcg.Load (dst, Tcg.Local id) -> (
+        match Hashtbl.find_opt param_args id with
+        | Some arg ->
+            simplify_simple_instr (Tcg.Move (rename_temp dst, arg))
+        | None ->
+            failwith
+              "internal item7 store cfg inline non-parameter local load")
+    | Tcg.Store (Tcg.Local _, _) ->
+        failwith "internal item7 store cfg inline local store"
+    | instr ->
+        rewrite_instr_temps rename_temp instr
+  in
+  let clone_block (block : Cfg.block) =
+    let body = List.map clone_instr block.body in
+    let body, term =
+      match block.term with
+      | Cfg.Return (Some value) ->
+          let body =
+            match call_dst_opt with
+            | None -> body
+            | Some call_dst ->
+                body
+                @ [
+                    simplify_simple_instr
+                      (Tcg.Move (call_dst, rename_operand value));
+                  ]
+          in
+          (body, Cfg.Jump continuation_label)
+      | Cfg.Return None ->
+          failwith "internal item7 store cfg inline void return"
+      | term ->
+          (body, rewrite_term rename_label rename_operand term)
+    in
+    {
+      Cfg.label = rename_label block.label;
+      body;
+      term;
+      preds = [];
+      succs = Cfg.successors term;
+    }
+  in
+  let cloned_blocks = List.map clone_block callee.blocks in
+  let cloned_entry = rename_label callee.entry in
+  let blocks =
+    List.concat_map
+      (fun (block : Cfg.block) ->
+        if block.label <> site_label then [ block ]
+        else
+          let before =
+            {
+              block with
+              body = prefix;
+              term = Cfg.Jump cloned_entry;
+              succs = [ cloned_entry ];
+            }
+          in
+          let continuation =
+            {
+              Cfg.label = continuation_label;
+              body = suffix;
+              term = block.term;
+              preds = [];
+              succs = Cfg.successors block.term;
+            }
+          in
+          before :: cloned_blocks @ [ continuation ])
+      f.blocks
+  in
+  let candidate =
+    Cfg.rebuild_edges
+      { f with temp_count = temp_base + callee.temp_count; blocks }
+  in
+  if cfg_targets_valid candidate then Some candidate
+  else begin
+    debug_cfg_validation
+      (Printf.sprintf "item7-store-cfg:%s->%s" f.name callee_label)
+      candidate;
+    None
+  end
+
+let item7_debug_store_cfg_site_pressure summaries globals
+    (f : Cfg.func)
+    ((site_label, _prefix, call_dst_opt, _callee_label, args, suffix, callee)
+      : late_store_cfg_inline_site) =
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_STORE_CFG_SITE" <> None then begin
+    let live_in_t, _ = compute_liveness summaries globals f in
+    let live_after_call =
+      match
+        List.find_opt
+          (fun (block : Cfg.block) -> block.label = site_label)
+          f.blocks
+      with
+      | None -> IntSet.empty
+      | Some (block : Cfg.block) ->
+          let live =
+            ref
+              (add_term_use_temps
+                 (live_out_t live_in_t block)
+                 block.term)
+          in
+          List.iter
+            (fun instr ->
+              begin
+                match defs_temp instr with
+                | Some dst -> live := IntSet.remove dst !live
+                | None -> ()
+              end;
+              live := add_instr_use_temps !live instr)
+            (List.rev suffix);
+          !live
+    in
+    let live_across =
+      match call_dst_opt with
+      | Some dst -> IntSet.remove dst live_after_call
+      | None -> live_after_call
+    in
+    let _, loops, headers = discover_natural_loops f in
+    let containing_loop_sizes =
+      List.filter_map
+        (fun header ->
+          let loop =
+            table_find_or_empty loops header LabelSet.empty
+          in
+          if LabelSet.mem site_label loop then
+            Some (LabelSet.cardinal loop)
+          else None)
+        headers
+    in
+    let loop_depth = List.length containing_loop_sizes in
+    let min_loop_size =
+      match containing_loop_sizes with
+      | [] -> 0
+      | size :: rest -> List.fold_left min size rest
+    in
+    let callee_instrs =
+      List.fold_left
+        (fun acc (block : Cfg.block) ->
+          acc + List.length block.body)
+        0 callee.blocks
+    in
+    let callee_stores =
+      List.fold_left
+        (fun acc (block : Cfg.block) ->
+          List.fold_left
+            (fun acc -> function
+              | Tcg.Store (Tcg.Global _, _) -> acc + 1
+              | _ -> acc)
+            acc block.body)
+        0 callee.blocks
+    in
+    Printf.eprintf
+      "item7-store-cfg-site caller=%s callee=%s site=%s result=%d args=%d in-loop=%d loop-depth=%d loop-size=%d live-across=%d caller-temps=%d callee-blocks=%d callee-instrs=%d callee-temps=%d stores=%d\n%!"
+      f.name callee.name site_label
+      (match call_dst_opt with Some _ -> 1 | None -> 0)
+      (List.length args)
+      (if loop_depth > 0 then 1 else 0)
+      loop_depth min_loop_size
+      (IntSet.cardinal live_across)
+      f.temp_count
+      (List.length callee.blocks)
+      callee_instrs callee.temp_count callee_stores
+  end
+
+let late_store_cfg_inline_nonloop_projected_temp_cap = 40
+
+let late_store_cfg_inline_site_in_loop
+    (f : Cfg.func)
+    ((site_label, _, _, _, _, _, _) : late_store_cfg_inline_site) =
+  let _, loops, headers = discover_natural_loops f in
+  List.exists
+    (fun header ->
+      let loop = table_find_or_empty loops header LabelSet.empty in
+      LabelSet.mem site_label loop)
+    headers
+
+let late_store_cfg_inline_site_profitable
+    (f : Cfg.func)
+    ((_, _, _, _, _, _, callee) as site : late_store_cfg_inline_site) =
+  if late_store_cfg_inline_site_in_loop f site then true
+  else
+    f.temp_count + callee.temp_count
+    <= late_store_cfg_inline_nonloop_projected_temp_cap
+
+let inline_late_store_cfg_calls_func summaries globals
+    (table : (string, Cfg.func) Hashtbl.t)
+    (f : Cfg.func) =
+  let rec apply serial fuel count current =
+    if fuel = 0 then (current, count)
+    else
+      match find_late_store_cfg_inline_site table current with
+      | None -> (current, count)
+      | Some site ->
+          if not (late_store_cfg_inline_site_profitable current site) then begin
+            if Sys.getenv_opt "TOYC_DEBUG_ITEM7_STORE_CFG_GUARD" <> None then begin
+              let
+                (site_label, _, _, callee_label, _, _, callee) = site
+              in
+              Printf.eprintf
+                "item7-store-cfg-guard caller=%s callee=%s site=%s caller-temps=%d callee-temps=%d projected=%d cap=%d reason=nonloop-pressure\n%!"
+                current.name callee_label site_label current.temp_count
+                callee.temp_count (current.temp_count + callee.temp_count)
+                late_store_cfg_inline_nonloop_projected_temp_cap
+            end;
+            (current, count)
+          end else begin
+            item7_debug_store_cfg_site_pressure summaries globals current site;
+            match inline_one_late_store_cfg_call serial current site with
+            | None -> (current, count)
+            | Some next ->
+                apply (serial + 1) (fuel - 1) (count + 1) next
+          end
+  in
+  apply 0 late_store_cfg_inline_max_sites_per_func 0 f
+
+let inline_late_store_cfg_calls_program globals (funcs : Cfg.func list) =
+  let total_replaced = ref 0 in
+  let rec iterate fuel current =
+    if fuel = 0 then current
+    else
+      let table = build_late_store_cfg_inline_table current in
+      if Hashtbl.length table = 0 then current
+      else
+        let site_summaries = compute_func_summaries globals current in
+        let changed = ref false in
+        let expanded =
+          List.map
+            (fun (f : Cfg.func) ->
+              let next, count =
+                inline_late_store_cfg_calls_func
+                  site_summaries globals table f
+              in
+              if count > 0 then begin
+                changed := true;
+                total_replaced := !total_replaced + count
+              end;
+              next)
+            current
+        in
+        if not !changed then current
+        else
+          let fresh_summaries =
+            compute_func_summaries globals expanded
+          in
+          let fresh_return_global_demands =
+            compute_return_global_demands fresh_summaries globals expanded
+          in
+          let cleaned =
+            List.map
+              (fun (f : Cfg.func) ->
+                let return_globals =
+                  match Hashtbl.find_opt fresh_return_global_demands f.label with
+                  | Some return_globals -> return_globals
+                  | None -> globals
+                in
+                eliminate_dead_code_func
+                  fresh_summaries globals return_globals f)
+              expanded
+          in
+          iterate (fuel - 1) cleaned
+  in
+  let result = iterate 3 funcs in
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_STORE_CFG_INLINE" <> None then
+    Printf.eprintf
+      "item7-store-cfg-inline replaced=%d\n%!" !total_replaced;
+  result
+
+
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v9: single-block Div/Mod leaf inline                                  *)
+(*                                                                            *)
+(* v5's blocker-relaxation audit found 20 residual call sites whose only       *)
+(* blocker is Div/Mod.  Div/Mod is intentionally treated more conservatively   *)
+(* than ordinary arithmetic elsewhere in this optimizer: it may trap / fail to *)
+(* terminate normally (e.g. division by zero), so dead-call removal refuses to *)
+(* assume a Div/Mod-containing helper is removable.                            *)
+(*                                                                            *)
+(* Therefore this pass preserves the callee body literally at the call site and*)
+(* DOES NOT run DCE or the full optimize_func pipeline afterward.  This keeps  *)
+(* every Div/Mod execution that the original call would perform.  The first     *)
+(* version is deliberately narrow: exactly one reachable block, TInt return,   *)
+(* no Store, no nested Call, only parameter/global Loads, and at least one      *)
+(* Div/Mod instruction.                                                        *)
+(*                                                                            *)
+(* To avoid repeating the register-pressure failure found by item7 v8, ordinary*)
+(* non-loop sites also use the proven projected-temp cap of 40.  Natural-loop  *)
+(* sites remain eligible because removing call/frame overhead there has much    *)
+(* higher dynamic leverage.                                                    *)
+(* -------------------------------------------------------------------------- *)
+
+type late_divmod_scalar_inline_candidate = {
+  divmod_scalar_func : Cfg.func;
+  divmod_scalar_block : Cfg.block;
+  divmod_scalar_return : Tcg.operand;
+}
+
+let late_divmod_scalar_inline_candidate_of_func (f : Cfg.func) =
+  if f.ret <> TInt then None
+  else
+    let view =
+      f
+      |> thread_and_prune_func
+      |> simplify_cfg_func
+      |> final_linear_merge_func
+      |> thread_and_prune_func
+    in
+    if not (cfg_targets_valid view) then None
+    else
+      let reachable = reachable_labels view.entry view.blocks in
+      let blocks =
+        List.filter
+          (fun (block : Cfg.block) -> LabelSet.mem block.label reachable)
+          view.blocks
+      in
+      match blocks with
+      | [ (block : Cfg.block) ] when block.label = view.entry ->
+          let param_ids =
+            List.fold_left
+              (fun acc (param : Tcg.var) -> IntSet.add param.id acc)
+              IntSet.empty view.params
+          in
+          let has_divmod = ref false in
+          let instr_safe = function
+            | Tcg.Move _ | Tcg.Un _ -> true
+            | Tcg.Bin (_, (Div | Mod), _, _) ->
+                has_divmod := true;
+                true
+            | Tcg.Bin _ -> true
+            | Tcg.Load (_, Tcg.Local id) -> IntSet.mem id param_ids
+            | Tcg.Load (_, Tcg.Global _) -> true
+            | Tcg.Store _ | Tcg.Call _ -> false
+          in
+          let body_safe = List.for_all instr_safe block.body in
+          if List.length block.body > late_scalar_inline_max_instrs
+             || view.temp_count > late_scalar_inline_max_temps
+             || not body_safe
+             || not !has_divmod
+          then None
+          else
+            begin
+              match block.term with
+              | Cfg.Return (Some operand) ->
+                  Some
+                    {
+                      divmod_scalar_func = view;
+                      divmod_scalar_block = block;
+                      divmod_scalar_return = operand;
+                    }
+              | Cfg.Return None
+              | Cfg.Jump _
+              | Cfg.BranchZero _
+              | Cfg.BranchNonZero _
+              | Cfg.BranchCompare _ ->
+                  None
+            end
+      | _ -> None
+
+let build_late_divmod_scalar_inline_table funcs =
+  let table = Hashtbl.create (max 8 (List.length funcs)) in
+  List.iter
+    (fun (f : Cfg.func) ->
+      match late_divmod_scalar_inline_candidate_of_func f with
+      | None -> ()
+      | Some candidate ->
+          Hashtbl.replace table f.label candidate;
+          if Sys.getenv_opt "TOYC_DEBUG_ITEM7_DIVMOD_INLINE" <> None then
+            Printf.eprintf
+              "item7-divmod-inline-candidate func=%s instrs=%d temps=%d params=%d\n%!"
+              f.name (List.length candidate.divmod_scalar_block.body)
+              candidate.divmod_scalar_func.temp_count
+              (List.length candidate.divmod_scalar_func.params))
+    funcs;
+  table
+
+let block_labels_in_natural_loops (f : Cfg.func) =
+  let _, loops, _ = discover_natural_loops f in
+  Hashtbl.fold
+    (fun _ loop acc -> LabelSet.union loop acc)
+    loops LabelSet.empty
+
+let rewrite_late_divmod_scalar_calls_func
+    (table : (string, late_divmod_scalar_inline_candidate) Hashtbl.t)
+    (f : Cfg.func) =
+  let next_temp = ref f.temp_count in
+  let sites_left = ref late_scalar_inline_max_sites_per_func in
+  let replaced = ref 0 in
+  let loop_labels = block_labels_in_natural_loops f in
+
+  let expand_call dst_opt args
+      (candidate : late_divmod_scalar_inline_candidate) =
+    let callee = candidate.divmod_scalar_func in
+    if List.length args <> List.length callee.params then None
+    else
+      let temp_base = !next_temp in
+      next_temp := temp_base + callee.temp_count;
+      let rename_temp temp = temp_base + temp in
+      let rename_operand = rewrite_operand_temp rename_temp in
+      let param_args = Hashtbl.create (max 4 (List.length callee.params)) in
+      List.iter2
+        (fun (param : Tcg.var) arg -> Hashtbl.replace param_args param.id arg)
+        callee.params args;
+      let clone_instr = function
+        | Tcg.Load (temp, Tcg.Local id) -> (
+            match Hashtbl.find_opt param_args id with
+            | Some arg ->
+                simplify_simple_instr
+                  (Tcg.Move (rename_temp temp, arg))
+            | None ->
+                failwith
+                  "internal item7 divmod scalar inline non-parameter local load")
+        | Tcg.Store _ ->
+            failwith "internal item7 divmod scalar inline store"
+        | Tcg.Call _ ->
+            failwith "internal item7 divmod scalar inline nested call"
+        | instr ->
+            rewrite_instr_temps rename_temp instr
+      in
+      let body = List.map clone_instr candidate.divmod_scalar_block.body in
+      let suffix =
+        match dst_opt with
+        | None -> []
+        | Some dst ->
+            [
+              simplify_simple_instr
+                (Tcg.Move
+                   (dst, rename_operand candidate.divmod_scalar_return));
+            ]
+      in
+      Some (body @ suffix)
+  in
+
+  let rewrite_body block_label body =
+    let rec loop rev_acc = function
+      | [] -> List.rev rev_acc
+      | Tcg.Call (dst_opt, callee, args) as instr :: rest
+        when !sites_left > 0 -> (
+          match Hashtbl.find_opt table callee with
+          | Some candidate when callee <> f.label ->
+              let in_loop = LabelSet.mem block_label loop_labels in
+              let projected = !next_temp + candidate.divmod_scalar_func.temp_count in
+              let profitable =
+                in_loop
+                || projected <= late_store_cfg_inline_nonloop_projected_temp_cap
+              in
+              if not profitable then begin
+                if Sys.getenv_opt "TOYC_DEBUG_ITEM7_DIVMOD_GUARD" <> None then
+                  Printf.eprintf
+                    "item7-divmod-guard caller=%s callee=%s site=%s projected=%d cap=%d reason=nonloop-pressure\n%!"
+                    f.name candidate.divmod_scalar_func.name block_label projected
+                    late_store_cfg_inline_nonloop_projected_temp_cap;
+                loop (instr :: rev_acc) rest
+              end else (
+                match expand_call dst_opt args candidate with
+                | Some expanded ->
+                    decr sites_left;
+                    incr replaced;
+                    loop (List.rev_append expanded rev_acc) rest
+                | None ->
+                    loop (instr :: rev_acc) rest)
+          | Some _ | None ->
+              loop (instr :: rev_acc) rest)
+      | instr :: rest ->
+          loop (instr :: rev_acc) rest
+    in
+    loop [] body
+  in
+
+  let blocks =
+    List.map
+      (fun (block : Cfg.block) ->
+        { block with body = rewrite_body block.label block.body })
+      f.blocks
+  in
+  if !replaced = 0 then (f, 0)
+  else
+    let rewritten =
+      Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
+    in
+    (rewritten, !replaced)
+
+let inline_late_divmod_scalar_calls_program (funcs : Cfg.func list) =
+  let total_replaced = ref 0 in
+  let rec iterate fuel current =
+    if fuel = 0 then current
+    else
+      let table = build_late_divmod_scalar_inline_table current in
+      if Hashtbl.length table = 0 then current
+      else
+        let changed = ref false in
+        let next =
+          List.map
+            (fun (f : Cfg.func) ->
+              let rewritten, count =
+                rewrite_late_divmod_scalar_calls_func table f
+              in
+              if count > 0 then begin
+                changed := true;
+                total_replaced := !total_replaced + count
+              end;
+              rewritten)
+            current
+        in
+        if !changed then iterate (fuel - 1) next else current
+  in
+  let result = iterate 3 funcs in
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_DIVMOD_INLINE" <> None then
+    Printf.eprintf
+      "item7-divmod-inline replaced=%d\n%!" !total_replaced;
+  result
+
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
   last_liveness_cache := None;
@@ -32158,6 +32889,12 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   in
   let optimized_funcs =
     inline_late_store_scalar_calls_program globals optimized_funcs
+  in
+  let optimized_funcs =
+    inline_late_store_cfg_calls_program globals optimized_funcs
+  in
+  let optimized_funcs =
+    inline_late_divmod_scalar_calls_program optimized_funcs
   in
   item7_debug_inline_effect_capability summaries removable_calls globals optimized_funcs;
   { Cfg.funcs = optimized_funcs }
