@@ -28095,22 +28095,68 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       debug_lcssa_lite_report summaries globals current
     end
   in
-  (* v46 correctness fix: keep the first mem2reg pass conservative.
+  (* v48 experimental hybrid early mem2reg.
 
-     Optimistic loop-phi promotion before counted-loop analysis changes the
-     provenance/phase shape of loop-carried values.  Two independent wrong-code
-     regressions demonstrate that the existing counted analysis is not sound on
-     that early optimistic form:
+     v46 established that making *all* early loop PHIs optimistic is unsound
+     for the current counted-loop provenance model:
 
        tailrec_acc_sum        21 -> 15
        nest3_rect_small       14 -> 95
 
-     The same current pipeline becomes correct when only early optimistic
-     mem2reg is disabled, while disabling early move propagation has no effect.
-     Keep optimistic mem2reg in the already-existing post-counted / late stages,
-     where it cannot change the recurrence facts consumed by the first counted
-     analysis. *)
-  let early_mem2reg = mem2reg_func f in
+     But keeping every function conservative also causes a large p07_loop
+     regression, because ordinary one-level loops never expose their scalar
+     IV/reduction PHIs early enough.
+
+     Recover that performance without re-opening the two known unsafe classes:
+       - a true nested natural-loop forest stays conservative;
+       - a synthetic tail-recursion entry stays conservative;
+       - otherwise, when explicitly enabled, use optimistic loop-PHI mem2reg.
+
+     Note that "multiple loops" is NOT treated as nested: two sequential sibling
+     loops may still use the optimistic path.  We test actual containment of one
+     natural-loop header in another natural-loop body. *)
+  let enable_hybrid_early_optimistic_mem2reg =
+    Sys.getenv_opt "TOYC_ENABLE_HYBRID_EARLY_OPTIMISTIC_MEM2REG" <> None
+  in
+  let _, early_loops, early_headers = discover_natural_loops f in
+  let has_nested_natural_loop =
+    List.exists
+      (fun parent_header ->
+        let parent_loop =
+          table_find_or_empty early_loops parent_header LabelSet.empty
+        in
+        List.exists
+          (fun child_header ->
+            child_header <> parent_header
+            && LabelSet.mem child_header parent_loop)
+          early_headers)
+      early_headers
+  in
+  let synthetic_tail_entry =
+    contains_substring f.entry "_tail_entry_"
+  in
+  let use_early_optimistic_mem2reg =
+    enable_hybrid_early_optimistic_mem2reg
+    && not has_nested_natural_loop
+    && not synthetic_tail_entry
+  in
+  let early_mem2reg =
+    if use_early_optimistic_mem2reg then
+      mem2reg_func ~optimistic_loop_phi:true f
+    else
+      mem2reg_func f
+  in
+  if
+    Sys.getenv_opt "TOYC_DEBUG_EARLY_MEM2REG_MODE" <> None
+    || Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None
+  then
+    Printf.eprintf
+      "early-mem2reg-mode func=%s mode=%s nested=%b tail-entry=%b loops=%d\n%!"
+      f.name
+      (if use_early_optimistic_mem2reg then "optimistic" else "conservative")
+      has_nested_natural_loop
+      synthetic_tail_entry
+      (List.length early_headers);
   let promoted_before_move_cleanup =
     early_mem2reg |> promote_globals_func summaries globals
   in
