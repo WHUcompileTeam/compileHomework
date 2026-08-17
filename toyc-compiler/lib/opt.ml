@@ -25566,6 +25566,62 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
         doms def_blocks multi_defs
         [ preheader_label ] operand
     in
+
+    (* v64: diamond splitting materializes the prefix-loop bound into one temp
+       on mutually exclusive incoming paths:
+
+           take_outer:  bound_tmp = outer
+           take_prefix: bound_tmp = prefix
+                       \ /
+                    preheader
+
+       Such a temp is intentionally multi-defined, so the generic LVE
+       availability predicate rejects it unconditionally.  For the runtime
+       summary guard, however, the value is safe to read after the preheader
+       exactly when every incoming edge has an unambiguous reaching Move for
+       that temp.
+
+       Keep this proof local to runtime-summary bound operands.  It does not
+       relax general multi-def availability. *)
+    let path_merged_move_available_at_preheader preheader_label temp =
+      let preheader : Cfg.block = get_block preheader_label in
+      preheader.preds <> []
+      && List.for_all
+           (fun pred ->
+             match
+               reaching_move_cases_on_edge
+                 get_block
+                 ~stop_label:preheader_label
+                 ~pred_label:pred
+                 temp
+             with
+             | Some cases -> cases <> []
+             | None -> false)
+           preheader.preds
+    in
+
+    let runtime_bound_available
+        def_blocks multi_defs preheader_label operand =
+      if
+        operand_available_at_preheader
+          def_blocks multi_defs preheader_label operand
+      then
+        true
+      else
+        match operand with
+        | Tcg.Imm _ -> true
+        | Tcg.Temp temp
+          when IntSet.mem temp multi_defs
+               && path_merged_move_available_at_preheader
+                    preheader_label temp ->
+            if Sys.getenv_opt "TOYC_DEBUG_LVE_SUMMARY" <> None then
+              Printf.eprintf
+                "lve-runtime-path-merged-bound preheader=%s temp=t%d result=available\n%!"
+                preheader_label temp;
+            true
+        | Tcg.Temp _ ->
+            false
+    in
     let next_temp = ref f.temp_count in
     let fresh_temp () =
       let temp = !next_temp in
@@ -25632,12 +25688,13 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
             name
             (String.concat "," (List.map string_of_lve_operand args))
     in
-    let reaching_seed_on_edge ~header ~pred_label temp =
+    let reaching_seed_values_on_edge ~header ~pred_label temp =
       match
         reaching_move_cases_on_edge
           get_block ~stop_label:header ~pred_label temp
       with
-      | None -> None
+      | None ->
+          None
       | Some cases ->
           let values =
             cases
@@ -25646,6 +25703,14 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                    resolve_chain_operand
                      case.reaching_chain case.reaching_source)
           in
+          if values = [] then None else Some values
+    in
+    let reaching_seed_on_edge ~header ~pred_label temp =
+      match
+        reaching_seed_values_on_edge ~header ~pred_label temp
+      with
+      | None -> None
+      | Some values ->
           (match values with
            | [] -> None
            | first :: rest
@@ -26932,17 +26997,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                           reaching_seed_on_edge
                             ~header ~pred_label:preheader_label iv_temp
                         in
-                        (if debug then
-                           Printf.eprintf
-                             "lve-runtime-summary-candidate func=%s header=%s iv=t%d scale=%s bias=%s step=%s bound=%s init=%s\n%!"
-                             f.name header iv_temp
-                             (string_of_loop_inv_expr control_scale)
-                             (string_of_loop_inv_expr control_bias)
-                             (string_of_loop_inv_expr step_expr)
-                             (string_of_lve_operand bound_operand)
-                             (match initial_iv with
-                              | Some operand -> string_of_lve_operand operand
-                              | None -> "<unknown>"));
                         let initial_iv_expr =
                           Option.bind initial_iv invariant_expr
                         in
@@ -26955,35 +27009,196 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                           | None ->
                               false
                         in
-                        let semantic_start_agrees =
+
+                        (* v65: a split-post loop can be entered in two legal
+                           ways: directly from the split dispatch, or after the
+                           split-pre loop reaches its boundary.  The two
+                           incoming edge-copy seeds for the IV are therefore
+                           intentionally different, so requiring one common
+                           SCEV start rejects the exact CFG produced by the
+                           diamond splitter.
+
+                           For the very narrow rotated split-post shape
+                             control = iv + step
+                             iv += positive_constant_step
+                           prove that every preheader->header path has a
+                           reaching edge-copy seed, then snapshot the current
+                           IV on the summary path.  That runtime value is the
+                           exact path-specific loop start.  The snapshot is a
+                           fresh temp only; every failed runtime proof still
+                           falls back to the untouched original loop. *)
+                        let dynamic_start_seed_values =
+                          if
+                            contains_substring header "_split_post_"
+                            && initial_iv = None
+                            && loop_inv_expr_equal
+                                 control_scale scalar_inv_one
+                            && loop_inv_expr_equal
+                                 control_bias step_expr
+                          then
+                            match loop_inv_expr_const_opt step_expr with
+                            | Some step when step > 0L ->
+                                reaching_seed_values_on_edge
+                                  ~header
+                                  ~pred_label:preheader_label
+                                  iv_temp
+                            | Some _
+                            | None ->
+                                None
+                          else
+                            None
+                        in
+                        (* v66: after loop rotation, [preheader_label] is a
+                           synthetic rotate guard.  Requiring a reaching
+                           mem2reg Move for [iv_temp] is unnecessarily strict:
+                           the guard itself already reads the current IV to
+                           decide whether the post loop executes.
+
+                           This is a stronger local proof of availability:
+                             - this is exactly a compiler-generated rotate guard;
+                             - its branch has one successor inside this loop and
+                               one outside, with the inside edge entering
+                               [header];
+                             - the guard condition uses [iv_temp];
+                             - the guard body does not redefine [iv_temp].
+
+                           Therefore the value observed by the guard on the
+                           taken edge is exactly the path-specific pre-body
+                           start.  Snapshotting it in the summary values block
+                           preserves both direct->post and pre->bridge->post
+                           entries without guessing a common seed. *)
+                        let dynamic_start_rotate_guard =
+                          is_rotate_guard_label preheader_label
+                          && last_def_of_temp preheader iv_temp = None
+                          && IntSet.mem
+                               iv_temp
+                               (add_term_use_temps
+                                  IntSet.empty preheader.term)
+                          &&
                           match
-                            (symbolic_trip_spec, initial_iv_expr)
+                            classify_loop_rotate_targets
+                              loop preheader.term
                           with
-                          | Some spec, Some expr ->
-                              loop_inv_expr_equal
-                                spec.symbolic_trip_start
-                                (normalize_loop_inv_expr expr)
-                          | Some _, None ->
+                          | Some (inside_label, _outside_label) ->
+                              inside_label = header
+                          | None ->
                               false
-                          | None, _ ->
-                              initial_zero
+                        in
+                        let dynamic_start_snapshot =
+                          match dynamic_start_seed_values with
+                          | Some (_ :: _) ->
+                              Some (fresh_temp ())
+                          | Some [] ->
+                              None
+                          | None when dynamic_start_rotate_guard ->
+                              Some (fresh_temp ())
+                          | None ->
+                              None
+                        in
+                        let () =
+                          if debug && contains_substring header "_split_post_" then
+                            Printf.eprintf
+                              "lve-runtime-dynamic-post-gate func=%s header=%s preheader=%s init-none=%b scale-one=%b bias-step=%b step=%s seed=%s rotate-guard=%b\n%!"
+                              f.name header preheader_label
+                              (initial_iv = None)
+                              (loop_inv_expr_equal control_scale scalar_inv_one)
+                              (loop_inv_expr_equal control_bias step_expr)
+                              (string_of_loop_inv_expr step_expr)
+                              (match dynamic_start_seed_values with
+                               | Some values -> Printf.sprintf "some:%d" (List.length values)
+                               | None -> "none")
+                              dynamic_start_rotate_guard
+                        in
+                        (if debug then
+                           Printf.eprintf
+                             "lve-runtime-summary-candidate func=%s header=%s iv=t%d scale=%s bias=%s step=%s bound=%s init=%s\n%!"
+                             f.name header iv_temp
+                             (string_of_loop_inv_expr control_scale)
+                             (string_of_loop_inv_expr control_bias)
+                             (string_of_loop_inv_expr step_expr)
+                             (string_of_lve_operand bound_operand)
+                             (match initial_iv, dynamic_start_snapshot with
+                              | Some operand, _ ->
+                                  string_of_lve_operand operand
+                              | None, Some snapshot ->
+                                  Printf.sprintf
+                                    "<dynamic-current:t%d>" snapshot
+                              | None, None ->
+                                  "<unknown>"));
+                        let semantic_start_agrees =
+                          match dynamic_start_snapshot with
+                          | Some _ ->
+                              true
+                          | None ->
+                              match
+                                (symbolic_trip_spec, initial_iv_expr)
+                              with
+                              | Some spec, Some expr ->
+                                  loop_inv_expr_equal
+                                    spec.symbolic_trip_start
+                                    (normalize_loop_inv_expr expr)
+                              | Some _, None ->
+                                  false
+                              | None, _ ->
+                                  initial_zero
                         in
                         if not semantic_start_agrees then
                           reject header
                             "initial-iv-scev-start-mismatch"
                         else
-                          let proof_control_start_expr =
-                            match symbolic_trip_spec with
-                            | Some spec ->
-                                symbolic_trip_control_start spec
+                          let () =
+                            match dynamic_start_snapshot with
+                            | Some snapshot when debug ->
+                                Printf.eprintf
+                                  "lve-runtime-dynamic-post-start func=%s header=%s iv=t%d snapshot=t%d proof=%s incoming-cases=%d\n%!"
+                                  f.name header iv_temp snapshot
+                                  (if dynamic_start_rotate_guard
+                                   then "rotate-guard-use"
+                                   else "reaching-seed")
+                                  (match dynamic_start_seed_values with
+                                   | Some values -> List.length values
+                                   | None -> 0)
+                            | Some _
                             | None ->
-                                control_bias
+                                ()
+                          in
+                          let summary_start_expr =
+                            match dynamic_start_snapshot with
+                            | Some snapshot ->
+                                LveOperand (Tcg.Temp snapshot)
+                            | None ->
+                                match symbolic_trip_spec with
+                                | Some spec ->
+                                    spec.symbolic_trip_start
+                                | None ->
+                                    scalar_inv_zero
+                          in
+                          let proof_control_start_expr =
+                            match dynamic_start_snapshot with
+                            | Some snapshot ->
+                                normalize_loop_inv_expr
+                                  (LveAdd
+                                     ( LveMul
+                                         ( control_scale,
+                                           LveOperand
+                                             (Tcg.Temp snapshot) ),
+                                       control_bias ))
+                            | None ->
+                                match symbolic_trip_spec with
+                                | Some spec ->
+                                    symbolic_trip_control_start spec
+                                | None ->
+                                    control_bias
                           in
                           let control_start_available =
-                            lve_expr_available_before_preds
-                              doms def_blocks multi_defs
-                              [ preheader_label ]
-                              proof_control_start_expr
+                            match dynamic_start_snapshot with
+                            | Some _ ->
+                                true
+                            | None ->
+                                lve_expr_available_before_preds
+                                  doms def_blocks multi_defs
+                                  [ preheader_label ]
+                                  proof_control_start_expr
                           in
                           let step_available =
                             lve_expr_available_before_preds
@@ -26991,7 +27206,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                               [ preheader_label ] step_expr
                           in
                           let bound_available =
-                            operand_available_at_preheader
+                            runtime_bound_available
                               def_blocks multi_defs preheader_label
                               bound_operand
                           in
@@ -27617,13 +27832,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                         fresh_temp temp complex,
                                                       Tcg.Temp temp )
                                               in
-                                              let summary_start_expr =
-                                                match symbolic_trip_spec with
-                                                | Some spec ->
-                                                    spec.symbolic_trip_start
-                                                | None ->
-                                                    scalar_inv_zero
-                                              in
                                               let build_reduction_apply_body
                                                   trip =
                                                 let summary_trip, trip_prep =
@@ -27990,9 +28198,19 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                 materialize_inv_expr
                                                   proof_control_start_expr
                                               in
+                                              let dynamic_start_prep =
+                                                match dynamic_start_snapshot with
+                                                | Some snapshot ->
+                                                    [ Tcg.Move
+                                                        ( snapshot,
+                                                          Tcg.Temp iv_temp ) ]
+                                                | None ->
+                                                    []
+                                              in
                                               let values_body =
                                                 step_prep
                                                 @ scale_prep
+                                                @ dynamic_start_prep
                                                 @ control_start_prep
                                               in
                                               let values_term =
