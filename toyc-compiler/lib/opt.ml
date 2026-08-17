@@ -23421,7 +23421,157 @@ let temp_use_counts blocks =
     blocks;
   counts
 
+(* -------------------------------------------------------------------------- *)
+(* item6 v3: canonical identity adoption audit                               *)
+(*                                                                            *)
+(* Keep the physical IR unchanged.  Measure places where the optimizer still  *)
+(* asks for syntactic operand identity even though the shared canonical scalar *)
+(* identity can prove the operands semantically equal.                        *)
+(* -------------------------------------------------------------------------- *)
+
+let item6_canonical_adoption_audit (f : Cfg.func) =
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" = None then ()
+  else
+    let analyze = make_linear_analyzer f in
+    let _, _, def_instrs, multi_defs =
+      analyze_temp_defs_of_blocks f.temp_count f.blocks
+    in
+    let semantic_operand_equal lhs rhs =
+      canonical_scalar_key_equal (analyze lhs) (analyze rhs)
+    in
+    let semantic_only_equal lhs rhs =
+      not (operand_equal lhs rhs)
+      && semantic_operand_equal lhs rhs
+    in
+    let unique_def_of_operand = function
+      | Tcg.Temp temp when not (IntSet.mem temp multi_defs) ->
+          Hashtbl.find_opt def_instrs temp
+      | Tcg.Temp _ | Tcg.Imm _ ->
+          None
+    in
+    let self_eq_gap = ref 0 in
+    let cancel_gap = ref 0 in
+    let local_key_gap = ref 0 in
+
+    let has_cancel_gap instr =
+      match instr with
+      | Tcg.Bin (_, Sub, lhs, rhs) ->
+          let lhs_gap =
+            match unique_def_of_operand lhs with
+            | Some (Tcg.Bin (_, Add, a, b)) ->
+                semantic_only_equal rhs a
+                || semantic_only_equal rhs b
+            | Some _ | None ->
+                false
+          in
+          let rhs_gap =
+            match unique_def_of_operand rhs with
+            | Some (Tcg.Bin (_, Sub, a, _b)) ->
+                semantic_only_equal lhs a
+            | Some _ | None ->
+                false
+          in
+          lhs_gap || rhs_gap
+      | Tcg.Bin (_, Add, lhs, rhs) ->
+          let from_mid mid other =
+            match unique_def_of_operand mid with
+            | Some (Tcg.Bin (_, Sub, _a, b)) ->
+                semantic_only_equal other b
+            | Some _ | None ->
+                false
+          in
+          from_mid lhs rhs || from_mid rhs lhs
+      | Tcg.Move _
+      | Tcg.Un _
+      | Tcg.Bin _
+      | Tcg.Load _
+      | Tcg.Store _
+      | Tcg.Call _ ->
+          false
+    in
+
+    let current_gvn_key_of_instr instr =
+      match instr with
+      | Tcg.Un (_, op, src) -> (
+          match linear_expr_key_of_un analyze op src with
+          | Some key -> Some key
+          | None -> Some (KeyUn (op, src)))
+      | Tcg.Bin (_, op, lhs, rhs) ->
+          let lhs, rhs = normalize_bin_operands op lhs rhs in
+          begin match linear_expr_key_of_bin analyze op lhs rhs with
+          | Some key -> Some key
+          | None -> Some (KeyBin (op, lhs, rhs))
+          end
+      | Tcg.Move _
+      | Tcg.Load _
+      | Tcg.Store _
+      | Tcg.Call _ ->
+          None
+    in
+    let semantic_key_of_instr instr =
+      match instr with
+      | Tcg.Un (_, op, src) ->
+          Some
+            (canonical_scalar_key_of_form
+               (canonical_scalar_un op (analyze src)))
+      | Tcg.Bin (_, op, lhs, rhs) ->
+          Some
+            (canonical_scalar_key_of_form
+               (canonical_scalar_bin op (analyze lhs) (analyze rhs)))
+      | Tcg.Move _
+      | Tcg.Load _
+      | Tcg.Store _
+      | Tcg.Call _ ->
+          None
+    in
+
+    List.iter
+      (fun (block : Cfg.block) ->
+        let semantic_seen = Hashtbl.create 16 in
+        List.iter
+          (fun instr ->
+            begin match instr with
+            | Tcg.Bin (_, (Sub | Eq | Ne | Lt | Gt | Le | Ge), lhs, rhs)
+              when semantic_only_equal lhs rhs ->
+                incr self_eq_gap
+            | Tcg.Move _
+            | Tcg.Un _
+            | Tcg.Bin _
+            | Tcg.Load _
+            | Tcg.Store _
+            | Tcg.Call _ ->
+                ()
+            end;
+            if has_cancel_gap instr then incr cancel_gap;
+            match semantic_key_of_instr instr, current_gvn_key_of_instr instr with
+            | Some semantic_key, Some current_key -> (
+                match Hashtbl.find_opt semantic_seen semantic_key with
+                | Some previous_key when previous_key <> current_key ->
+                    incr local_key_gap
+                | Some _ ->
+                    ()
+                | None ->
+                    Hashtbl.add semantic_seen semantic_key current_key)
+            | _ ->
+                ())
+          block.body)
+      f.blocks;
+    Printf.eprintf
+      "item6-adoption-audit func=%s semantic-self-gap=%d algebra-cancel-gap=%d local-gvn-key-gap=%d\n%!"
+      f.name !self_eq_gap !cancel_gap !local_key_gap
+
 let algebra_canonicalize_func (f : Cfg.func) =
+  let () = item6_canonical_adoption_audit f in
+  (* item6 v4: consume the shared canonical scalar identity only when it
+     proves an entire operation has a constant result.  Unlike v2/v2b this
+     does not reassociate or reify a canonical expression tree, so downstream
+     passes keep their preferred physical IR shapes. *)
+  let semantic_analyze = make_linear_analyzer f in
+  let semantic_operand_equal lhs rhs =
+    canonical_scalar_key_equal
+      (semantic_analyze lhs)
+      (semantic_analyze rhs)
+  in
   let _, _, def_instrs, multi_defs =
     analyze_temp_defs_of_blocks f.temp_count f.blocks
   in
@@ -23556,10 +23706,40 @@ let algebra_canonicalize_func (f : Cfg.func) =
   in
   let rewrites = ref 0 in
   let cancellation_rewrites = ref 0 in
+  let semantic_self_rewrites = ref 0 in
+  let semantic_self_fold = function
+    | Tcg.Bin
+        ( dst,
+          ((Sub | Eq | Ne | Lt | Gt | Le | Ge) as op),
+          lhs,
+          rhs )
+      when not (operand_equal lhs rhs)
+           && semantic_operand_equal lhs rhs ->
+        let value =
+          match op with
+          | Sub | Ne | Lt | Gt -> 0L
+          | Eq | Le | Ge -> 1L
+          | Add | Mul | Div | Mod | LAnd | LOr ->
+              assert false
+        in
+        Some (Tcg.Move (dst, Tcg.Imm value))
+    | Tcg.Move _
+    | Tcg.Un _
+    | Tcg.Bin _
+    | Tcg.Load _
+    | Tcg.Store _
+    | Tcg.Call _ ->
+        None
+  in
   let rewrite_instr instr =
     let initial = simplify_simple_instr instr in
     let rewritten =
-      match initial with
+      match semantic_self_fold initial with
+      | Some rewritten ->
+          incr semantic_self_rewrites;
+          rewritten
+      | None ->
+          match initial with
       | Tcg.Bin (dst, Add, lhs, rhs) -> (
           match cancel_sub_add dst lhs rhs with
           | Some rewritten ->
@@ -23632,441 +23812,61 @@ let algebra_canonicalize_func (f : Cfg.func) =
   in
   if Sys.getenv_opt "TOYC_DEBUG_ALGEBRA" <> None then
     Printf.eprintf
-      "algebra func=%s rewrites=%d cancellations=%d\n%!"
-      f.name !rewrites !cancellation_rewrites;
-  if Sys.getenv_opt "TOYC_DEBUG_ITEM6" <> None then
+      "algebra func=%s rewrites=%d cancellations=%d semantic-self=%d\n%!"
+      f.name !rewrites !cancellation_rewrites !semantic_self_rewrites;
+  if
+    Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" <> None
+    && !semantic_self_rewrites > 0
+  then
     Printf.eprintf
-      "item6-algebra-audit func=%s rewrites=%d cancellations=%d\n%!"
-      f.name !rewrites !cancellation_rewrites;
+      "item6-semantic-self func=%s rewrites=%d\n%!"
+      f.name !semantic_self_rewrites;
   if !rewrites = 0 then f else Cfg.rebuild_edges { f with blocks }
-
-type item6_linear_tree =
-  | Item6LinearLeaf of Tcg.operand
-  | Item6LinearNeg of item6_linear_tree
-  | Item6LinearAdd of item6_linear_tree * item6_linear_tree
-  | Item6LinearSub of item6_linear_tree * item6_linear_tree
-
-let item6_plain_temp_terms form =
-  let rec collect acc = function
-    | [] -> Some (List.rev acc)
-    | (CanonicalOperandAtom (Tcg.Temp temp), coeff) :: rest ->
-        collect ((temp, i32 coeff) :: acc) rest
-    | (CanonicalOperandAtom (Tcg.Imm _), _) :: _
-    | (CanonicalPlaceAtom _, _) :: _
-    | (CanonicalUnaryAtom _, _) :: _
-    | (CanonicalBinaryAtom _, _) :: _ ->
-        None
-  in
-  collect []
-    (CanonicalScalarAtomMap.bindings form.canonical_scalar_atoms)
-
-(* item6 v2 deliberately starts with +/-1 linear terms.  Scaled terms stay for
-   the next step: this keeps the first multi-instruction reifier small while
-   covering the two dominant audit gaps, [x+y+C] and 3+ plain linear terms. *)
-let item6_canonical_plain_tree form =
-  let const = i32 form.canonical_scalar_const in
-  match item6_plain_temp_terms form with
-  | None -> None
-  | Some terms ->
-      let term_count = List.length terms in
-      let targeted =
-        (term_count = 2 && const <> 0L)
-        || term_count >= 3
-      in
-      if
-        not targeted
-        || List.exists
-             (fun (_, coeff) -> coeff <> 1L && coeff <> -1L)
-             terms
-      then
-        None
-      else
-        let rec first_positive = function
-          | [] -> None
-          | (temp, 1L) :: _ -> Some temp
-          | _ :: rest -> first_positive rest
-        in
-        match terms with
-        | [] -> None
-        | _ ->
-            begin match first_positive terms with
-            | Some first_temp ->
-                let tree = Item6LinearLeaf (Tcg.Temp first_temp) in
-                let skipped = ref false in
-                let tree =
-                  List.fold_left
-                    (fun tree (temp, coeff) ->
-                      if not !skipped && temp = first_temp && coeff = 1L then begin
-                        skipped := true;
-                        tree
-                      end else if coeff = 1L then
-                        Item6LinearAdd (tree, Item6LinearLeaf (Tcg.Temp temp))
-                      else
-                        Item6LinearSub (tree, Item6LinearLeaf (Tcg.Temp temp)))
-                    tree terms
-                in
-                if const = 0L then Some tree
-                else
-                  Some
-                    (Item6LinearAdd
-                       (tree, Item6LinearLeaf (Tcg.Imm const)))
-            | None ->
-                (* Every term is negative.  Seed from the constant when one is
-                   available; otherwise materialize [-first] and subtract the
-                   rest. *)
-                begin match terms with
-                | (first_temp, _) :: rest ->
-                    let tree =
-                      if const = 0L then
-                        Item6LinearNeg
-                          (Item6LinearLeaf (Tcg.Temp first_temp))
-                      else
-                        Item6LinearSub
-                          ( Item6LinearLeaf (Tcg.Imm const),
-                            Item6LinearLeaf (Tcg.Temp first_temp) )
-                    in
-                    Some
-                      (List.fold_left
-                         (fun tree (temp, _) ->
-                           Item6LinearSub
-                             (tree, Item6LinearLeaf (Tcg.Temp temp)))
-                         tree rest)
-                | [] -> None
-                end
-            end
-
-let rec item6_linear_tree_cost = function
-  | Item6LinearLeaf _ -> 0
-  | Item6LinearNeg inner ->
-      1 + item6_linear_tree_cost inner
-  | Item6LinearAdd (lhs, rhs)
-  | Item6LinearSub (lhs, rhs) ->
-      1 + item6_linear_tree_cost lhs + item6_linear_tree_cost rhs
-
-let item6_reify_linear_tree fresh_temp dst tree =
-  let leaf_operand = function
-    | Item6LinearLeaf operand -> Some operand
-    | Item6LinearNeg _
-    | Item6LinearAdd _
-    | Item6LinearSub _ -> None
-  in
-  let rec emit dst = function
-    | Item6LinearLeaf operand ->
-        Some [ simplify_simple_instr (Tcg.Move (dst, operand)) ]
-    | Item6LinearNeg inner ->
-        Option.map
-          (fun operand ->
-            [ simplify_simple_instr (Tcg.Un (dst, UMinus, operand)) ])
-          (leaf_operand inner)
-    | Item6LinearAdd (lhs, rhs) ->
-        emit_bin dst Add lhs rhs
-    | Item6LinearSub (lhs, rhs) ->
-        emit_bin dst Sub lhs rhs
-  and emit_bin dst op lhs rhs =
-    match leaf_operand rhs with
-    | None -> None
-    | Some rhs_operand ->
-        begin match leaf_operand lhs with
-        | Some lhs_operand ->
-            Some
-              [ simplify_simple_instr
-                  (Tcg.Bin (dst, op, lhs_operand, rhs_operand)) ]
-        | None ->
-            let mid = fresh_temp () in
-            Option.map
-              (fun prefix ->
-                prefix
-                @ [ simplify_simple_instr
-                      (Tcg.Bin
-                         (dst, op, Tcg.Temp mid, rhs_operand)) ])
-              (emit mid lhs)
-        end
-  in
-  emit dst tree
 
 let general_linear_canonicalize_func (f : Cfg.func) =
   let analyze = make_linear_analyzer f in
-  let debug_item6 = Sys.getenv_opt "TOYC_DEBUG_ITEM6" <> None in
-  let use_counts = temp_use_counts f.blocks in
-  let use_count temp =
-    Option.value ~default:0 (Hashtbl.find_opt use_counts temp)
-  in
-  let _, def_blocks, def_instrs, multi_defs =
-    analyze_temp_defs_of_blocks f.temp_count f.blocks
-  in
-  let next_temp = ref f.temp_count in
-  let fresh_temp () =
-    let temp = !next_temp in
-    incr next_temp;
-    temp
-  in
-
-  (* A profitability-oriented analyzer.  Unlike the shared identity analyzer,
-     this one only expands unique-definition temporaries with exactly one use,
-     and only when the definition is in the consumer block.  Every expanded
-     definition is therefore expected to become dead when the root expression
-     is replaced, without moving arithmetic across control-flow boundaries. *)
-  let rec profit_operand root_label seen = function
-    | Tcg.Imm value ->
-        (canonical_scalar_const value, IntSet.empty)
-    | Tcg.Temp temp as operand ->
-        if
-          IntSet.mem temp seen
-          || IntSet.mem temp multi_defs
-          || use_count temp <> 1
-          || Hashtbl.find_opt def_blocks temp <> Some root_label
-        then
-          (canonical_scalar_operand operand, IntSet.empty)
-        else
-          let seen = IntSet.add temp seen in
-          let expanded form defs =
-            (form, IntSet.add temp defs)
-          in
-          match Hashtbl.find_opt def_instrs temp with
-          | Some (Tcg.Move (_, src))
-          | Some (Tcg.Un (_, UPlus, src)) ->
-              let form, defs = profit_operand root_label seen src in
-              expanded form defs
-          | Some (Tcg.Un (_, UMinus, src)) ->
-              let form, defs = profit_operand root_label seen src in
-              expanded (canonical_scalar_un UMinus form) defs
-          | Some (Tcg.Bin (_, ((Add | Sub | Mul) as op), lhs, rhs)) ->
-              let lhs_form, lhs_defs = profit_operand root_label seen lhs in
-              let rhs_form, rhs_defs = profit_operand root_label seen rhs in
-              expanded
-                (canonical_scalar_bin op lhs_form rhs_form)
-                (IntSet.union lhs_defs rhs_defs)
-          | Some (Tcg.Un _)
-          | Some (Tcg.Bin _)
-          | Some (Tcg.Load _)
-          | Some (Tcg.Store _)
-          | Some (Tcg.Call _)
-          | None ->
-              (canonical_scalar_operand operand, IntSet.empty)
-  in
-  let profit_un root_label op src =
-    let src_form, defs = profit_operand root_label IntSet.empty src in
-    match op with
-    | UPlus -> Some (src_form, defs)
-    | UMinus -> Some (canonical_scalar_un UMinus src_form, defs)
-    | UNot -> None
-  in
-  let profit_bin root_label op lhs rhs =
-    match op with
-    | Add | Sub | Mul ->
-        let lhs_form, lhs_defs = profit_operand root_label IntSet.empty lhs in
-        let rhs_form, rhs_defs = profit_operand root_label IntSet.empty rhs in
-        Some
-          ( canonical_scalar_bin op lhs_form rhs_form,
-            IntSet.union lhs_defs rhs_defs )
-    | Div | Mod | Lt | Gt | Le | Ge
-    | Eq | Ne | LAnd | LOr ->
-        None
-  in
-
-  (* Reconstruct the current single-use expression tree using exactly the same
-     expansion policy.  Equal-cost canonicalization is allowed only when this
-     tree differs from the deterministic target tree.  Once v2 has emitted the
-     target, a later optimizer round recognizes it and does not manufacture a
-     fresh set of temporaries again. *)
-  let rec current_tree_of_operand root_label seen = function
-    | Tcg.Imm _ as operand ->
-        Item6LinearLeaf operand
-    | Tcg.Temp temp as operand ->
-        if
-          IntSet.mem temp seen
-          || IntSet.mem temp multi_defs
-          || use_count temp <> 1
-          || Hashtbl.find_opt def_blocks temp <> Some root_label
-        then
-          Item6LinearLeaf operand
-        else
-          let seen = IntSet.add temp seen in
-          match Hashtbl.find_opt def_instrs temp with
-          | Some (Tcg.Move (_, src))
-          | Some (Tcg.Un (_, UPlus, src)) ->
-              current_tree_of_operand root_label seen src
-          | Some (Tcg.Un (_, UMinus, src)) ->
-              Item6LinearNeg
-                (current_tree_of_operand root_label seen src)
-          | Some (Tcg.Bin (_, Add, lhs, rhs)) ->
-              Item6LinearAdd
-                ( current_tree_of_operand root_label seen lhs,
-                  current_tree_of_operand root_label seen rhs )
-          | Some (Tcg.Bin (_, Sub, lhs, rhs)) ->
-              Item6LinearSub
-                ( current_tree_of_operand root_label seen lhs,
-                  current_tree_of_operand root_label seen rhs )
-          | Some (Tcg.Bin (_, Mul, _, _))
-          | Some (Tcg.Un _)
-          | Some (Tcg.Bin _)
-          | Some (Tcg.Load _)
-          | Some (Tcg.Store _)
-          | Some (Tcg.Call _)
-          | None ->
-              Item6LinearLeaf operand
-  in
-  let current_tree_of_instr root_label = function
-    | Tcg.Move (_, src)
-    | Tcg.Un (_, UPlus, src) ->
-        Some (current_tree_of_operand root_label IntSet.empty src)
-    | Tcg.Un (_, UMinus, src) ->
-        Some
-          (Item6LinearNeg
-             (current_tree_of_operand root_label IntSet.empty src))
-    | Tcg.Bin (_, Add, lhs, rhs) ->
-        Some
-          (Item6LinearAdd
-             ( current_tree_of_operand root_label IntSet.empty lhs,
-               current_tree_of_operand root_label IntSet.empty rhs ))
-    | Tcg.Bin (_, Sub, lhs, rhs) ->
-        Some
-          (Item6LinearSub
-             ( current_tree_of_operand root_label IntSet.empty lhs,
-               current_tree_of_operand root_label IntSet.empty rhs ))
-    | Tcg.Bin (_, Mul, _, _)
-    | Tcg.Bin _
-    | Tcg.Un _
-    | Tcg.Load _
-    | Tcg.Store _
-    | Tcg.Call _ ->
-        None
-  in
-
   let rewrites = ref 0 in
-  let reify_successes = ref 0 in
-  let multi_rewrites = ref 0 in
-  let multi_cost_saved = ref 0 in
-  let multi_equal_cost = ref 0 in
-  let multi_cost_rejects = ref 0 in
-  let multi_already_canonical = ref 0 in
-  let miss_plain = ref 0 in
-  let miss_one_scaled_const = ref 0 in
-  let miss_two_const = ref 0 in
-  let miss_two_scaled = ref 0 in
-  let miss_multi = ref 0 in
-  let miss_opaque = ref 0 in
-  let classify_reify_miss form =
-    if debug_item6 then begin
-      let const = i32 form.canonical_scalar_const in
-      match item6_plain_temp_terms form with
-      | None -> incr miss_opaque
-      | Some terms ->
-          incr miss_plain;
-          begin match terms with
-          | [ (_, coeff) ]
-            when const <> 0L && coeff <> 1L && coeff <> -1L ->
-              incr miss_one_scaled_const
-          | [ _; _ ] when const <> 0L ->
-              incr miss_two_const
-          | [ (_, coeff1); (_, coeff2) ]
-            when coeff1 <> 1L || coeff2 <> 1L ->
-              incr miss_two_scaled
-          | [ _; _; _ ] ->
-              incr miss_multi
-          | _ :: _ :: _ :: _ :: _ ->
-              incr miss_multi
-          | _ -> ()
-          end
-    end
-  in
-
-  let try_multi_reify root_label dst initial profit =
-    match profit with
-    | None -> [ initial ]
-    | Some (form, expanded_defs) ->
-        begin match item6_canonical_plain_tree form with
-        | None -> [ initial ]
-        | Some target_tree ->
-            let old_cost = 1 + IntSet.cardinal expanded_defs in
-            let new_cost = item6_linear_tree_cost target_tree in
-            if new_cost >= old_cost then begin
-              (* v2b sealing guard: equal-cost canonicalization changed arithmetic
-                 tree shape without reducing work, and that can hide patterns from
-                 later loop/inline/dead-loop passes.  Keep multi-instruction
-                 reification strictly profitable: only materialize when the new
-                 canonical tree uses fewer instructions than the single-use local
-                 dependency slice it replaces.  Equal-cost opportunities are
-                 audited but deliberately left untouched. *)
-              if new_cost = old_cost then begin
-                if current_tree_of_instr root_label initial = Some target_tree then
-                  incr multi_already_canonical
-                else
-                  incr multi_equal_cost
-              end else
-                incr multi_cost_rejects;
-              [ initial ]
-            end else
-              match
-                item6_reify_linear_tree fresh_temp dst target_tree
-              with
-              | None -> [ initial ]
-              | Some instrs ->
-                  incr multi_rewrites;
-                  multi_cost_saved :=
-                    !multi_cost_saved + (old_cost - new_cost);
-                  instrs
-        end
-  in
-
-  let rewrite_instr root_label instr =
+  let rewrite_instr instr =
     let initial = simplify_simple_instr instr in
-    let result =
+    let candidate =
       match initial with
       | Tcg.Un (dst, ((UPlus | UMinus) as op), src) -> (
           match linear_form_of_un analyze op src with
           | Some form -> (
               match reify_linear_one_instr dst form with
-              | Some rewritten ->
-                  if debug_item6 then incr reify_successes;
-                  [ simplify_simple_instr rewritten ]
-              | None ->
-                  classify_reify_miss form;
-                  try_multi_reify root_label dst initial (profit_un root_label op src))
-          | None -> [ initial ])
+              | Some rewritten -> simplify_simple_instr rewritten
+              | None -> initial)
+          | None -> initial)
       | Tcg.Bin (dst, ((Add | Sub | Mul) as op), lhs, rhs) -> (
           match linear_form_of_bin analyze op lhs rhs with
           | Some form -> (
               match reify_linear_one_instr dst form with
-              | Some rewritten ->
-                  if debug_item6 then incr reify_successes;
-                  [ simplify_simple_instr rewritten ]
-              | None ->
-                  classify_reify_miss form;
-                  try_multi_reify root_label dst initial (profit_bin root_label op lhs rhs))
-          | None -> [ initial ])
+              | Some rewritten -> simplify_simple_instr rewritten
+              | None -> initial)
+          | None -> initial)
       | Tcg.Move _
       | Tcg.Un _
       | Tcg.Bin _
       | Tcg.Load _
       | Tcg.Store _
       | Tcg.Call _ ->
-          [ initial ]
+          initial
     in
-    if result <> [ instr ] then incr rewrites;
-    result
+    if candidate <> instr then incr rewrites;
+    candidate
   in
   let blocks =
     List.map
       (fun (block : Cfg.block) ->
-        { block with body = List.concat_map (rewrite_instr block.label) block.body })
+        { block with body = List.map rewrite_instr block.body })
       f.blocks
   in
   if Sys.getenv_opt "TOYC_DEBUG_LINEAR" <> None then
     Printf.eprintf
-      "linear-canon func=%s rewrites=%d multi=%d saved=%d equal=%d\n%!"
-      f.name !rewrites !multi_rewrites !multi_cost_saved !multi_equal_cost;
-  if debug_item6 then
-    Printf.eprintf
-      "item6-linear-audit func=%s rewrites=%d reify-ok=%d miss-plain=%d miss-one-scaled-const=%d miss-two-const=%d miss-two-scaled=%d miss-multi=%d miss-opaque=%d multi-rewrites=%d multi-cost-saved=%d multi-equal-cost=%d multi-cost-reject=%d multi-already-canonical=%d\n%!"
-      f.name !rewrites !reify_successes !miss_plain
-      !miss_one_scaled_const !miss_two_const !miss_two_scaled
-      !miss_multi !miss_opaque !multi_rewrites !multi_cost_saved
-      !multi_equal_cost !multi_cost_rejects !multi_already_canonical;
+      "linear-canon func=%s rewrites=%d\n%!"
+      f.name !rewrites;
   if !rewrites = 0 then f
-  else
-    Cfg.rebuild_edges
-      { f with temp_count = !next_temp; blocks }
+  else Cfg.rebuild_edges { f with blocks }
 
 
 
@@ -24240,15 +24040,12 @@ let factor_common_mul_func (f : Cfg.func) =
 
   let blocks = List.map rewrite_block f.blocks in
   if
-    Sys.getenv_opt "TOYC_DEBUG_FACTOR_MUL" <> None
+    (Sys.getenv_opt "TOYC_DEBUG_FACTOR_MUL" <> None
+     || Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" <> None)
     && !rewrites > 0
   then
     Printf.eprintf
       "factor-mul func=%s rewrites=%d semantic-common=%d\n%!"
-      f.name !rewrites !semantic_common_rewrites;
-  if Sys.getenv_opt "TOYC_DEBUG_ITEM6" <> None then
-    Printf.eprintf
-      "item6-factor-audit func=%s rewrites=%d semantic-common=%d\n%!"
       f.name !rewrites !semantic_common_rewrites;
   if not !changed then f
   else Cfg.rebuild_edges { f with blocks }
@@ -24333,7 +24130,13 @@ let reassociate_loop_adds_func (f : Cfg.func) =
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
     let get_block = get_block_exn current_blocks in
     let changed = ref false in
-    let rewrites = ref 0 in
+    let adoption_reassoc_mid_gap = ref 0 in
+    let adoption_analyze = make_linear_analyzer f in
+    let adoption_semantic_equal lhs rhs =
+      canonical_scalar_key_equal
+        (adoption_analyze lhs)
+        (adoption_analyze rhs)
+    in
     List.iter
       (fun header ->
         let loop = table_find_or_empty loops header LabelSet.empty in
@@ -24352,12 +24155,39 @@ let reassociate_loop_adds_func (f : Cfg.func) =
               let single_use temp =
                 Option.value ~default:0 (Hashtbl.find_opt use_counts temp) = 1
               in
+              let semantic_second_uses_mid mid second =
+                let mid_operand = Tcg.Temp mid in
+                let semantic_only operand =
+                  operand <> mid_operand
+                  && adoption_semantic_equal operand mid_operand
+                in
+                match second with
+                | Tcg.Bin (_, Add, lhs, rhs) ->
+                    (invariant rhs && semantic_only lhs)
+                    || (invariant lhs && semantic_only rhs)
+                | Tcg.Bin (_, Sub, lhs, rhs) ->
+                    (invariant rhs && semantic_only lhs)
+                    || (invariant lhs && semantic_only rhs)
+                | Tcg.Move _
+                | Tcg.Un _
+                | Tcg.Bin _
+                | Tcg.Load _
+                | Tcg.Store _
+                | Tcg.Call _ ->
+                    false
+              in
               let try_reassociate first second =
                 match classify_reassoc_first invariant first with
                 | Some (mid, first_shape) when single_use mid -> (
                     match classify_reassoc_second mid invariant second with
                     | Some second_shape -> build_reassoc_instrs mid first_shape second_shape
-                    | None -> None)
+                    | None ->
+                        if
+                          Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" <> None
+                          && semantic_second_uses_mid mid second
+                        then
+                          incr adoption_reassoc_mid_gap;
+                        None)
                 | Some _ | None -> None
               in
               let rec rewrite = function
@@ -24365,7 +24195,6 @@ let reassociate_loop_adds_func (f : Cfg.func) =
                     match try_reassociate first second with
                     | Some (first', second') ->
                         changed := true;
-                        incr rewrites;
                         first' :: second' :: rewrite rest
                     | None -> first :: rewrite (second :: rest))
                 | body -> body
@@ -24373,10 +24202,10 @@ let reassociate_loop_adds_func (f : Cfg.func) =
               Hashtbl.replace current_blocks current.label { current with body = rewrite current.body })
           f.blocks)
       headers;
-    if Sys.getenv_opt "TOYC_DEBUG_ITEM6" <> None then
+    if Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" <> None then
       Printf.eprintf
-        "item6-reassoc-audit func=%s loops=%d rewrites=%d\n%!"
-        f.name (List.length headers) !rewrites;
+        "item6-reassoc-adoption func=%s semantic-mid-gap=%d\n%!"
+        f.name !adoption_reassoc_mid_gap;
     if !changed then
       let ordered_labels = List.map (fun (block : Cfg.block) -> block.label) f.blocks in
       let blocks = List.map get_block ordered_labels in
