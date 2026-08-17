@@ -19933,12 +19933,11 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
       build_child_temp_summary_report
         summaries globals f lcssa_report
     in
-    (* Correctness-first rollout gate.  The compositional consumer is newer
-       than the analysis/reporting machinery and must not affect normal -opt
-       until the full smoke suite validates it.  Analysis stays on; only the
-       CFG-transforming consumer is opt-in for now. *)
+    (* item5 v45 sealed: nested/piecewise composition has passed the full
+       correctness/performance gates and is enabled by default.  Keep an
+       emergency kill switch for conservative rollback/debugging. *)
     let enable_nested_temp_composition =
-      Sys.getenv_opt "TOYC_ENABLE_NESTED_TEMP_COMPOSITION" <> None
+      Sys.getenv_opt "TOYC_DISABLE_NESTED_TEMP_COMPOSITION" = None
     in
     let composition_parent_headers =
       if not enable_nested_temp_composition then []
