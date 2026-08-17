@@ -15964,9 +15964,54 @@ type child_scalar_summary_link = {
   child_link_direct_summary_found : bool;
 }
 
+type child_scalar_trip_semantics = {
+  child_trip_phi_temp : Tcg.temp;
+  child_trip_step : int64;
+  child_trip_kind : counted_loop_kind;
+}
+
+type child_scalar_invariant_transfer = {
+  child_transfer_header : Tcg.label;
+  child_transfer_parent : Tcg.label option;
+  child_transfer_depth : int;
+  child_transfer_place : Tcg.place;
+  child_transfer_trip : child_scalar_trip_semantics;
+  child_transfer_step_expr : summary_expr;
+  child_transfer_subtract : bool;
+}
+
+type child_scalar_transfer_link = {
+  child_transfer_link_parent : Tcg.label;
+  child_transfer_link_child : Tcg.label;
+  child_transfer_link_place : Tcg.place;
+  child_transfer_link_resolved :
+    child_scalar_invariant_transfer option;
+}
+
+type parent_child_composition_status =
+  | ParentComposeReadyConstant
+  | ParentComposeNeedsRuntimeGuard
+  | ParentComposeReject of string
+
+type parent_child_composition_proof = {
+  parent_comp_parent_header : Tcg.label;
+  parent_comp_child_header : Tcg.label;
+  parent_comp_place : Tcg.place;
+  parent_comp_child_start : loop_inv_expr option;
+  parent_comp_child_bound : loop_inv_expr option;
+  parent_comp_step_parent_invariant : bool;
+  parent_comp_status : parent_child_composition_status;
+}
+
 type child_scalar_summary_report = {
   child_scalar_direct_summaries : child_scalar_direct_summary list;
   child_scalar_links : child_scalar_summary_link list;
+  child_scalar_invariant_transfers :
+    child_scalar_invariant_transfer list;
+  child_scalar_transfer_links :
+    child_scalar_transfer_link list;
+  child_scalar_parent_composition_proofs :
+    parent_child_composition_proof list;
 }
 
 let string_of_child_operand = function
@@ -16074,6 +16119,226 @@ let string_of_child_counted_kind = function
       Printf.sprintf
         "down-ge-scaled:bound=%s,scale=%Ld,bias=%Ld"
         (string_of_child_operand bound) scale bias
+
+let child_trip_stride step =
+  if step < 0L then Int64.neg step else step
+
+let child_adjusted_bound_string bound bias =
+  let bound = string_of_child_operand bound in
+  if bias = 0L then bound
+  else Printf.sprintf "(%s-%Ld)" bound bias
+
+let string_of_child_trip_semantics
+    (trip : child_scalar_trip_semantics) =
+  let phi =
+    Printf.sprintf "t%d" trip.child_trip_phi_temp
+  in
+  let stride = child_trip_stride trip.child_trip_step in
+  let ceil_formula lhs rhs divisor =
+    Printf.sprintf
+      "max(0,ceil(((%s)-(%s))/%Ld))"
+      lhs rhs divisor
+  in
+  let inclusive_formula lhs rhs divisor =
+    Printf.sprintf
+      "max(0,floor(((%s)-(%s))/%Ld)+1)"
+      lhs rhs divisor
+  in
+  match trip.child_trip_kind with
+  | CountUpLt (bound, bias) ->
+      ceil_formula
+        (child_adjusted_bound_string bound bias)
+        phi stride
+  | CountUpLe (bound, bias) ->
+      inclusive_formula
+        (child_adjusted_bound_string bound bias)
+        phi stride
+  | CountDownGt (bound, bias) ->
+      ceil_formula
+        phi
+        (child_adjusted_bound_string bound bias)
+        stride
+  | CountDownGe (bound, bias) ->
+      inclusive_formula
+        phi
+        (child_adjusted_bound_string bound bias)
+        stride
+  | CountUpLtScaled (bound, scale, bias) ->
+      ceil_formula
+        (child_adjusted_bound_string bound bias)
+        (Printf.sprintf "(%Ld*%s)" scale phi)
+        Int64.(mul scale stride)
+  | CountUpLeScaled (bound, scale, bias) ->
+      inclusive_formula
+        (child_adjusted_bound_string bound bias)
+        (Printf.sprintf "(%Ld*%s)" scale phi)
+        Int64.(mul scale stride)
+  | CountDownGtScaled (bound, scale, bias) ->
+      ceil_formula
+        (Printf.sprintf "(%Ld*%s)" scale phi)
+        (child_adjusted_bound_string bound bias)
+        Int64.(mul scale stride)
+  | CountDownGeScaled (bound, scale, bias) ->
+      inclusive_formula
+        (Printf.sprintf "(%Ld*%s)" scale phi)
+        (child_adjusted_bound_string bound bias)
+        Int64.(mul scale stride)
+
+let string_of_child_invariant_delta
+    (transfer : child_scalar_invariant_transfer) =
+  let trip =
+    string_of_child_trip_semantics
+      transfer.child_transfer_trip
+  in
+  let step =
+    string_of_child_summary_expr
+      transfer.child_transfer_step_expr
+  in
+  if step = "0" then "0"
+  else if step = "1" then trip
+  else if step = "-1" then
+    Printf.sprintf "-(%s)" trip
+  else
+    Printf.sprintf "(%s*%s)" trip step
+
+let parent_invariant_expr_of_operand
+    loop_defs multi_defs def_instrs operand =
+  let rec resolve seen operand =
+    match operand with
+    | Tcg.Imm value ->
+        Some (LveConst value)
+    | Tcg.Temp temp ->
+        if IntSet.mem temp seen
+           || IntSet.mem temp multi_defs
+        then
+          None
+        else if not (IntSet.mem temp loop_defs) then
+          lve_invariant_expr_of_operand
+            loop_defs multi_defs def_instrs operand
+          |> Option.map normalize_loop_inv_expr
+        else
+          let seen = IntSet.add temp seen in
+          match Hashtbl.find_opt def_instrs temp with
+          | Some (Tcg.Move (_, src))
+          | Some (Tcg.Un (_, UPlus, src)) ->
+              resolve seen src
+          | Some (Tcg.Un (_, UMinus, src)) ->
+              Option.map
+                (fun expr ->
+                  normalize_loop_inv_expr (LveNeg expr))
+                (resolve seen src)
+          | Some (Tcg.Bin (_, Add, lhs, rhs)) -> (
+              match resolve seen lhs, resolve seen rhs with
+              | Some lhs, Some rhs ->
+                  Some
+                    (normalize_loop_inv_expr
+                       (LveAdd (lhs, rhs)))
+              | _ ->
+                  None)
+          | Some (Tcg.Bin (_, Sub, lhs, rhs)) -> (
+              match resolve seen lhs, resolve seen rhs with
+              | Some lhs, Some rhs ->
+                  Some
+                    (normalize_loop_inv_expr
+                       (LveAdd (lhs, LveNeg rhs)))
+              | _ ->
+                  None)
+          | Some (Tcg.Bin (_, Mul, lhs, rhs)) -> (
+              match resolve seen lhs, resolve seen rhs with
+              | Some lhs, Some rhs ->
+                  Some
+                    (normalize_loop_inv_expr
+                       (LveMul (lhs, rhs)))
+              | _ ->
+                  None)
+          | Some (Tcg.Un (_, UNot, _))
+          | Some (Tcg.Bin (_, Div, _, _))
+          | Some (Tcg.Bin (_, Mod, _, _))
+          | Some (Tcg.Bin (_, Lt, _, _))
+          | Some (Tcg.Bin (_, Le, _, _))
+          | Some (Tcg.Bin (_, Gt, _, _))
+          | Some (Tcg.Bin (_, Ge, _, _))
+          | Some (Tcg.Bin (_, Eq, _, _))
+          | Some (Tcg.Bin (_, Ne, _, _))
+          | Some (Tcg.Bin (_, LAnd, _, _))
+          | Some (Tcg.Bin (_, LOr, _, _))
+          | Some (Tcg.Load _)
+          | Some (Tcg.Store _)
+          | Some (Tcg.Call _)
+          | None ->
+              None
+  in
+  resolve IntSet.empty operand
+
+let common_parent_invariant_entry_expr
+    loop_defs multi_defs def_instrs
+    (iv : basic_induction_var) =
+  match iv.outside_inputs with
+  | [] ->
+      None
+  | (_, first_operand) :: rest ->
+      Option.bind
+        (parent_invariant_expr_of_operand
+           loop_defs multi_defs def_instrs
+           first_operand)
+        (fun first ->
+          let rec agree = function
+            | [] ->
+                Some first
+            | (_, operand) :: tail -> (
+                match
+                  parent_invariant_expr_of_operand
+                    loop_defs multi_defs def_instrs
+                    operand
+                with
+                | Some other
+                  when loop_inv_expr_equal first other ->
+                    agree tail
+                | Some _
+                | None ->
+                    None)
+          in
+          agree rest)
+
+let counted_kind_bound_operand = function
+  | CountUpLt (bound, _)
+  | CountUpLe (bound, _)
+  | CountDownGt (bound, _)
+  | CountDownGe (bound, _)
+  | CountUpLtScaled (bound, _, _)
+  | CountUpLeScaled (bound, _, _)
+  | CountDownGtScaled (bound, _, _)
+  | CountDownGeScaled (bound, _, _) ->
+      bound
+
+let rec summary_expr_parent_invariant
+    loop_defs multi_defs def_instrs effects = function
+  | SummaryOperand operand ->
+      Option.is_some
+        (parent_invariant_expr_of_operand
+           loop_defs multi_defs def_instrs operand)
+  | SummaryPlace place ->
+      load_place_invariant effects place
+  | SummaryUn (_, expr) ->
+      summary_expr_parent_invariant
+        loop_defs multi_defs def_instrs effects expr
+  | SummaryBin (_, lhs, rhs) ->
+      summary_expr_parent_invariant
+        loop_defs multi_defs def_instrs effects lhs
+      &&
+      summary_expr_parent_invariant
+        loop_defs multi_defs def_instrs effects rhs
+
+let loop_inv_expr_is_const expr =
+  Option.is_some (loop_inv_expr_const_opt expr)
+
+let string_of_parent_comp_status = function
+  | ParentComposeReadyConstant ->
+      "ready-constant"
+  | ParentComposeNeedsRuntimeGuard ->
+      "needs-runtime-guard"
+  | ParentComposeReject reason ->
+      "reject:" ^ reason
 
 let reduction_targets_place place
     (reduction : counted_reduction) =
@@ -16288,10 +16553,179 @@ let build_child_scalar_summary_report
                                      item.lcssa_place;
                                })))
   in
+  let invariant_transfers =
+    direct_summaries
+    |> List.filter_map
+         (fun summary ->
+           match summary.child_summary_reduction.step with
+           | ReductionInvariant step_expr ->
+               Some
+                 {
+                   child_transfer_header =
+                     summary.child_summary_header;
+                   child_transfer_parent =
+                     summary.child_summary_parent;
+                   child_transfer_depth =
+                     summary.child_summary_depth;
+                   child_transfer_place =
+                     summary.child_summary_place;
+                   child_transfer_trip =
+                     {
+                       child_trip_phi_temp =
+                         summary.child_summary_control.control_iv.phi_temp;
+                       child_trip_step =
+                         summary.child_summary_control.control_iv.step;
+                       child_trip_kind =
+                         summary.child_summary_control.kind;
+                     };
+                   child_transfer_step_expr = step_expr;
+                   child_transfer_subtract =
+                     summary.child_summary_reduction.subtract;
+                 }
+           | ReductionAffine _
+           | ReductionQuadratic _
+           | ReductionCubic _
+           | ReductionCarrierProgression _ ->
+               None)
+  in
+  let find_transfer child_header place =
+    List.find_opt
+      (fun transfer ->
+        transfer.child_transfer_header = child_header
+        && transfer.child_transfer_place = place)
+      invariant_transfers
+  in
+  let transfer_links =
+    links
+    |> List.map
+         (fun link ->
+           {
+             child_transfer_link_parent =
+               link.child_link_parent_header;
+             child_transfer_link_child =
+               link.child_link_child_header;
+             child_transfer_link_place =
+               link.child_link_place;
+             child_transfer_link_resolved =
+               find_transfer
+                 link.child_link_child_header
+                 link.child_link_place;
+           })
+  in
+  let parent_composition_proofs =
+    transfer_links
+    |> List.filter_map
+         (fun link ->
+           match
+             link.child_transfer_link_resolved,
+             Hashtbl.find_opt
+               forest.loop_forest_infos
+               link.child_transfer_link_parent
+           with
+           | Some transfer, Some parent_info ->
+               let parent_loop =
+                 parent_info.loop_info_blocks
+               in
+               let
+                 ( parent_loop_defs,
+                   _,
+                   parent_def_instrs,
+                   parent_multi_defs ) =
+                 analyze_temp_defs_of_blocks
+                   ~loop:parent_loop
+                   f.temp_count f.blocks
+               in
+               let parent_effects =
+                 collect_loop_effects
+                   summaries globals
+                   parent_loop f.blocks
+               in
+               let child_summary =
+                 List.find_opt
+                   (fun summary ->
+                     summary.child_summary_header =
+                       link.child_transfer_link_child
+                     &&
+                     summary.child_summary_place =
+                       link.child_transfer_link_place)
+                   direct_summaries
+               in
+               Option.map
+                 (fun summary ->
+                   let start_expr =
+                     common_parent_invariant_entry_expr
+                       parent_loop_defs
+                       parent_multi_defs
+                       parent_def_instrs
+                       summary.child_summary_control.control_iv
+                   in
+                   let bound_expr =
+                     parent_invariant_expr_of_operand
+                       parent_loop_defs
+                       parent_multi_defs
+                       parent_def_instrs
+                       (counted_kind_bound_operand
+                          summary.child_summary_control.kind)
+                   in
+                   let step_parent_invariant =
+                     summary_expr_parent_invariant
+                       parent_loop_defs
+                       parent_multi_defs
+                       parent_def_instrs
+                       parent_effects
+                       transfer.child_transfer_step_expr
+                   in
+                   let status =
+                     match
+                       start_expr,
+                       bound_expr,
+                       step_parent_invariant
+                     with
+                     | None, _, _ ->
+                         ParentComposeReject
+                           "child-entry-start-not-parent-invariant"
+                     | _, None, _ ->
+                         ParentComposeReject
+                           "child-bound-not-parent-invariant"
+                     | _, _, false ->
+                         ParentComposeReject
+                           "reduction-step-not-parent-invariant"
+                     | Some start, Some bound, true
+                       when
+                         loop_inv_expr_is_const start
+                         && loop_inv_expr_is_const bound ->
+                         ParentComposeReadyConstant
+                     | Some _, Some _, true ->
+                         ParentComposeNeedsRuntimeGuard
+                   in
+                   {
+                     parent_comp_parent_header =
+                       link.child_transfer_link_parent;
+                     parent_comp_child_header =
+                       link.child_transfer_link_child;
+                     parent_comp_place =
+                       link.child_transfer_link_place;
+                     parent_comp_child_start = start_expr;
+                     parent_comp_child_bound = bound_expr;
+                     parent_comp_step_parent_invariant =
+                       step_parent_invariant;
+                     parent_comp_status = status;
+                   })
+                 child_summary
+           | None, _
+           | _, None ->
+               None)
+  in
   {
     child_scalar_direct_summaries =
       direct_summaries;
     child_scalar_links = links;
+    child_scalar_invariant_transfers =
+      invariant_transfers;
+    child_scalar_transfer_links =
+      transfer_links;
+    child_scalar_parent_composition_proofs =
+      parent_composition_proofs;
   }
 
 let debug_child_scalar_summary_report
@@ -16339,8 +16773,77 @@ let debug_child_scalar_summary_report
           (lcssa_string_of_place link.child_link_place)
           link.child_link_direct_summary_found)
       report.child_scalar_links;
+    List.iter
+      (fun transfer ->
+        let trip =
+          string_of_child_trip_semantics
+            transfer.child_transfer_trip
+        in
+        let delta =
+          string_of_child_invariant_delta transfer
+        in
+        Printf.eprintf
+          "child-scalar-transfer func=%s header=%s depth=%d parent=%s place=%s trip=%s step=%s delta=%s update=%s\n%!"
+          f.name
+          transfer.child_transfer_header
+          transfer.child_transfer_depth
+          (match transfer.child_transfer_parent with
+           | Some parent -> parent
+           | None -> "<root>")
+          (lcssa_string_of_place
+             transfer.child_transfer_place)
+          trip
+          (string_of_child_summary_expr
+             transfer.child_transfer_step_expr)
+          delta
+          (if transfer.child_transfer_subtract
+           then "place_out=place_in-delta"
+           else "place_out=place_in+delta"))
+      report.child_scalar_invariant_transfers;
+    List.iter
+      (fun link ->
+        match link.child_transfer_link_resolved with
+        | None ->
+            Printf.eprintf
+              "parent-child-transfer func=%s parent=%s child=%s place=%s resolved=false\n%!"
+              f.name
+              link.child_transfer_link_parent
+              link.child_transfer_link_child
+              (lcssa_string_of_place
+                 link.child_transfer_link_place)
+        | Some transfer ->
+            Printf.eprintf
+              "parent-child-transfer func=%s parent=%s child=%s place=%s resolved=true delta=%s update=%s\n%!"
+              f.name
+              link.child_transfer_link_parent
+              link.child_transfer_link_child
+              (lcssa_string_of_place
+                 link.child_transfer_link_place)
+              (string_of_child_invariant_delta transfer)
+              (if transfer.child_transfer_subtract
+               then "place_out=place_in-delta"
+               else "place_out=place_in+delta"))
+      report.child_scalar_transfer_links;
+    List.iter
+      (fun proof ->
+        Printf.eprintf
+          "parent-compose-proof func=%s parent=%s child=%s place=%s start=%s bound=%s step-parent-invariant=%b status=%s\n%!"
+          f.name
+          proof.parent_comp_parent_header
+          proof.parent_comp_child_header
+          (lcssa_string_of_place proof.parent_comp_place)
+          (match proof.parent_comp_child_start with
+           | Some expr -> string_of_loop_inv_expr expr
+           | None -> "<unknown>")
+          (match proof.parent_comp_child_bound with
+           | Some expr -> string_of_loop_inv_expr expr
+           | None -> "<unknown>")
+          proof.parent_comp_step_parent_invariant
+          (string_of_parent_comp_status
+             proof.parent_comp_status))
+      report.child_scalar_parent_composition_proofs;
     Printf.eprintf
-      "child-scalar-summary func=%s direct=%d links=%d resolved-links=%d\n%!"
+      "child-scalar-summary func=%s direct=%d links=%d resolved-links=%d invariant-transfers=%d resolved-transfers=%d parent-compose-proofs=%d\n%!"
       f.name
       (List.length report.child_scalar_direct_summaries)
       (List.length report.child_scalar_links)
@@ -16350,6 +16853,15 @@ let debug_child_scalar_summary_report
            then count + 1
            else count)
          0 report.child_scalar_links)
+      (List.length report.child_scalar_invariant_transfers)
+      (List.fold_left
+         (fun count link ->
+           match link.child_transfer_link_resolved with
+           | Some _ -> count + 1
+           | None -> count)
+         0 report.child_scalar_transfer_links)
+      (List.length
+         report.child_scalar_parent_composition_proofs)
   end
 
 let debug_lcssa_lite_report
