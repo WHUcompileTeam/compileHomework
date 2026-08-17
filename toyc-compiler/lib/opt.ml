@@ -31831,6 +31831,251 @@ let refresh_final_effect_sets_dce_program summaries globals funcs =
   ignore summaries;
   result
 
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v6: late scalar leaf inlining with explicit global stores            *)
+(*                                                                            *)
+(* v5 showed that Store is by far the dominant single residual inline blocker. *)
+(* Keep the first real relaxation deliberately narrow:                         *)
+(*   - exactly one reachable entry block; TInt value return;                   *)
+(*   - <= existing scalar size/temp limits;                                    *)
+(*   - Move/Un/non-trapping Bin, parameter/global Loads;                        *)
+(*   - Store is allowed ONLY to a Global place;                                *)
+(*   - no local Store, nested Call, Div, or Mod.                               *)
+(*                                                                            *)
+(* Expansion happens exactly at the Call instruction.  Global Stores therefore *)
+(* keep their original relative ordering with caller instructions.  Parameter  *)
+(* Loads are replaced by already-evaluated call operands, exactly as in the     *)
+(* existing late scalar inliner.  Resultless calls are supported: the callee    *)
+(* body (including Stores) is cloned and the return value is simply discarded. *)
+(*                                                                            *)
+(* Cleanup is intentionally narrow too: recompute fresh effect summaries after *)
+(* each wave and run one DCE pass.  Do NOT feed the expanded CFG back through   *)
+(* the full optimize_func pipeline (item7 v4 showed that arbitrary second full *)
+(* optimization is not a safe re-entrant operation).                           *)
+(* -------------------------------------------------------------------------- *)
+
+type late_store_scalar_inline_candidate = {
+  store_scalar_func : Cfg.func;
+  store_scalar_block : Cfg.block;
+  store_scalar_return : Tcg.operand;
+}
+
+let late_store_scalar_inline_candidate_of_func (f : Cfg.func) =
+  if f.ret <> TInt then None
+  else
+    let view =
+      f
+      |> thread_and_prune_func
+      |> simplify_cfg_func
+      |> final_linear_merge_func
+      |> thread_and_prune_func
+    in
+    if not (cfg_targets_valid view) then None
+    else
+      let reachable = reachable_labels view.entry view.blocks in
+      let blocks =
+        List.filter
+          (fun (block : Cfg.block) -> LabelSet.mem block.label reachable)
+          view.blocks
+      in
+      match blocks with
+      | [ (block : Cfg.block) ] when block.label = view.entry ->
+          let param_ids =
+            List.fold_left
+              (fun acc (param : Tcg.var) -> IntSet.add param.id acc)
+              IntSet.empty view.params
+          in
+          let has_global_store = ref false in
+          let instr_safe = function
+            | Tcg.Move _ | Tcg.Un _ -> true
+            | Tcg.Bin (_, (Div | Mod), _, _) -> false
+            | Tcg.Bin _ -> true
+            | Tcg.Load (_, Tcg.Local id) -> IntSet.mem id param_ids
+            | Tcg.Load (_, Tcg.Global _) -> true
+            | Tcg.Store (Tcg.Global _, _) ->
+                has_global_store := true;
+                true
+            | Tcg.Store (Tcg.Local _, _) -> false
+            | Tcg.Call _ -> false
+          in
+          if List.length block.body > late_scalar_inline_max_instrs
+             || view.temp_count > late_scalar_inline_max_temps
+             || not (List.for_all instr_safe block.body)
+             || not !has_global_store
+          then None
+          else
+            begin
+              match block.term with
+              | Cfg.Return (Some operand) ->
+                  Some
+                    {
+                      store_scalar_func = view;
+                      store_scalar_block = block;
+                      store_scalar_return = operand;
+                    }
+              | Cfg.Return None
+              | Cfg.Jump _
+              | Cfg.BranchZero _
+              | Cfg.BranchNonZero _
+              | Cfg.BranchCompare _ ->
+                  None
+            end
+      | _ -> None
+
+let build_late_store_scalar_inline_table funcs =
+  let table = Hashtbl.create (max 8 (List.length funcs)) in
+  List.iter
+    (fun (f : Cfg.func) ->
+      match late_store_scalar_inline_candidate_of_func f with
+      | None -> ()
+      | Some candidate ->
+          Hashtbl.replace table f.label candidate;
+          if Sys.getenv_opt "TOYC_DEBUG_ITEM7_STORE_INLINE" <> None then
+            Printf.eprintf
+              "item7-store-inline-candidate func=%s instrs=%d temps=%d params=%d\n%!"
+              f.name (List.length candidate.store_scalar_block.body)
+              candidate.store_scalar_func.temp_count
+              (List.length candidate.store_scalar_func.params))
+    funcs;
+  table
+
+let rewrite_late_store_scalar_calls_func
+    (table : (string, late_store_scalar_inline_candidate) Hashtbl.t)
+    (f : Cfg.func) =
+  let next_temp = ref f.temp_count in
+  let sites_left = ref late_scalar_inline_max_sites_per_func in
+  let replaced = ref 0 in
+
+  let expand_call dst_opt args
+      (candidate : late_store_scalar_inline_candidate) =
+    let callee = candidate.store_scalar_func in
+    if List.length args <> List.length callee.params then None
+    else
+      let temp_base = !next_temp in
+      next_temp := temp_base + callee.temp_count;
+      let rename_temp temp = temp_base + temp in
+      let rename_operand = rewrite_operand_temp rename_temp in
+      let param_args = Hashtbl.create (max 4 (List.length callee.params)) in
+      List.iter2
+        (fun (param : Tcg.var) arg -> Hashtbl.replace param_args param.id arg)
+        callee.params args;
+      let clone_instr = function
+        | Tcg.Load (temp, Tcg.Local id) -> (
+            match Hashtbl.find_opt param_args id with
+            | Some arg ->
+                simplify_simple_instr
+                  (Tcg.Move (rename_temp temp, arg))
+            | None ->
+                failwith
+                  "internal item7 store scalar inline non-parameter local load")
+        | Tcg.Store (Tcg.Local _, _) ->
+            failwith "internal item7 store scalar inline local store"
+        | instr ->
+            rewrite_instr_temps rename_temp instr
+      in
+      let body =
+        List.map clone_instr candidate.store_scalar_block.body
+      in
+      let suffix =
+        match dst_opt with
+        | None -> []
+        | Some dst ->
+            [
+              simplify_simple_instr
+                (Tcg.Move
+                   (dst, rename_operand candidate.store_scalar_return));
+            ]
+      in
+      Some (body @ suffix)
+  in
+
+  let rewrite_body body =
+    let rec loop rev_acc = function
+      | [] -> List.rev rev_acc
+      | Tcg.Call (dst_opt, callee, args) as instr :: rest
+        when !sites_left > 0 -> (
+          match Hashtbl.find_opt table callee with
+          | Some candidate when callee <> f.label -> (
+              match expand_call dst_opt args candidate with
+              | Some expanded ->
+                  decr sites_left;
+                  incr replaced;
+                  loop (List.rev_append expanded rev_acc) rest
+              | None ->
+                  loop (instr :: rev_acc) rest)
+          | Some _ | None ->
+              loop (instr :: rev_acc) rest)
+      | instr :: rest ->
+          loop (instr :: rev_acc) rest
+    in
+    loop [] body
+  in
+
+  let blocks =
+    List.map
+      (fun (block : Cfg.block) ->
+        { block with body = rewrite_body block.body })
+      f.blocks
+  in
+  if !replaced = 0 then (f, 0)
+  else
+    let rewritten =
+      Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
+    in
+    (rewritten, !replaced)
+
+let inline_late_store_scalar_calls_program globals (funcs : Cfg.func list) =
+  let total_replaced = ref 0 in
+  let rec iterate fuel current =
+    if fuel = 0 then current
+    else
+      let table = build_late_store_scalar_inline_table current in
+      if Hashtbl.length table = 0 then current
+      else
+        let changed = ref false in
+        let expanded =
+          List.map
+            (fun (f : Cfg.func) ->
+              let next, count =
+                rewrite_late_store_scalar_calls_func table f
+              in
+              if count > 0 then begin
+                changed := true;
+                total_replaced := !total_replaced + count
+              end;
+              next)
+            current
+        in
+        if not !changed then current
+        else
+          let fresh_summaries =
+            compute_func_summaries globals expanded
+          in
+          let fresh_return_global_demands =
+            compute_return_global_demands fresh_summaries globals expanded
+          in
+          let cleaned =
+            List.map
+              (fun (f : Cfg.func) ->
+                let return_globals =
+                  match Hashtbl.find_opt fresh_return_global_demands f.label with
+                  | Some return_globals -> return_globals
+                  | None -> globals
+                in
+                eliminate_dead_code_func
+                  fresh_summaries globals return_globals f)
+              expanded
+          in
+          iterate (fuel - 1) cleaned
+  in
+  let result = iterate 3 funcs in
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_STORE_INLINE" <> None then
+    Printf.eprintf
+      "item7-store-inline replaced=%d\n%!" !total_replaced;
+  result
+
+
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
   last_liveness_cache := None;
@@ -31910,6 +32155,9 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   in
   let optimized_funcs =
     refresh_final_effect_sets_dce_program summaries globals optimized_funcs
+  in
+  let optimized_funcs =
+    inline_late_store_scalar_calls_program globals optimized_funcs
   in
   item7_debug_inline_effect_capability summaries removable_calls globals optimized_funcs;
   { Cfg.funcs = optimized_funcs }
