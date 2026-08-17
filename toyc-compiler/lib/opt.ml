@@ -21102,128 +21102,15 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                         || IntSet.mem iv.phi_temp live_t_exit)
                       ivs
                   in
-                  let with_control =
-                    if
-                      List.exists
-                        (fun (iv : basic_induction_var) ->
-                          iv.phi_temp = info.control_iv.phi_temp)
-                        syntactic_live
-                    then
+                  if
+                    List.exists
+                      (fun (iv : basic_induction_var) ->
+                        iv.phi_temp = info.control_iv.phi_temp)
                       syntactic_live
-                    else
-                      info.control_iv :: syntactic_live
-                  in
-
-                  (* v58: a split/rotated loop can lose the physical edge-copy
-                     shape required by [collect_basic_induction_vars] while the
-                     unified recurrence layer still proves a logical AddRec.
-
-                     Do NOT expose semantic IVs to the general reduction/carrier
-                     analysis.  Admit one only as a final live-out IV update,
-                     and only when:
-                       - the temp is live at the loop exit;
-                       - it is a constant-step scalar AddRec;
-                       - it is not already represented by a syntactic/control IV;
-                       - at the actual control-block exit its recurrence phase is
-                         exactly zero.
-
-                     The phase-zero condition is the key safety guard: the
-                     summary is entered from that control point, so
-                       final = current + trip * step
-                     is valid only when [phi_temp] denotes the logical current
-                     iteration value there. *)
-                  let represented =
-                    List.fold_left
-                      (fun acc (iv : basic_induction_var) ->
-                        IntSet.add iv.phi_temp acc)
-                      IntSet.empty
-                      with_control
-                  in
-                  let semantic_live =
-                    recurrence_facts.recurrence_addrecs
-                    |> List.filter_map
-                         (fun (addrec : loop_addrec) ->
-                           match loop_inv_expr_const_opt addrec.addrec_step with
-                           | None ->
-                               if debug_counted
-                                  && IntSet.mem addrec.addrec_phi_temp live_t_exit
-                               then
-                                 debugf
-                                   "counted-semantic-live-iv-reject func=%s header=%s phi=t%d reason=nonconstant-step step=%s"
-                                   f.name header addrec.addrec_phi_temp
-                                   (string_of_loop_inv_expr addrec.addrec_step);
-                               None
-                           | Some step ->
-                               let temp = addrec.addrec_phi_temp in
-                               if
-                                 IntSet.mem temp represented
-                                 || not (IntSet.mem temp live_t_exit)
-                               then
-                                 None
-                               else
-                                 match
-                                   recurrence_phase_at
-                                     recurrence_facts
-                                     addrec
-                                     (RecurrenceBlockExit info.control_label)
-                                 with
-                                 | RecurrencePhaseKnown 0 ->
-                                     (* v59: consume the already-proved logical
-                                        AddRec directly.
-
-                                        Do not call [basic_iv_of_scalar_addrec]
-                                        here.  That helper deliberately
-                                        re-derives physical outside-edge moves,
-                                        which split/rotated loops may no longer
-                                        carry even though [analyze_loop_addrecs]
-                                        has already proved the logical
-                                        recurrence.
-
-                                        For a live-out final update we only use
-                                          current + trip * step.
-                                        The current value is validated at the
-                                        exact summary-entry program point by the
-                                        phase-zero requirement below, so no
-                                        physical-PHI reconstruction is needed. *)
-                                     let iv : basic_induction_var =
-                                       {
-                                         phi_temp = temp;
-                                         outside_inputs =
-                                           addrec.addrec_outside_inputs;
-                                         backedge_preds =
-                                           addrec.addrec_backedge_preds;
-                                         step;
-                                         origin = `Semantic;
-                                       }
-                                     in
-                                     if debug_counted then
-                                       debugf
-                                         "counted-semantic-live-iv func=%s header=%s control=%s phi=t%d step=%Ld phase=0 source=direct-addrec outside=%d backedges=%d"
-                                         f.name header info.control_label
-                                         temp step
-                                         (List.length addrec.addrec_outside_inputs)
-                                         (List.length addrec.addrec_backedge_preds);
-                                     Some iv
-                                 | RecurrencePhaseKnown phase ->
-                                     if debug_counted then
-                                       debugf
-                                         "counted-semantic-live-iv-reject func=%s header=%s phi=t%d reason=phase phase=%d"
-                                         f.name header temp phase;
-                                     None
-                                 | RecurrencePhaseUnseen ->
-                                     if debug_counted then
-                                       debugf
-                                         "counted-semantic-live-iv-reject func=%s header=%s phi=t%d reason=phase-unseen"
-                                         f.name header temp;
-                                     None
-                                 | RecurrencePhaseConflict ->
-                                     if debug_counted then
-                                       debugf
-                                         "counted-semantic-live-iv-reject func=%s header=%s phi=t%d reason=phase-conflict"
-                                         f.name header temp;
-                                     None)
-                  in
-                  with_control @ semantic_live
+                  then
+                    syntactic_live
+                  else
+                    info.control_iv :: syntactic_live
                 in
                 let loop_live_defs =
                   IntSet.inter loop_defs live_t_exit
@@ -28786,6 +28673,74 @@ let optimize_func global_init summaries globals return_globals removable_calls (
              ~removable_calls summaries globals return_globals
         |> copy_coalesce_func summaries globals
       in
+
+      (* v61: diamond splitting creates two generated loop phases whose
+         recurrence/control facts often become fully recoverable only after the
+         late algebra/runtime-summary cleanup above.
+
+         The older post-summary counted retry is intentionally gated on
+           optimized_loop_count < canonical_loop_count
+         because it was designed for nested-summary follow-up.  A successful
+         diamond split does the opposite (typically one loop becomes two), so
+         that gate can never service the generated split loops.
+
+         Give only compiler-generated split CFGs one final counted-loop
+         opportunity at the mature late IR.  This does not weaken any counted
+         proof: [eliminate_counted_loops_func] performs the same control,
+         recurrence, trip-count, live-out, and phase checks as before.  If it
+         cannot eliminate anything, discard the analysis attempt and preserve
+         [late_runtime_cleaned] byte-for-byte. *)
+      let has_generated_split_loop (func : Cfg.func) =
+        List.exists
+          (fun (block : Cfg.block) ->
+            contains_substring block.label "_split_pre_"
+            || contains_substring block.label "_split_post_")
+          func.blocks
+      in
+      let late_split_counted =
+        if not (has_generated_split_loop late_runtime_cleaned) then
+          late_runtime_cleaned
+        else
+          let retry_candidate =
+            eliminate_counted_loops_func
+              global_init summaries globals late_runtime_cleaned
+          in
+          if retry_candidate = late_runtime_cleaned then begin
+            if Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None then
+              Printf.eprintf
+                "counted-late-split-retry func=%s result=no-followup loops=%d\n%!"
+                late_runtime_cleaned.name
+                (let _, _, headers =
+                   discover_natural_loops late_runtime_cleaned
+                 in
+                 List.length headers);
+            late_runtime_cleaned
+          end else begin
+            let cleaned =
+              retry_candidate
+              |> thread_and_prune_func
+              |> simplify_cfg_func
+              |> const_propagate_func global_init summaries globals
+              |> eliminate_dead_code_func
+                   ~removable_calls summaries globals return_globals
+            in
+            if Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None then
+              Printf.eprintf
+                "counted-late-split-retry func=%s result=applied loops=%d->%d blocks=%d->%d\n%!"
+                late_runtime_cleaned.name
+                (let _, _, headers =
+                   discover_natural_loops late_runtime_cleaned
+                 in
+                 List.length headers)
+                (let _, _, headers =
+                   discover_natural_loops cleaned
+                 in
+                 List.length headers)
+                (List.length late_runtime_cleaned.blocks)
+                (List.length cleaned.blocks);
+            cleaned
+          end
+      in
       if Sys.getenv_opt "TOYC_DEBUG_LATE_ALGEBRA" <> None then begin
         let before = metrics_of_func late_promoted in
         let after_algebra = metrics_of_func late_algebra in
@@ -28801,8 +28756,14 @@ let optimize_func global_init summaries globals return_globals removable_calls (
           "late-runtime-cleaned"
           late_runtime_cleaned
       in
+      let () =
+        if late_split_counted <> late_runtime_cleaned then
+          debug_lcssa_stage
+            "late-split-counted-retry"
+            late_split_counted
+      in
       let with_hoisted_loop_bounds =
-        hoist_unrolled_loop_branch_immediates_func summaries globals late_runtime_cleaned
+        hoist_unrolled_loop_branch_immediates_func summaries globals late_split_counted
       in
       let final_candidate =
         final_linear_merge_func with_hoisted_loop_bounds
@@ -28817,6 +28778,7 @@ let optimize_func global_init summaries globals return_globals removable_calls (
         let fallbacks =
           [
             ("pre-final-merge", with_hoisted_loop_bounds);
+            ("late-split-counted-retry", late_split_counted);
             ("late-runtime-cleaned", late_runtime_cleaned);
             ("late-equiv-recanon", late_equiv_recanon);
             ("late-equiv-cleaned", late_equiv_cleaned);
