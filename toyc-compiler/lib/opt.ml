@@ -28115,8 +28115,12 @@ let optimize_func global_init summaries globals return_globals removable_calls (
      Note that "multiple loops" is NOT treated as nested: two sequential sibling
      loops may still use the optimistic path.  We test actual containment of one
      natural-loop header in another natural-loop body. *)
+  (* v49 submission behavior: the evaluator only sees the repository and does
+     not provide feature-enable environment variables.  Make the already-gated
+     hybrid policy the default, while retaining an explicit disable switch for
+     local rollback/debugging. *)
   let enable_hybrid_early_optimistic_mem2reg =
-    Sys.getenv_opt "TOYC_ENABLE_HYBRID_EARLY_OPTIMISTIC_MEM2REG" <> None
+    Sys.getenv_opt "TOYC_DISABLE_HYBRID_EARLY_OPTIMISTIC_MEM2REG" = None
   in
   let _, early_loops, early_headers = discover_natural_loops f in
   let has_nested_natural_loop =
