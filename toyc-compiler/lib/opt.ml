@@ -31470,9 +31470,10 @@ let fold_constant_calls_program
 (*   Call(Some dst, f, [Imm ...]) -> Move(dst, Imm result)                    *)
 (*   Call(None,     f, [Imm ...]) -> <removed>                               *)
 (*                                                                            *)
-(* A successful [constant_eval_func] run proves, for this concrete call path, *)
-(* termination within the hard evaluator budget and absence of global stores  *)
-(* or nested calls. Global loads are accepted only when supplied through the   *)
+(* A successful bounded program-call evaluation proves, for this concrete      *)
+(* call tree, termination within the shared evaluator budget and absence of     *)
+(* executed global stores/unsupported calls. Global loads are accepted only     *)
+(* when supplied through the v24 readonly-global environment.                   *)
 (* v24 readonly-global environment. Division/modulo by zero causes evaluation  *)
 (* failure, so potentially trapping calls are left untouched.  No DCE/GVN or  *)
 (* full optimize_func re-entry is performed afterwards.                       *)
@@ -31487,6 +31488,236 @@ let item7_collect_immediate_args (args : Tcg.operand list) =
         None
   in
   collect [] args
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v28: bounded recursive / nested constant evaluation                  *)
+(*                                                                            *)
+(* [constant_eval_func] deliberately rejects nested calls.  Once a root call   *)
+(* is concrete, however, a nested direct call may itself become concrete only  *)
+(* after executing earlier instructions (e.g. fact(n - 1) is passed as a Temp, *)
+(* not an Imm in the CFG).  Interpret such calls recursively instead of        *)
+(* inlining them.  Safety is intentionally resource-bounded rather than based   *)
+(* on recursion shape:                                                         *)
+(*   - all executed call arguments must evaluate to concrete i32 values;        *)
+(*   - global stores and unknown/missing calls reject the whole evaluation;     *)
+(*   - global loads are allowed only through the proven [known_globals] map;    *)
+(*   - Div/Mod failure (including division by zero) rejects evaluation;         *)
+(*   - one shared execution budget covers the whole call tree;                  *)
+(*   - a hard call-depth cap protects the compiler stack;                       *)
+(*   - re-entering the exact same (callee,args) state while active detects      *)
+(*     direct/mutual non-progress cycles early;                                 *)
+(*   - successful completed call states are memoized, which also makes          *)
+(*     Fibonacci-like constant recursion compile-time tractable when bounded.   *)
+(*                                                                            *)
+(* Failure never changes program semantics: the original Call is simply kept.  *)
+(* -------------------------------------------------------------------------- *)
+
+let item7_recursive_const_eval_max_depth = 256
+
+type item7_recursive_const_eval_success = {
+  item7_recursive_value : int64;
+  item7_recursive_nested_calls : int;
+  item7_recursive_max_depth : int;
+}
+
+let item7_constant_eval_program_call
+    ?(known_globals = PlaceMap.empty)
+    (func_by_label : (string, Cfg.func) Hashtbl.t)
+    root_callee
+    root_args =
+  let budget = ref constant_eval_call_budget in
+  let nested_calls = ref 0 in
+  let max_depth_seen = ref 0 in
+  let memo : (string, int64 option) Hashtbl.t = Hashtbl.create 64 in
+  let active : (string, unit) Hashtbl.t = Hashtbl.create 32 in
+  let consume () =
+    decr budget;
+    !budget >= 0
+  in
+  let call_key callee args =
+    callee
+    ^ "("
+    ^ String.concat "," (List.map Int64.to_string args)
+    ^ ")"
+  in
+  let rec eval_call depth callee args =
+    if depth > item7_recursive_const_eval_max_depth then None
+    else
+      let key = call_key callee args in
+      match Hashtbl.find_opt memo key with
+      | Some result -> result
+      | None ->
+          if Hashtbl.mem active key || not (consume ()) then None
+          else begin
+            Hashtbl.replace active key ();
+            if depth > !max_depth_seen then max_depth_seen := depth;
+            let result =
+              match Hashtbl.find_opt func_by_label callee with
+              | Some callee_func -> eval_func depth callee_func args
+              | None -> None
+            in
+            Hashtbl.remove active key;
+            Hashtbl.replace memo key result;
+            result
+          end
+  and eval_func depth (f : Cfg.func) args =
+    if List.length args <> List.length f.params then None
+    else
+      let blocks = Hashtbl.create (max 8 (List.length f.blocks)) in
+      List.iter
+        (fun (block : Cfg.block) ->
+          Hashtbl.replace blocks block.label block)
+        f.blocks;
+      let temps : (int, int64) Hashtbl.t =
+        Hashtbl.create (max 16 f.temp_count)
+      in
+      let locals : (int, int64) Hashtbl.t =
+        Hashtbl.create (max 8 (List.length f.params))
+      in
+      List.iter2
+        (fun (param : Tcg.var) value ->
+          Hashtbl.replace locals param.id (i32 value))
+        f.params args;
+      let eval_operand = function
+        | Tcg.Imm value -> Some (i32 value)
+        | Tcg.Temp temp -> Hashtbl.find_opt temps temp
+      in
+      let rec eval_operands acc = function
+        | [] -> Some (List.rev acc)
+        | operand :: rest -> (
+            match eval_operand operand with
+            | Some value -> eval_operands (i32 value :: acc) rest
+            | None -> None)
+      in
+      let set_temp temp value =
+        Hashtbl.replace temps temp (i32 value)
+      in
+      let exec_instr = function
+        | Tcg.Move (dst, src) -> (
+            match eval_operand src with
+            | Some value ->
+                set_temp dst value;
+                true
+            | None -> false)
+        | Tcg.Un (dst, op, src) -> (
+            match eval_operand src with
+            | Some value -> (
+                match fold_unop op value with
+                | Some result ->
+                    set_temp dst result;
+                    true
+                | None -> false)
+            | None -> false)
+        | Tcg.Bin (dst, op, lhs, rhs) -> (
+            match (eval_operand lhs, eval_operand rhs) with
+            | Some lhs, Some rhs -> (
+                match fold_binop op lhs rhs with
+                | Some result ->
+                    set_temp dst result;
+                    true
+                | None -> false)
+            | _ -> false)
+        | Tcg.Load (dst, Tcg.Local id) -> (
+            match Hashtbl.find_opt locals id with
+            | Some value ->
+                set_temp dst value;
+                true
+            | None -> false)
+        | Tcg.Store (Tcg.Local id, src) -> (
+            match eval_operand src with
+            | Some value ->
+                Hashtbl.replace locals id (i32 value);
+                true
+            | None -> false)
+        | Tcg.Load (dst, (Tcg.Global _ as place)) -> (
+            match PlaceMap.find_opt place known_globals with
+            | Some value ->
+                set_temp dst value;
+                true
+            | None -> false)
+        | Tcg.Store (Tcg.Global _, _) ->
+            false
+        | Tcg.Call (Some dst, callee, call_args) -> (
+            match eval_operands [] call_args with
+            | Some concrete_args ->
+                incr nested_calls;
+                begin
+                  match eval_call (depth + 1) callee concrete_args with
+                  | Some value ->
+                      set_temp dst value;
+                      true
+                  | None -> false
+                end
+            | None -> false)
+        | Tcg.Call (None, callee, call_args) -> (
+            match eval_operands [] call_args with
+            | Some concrete_args ->
+                incr nested_calls;
+                begin
+                  match eval_call (depth + 1) callee concrete_args with
+                  | Some _ -> true
+                  | None -> false
+                end
+            | None -> false)
+      in
+      let rec exec_body = function
+        | [] -> true
+        | instr :: rest ->
+            if consume () && exec_instr instr then exec_body rest
+            else false
+      in
+      let rec run label =
+        if not (consume ()) then None
+        else
+          match Hashtbl.find_opt blocks label with
+          | None -> None
+          | Some (block : Cfg.block) ->
+              if not (exec_body block.body) then None
+              else
+                match block.term with
+                | Cfg.Jump next -> run next
+                | Cfg.BranchZero (cond, if_zero, if_nonzero) -> (
+                    match eval_operand cond with
+                    | Some value ->
+                        run
+                          (if i32 value = 0L
+                           then if_zero
+                           else if_nonzero)
+                    | None -> None)
+                | Cfg.BranchNonZero (cond, if_nonzero, if_zero) -> (
+                    match eval_operand cond with
+                    | Some value ->
+                        run
+                          (if i32 value <> 0L
+                           then if_nonzero
+                           else if_zero)
+                    | None -> None)
+                | Cfg.BranchCompare
+                    (op, lhs, rhs, if_true, if_false) -> (
+                    match (eval_operand lhs, eval_operand rhs) with
+                    | Some lhs, Some rhs -> (
+                        match fold_binop op lhs rhs with
+                        | Some result ->
+                            run
+                              (if truth result then if_true else if_false)
+                        | None -> None)
+                    | _ -> None)
+                | Cfg.Return (Some value) ->
+                    Option.map i32 (eval_operand value)
+                | Cfg.Return None ->
+                    None
+      in
+      run f.entry
+  in
+  match eval_call 0 root_callee root_args with
+  | Some value ->
+      Some
+        {
+          item7_recursive_value = i32 value;
+          item7_recursive_nested_calls = !nested_calls;
+          item7_recursive_max_depth = !max_depth_seen;
+        }
+  | None -> None
 
 let fold_safe_late_constant_calls_program
     ?(known_globals = PlaceMap.empty)
@@ -31507,7 +31738,7 @@ let fold_safe_late_constant_calls_program
           Hashtbl.replace func_by_label f.label f)
         current;
 
-      let memo : (string, int64 option) Hashtbl.t =
+      let memo : (string, item7_recursive_const_eval_success option) Hashtbl.t =
         Hashtbl.create 32
       in
       let eval_call callee args =
@@ -31521,10 +31752,8 @@ let fold_safe_late_constant_calls_program
         | Some result -> result
         | None ->
             let result =
-              match Hashtbl.find_opt func_by_label callee with
-              | Some callee_func ->
-                  constant_eval_func ~known_globals callee_func args
-              | None -> None
+              item7_constant_eval_program_call
+                ~known_globals func_by_label callee args
             in
             Hashtbl.replace memo key result;
             result
@@ -31546,15 +31775,18 @@ let fold_safe_late_constant_calls_program
                             match item7_collect_immediate_args call_args with
                             | Some args -> (
                                 match eval_call callee args with
-                                | Some value ->
+                                | Some eval_result ->
+                                    let value = eval_result.item7_recursive_value in
                                     changed_any := true;
                                     changed_func := true;
                                     incr total_value;
                                     if debug then
                                       Printf.eprintf
-                                        "item7-const-call-fold caller=%s callee=%s site=%s kind=value argc=%d value=%Ld\n%!"
+                                        "item7-const-call-fold caller=%s callee=%s site=%s kind=value argc=%d value=%Ld nested=%d depth=%d\n%!"
                                         caller.name callee block.label
-                                        (List.length args) (i32 value);
+                                        (List.length args) (i32 value)
+                                        eval_result.item7_recursive_nested_calls
+                                        eval_result.item7_recursive_max_depth;
                                     Tcg.Move (dst, Tcg.Imm (i32 value)) :: acc
                                 | None -> instr :: acc)
                             | None -> instr :: acc)
@@ -31562,15 +31794,17 @@ let fold_safe_late_constant_calls_program
                             match item7_collect_immediate_args call_args with
                             | Some args -> (
                                 match eval_call callee args with
-                                | Some _value ->
+                                | Some eval_result ->
                                     changed_any := true;
                                     changed_func := true;
                                     incr total_void;
                                     if debug then
                                       Printf.eprintf
-                                        "item7-const-call-fold caller=%s callee=%s site=%s kind=resultless argc=%d\n%!"
+                                        "item7-const-call-fold caller=%s callee=%s site=%s kind=resultless argc=%d nested=%d depth=%d\n%!"
                                         caller.name callee block.label
-                                        (List.length args);
+                                        (List.length args)
+                                        eval_result.item7_recursive_nested_calls
+                                        eval_result.item7_recursive_max_depth;
                                     acc
                                 | None -> instr :: acc)
                             | None -> instr :: acc)
@@ -33908,6 +34142,201 @@ let inline_late_divmod_sparse_oversize_cycle_calls_program
   result
 
 
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v27: plain single-block-loop CFG inline                              *)
+(*                                                                            *)
+(* After default-on constant-parameter specialization and safe whole-call     *)
+(* evaluation, the post-const residual audit still exposes a narrow cyclic     *)
+(* hole not covered by the Div/Mod-specific v13/v18 families: small helpers    *)
+(* with exactly one natural loop, whose loop body is one CFG block, and whose  *)
+(* body contains only ordinary Move/Un/Bin plus parameter/global Loads.        *)
+(*                                                                            *)
+(* This is the non-Div/Mod counterpart of v13.  It deliberately keeps the      *)
+(* already-proven ordinary CFG size envelope and the shared static-growth      *)
+(* profitability policy; it does NOT relax the budget for the six remaining    *)
+(* growth-heavy Div/Mod cyclic residuals.  Store, nested Call, Div/Mod, bad     *)
+(* Local loads, Return None, self-recursion, and richer/multi-loop CFGs remain  *)
+(* outside this family.                                                        *)
+(*                                                                            *)
+(* The generic CFG cloner preserves every edge/backedge and only redirects     *)
+(* Return(Some v) to the caller continuation.  No full optimize_func re-entry  *)
+(* or post-inline DCE is run here.                                             *)
+(* -------------------------------------------------------------------------- *)
+
+let late_plain_singleblock_cycle_candidate
+    (f : Cfg.func) : Cfg.func option =
+  if f.ret <> TInt then None
+  else
+    let view =
+      f
+      |> thread_and_prune_func
+      |> simplify_cfg_func
+      |> final_linear_merge_func
+      |> thread_and_prune_func
+    in
+    if not (cfg_targets_valid view) then None
+    else
+      let reachable = reachable_labels view.entry view.blocks in
+      let blocks =
+        List.filter
+          (fun (block : Cfg.block) -> LabelSet.mem block.label reachable)
+          view.blocks
+      in
+      let view = { view with blocks } in
+      let block_count = List.length blocks in
+      let instr_count =
+        List.fold_left
+          (fun acc (block : Cfg.block) -> acc + List.length block.body)
+          0 blocks
+      in
+      let clone_units = item7_cfg_clone_units blocks in
+      let param_ids =
+        List.fold_left
+          (fun acc (param : Tcg.var) -> IntSet.add param.id acc)
+          IntSet.empty view.params
+      in
+      let instr_safe = function
+        | Tcg.Move _ | Tcg.Un _ -> true
+        | Tcg.Bin (_, (Div | Mod), _, _) -> false
+        | Tcg.Bin _ -> true
+        | Tcg.Load (_, Tcg.Local id) -> IntSet.mem id param_ids
+        | Tcg.Load (_, Tcg.Global _) -> true
+        | Tcg.Store _ | Tcg.Call _ -> false
+      in
+      let term_safe = function
+        | Cfg.Return (Some _)
+        | Cfg.Jump _
+        | Cfg.BranchZero _
+        | Cfg.BranchNonZero _
+        | Cfg.BranchCompare _ ->
+            true
+        | Cfg.Return None -> false
+      in
+      let has_value_return =
+        List.exists
+          (fun (block : Cfg.block) ->
+            match block.term with
+            | Cfg.Return (Some _) -> true
+            | Cfg.Return None
+            | Cfg.Jump _
+            | Cfg.BranchZero _
+            | Cfg.BranchNonZero _
+            | Cfg.BranchCompare _ ->
+                false)
+          blocks
+      in
+      let all_safe =
+        List.for_all
+          (fun (block : Cfg.block) ->
+            List.for_all instr_safe block.body && term_safe block.term)
+          blocks
+      in
+      if
+        block_count < 2
+        || block_count > late_branch_inline_max_blocks
+        || instr_count > late_branch_inline_max_instrs
+        || clone_units > item7_inline_static_growth_instr_budget
+        || view.temp_count > late_branch_inline_max_temps
+        || not all_safe
+        || not has_value_return
+      then None
+      else
+        let ignored = Hashtbl.create 1 in
+        if cfg_acyclic_ignoring_edges view ignored then None
+        else
+          let report = build_loop_simplify_report view in
+          let forest = report.loop_simplify_forest in
+          match forest.loop_forest_headers, forest.loop_forest_roots with
+          | [ header ], [ root ] when header = root ->
+              begin
+                match
+                  Hashtbl.find_opt forest.loop_forest_infos header,
+                  Hashtbl.find_opt report.loop_simplify_infos header
+                with
+                | Some loop_info, Some simplify_info
+                  when LabelSet.cardinal loop_info.loop_info_blocks = 1
+                       && List.length loop_info.loop_info_latches = 1
+                       && List.length loop_info.loop_info_exit_edges = 1
+                       && simplify_info.loop_simplify_single_latch
+                       && simplify_info.loop_simplify_single_exit_control ->
+                    Some view
+                | Some _, Some _ | None, _ | _, None -> None
+              end
+          | _ -> None
+
+let build_late_plain_singleblock_cycle_table
+    (funcs : Cfg.func list) : (string, Cfg.func) Hashtbl.t =
+  let table = Hashtbl.create (max 8 (List.length funcs)) in
+  List.iter
+    (fun (f : Cfg.func) ->
+      match late_plain_singleblock_cycle_candidate f with
+      | None -> ()
+      | Some candidate ->
+          Hashtbl.replace table f.label candidate;
+          if Sys.getenv_opt "TOYC_DEBUG_ITEM7_PLAIN_CYCLE_INLINE" <> None then
+            Printf.eprintf
+              "item7-plain-cycle-candidate func=%s blocks=%d instrs=%d clone-units=%d temps=%d params=%d\n%!"
+              f.name (List.length candidate.blocks)
+              (List.fold_left
+                 (fun acc (block : Cfg.block) -> acc + List.length block.body)
+                 0 candidate.blocks)
+              (item7_cfg_clone_units candidate.blocks)
+              candidate.temp_count (List.length candidate.params))
+    funcs;
+  table
+
+let inline_late_plain_singleblock_cycle_calls_func
+    (table : (string, Cfg.func) Hashtbl.t)
+    (f : Cfg.func) =
+  let rec apply serial fuel count current =
+    if fuel = 0 then (current, count)
+    else
+      match
+        find_item7_cfg_growth_profitable_site_v16
+          "plain-cycle" table current
+      with
+      | None -> (current, count)
+      | Some site ->
+          match inline_one_late_store_cfg_call serial current site with
+          | None -> (current, count)
+          | Some next ->
+              apply (serial + 1) (fuel - 1) (count + 1) next
+  in
+  apply 0 late_store_cfg_inline_max_sites_per_func 0 f
+
+let inline_late_plain_singleblock_cycle_calls_program
+    (funcs : Cfg.func list) =
+  let total_replaced = ref 0 in
+  let rec iterate fuel current =
+    if fuel = 0 then current
+    else
+      let table = build_late_plain_singleblock_cycle_table current in
+      if Hashtbl.length table = 0 then current
+      else
+        let changed = ref false in
+        let next =
+          List.map
+            (fun (f : Cfg.func) ->
+              let rewritten, count =
+                inline_late_plain_singleblock_cycle_calls_func table f
+              in
+              if count > 0 then begin
+                changed := true;
+                total_replaced := !total_replaced + count
+              end;
+              rewritten)
+            current
+        in
+        if !changed then iterate (fuel - 1) next else current
+  in
+  let result = iterate 3 funcs in
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_PLAIN_CYCLE_INLINE" <> None then
+    Printf.eprintf
+      "item7-plain-cycle-inline replaced=%d\n%!" !total_replaced;
+  result
+
+
 (* -------------------------------------------------------------------------- *)
 (* item7 v14: generalized inline-profitability feature audit                  *)
 (*                                                                            *)
@@ -35173,6 +35602,13 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
     item7_readonly_global_values global_init globals optimized_funcs
   in
   let () = item7_debug_readonly_global_values item7_readonly_globals in
+  (* item7 v27 fix1: run the stronger whole-call constant evaluator before
+     the weaker plain cyclic CFG inliner.  Otherwise an all-constant call
+     that could collapse to [Move (dst, Imm k)] may be consumed by the
+     inliner first, exposing a runtime loop and shadowing constantization. *)
+  (* item7 v28: the safe whole-call evaluator is now program-aware and may
+     recursively interpret concrete nested/direct recursive calls.  It still
+     runs before plain-cycle inline so whole-call elimination gets first refusal. *)
   let optimized_funcs =
     fold_safe_late_constant_calls_program
       ~known_globals:item7_readonly_globals
@@ -35181,6 +35617,9 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let () =
     item7_debug_callsite_global_snapshot
       global_init globals item7_readonly_globals optimized_funcs
+  in
+  let optimized_funcs =
+    inline_late_plain_singleblock_cycle_calls_program optimized_funcs
   in
   let () = item7_debug_post_const_residual globals optimized_funcs in
   let () = item7_debug_const_eval_failure_reasons optimized_funcs in
