@@ -9143,42 +9143,12 @@ let find_recurrence_loop_control_candidate
     (facts : recurrence_facts)
     multi_defs
     def_instrs =
-  let debug_control =
-    Sys.getenv_opt "TOYC_DEBUG_SCEV_CONTROL" <> None
-  in
-  let debugf fmt =
-    if debug_control then
-      Printf.ksprintf (fun msg -> Printf.eprintf "%s\n%!" msg) fmt
-    else
-      Printf.ksprintf (fun _ -> ()) fmt
-  in
-  let string_of_operand_local = function
-    | Tcg.Imm value -> Printf.sprintf "%Ld" value
-    | Tcg.Temp temp -> Printf.sprintf "t%d" temp
-  in
-  let string_of_recurrence_opt = function
-    | None -> "none"
-    | Some recurrence -> string_of_scalar_recurrence recurrence
-  in
-  let string_of_invariant_opt = function
-    | None -> "none"
-    | Some expr -> string_of_loop_inv_expr expr
-  in
   let loop = facts.recurrence_loop in
   let match_one label varying bound =
     let point = RecurrenceBlockExit label in
-    let varying_rec = recurrence_at facts point varying in
-    let bound_inv = recurrence_invariant_at facts point bound in
-    debugf
-      "scev-control-match header=%s label=%s varying=%s bound=%s varying_rec=%s bound_inv=%s"
-      facts.recurrence_header label
-      (string_of_operand_local varying)
-      (string_of_operand_local bound)
-      (string_of_recurrence_opt varying_rec)
-      (string_of_invariant_opt bound_inv);
     match
-      ( varying_rec,
-        bound_inv )
+      ( recurrence_at facts point varying,
+        recurrence_invariant_at facts point bound )
     with
     | Some
         ((ScalarAddRec _ | ScalarAffine _) as recurrence),
@@ -9208,13 +9178,6 @@ let find_recurrence_loop_control_candidate
            when
              LabelSet.mem if_true loop
              <> LabelSet.mem if_false loop ->
-             debugf
-               "scev-control-outward header=%s label=%s lhs=%s rhs=%s true=%s true_in=%b false=%s false_in=%b"
-               facts.recurrence_header label
-               (string_of_operand_local lhs)
-               (string_of_operand_local rhs)
-               if_true (LabelSet.mem if_true loop)
-               if_false (LabelSet.mem if_false loop);
              let true_in = LabelSet.mem if_true loop in
              let continue_op, inside_label, exit_label =
                if true_in then
@@ -9296,16 +9259,7 @@ let find_recurrence_loop_control_candidate
                         bound_expr);
                  candidate)
                matched
-         | Some (_op, lhs, rhs, if_true, if_false) ->
-             debugf
-               "scev-control-internal-branch header=%s label=%s lhs=%s rhs=%s true=%s true_in=%b false=%s false_in=%b"
-               facts.recurrence_header label
-               (string_of_operand_local lhs)
-               (string_of_operand_local rhs)
-               if_true (LabelSet.mem if_true loop)
-               if_false (LabelSet.mem if_false loop);
-             None
-         | None ->
+         | Some _ | None ->
              None)
 
 let proven_counted_control_of_recurrence_candidate
@@ -9368,73 +9322,6 @@ let proven_counted_control_of_recurrence_candidate
                     kind;
                   })
                 (build_kind control_iv.step)
-
-          (* v63: loop rotation turns the canonical pre-test
-
-                 while (i < bound) { body; i = i + step; }
-
-             into a guarded body whose latch tests the post-step value:
-
-                 body;
-                 i = i + step;
-                 if (i < bound) goto body;
-
-             In the unified recurrence domain this appears as
-
-                 Affine(phi=i, step=step, scale=1, bias=step).
-
-             The counted backend already represents this exactly as
-             [CountUpLt(bound, bias)] and computes
-
-                 ceil((bound - bias - i) / step).
-
-             Keep the semantic extension deliberately narrow:
-               - only compiler-generated split loops;
-               - the control block is distinct from the rotated header;
-               - zero logical start;
-               - unit scale;
-               - positive LT recurrence;
-               - bias is exactly one recurrence step.
-
-             This is the post-step rotation identity, not a general affine
-             relaxation.  All existing trip/live/phase proofs still run. *)
-          | Some 1L, Some bias
-            when
-              contains_substring header "_split_"
-              && candidate.recurrence_control_label <> header
-              && candidate.recurrence_control_op = Lt
-              && control_iv.step > 0L
-              && bias = control_iv.step
-              && loop_inv_expr_const_opt
-                   spec.symbolic_trip_start
-                 = Some 0L ->
-              if
-                Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS"
-                <> None
-              then
-                Printf.eprintf
-                  "counted-semantic-rotated-control-hit header=%s control=%s phi=t%d step=%Ld bias=%Ld\n%!"
-                  header
-                  candidate.recurrence_control_label
-                  control_iv.phi_temp
-                  control_iv.step
-                  bias;
-              Some
-                {
-                  control_iv;
-                  control_label =
-                    candidate.recurrence_control_label;
-                  inside_label =
-                    candidate.recurrence_control_inside_label;
-                  exit_label =
-                    candidate.recurrence_control_exit_label;
-                  kind =
-                    CountUpLt
-                      ( candidate
-                          .recurrence_control_bound_operand,
-                        bias );
-                }
-
           | Some scale, Some bias
             when
               candidate.recurrence_control_op = Lt
@@ -10222,220 +10109,6 @@ let find_counted_loop_control_semantic
     (proven_counted_control_of_recurrence_candidate
        header loop get_block facts)
 
-(* Recover direct logical AddRecs from a rotated linear counted loop.
-
-   [summarize_runtime_symbolic_affine_loops_func] already performs this
-   reconstruction locally for shapes such as
-
-       body(header):    x = x + c; jump control
-       control(latch):  if (i < bound) body else exit
-
-   After loop rotation the physical edge-copy/PHI shape can disappear, so the
-   general AddRec collector may miss [i] and other self-updated live values even
-   though the loop has a unique linear control path.  Counted elimination needs
-   the same facts.
-
-   Keep this deliberately structural and conservative:
-   - exactly one outward BranchCompare in the natural loop;
-   - the in-loop continuation reaches that compare through jump-only blocks;
-   - that chain covers the complete loop;
-   - only direct self Add/Sub updates with loop-invariant deltas are recovered;
-   - each recovered temp has exactly one such update in the loop body.
-
-   These AddRecs are only additional facts.  All existing counted-control,
-   trip-count, live-out and phase proofs still run afterwards. *)
-let recover_rotated_direct_addrecs_for_counted
-    header loop get_block
-    loop_defs multi_defs def_instrs
-    existing_addrecs =
-  let header_block : Cfg.block = get_block header in
-  let outside_preds =
-    List.filter
-      (fun pred -> not (LabelSet.mem pred loop))
-      header_block.preds
-  in
-  let internal_preds =
-    List.filter
-      (fun pred -> LabelSet.mem pred loop)
-      header_block.preds
-  in
-  match outside_preds, internal_preds with
-  | [ preheader_label ], _ :: _ ->
-      let loop_blocks =
-        LabelSet.elements loop |> List.map get_block
-      in
-      let outward_controls =
-        List.filter_map
-          (fun (block : Cfg.block) ->
-            match block.term with
-            | Cfg.BranchCompare
-                (_op, _lhs, _rhs, if_true, if_false) ->
-                let true_inside = LabelSet.mem if_true loop in
-                let false_inside = LabelSet.mem if_false loop in
-                if true_inside = false_inside then
-                  None
-                else
-                  let continue_label =
-                    if true_inside then if_true else if_false
-                  in
-                  Some (block, continue_label)
-            | Cfg.BranchZero _
-            | Cfg.BranchNonZero _
-            | Cfg.Jump _
-            | Cfg.Return _ ->
-                None)
-          loop_blocks
-      in
-      begin
-        match outward_controls with
-        | [ (control_block, continue_label) ] ->
-            let rec trace_chain visited labels_rev instrs label =
-              if label = control_block.label then
-                Some (visited, List.rev labels_rev, instrs)
-              else if
-                not (LabelSet.mem label loop)
-                || LabelSet.mem label visited
-              then
-                None
-              else
-                let block : Cfg.block = get_block label in
-                match block.term with
-                | Cfg.Jump next ->
-                    trace_chain
-                      (LabelSet.add label visited)
-                      (label :: labels_rev)
-                      (instrs @ block.body)
-                      next
-                | Cfg.BranchZero _
-                | Cfg.BranchNonZero _
-                | Cfg.BranchCompare _
-                | Cfg.Return _ ->
-                    None
-            in
-            let traced =
-              if continue_label = control_block.label then
-                Some (LabelSet.empty, [], [])
-              else
-                trace_chain
-                  LabelSet.empty [] [] continue_label
-            in
-            begin
-              match traced with
-              | Some (visited_body, _body_labels, prefix_instrs)
-                when
-                  LabelSet.equal
-                    (LabelSet.add control_block.label visited_body)
-                    loop ->
-                  let body_instrs =
-                    prefix_instrs @ control_block.body
-                  in
-                  let existing_temps =
-                    List.fold_left
-                      (fun acc (addrec : loop_addrec) ->
-                        IntSet.add addrec.addrec_phi_temp acc)
-                      IntSet.empty
-                      existing_addrecs
-                  in
-                  let step_of_direct_update = function
-                    | Tcg.Bin
-                        (dst, Add, Tcg.Temp lhs, rhs)
-                      when dst = lhs ->
-                        Option.map
-                          normalize_loop_inv_expr
-                          (lve_invariant_expr_of_operand
-                             loop_defs multi_defs
-                             def_instrs rhs)
-                    | Tcg.Bin
-                        (dst, Add, lhs, Tcg.Temp rhs)
-                      when dst = rhs ->
-                        Option.map
-                          normalize_loop_inv_expr
-                          (lve_invariant_expr_of_operand
-                             loop_defs multi_defs
-                             def_instrs lhs)
-                    | Tcg.Bin
-                        (dst, Sub, Tcg.Temp lhs, rhs)
-                      when dst = lhs ->
-                        Option.map
-                          (fun step ->
-                            normalize_loop_inv_expr
-                              (LveNeg step))
-                          (lve_invariant_expr_of_operand
-                             loop_defs multi_defs
-                             def_instrs rhs)
-                    | Tcg.Move _
-                    | Tcg.Un _
-                    | Tcg.Bin _
-                    | Tcg.Load _
-                    | Tcg.Store _
-                    | Tcg.Call _ ->
-                        None
-                  in
-                  let grouped =
-                    List.fold_left
-                      (fun table instr ->
-                        match defs_temp instr with
-                        | Some dst
-                          when not (IntSet.mem dst existing_temps) ->
-                            begin
-                              match step_of_direct_update instr with
-                              | Some step ->
-                                  let old =
-                                    Option.value
-                                      ~default:[]
-                                      (IntMap.find_opt dst table)
-                                  in
-                                  IntMap.add dst (step :: old) table
-                              | None ->
-                                  table
-                            end
-                        | Some _
-                        | None ->
-                            table)
-                      IntMap.empty
-                      body_instrs
-                  in
-                  IntMap.bindings grouped
-                  |> List.filter_map
-                       (fun (dst, steps) ->
-                         match steps with
-                         | [ step ] ->
-                             let addrec =
-                               {
-                                 addrec_phi_temp = dst;
-                                 addrec_outside_inputs =
-                                   [ (preheader_label, Tcg.Temp dst) ];
-                                 addrec_backedge_preds =
-                                   internal_preds;
-                                 addrec_step = step;
-                               }
-                             in
-                             if
-                               Sys.getenv_opt
-                                 "TOYC_DEBUG_COUNTED_LOOPS"
-                               <> None
-                             then
-                               Printf.eprintf
-                                 "counted-rotated-addrec header=%s control=%s phi=t%d step=%s\n%!"
-                                 header control_block.label dst
-                                 (string_of_loop_inv_expr step);
-                             Some addrec
-                         | []
-                         | _ :: _ :: _ ->
-                             None)
-              | Some _
-              | None ->
-                  []
-            end
-        | []
-        | _ :: _ :: _ ->
-            []
-      end
-  | [], _
-  | _ :: _ :: _, _
-  | _, [] ->
-      []
-
 let analyze_counted_loop_for_elimination
     header loop get_block temp_count blocks =
   let loop_defs, def_blocks, def_instrs, multi_defs =
@@ -10447,36 +10120,10 @@ let analyze_counted_loop_for_elimination
       header loop get_block
       def_blocks multi_defs def_instrs
   in
-  let base_recurrence_analysis =
+  let recurrence_analysis =
     build_loop_recurrence_analysis
       header loop get_block
       loop_defs multi_defs def_instrs
-  in
-  let rotated_direct_addrecs =
-    recover_rotated_direct_addrecs_for_counted
-      header loop get_block
-      loop_defs multi_defs def_instrs
-      base_recurrence_analysis.loop_recurrence_addrecs
-  in
-  let recurrence_analysis =
-    if rotated_direct_addrecs = [] then
-      base_recurrence_analysis
-    else
-      let combined_addrecs =
-        base_recurrence_analysis.loop_recurrence_addrecs
-        @ rotated_direct_addrecs
-      in
-      let combined_facts =
-        build_recurrence_facts
-          header loop get_block
-          loop_defs multi_defs def_instrs
-          combined_addrecs
-      in
-      {
-        base_recurrence_analysis with
-        loop_recurrence_addrecs = combined_addrecs;
-        loop_recurrence_facts = combined_facts;
-      }
   in
   let syntactic_ivs =
     recurrence_analysis.loop_recurrence_syntactic_ivs
@@ -21455,128 +21102,15 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                         || IntSet.mem iv.phi_temp live_t_exit)
                       ivs
                   in
-                  let with_control =
-                    if
-                      List.exists
-                        (fun (iv : basic_induction_var) ->
-                          iv.phi_temp = info.control_iv.phi_temp)
-                        syntactic_live
-                    then
+                  if
+                    List.exists
+                      (fun (iv : basic_induction_var) ->
+                        iv.phi_temp = info.control_iv.phi_temp)
                       syntactic_live
-                    else
-                      info.control_iv :: syntactic_live
-                  in
-
-                  (* v58: a split/rotated loop can lose the physical edge-copy
-                     shape required by [collect_basic_induction_vars] while the
-                     unified recurrence layer still proves a logical AddRec.
-
-                     Do NOT expose semantic IVs to the general reduction/carrier
-                     analysis.  Admit one only as a final live-out IV update,
-                     and only when:
-                       - the temp is live at the loop exit;
-                       - it is a constant-step scalar AddRec;
-                       - it is not already represented by a syntactic/control IV;
-                       - at the actual control-block exit its recurrence phase is
-                         exactly zero.
-
-                     The phase-zero condition is the key safety guard: the
-                     summary is entered from that control point, so
-                       final = current + trip * step
-                     is valid only when [phi_temp] denotes the logical current
-                     iteration value there. *)
-                  let represented =
-                    List.fold_left
-                      (fun acc (iv : basic_induction_var) ->
-                        IntSet.add iv.phi_temp acc)
-                      IntSet.empty
-                      with_control
-                  in
-                  let semantic_live =
-                    recurrence_facts.recurrence_addrecs
-                    |> List.filter_map
-                         (fun (addrec : loop_addrec) ->
-                           match loop_inv_expr_const_opt addrec.addrec_step with
-                           | None ->
-                               if debug_counted
-                                  && IntSet.mem addrec.addrec_phi_temp live_t_exit
-                               then
-                                 debugf
-                                   "counted-semantic-live-iv-reject func=%s header=%s phi=t%d reason=nonconstant-step step=%s"
-                                   f.name header addrec.addrec_phi_temp
-                                   (string_of_loop_inv_expr addrec.addrec_step);
-                               None
-                           | Some step ->
-                               let temp = addrec.addrec_phi_temp in
-                               if
-                                 IntSet.mem temp represented
-                                 || not (IntSet.mem temp live_t_exit)
-                               then
-                                 None
-                               else
-                                 match
-                                   recurrence_phase_at
-                                     recurrence_facts
-                                     addrec
-                                     (RecurrenceBlockExit info.control_label)
-                                 with
-                                 | RecurrencePhaseKnown 0 ->
-                                     (* v59: consume the already-proved logical
-                                        AddRec directly.
-
-                                        Do not call [basic_iv_of_scalar_addrec]
-                                        here.  That helper deliberately
-                                        re-derives physical outside-edge moves,
-                                        which split/rotated loops may no longer
-                                        carry even though [analyze_loop_addrecs]
-                                        has already proved the logical
-                                        recurrence.
-
-                                        For a live-out final update we only use
-                                          current + trip * step.
-                                        The current value is validated at the
-                                        exact summary-entry program point by the
-                                        phase-zero requirement below, so no
-                                        physical-PHI reconstruction is needed. *)
-                                     let iv : basic_induction_var =
-                                       {
-                                         phi_temp = temp;
-                                         outside_inputs =
-                                           addrec.addrec_outside_inputs;
-                                         backedge_preds =
-                                           addrec.addrec_backedge_preds;
-                                         step;
-                                         origin = `Semantic;
-                                       }
-                                     in
-                                     if debug_counted then
-                                       debugf
-                                         "counted-semantic-live-iv func=%s header=%s control=%s phi=t%d step=%Ld phase=0 source=direct-addrec outside=%d backedges=%d"
-                                         f.name header info.control_label
-                                         temp step
-                                         (List.length addrec.addrec_outside_inputs)
-                                         (List.length addrec.addrec_backedge_preds);
-                                     Some iv
-                                 | RecurrencePhaseKnown phase ->
-                                     if debug_counted then
-                                       debugf
-                                         "counted-semantic-live-iv-reject func=%s header=%s phi=t%d reason=phase phase=%d"
-                                         f.name header temp phase;
-                                     None
-                                 | RecurrencePhaseUnseen ->
-                                     if debug_counted then
-                                       debugf
-                                         "counted-semantic-live-iv-reject func=%s header=%s phi=t%d reason=phase-unseen"
-                                         f.name header temp;
-                                     None
-                                 | RecurrencePhaseConflict ->
-                                     if debug_counted then
-                                       debugf
-                                         "counted-semantic-live-iv-reject func=%s header=%s phi=t%d reason=phase-conflict"
-                                         f.name header temp;
-                                     None)
-                  in
-                  with_control @ semantic_live
+                  then
+                    syntactic_live
+                  else
+                    info.control_iv :: syntactic_live
                 in
                 let loop_live_defs =
                   IntSet.inter loop_defs live_t_exit
@@ -25566,62 +25100,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
         doms def_blocks multi_defs
         [ preheader_label ] operand
     in
-
-    (* v64: diamond splitting materializes the prefix-loop bound into one temp
-       on mutually exclusive incoming paths:
-
-           take_outer:  bound_tmp = outer
-           take_prefix: bound_tmp = prefix
-                       \ /
-                    preheader
-
-       Such a temp is intentionally multi-defined, so the generic LVE
-       availability predicate rejects it unconditionally.  For the runtime
-       summary guard, however, the value is safe to read after the preheader
-       exactly when every incoming edge has an unambiguous reaching Move for
-       that temp.
-
-       Keep this proof local to runtime-summary bound operands.  It does not
-       relax general multi-def availability. *)
-    let path_merged_move_available_at_preheader preheader_label temp =
-      let preheader : Cfg.block = get_block preheader_label in
-      preheader.preds <> []
-      && List.for_all
-           (fun pred ->
-             match
-               reaching_move_cases_on_edge
-                 get_block
-                 ~stop_label:preheader_label
-                 ~pred_label:pred
-                 temp
-             with
-             | Some cases -> cases <> []
-             | None -> false)
-           preheader.preds
-    in
-
-    let runtime_bound_available
-        def_blocks multi_defs preheader_label operand =
-      if
-        operand_available_at_preheader
-          def_blocks multi_defs preheader_label operand
-      then
-        true
-      else
-        match operand with
-        | Tcg.Imm _ -> true
-        | Tcg.Temp temp
-          when IntSet.mem temp multi_defs
-               && path_merged_move_available_at_preheader
-                    preheader_label temp ->
-            if Sys.getenv_opt "TOYC_DEBUG_LVE_SUMMARY" <> None then
-              Printf.eprintf
-                "lve-runtime-path-merged-bound preheader=%s temp=t%d result=available\n%!"
-                preheader_label temp;
-            true
-        | Tcg.Temp _ ->
-            false
-    in
     let next_temp = ref f.temp_count in
     let fresh_temp () =
       let temp = !next_temp in
@@ -25688,13 +25166,12 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
             name
             (String.concat "," (List.map string_of_lve_operand args))
     in
-    let reaching_seed_values_on_edge ~header ~pred_label temp =
+    let reaching_seed_on_edge ~header ~pred_label temp =
       match
         reaching_move_cases_on_edge
           get_block ~stop_label:header ~pred_label temp
       with
-      | None ->
-          None
+      | None -> None
       | Some cases ->
           let values =
             cases
@@ -25703,14 +25180,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                    resolve_chain_operand
                      case.reaching_chain case.reaching_source)
           in
-          if values = [] then None else Some values
-    in
-    let reaching_seed_on_edge ~header ~pred_label temp =
-      match
-        reaching_seed_values_on_edge ~header ~pred_label temp
-      with
-      | None -> None
-      | Some values ->
           (match values with
            | [] -> None
            | first :: rest
@@ -26997,6 +26466,17 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                           reaching_seed_on_edge
                             ~header ~pred_label:preheader_label iv_temp
                         in
+                        (if debug then
+                           Printf.eprintf
+                             "lve-runtime-summary-candidate func=%s header=%s iv=t%d scale=%s bias=%s step=%s bound=%s init=%s\n%!"
+                             f.name header iv_temp
+                             (string_of_loop_inv_expr control_scale)
+                             (string_of_loop_inv_expr control_bias)
+                             (string_of_loop_inv_expr step_expr)
+                             (string_of_lve_operand bound_operand)
+                             (match initial_iv with
+                              | Some operand -> string_of_lve_operand operand
+                              | None -> "<unknown>"));
                         let initial_iv_expr =
                           Option.bind initial_iv invariant_expr
                         in
@@ -27009,242 +26489,45 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                           | None ->
                               false
                         in
-
-                        (* v65: a split-post loop can be entered in two legal
-                           ways: directly from the split dispatch, or after the
-                           split-pre loop reaches its boundary.  The two
-                           incoming edge-copy seeds for the IV are therefore
-                           intentionally different, so requiring one common
-                           SCEV start rejects the exact CFG produced by the
-                           diamond splitter.
-
-                           For the very narrow rotated split-post shape
-                             control = iv + step
-                             iv += positive_constant_step
-                           prove that every preheader->header path has a
-                           reaching edge-copy seed, then snapshot the current
-                           IV on the summary path.  That runtime value is the
-                           exact path-specific loop start.  The snapshot is a
-                           fresh temp only; every failed runtime proof still
-                           falls back to the untouched original loop. *)
-                        let dynamic_start_seed_values =
-                          if
-                            contains_substring header "_split_post_"
-                            && initial_iv = None
-                            && loop_inv_expr_equal
-                                 control_scale scalar_inv_one
-                            && loop_inv_expr_equal
-                                 control_bias step_expr
-                          then
-                            match loop_inv_expr_const_opt step_expr with
-                            | Some step when step > 0L ->
-                                reaching_seed_values_on_edge
-                                  ~header
-                                  ~pred_label:preheader_label
-                                  iv_temp
-                            | Some _
-                            | None ->
-                                None
-                          else
-                            None
-                        in
-                        (* v66: after loop rotation, [preheader_label] is a
-                           synthetic rotate guard.  Requiring a reaching
-                           mem2reg Move for [iv_temp] is unnecessarily strict:
-                           the guard itself already reads the current IV to
-                           decide whether the post loop executes.
-
-                           This is a stronger local proof of availability:
-                             - this is exactly a compiler-generated rotate guard;
-                             - its branch has one successor inside this loop and
-                               one outside, with the inside edge entering
-                               [header];
-                             - the guard condition uses [iv_temp];
-                             - the guard body does not redefine [iv_temp].
-
-                           Therefore the value observed by the guard on the
-                           taken edge is exactly the path-specific pre-body
-                           start.  Snapshotting it in the summary values block
-                           preserves both direct->post and pre->bridge->post
-                           entries without guessing a common seed. *)
-                        let dynamic_start_rotate_guard =
-                          is_rotate_guard_label preheader_label
-                          && last_def_of_temp preheader iv_temp = None
-                          && IntSet.mem
-                               iv_temp
-                               (add_term_use_temps
-                                  IntSet.empty preheader.term)
-                          &&
-                          match
-                            classify_loop_rotate_targets
-                              loop preheader.term
-                          with
-                          | Some (inside_label, _outside_label) ->
-                              inside_label = header
-                          | None ->
-                              false
-                        in
-                        let dynamic_start_snapshot =
-                          match dynamic_start_seed_values with
-                          | Some (_ :: _) ->
-                              Some (fresh_temp ())
-                          | Some [] ->
-                              None
-                          | None when dynamic_start_rotate_guard ->
-                              Some (fresh_temp ())
-                          | None ->
-                              None
-                        in
-                        let () =
-                          if debug && contains_substring header "_split_post_" then
-                            Printf.eprintf
-                              "lve-runtime-dynamic-post-gate func=%s header=%s preheader=%s init-none=%b scale-one=%b bias-step=%b step=%s seed=%s rotate-guard=%b\n%!"
-                              f.name header preheader_label
-                              (initial_iv = None)
-                              (loop_inv_expr_equal control_scale scalar_inv_one)
-                              (loop_inv_expr_equal control_bias step_expr)
-                              (string_of_loop_inv_expr step_expr)
-                              (match dynamic_start_seed_values with
-                               | Some values -> Printf.sprintf "some:%d" (List.length values)
-                               | None -> "none")
-                              dynamic_start_rotate_guard
-                        in
-                        (if debug then
-                           Printf.eprintf
-                             "lve-runtime-summary-candidate func=%s header=%s iv=t%d scale=%s bias=%s step=%s bound=%s init=%s\n%!"
-                             f.name header iv_temp
-                             (string_of_loop_inv_expr control_scale)
-                             (string_of_loop_inv_expr control_bias)
-                             (string_of_loop_inv_expr step_expr)
-                             (string_of_lve_operand bound_operand)
-                             (match initial_iv, dynamic_start_snapshot with
-                              | Some operand, _ ->
-                                  string_of_lve_operand operand
-                              | None, Some snapshot ->
-                                  Printf.sprintf
-                                    "<dynamic-current:t%d>" snapshot
-                              | None, None ->
-                                  "<unknown>"));
                         let semantic_start_agrees =
-                          match dynamic_start_snapshot with
-                          | Some _ ->
-                              true
-                          | None ->
-                              match
-                                (symbolic_trip_spec, initial_iv_expr)
-                              with
-                              | Some spec, Some expr ->
-                                  loop_inv_expr_equal
-                                    spec.symbolic_trip_start
-                                    (normalize_loop_inv_expr expr)
-                              | Some _, None ->
-                                  false
-                              | None, _ ->
-                                  initial_zero
+                          match
+                            (symbolic_trip_spec, initial_iv_expr)
+                          with
+                          | Some spec, Some expr ->
+                              loop_inv_expr_equal
+                                spec.symbolic_trip_start
+                                (normalize_loop_inv_expr expr)
+                          | Some _, None ->
+                              false
+                          | None, _ ->
+                              initial_zero
                         in
                         if not semantic_start_agrees then
                           reject header
                             "initial-iv-scev-start-mismatch"
                         else
-                          let () =
-                            match dynamic_start_snapshot with
-                            | Some snapshot when debug ->
-                                Printf.eprintf
-                                  "lve-runtime-dynamic-post-start func=%s header=%s iv=t%d snapshot=t%d proof=%s incoming-cases=%d\n%!"
-                                  f.name header iv_temp snapshot
-                                  (if dynamic_start_rotate_guard
-                                   then "rotate-guard-use"
-                                   else "reaching-seed")
-                                  (match dynamic_start_seed_values with
-                                   | Some values -> List.length values
-                                   | None -> 0)
-                            | Some _
-                            | None ->
-                                ()
-                          in
-                          let summary_start_expr =
-                            match dynamic_start_snapshot with
-                            | Some snapshot ->
-                                LveOperand (Tcg.Temp snapshot)
-                            | None ->
-                                match symbolic_trip_spec with
-                                | Some spec ->
-                                    spec.symbolic_trip_start
-                                | None ->
-                                    scalar_inv_zero
-                          in
                           let proof_control_start_expr =
-                            match dynamic_start_snapshot with
-                            | Some snapshot ->
-                                normalize_loop_inv_expr
-                                  (LveAdd
-                                     ( LveMul
-                                         ( control_scale,
-                                           LveOperand
-                                             (Tcg.Temp snapshot) ),
-                                       control_bias ))
+                            match symbolic_trip_spec with
+                            | Some spec ->
+                                symbolic_trip_control_start spec
                             | None ->
-                                match symbolic_trip_spec with
-                                | Some spec ->
-                                    symbolic_trip_control_start spec
-                                | None ->
-                                    control_bias
+                                control_bias
                           in
                           let control_start_available =
-                            match dynamic_start_snapshot with
-                            | Some _ ->
-                                true
-                            | None ->
-                                lve_expr_available_before_preds
-                                  doms def_blocks multi_defs
-                                  [ preheader_label ]
-                                  proof_control_start_expr
+                            lve_expr_available_before_preds
+                              doms def_blocks multi_defs
+                              [ preheader_label ]
+                              proof_control_start_expr
                           in
                           let step_available =
                             lve_expr_available_before_preds
                               doms def_blocks multi_defs
                               [ preheader_label ] step_expr
                           in
-                          let rotate_guard_bound_available =
-                            match bound_operand with
-                            | Tcg.Imm _ ->
-                                true
-                            | Tcg.Temp temp ->
-                                is_rotate_guard_label preheader_label
-                                && last_def_of_temp preheader temp = None
-                                && IntSet.mem
-                                     temp
-                                     (add_term_use_temps
-                                        IntSet.empty preheader.term)
-                                &&
-                                match
-                                  classify_loop_rotate_targets
-                                    loop preheader.term
-                                with
-                                | Some (inside_label, _outside_label) ->
-                                    inside_label = header
-                                | None ->
-                                    false
-                          in
                           let bound_available =
-                            runtime_bound_available
+                            operand_available_at_preheader
                               def_blocks multi_defs preheader_label
                               bound_operand
-                            || rotate_guard_bound_available
-                          in
-                          let () =
-                            if
-                              debug
-                              && rotate_guard_bound_available
-                              && not
-                                   (runtime_bound_available
-                                      def_blocks multi_defs
-                                      preheader_label bound_operand)
-                            then
-                              Printf.eprintf
-                                "lve-runtime-rotate-guard-bound func=%s header=%s preheader=%s bound=%s result=available\n%!"
-                                f.name header preheader_label
-                                (string_of_lve_operand bound_operand)
                           in
                           let scale_available =
                             lve_expr_available_before_preds
@@ -27347,77 +26630,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                               List.filter
                                 (fun (_, dst, _) -> dst <> iv_temp)
                                 self_adds
-                            in
-                            let () =
-                              if debug then begin
-                                let live_exit_diag =
-                                  table_find_or_empty
-                                    live_in_t exit_label IntSet.empty
-                                in
-                                let loop_live_defs_diag =
-                                  IntSet.inter loop_defs live_exit_diag
-                                in
-                                let body_string =
-                                  body_indexed
-                                  |> List.map
-                                       (fun (index, instr) ->
-                                         Printf.sprintf
-                                           "%d:%s"
-                                           index
-                                           (string_of_simple_instr instr))
-                                  |> String.concat ";"
-                                in
-                                Printf.eprintf
-                                  "lve-runtime-body func=%s header=%s iv=t%d live-out={%s} instrs=[%s]\n%!"
-                                  f.name header iv_temp
-                                  (String.concat ","
-                                     (List.map string_of_int
-                                        (IntSet.elements
-                                           loop_live_defs_diag)))
-                                  body_string;
-                                IntSet.iter
-                                  (fun temp ->
-                                    let defs =
-                                      body_indexed
-                                      |> List.filter_map
-                                           (fun (index, instr) ->
-                                             match defs_temp instr with
-                                             | Some dst when dst = temp ->
-                                                 Some
-                                                   (Printf.sprintf
-                                                      "%d:%s"
-                                                      index
-                                                      (string_of_simple_instr
-                                                         instr))
-                                             | Some _
-                                             | None ->
-                                                 None)
-                                      |> String.concat ";"
-                                    in
-                                    Printf.eprintf
-                                      "lve-runtime-live-def func=%s header=%s temp=t%d multi=%b defs=[%s]\n%!"
-                                      f.name header temp
-                                      (IntSet.mem temp multi_defs)
-                                      defs)
-                                  loop_live_defs_diag
-                              end
-                            in
-                            let () =
-                              if debug then begin
-                                let show_one (index, dst, operand) =
-                                  Printf.sprintf
-                                    "%d:t%d+=%s"
-                                    index dst
-                                    (string_of_lve_operand operand)
-                                in
-                                Printf.eprintf
-                                  "lve-runtime-reduction-shape func=%s header=%s iv=t%d self-adds=[%s] non-iv=[%s]\n%!"
-                                  f.name header iv_temp
-                                  (String.concat ";"
-                                     (List.map show_one self_adds))
-                                  (String.concat ";"
-                                     (List.map show_one non_iv))
-                              end
                             in
 
                             (* Phase-aware direct affine reduction analysis.
@@ -27682,96 +26894,40 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                   None
                             in
 
-                            let match_direct_reductions () =
-                              let rec collect seen_accs acc = function
-                                | [] ->
-                                    if acc = [] then None
-                                    else Some (List.rev acc)
-                                | (acc_index, acc_temp, delta_operand) :: rest ->
-                                    if acc_temp = iv_temp then begin
-                                      if debug then
-                                        Printf.eprintf
-                                          "lve-runtime-multi-reduction-reject func=%s header=%s acc=t%d reason=is-control-iv\n%!"
-                                          f.name header acc_temp;
-                                      None
-                                    end
-                                    else if IntSet.mem acc_temp seen_accs then begin
-                                      if debug then
-                                        Printf.eprintf
-                                          "lve-runtime-multi-reduction-reject func=%s header=%s acc=t%d reason=duplicate-accumulator\n%!"
-                                          f.name header acc_temp;
-                                      None
-                                    end
-                                    else
-                                      match
-                                        direct_delta_affine_of_operand
-                                          acc_index IntSet.empty
-                                          delta_operand
-                                      with
-                                      | None ->
-                                          if debug then
-                                            Printf.eprintf
-                                              "lve-runtime-multi-reduction-reject func=%s header=%s acc=t%d index=%d delta=%s reason=delta-not-affine\n%!"
-                                              f.name header acc_temp acc_index
-                                              (string_of_lve_operand
-                                                 delta_operand);
-                                          None
-                                      | Some (delta_scale, delta_bias) ->
-                                          let delta_scale =
-                                            normalize_loop_inv_expr delta_scale
-                                          in
-                                          let delta_bias =
-                                            normalize_loop_inv_expr delta_bias
-                                          in
-                                          let scale_available =
-                                            lve_expr_available_before_preds
-                                              doms def_blocks multi_defs
-                                              [ preheader_label ] delta_scale
-                                          in
-                                          let bias_available =
-                                            lve_expr_available_before_preds
-                                              doms def_blocks multi_defs
-                                              [ preheader_label ] delta_bias
-                                          in
-                                          if
-                                            not scale_available
-                                            || not bias_available
-                                          then begin
-                                            if debug then
-                                              Printf.eprintf
-                                                "lve-runtime-multi-reduction-reject func=%s header=%s acc=t%d index=%d delta=%s reason=operand-unavailable scale=%s scale-ok=%b bias=%s bias-ok=%b\n%!"
-                                                f.name header acc_temp acc_index
-                                                (string_of_lve_operand
-                                                   delta_operand)
-                                                (string_of_loop_inv_expr
-                                                   delta_scale)
-                                                scale_available
-                                                (string_of_loop_inv_expr
-                                                   delta_bias)
-                                                bias_available;
-                                            None
-                                          end
-                                          else begin
-                                            if debug then
-                                              Printf.eprintf
-                                                "lve-runtime-multi-reduction-hit func=%s header=%s acc=t%d index=%d delta=%s scale=%s bias=%s\n%!"
-                                                f.name header acc_temp acc_index
-                                                (string_of_lve_operand
-                                                   delta_operand)
-                                                (string_of_loop_inv_expr
-                                                   delta_scale)
-                                                (string_of_loop_inv_expr
-                                                   delta_bias);
-                                            collect
-                                              (IntSet.add acc_temp seen_accs)
-                                              ( ( acc_temp,
-                                                  delta_scale,
-                                                  delta_bias )
-                                                :: acc )
-                                              rest
-                                          end
-                              in
-                              collect IntSet.empty [] non_iv
+                            let match_direct_reduction () =
+                              match non_iv with
+                              | [ (acc_index, acc_temp, delta_operand) ]
+                                when acc_temp <> iv_temp ->
+                                  Option.bind
+                                    (direct_delta_affine_of_operand
+                                       acc_index IntSet.empty delta_operand)
+                                    (fun (delta_scale, delta_bias) ->
+                                      let delta_scale =
+                                        normalize_loop_inv_expr delta_scale
+                                      in
+                                      let delta_bias =
+                                        normalize_loop_inv_expr delta_bias
+                                      in
+                                      let scale_available =
+                                        lve_expr_available_before_preds
+                                          doms def_blocks multi_defs
+                                          [ preheader_label ] delta_scale
+                                      in
+                                      let bias_available =
+                                        lve_expr_available_before_preds
+                                          doms def_blocks multi_defs
+                                          [ preheader_label ] delta_bias
+                                      in
+                                      if scale_available && bias_available then
+                                        Some
+                                          (`DirectAffine
+                                            ( acc_temp,
+                                              delta_scale,
+                                              delta_bias ))
+                                      else
+                                        None)
+                              | _ ->
+                                  None
                             in
 
                             let match_move_accumulator_carrier () =
@@ -27901,9 +27057,9 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                         derived_temp,
                                         delta_operand ))
                               | None ->
-                                  (match match_direct_reductions () with
-                                   | Some reductions ->
-                                       Some (`DirectAffines reductions)
+                                  (match match_direct_reduction () with
+                                   | Some _ as direct ->
+                                       direct
                                    | None ->
                                        (match match_pair () with
                                         | Some
@@ -27922,27 +27078,21 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                   "no-runtime-affine-reduction"
                             | Some reduction_shape ->
                                 (match reduction_shape with
-                                 | `DirectAffines reductions when debug ->
-                                     List.iter
-                                       (fun (acc, scale, bias) ->
-                                         Printf.eprintf
-                                           "lve-runtime-direct-affine-reduction func=%s header=%s iv=t%d acc=t%d scale=%s bias=%s step=%s\n%!"
-                                           f.name header iv_temp acc
-                                           (string_of_loop_inv_expr scale)
-                                           (string_of_loop_inv_expr bias)
-                                           (string_of_lve_operand step_operand))
-                                       reductions
-                                 | `DirectAffines _
+                                 | `DirectAffine (acc, scale, bias) when debug ->
+                                     Printf.eprintf
+                                        "lve-runtime-direct-affine-reduction func=%s header=%s iv=t%d acc=t%d scale=%s bias=%s step=%s\n%!"
+                                        f.name header iv_temp acc
+                                        (string_of_loop_inv_expr scale)
+                                        (string_of_loop_inv_expr bias)
+                                        (string_of_lve_operand step_operand)
+                                 | `DirectAffine _
                                  | `Carrier _ ->
                                      ());
-                                let acc_temps =
+                                let acc_temp =
                                   match reduction_shape with
-                                  | `Carrier (acc, _, _) ->
-                                      [ acc ]
-                                  | `DirectAffines reductions ->
-                                      List.map
-                                        (fun (acc, _, _) -> acc)
-                                        reductions
+                                  | `Carrier (acc, _, _)
+                                  | `DirectAffine (acc, _, _) ->
+                                      acc
                                 in
                                 let live_exit =
                                   table_find_or_empty
@@ -27952,11 +27102,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                   IntSet.inter loop_defs live_exit
                                 in
                                 let supported_live_temps =
-                                  List.fold_left
-                                    (fun supported acc ->
-                                      IntSet.add acc supported)
-                                    (IntSet.singleton iv_temp)
-                                    acc_temps
+                                  IntSet.add iv_temp (IntSet.singleton acc_temp)
                                 in
                                 let supported_live_temps,
                                     reconstruction_order,
@@ -28004,6 +27150,13 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                     ( emit_loop_inv_expr
                                                         fresh_temp temp complex,
                                                       Tcg.Temp temp )
+                                              in
+                                              let summary_start_expr =
+                                                match symbolic_trip_spec with
+                                                | Some spec ->
+                                                    spec.symbolic_trip_start
+                                                | None ->
+                                                    scalar_inv_zero
                                               in
                                               let build_reduction_apply_body
                                                   trip =
@@ -28071,7 +27224,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                 in
                                                 match reduction_shape with
                                                 | `Carrier
-                                                    ( acc_temp,
+                                                    ( _,
                                                       derived_temp,
                                                       delta_operand ) ->
                                                     let
@@ -28123,7 +27276,24 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                                 Tcg.Temp
                                                                   total_delta )) ]
                                                     @ reconstruction_instrs
-                                                | `DirectAffines reductions ->
+                                                | `DirectAffine
+                                                    ( _,
+                                                      delta_scale,
+                                                      delta_bias ) ->
+                                                    let
+                                                      scale_prep,
+                                                      scale_operand
+                                                    =
+                                                      materialize_summary_inv_expr
+                                                        delta_scale
+                                                    in
+                                                    let
+                                                      bias_prep,
+                                                      bias_operand
+                                                    =
+                                                      materialize_summary_inv_expr
+                                                        delta_bias
+                                                    in
                                                     let
                                                       start_prep,
                                                       start_operand
@@ -28138,133 +27308,80 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                       build_triangle_number_instrs
                                                         fresh_temp summary_trip
                                                     in
-                                                    let
-                                                      build_one
-                                                        ( acc_temp,
-                                                          delta_scale,
-                                                          delta_bias )
-                                                      =
-                                                      let
-                                                        scale_prep,
-                                                        scale_operand
-                                                      =
-                                                        materialize_summary_inv_expr
-                                                          delta_scale
-                                                      in
-                                                      let
-                                                        bias_prep,
-                                                        bias_operand
-                                                      =
-                                                        materialize_summary_inv_expr
-                                                          delta_bias
-                                                      in
-                                                      let start_scaled =
-                                                        fresh_temp ()
-                                                      in
-                                                      let effective_bias =
-                                                        fresh_temp ()
-                                                      in
-                                                      let step_triangle =
-                                                        fresh_temp ()
-                                                      in
-                                                      let series_delta =
-                                                        fresh_temp ()
-                                                      in
-                                                      let base_delta =
-                                                        fresh_temp ()
-                                                      in
-                                                      let total_delta =
-                                                        fresh_temp ()
-                                                      in
-                                                      scale_prep
-                                                      @ bias_prep
-                                                      @ [ simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( start_scaled,
-                                                                 Mul,
-                                                                 start_operand,
-                                                                 scale_operand ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( effective_bias,
-                                                                 Add,
-                                                                 Tcg.Temp
-                                                                   start_scaled,
-                                                                 bias_operand ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( step_triangle,
-                                                                 Mul,
-                                                                 Tcg.Temp
-                                                                   triangle,
-                                                                 step_operand ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( series_delta,
-                                                                 Mul,
-                                                                 Tcg.Temp
-                                                                   step_triangle,
-                                                                 scale_operand ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( base_delta,
-                                                                 Mul,
-                                                                 Tcg.Temp
-                                                                   summary_trip,
-                                                                 Tcg.Temp
-                                                                   effective_bias ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( total_delta,
-                                                                 Add,
-                                                                 Tcg.Temp
-                                                                   base_delta,
-                                                                 Tcg.Temp
-                                                                   series_delta ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( acc_temp,
-                                                                 Add,
-                                                                 Tcg.Temp
-                                                                   acc_temp,
-                                                                 Tcg.Temp
-                                                                   total_delta )) ]
+                                                    let start_scaled =
+                                                      fresh_temp ()
+                                                    in
+                                                    let effective_bias =
+                                                      fresh_temp ()
+                                                    in
+                                                    let step_triangle =
+                                                      fresh_temp ()
+                                                    in
+                                                    let series_delta =
+                                                      fresh_temp ()
+                                                    in
+                                                    let base_delta =
+                                                      fresh_temp ()
+                                                    in
+                                                    let total_delta =
+                                                      fresh_temp ()
                                                     in
                                                     iv_update_instrs
+                                                    @ scale_prep
+                                                    @ bias_prep
                                                     @ start_prep
                                                     @ triangle_instrs
-                                                    @ List.concat_map
-                                                        build_one reductions
+                                                    @ [ simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( start_scaled,
+                                                               Mul,
+                                                               start_operand,
+                                                               scale_operand ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( effective_bias,
+                                                               Add,
+                                                               Tcg.Temp
+                                                                 start_scaled,
+                                                               bias_operand ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( step_triangle,
+                                                               Mul,
+                                                               Tcg.Temp
+                                                                 triangle,
+                                                               step_operand ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( series_delta,
+                                                               Mul,
+                                                               Tcg.Temp
+                                                                 step_triangle,
+                                                               scale_operand ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                              ( base_delta,
+                                                                Mul,
+                                                                Tcg.Temp summary_trip,
+                                                                Tcg.Temp
+                                                                  effective_bias ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( total_delta,
+                                                               Add,
+                                                               Tcg.Temp
+                                                                 base_delta,
+                                                               Tcg.Temp
+                                                                 series_delta ));
+                                                         simplify_simple_instr
+                                                           (Tcg.Bin
+                                                              ( acc_temp,
+                                                                Add,
+                                                                Tcg.Temp
+                                                                  acc_temp,
+                                                                Tcg.Temp
+                                                                  total_delta )) ]
                                                     @ reconstruction_instrs
-                                              in
-                                              let reduction_accs_string =
-                                                String.concat ","
-                                                  (List.map string_of_int
-                                                     acc_temps)
-                                              in
-                                              let reduction_shape_string =
-                                                match reduction_shape with
-                                                | `Carrier
-                                                    (_, derived, delta) ->
-                                                    Printf.sprintf
-                                                      "carrier:t%d+=%s"
-                                                      derived
-                                                      (string_of_lve_operand
-                                                         delta)
-                                                | `DirectAffines reductions ->
-                                                    reductions
-                                                    |> List.map
-                                                         (fun (acc, scale, bias) ->
-                                                           Printf.sprintf
-                                                             "t%d:scale=%s,bias=%s"
-                                                             acc
-                                                             (string_of_loop_inv_expr
-                                                                scale)
-                                                             (string_of_loop_inv_expr
-                                                                bias))
-                                                    |> String.concat ";"
-                                                    |> Printf.sprintf
-                                                         "direct-affines:[%s]"
                                               in
                                               let use_affine_runtime_proof =
                                                 match symbolic_trip_family with
@@ -28407,19 +27524,9 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                 materialize_inv_expr
                                                   proof_control_start_expr
                                               in
-                                              let dynamic_start_prep =
-                                                match dynamic_start_snapshot with
-                                                | Some snapshot ->
-                                                    [ Tcg.Move
-                                                        ( snapshot,
-                                                          Tcg.Temp iv_temp ) ]
-                                                | None ->
-                                                    []
-                                              in
                                               let values_body =
                                                 step_prep
                                                 @ scale_prep
-                                                @ dynamic_start_prep
                                                 @ control_start_prep
                                               in
                                               let values_term =
@@ -28674,7 +27781,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                               changed := true;
                                               if debug then
                                                 Printf.eprintf
-                                                  "lve-runtime-invariant-affine-summary func=%s header=%s iv=t%d scale=%s bias=%s control-start=%s accs={%s} reduction=%s step=%s bound=%s fallback=%s\n%!"
+                                                  "lve-runtime-invariant-affine-summary func=%s header=%s iv=t%d scale=%s bias=%s control-start=%s acc=t%d reduction=%s step=%s bound=%s fallback=%s\n%!"
                                                   f.name header iv_temp
                                                   (string_of_loop_inv_expr
                                                      control_scale)
@@ -28682,12 +27789,28 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                      control_bias)
                                                   (string_of_loop_inv_expr
                                                      proof_control_start_expr)
-                                                  reduction_accs_string
-                                                  reduction_shape_string
-                                                  (string_of_lve_operand
-                                                     step_operand)
-                                                  (string_of_lve_operand
-                                                     bound_operand)
+                                                  acc_temp
+                                                  (match reduction_shape with
+                                                   | `Carrier
+                                                       (_, derived, delta) ->
+                                                       Printf.sprintf
+                                                         "carrier:t%d+=%s"
+                                                         derived
+                                                         (string_of_lve_operand
+                                                            delta)
+                                                   | `DirectAffine
+                                                        (_, scale, bias) ->
+                                                        Printf.sprintf
+                                                          "direct-affine:scale=%s,bias=%s"
+                                                          (string_of_loop_inv_expr
+                                                             scale)
+                                                          (string_of_loop_inv_expr
+                                                             bias)
+                                                  )
+                                                   (string_of_lve_operand
+                                                      step_operand)
+                                                   (string_of_lve_operand
+                                                      bound_operand)
                                                   header
                                             end else begin
                                               (if scev_debug then
@@ -28842,15 +27965,31 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                               changed := true;
                                               if debug then
                                                 Printf.eprintf
-                                                  "lve-runtime-summary func=%s header=%s blocks=%d iv=t%d accs={%s} reduction=%s step=%s bound=%s fallback=%s\n%!"
+                                                  "lve-runtime-summary func=%s header=%s blocks=%d iv=t%d acc=t%d reduction=%s step=%s bound=%s fallback=%s\n%!"
                                                   f.name header
                                                   (LabelSet.cardinal loop)
                                                   iv_temp
-                                                  reduction_accs_string
-                                                  reduction_shape_string
-                                                  (string_of_lve_operand step_operand)
-                                                  (string_of_lve_operand bound_operand)
-                                                  header
+                                                  acc_temp
+                                                  (match reduction_shape with
+                                                   | `Carrier
+                                                       (_, derived, delta) ->
+                                                       Printf.sprintf
+                                                         "carrier:t%d+=%s"
+                                                         derived
+                                                         (string_of_lve_operand
+                                                            delta)
+                                                   | `DirectAffine
+                                                        (_, scale, bias) ->
+                                                        Printf.sprintf
+                                                          "direct-affine:scale=%s,bias=%s"
+                                                          (string_of_loop_inv_expr
+                                                             scale)
+                                                          (string_of_loop_inv_expr
+                                                             bias)
+                                                  )
+                                                   (string_of_lve_operand step_operand)
+                                                   (string_of_lve_operand bound_operand)
+                                                   header
                                              end)
       | _ -> reject header "outside-predecessor-count")
       headers;
@@ -28956,72 +28095,12 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       debug_lcssa_lite_report summaries globals current
     end
   in
-  (* v48 experimental hybrid early mem2reg.
-
-     v46 established that making *all* early loop PHIs optimistic is unsound
-     for the current counted-loop provenance model:
-
-       tailrec_acc_sum        21 -> 15
-       nest3_rect_small       14 -> 95
-
-     But keeping every function conservative also causes a large p07_loop
-     regression, because ordinary one-level loops never expose their scalar
-     IV/reduction PHIs early enough.
-
-     Recover that performance without re-opening the two known unsafe classes:
-       - a true nested natural-loop forest stays conservative;
-       - a synthetic tail-recursion entry stays conservative;
-       - otherwise, when explicitly enabled, use optimistic loop-PHI mem2reg.
-
-     Note that "multiple loops" is NOT treated as nested: two sequential sibling
-     loops may still use the optimistic path.  We test actual containment of one
-     natural-loop header in another natural-loop body. *)
-  (* v49 submission behavior: the evaluator only sees the repository and does
-     not provide feature-enable environment variables.  Make the already-gated
-     hybrid policy the default, while retaining an explicit disable switch for
-     local rollback/debugging. *)
-  let enable_hybrid_early_optimistic_mem2reg =
-    Sys.getenv_opt "TOYC_DISABLE_HYBRID_EARLY_OPTIMISTIC_MEM2REG" = None
-  in
-  let _, early_loops, early_headers = discover_natural_loops f in
-  let has_nested_natural_loop =
-    List.exists
-      (fun parent_header ->
-        let parent_loop =
-          table_find_or_empty early_loops parent_header LabelSet.empty
-        in
-        List.exists
-          (fun child_header ->
-            child_header <> parent_header
-            && LabelSet.mem child_header parent_loop)
-          early_headers)
-      early_headers
-  in
-  let synthetic_tail_entry =
-    contains_substring f.entry "_tail_entry_"
-  in
-  let use_early_optimistic_mem2reg =
-    enable_hybrid_early_optimistic_mem2reg
-    && not has_nested_natural_loop
-    && not synthetic_tail_entry
-  in
   let early_mem2reg =
-    if use_early_optimistic_mem2reg then
-      mem2reg_func ~optimistic_loop_phi:true f
-    else
+    if Sys.getenv_opt "TOYC_DISABLE_EARLY_OPTIMISTIC_MEM2REG" <> None then
       mem2reg_func f
+    else
+      mem2reg_func ~optimistic_loop_phi:true f
   in
-  if
-    Sys.getenv_opt "TOYC_DEBUG_EARLY_MEM2REG_MODE" <> None
-    || Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None
-  then
-    Printf.eprintf
-      "early-mem2reg-mode func=%s mode=%s nested=%b tail-entry=%b loops=%d\n%!"
-      f.name
-      (if use_early_optimistic_mem2reg then "optimistic" else "conservative")
-      has_nested_natural_loop
-      synthetic_tail_entry
-      (List.length early_headers);
   let promoted_before_move_cleanup =
     early_mem2reg |> promote_globals_func summaries globals
   in
@@ -29349,95 +28428,6 @@ let optimize_func global_init summaries globals return_globals removable_calls (
          loop-header phis can now bootstrap loop-carried locals without feeding
          the new phi/edge-copy CFG back into rotate/split/unroll passes. *)
       let late_promoted = mem2reg_func ~optimistic_loop_phi:true optimized in
-
-      (* v47 experimental post-summary counted retry.
-
-         v46 deliberately keeps the *early* mem2reg conservative because an
-         optimistic loop-phi view before any trusted loop summary is known to
-         lose value-phase/provenance information (tailrec 21->15 and
-         nest3_rect_small 14->95).
-
-         The other side of that safety fix is performance: after the normal
-         rounds have safely removed at least one natural-loop layer, the final
-         optimistic mem2reg may expose the enclosing loop-carried locals, but
-         the old late pipeline never gives counted-loop elimination another
-         chance.
-
-         Retry counted elimination only when:
-           1. the retry has not been explicitly disabled for local rollback;
-           2. the conservative normal rounds have already reduced the natural
-              loop count, proving that this is genuinely a *post-summary*
-              promotion rather than the unsafe original optimistic view;
-           3. at least one natural loop remains.
-
-         The promoted/canonicalized form is still analysis-bridge state: if the
-         retry does not eliminate anything, keep [late_promoted] unchanged. *)
-      let natural_loop_count (func : Cfg.func) =
-        let _, _, headers = discover_natural_loops func in
-        List.length headers
-      in
-      let canonical_loop_count = natural_loop_count canonical in
-      let optimized_loop_count = natural_loop_count optimized in
-      (* v50 submission behavior: post-summary retry is part of the default
-         optimization path.  The external evaluator only receives the repository,
-         so feature-enable environment variables would otherwise leave this
-         optimization permanently disabled.  Keep only a disable switch for
-         local A/B rollback. *)
-      let enable_post_summary_counted_retry =
-        Sys.getenv_opt "TOYC_DISABLE_POST_SUMMARY_COUNTED_RETRY" = None
-      in
-      let post_summary_counted_retry_eligible =
-        enable_post_summary_counted_retry
-        && optimized_loop_count > 0
-        && optimized_loop_count < canonical_loop_count
-      in
-      let late_counted =
-        if not post_summary_counted_retry_eligible then
-          late_promoted
-        else
-          let retry_seed =
-            late_promoted
-            |> loop_canonicalize_func summaries globals
-            |> const_propagate_func global_init summaries globals
-            |> thread_and_prune_func
-            |> simplify_cfg_func
-            |> algebra_canonicalize_func
-            |> general_linear_canonicalize_func
-            |> factor_common_mul_func
-            |> eliminate_dead_code_func
-                 ~removable_calls summaries globals return_globals
-          in
-          let retry_candidate =
-            eliminate_counted_loops_func
-              global_init summaries globals retry_seed
-          in
-          if retry_candidate = retry_seed then begin
-            if Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None then
-              Printf.eprintf
-                "counted-post-summary-retry func=%s result=no-followup loops=%d->%d\n%!"
-                optimized.name canonical_loop_count optimized_loop_count;
-            late_promoted
-          end else begin
-            let cleaned =
-              retry_candidate
-              |> thread_and_prune_func
-              |> simplify_cfg_func
-              |> const_propagate_func global_init summaries globals
-              |> eliminate_dead_code_func
-                   ~removable_calls summaries globals return_globals
-            in
-            if Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None then
-              Printf.eprintf
-                "counted-post-summary-retry func=%s result=applied loops=%d->%d->%d blocks=%d->%d\n%!"
-                optimized.name
-                canonical_loop_count
-                optimized_loop_count
-                (natural_loop_count cleaned)
-                (List.length late_promoted.blocks)
-                (List.length cleaned.blocks);
-            cleaned
-          end
-      in
       if Sys.getenv_opt "TOYC_DEBUG_LATE_MEM2REG" <> None then begin
         let count_local_accesses (func : Cfg.func) =
           List.fold_left
@@ -29461,16 +28451,12 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       let () =
         debug_lcssa_stage "late-mem2reg" late_promoted
       in
-      let () =
-        if late_counted <> late_promoted then
-          debug_lcssa_stage "post-summary-counted-retry" late_counted
-      in
       (* IMPORTANT: run late algebra BEFORE copy coalescing.  Late mem2reg
          deliberately creates fresh, mostly single-definition/single-use temp
          chains.  [algebra_canonicalize_func] can safely follow those chains,
          but coalescing first can merge unrelated definitions onto one temp and
          make the canonicalizer reject them as multi-def/use-heavy. *)
-      let late_algebra = algebra_canonicalize_func late_counted in
+      let late_algebra = algebra_canonicalize_func late_promoted in
       let late_linear = general_linear_canonicalize_func late_algebra in
       let late_factor = factor_common_mul_func late_linear in
       let late_pre_summary_input =
@@ -29534,61 +28520,6 @@ let optimize_func global_init summaries globals return_globals removable_calls (
              ~removable_calls summaries globals return_globals
         |> copy_coalesce_func summaries globals
       in
-
-      (* v61.1: generated split loops may become classifiable only after the
-         late cleanup above.  Give those compiler-generated loops one final
-         counted-elimination opportunity without weakening any proof. *)
-      let has_generated_split_loop (func : Cfg.func) =
-        List.exists
-          (fun (block : Cfg.block) ->
-            contains_substring block.label "_split_pre_"
-            || contains_substring block.label "_split_post_")
-          func.blocks
-      in
-      let late_split_counted =
-        if not (has_generated_split_loop late_runtime_cleaned) then
-          late_runtime_cleaned
-        else
-          let retry_candidate =
-            eliminate_counted_loops_func
-              global_init summaries globals late_runtime_cleaned
-          in
-          if retry_candidate = late_runtime_cleaned then begin
-            if Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None then
-              Printf.eprintf
-                "counted-late-split-retry func=%s result=no-followup loops=%d\n%!"
-                late_runtime_cleaned.name
-                (let _, _, headers =
-                   discover_natural_loops late_runtime_cleaned
-                 in
-                 List.length headers);
-            late_runtime_cleaned
-          end else begin
-            let cleaned =
-              retry_candidate
-              |> thread_and_prune_func
-              |> simplify_cfg_func
-              |> const_propagate_func global_init summaries globals
-              |> eliminate_dead_code_func
-                   ~removable_calls summaries globals return_globals
-            in
-            if Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None then
-              Printf.eprintf
-                "counted-late-split-retry func=%s result=applied loops=%d->%d blocks=%d->%d\n%!"
-                late_runtime_cleaned.name
-                (let _, _, headers =
-                   discover_natural_loops late_runtime_cleaned
-                 in
-                 List.length headers)
-                (let _, _, headers =
-                   discover_natural_loops cleaned
-                 in
-                 List.length headers)
-                (List.length late_runtime_cleaned.blocks)
-                (List.length cleaned.blocks);
-            cleaned
-          end
-      in
       if Sys.getenv_opt "TOYC_DEBUG_LATE_ALGEBRA" <> None then begin
         let before = metrics_of_func late_promoted in
         let after_algebra = metrics_of_func late_algebra in
@@ -29605,7 +28536,7 @@ let optimize_func global_init summaries globals return_globals removable_calls (
           late_runtime_cleaned
       in
       let with_hoisted_loop_bounds =
-        hoist_unrolled_loop_branch_immediates_func summaries globals late_split_counted
+        hoist_unrolled_loop_branch_immediates_func summaries globals late_runtime_cleaned
       in
       let final_candidate =
         final_linear_merge_func with_hoisted_loop_bounds
