@@ -3505,43 +3505,24 @@ let mem2reg_eliminate_trivial_phi_temps
     Cfg.rebuild_edges { f with blocks }
   end
 
-let mem2reg_func ?(optimistic_loop_phi = false) ?(preserve_loop_phi_shape = false) ?(legacy_all_block_scope = false) (f : Cfg.func) =
+let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
   let all_candidates = collect_local_ids f in
   let rec attempt (current : Cfg.func) candidates =
     if IntSet.is_empty candidates then current
     else begin
-      (* v52 early-scope A/B.
-         Pre-item4 mem2reg solved local liveness/forward environments over the
-         complete current CFG and all recorded predecessor edges.  Item4
-         changed that to entry-reachable blocks only.  Keep the modern
-         reachable-only behavior by default, but allow the first analysis pass
-         to reproduce the old scope without affecting later/cascade mem2reg. *)
       let reachable =
-        if legacy_all_block_scope then
-          List.fold_left
-            (fun acc (block : Cfg.block) ->
-              LabelSet.add block.label acc)
-            LabelSet.empty
-            current.blocks
-        else
-          reachable_labels current.entry current.blocks
+        reachable_labels current.entry current.blocks
       in
       let reachable_blocks =
-        if legacy_all_block_scope then
+        List.filter
+          (fun (block : Cfg.block) ->
+            LabelSet.mem block.label reachable)
           current.blocks
-        else
-          List.filter
-            (fun (block : Cfg.block) ->
-              LabelSet.mem block.label reachable)
-            current.blocks
       in
       let reachable_preds (block : Cfg.block) =
-        if legacy_all_block_scope then
+        List.filter
+          (fun pred -> LabelSet.mem pred reachable)
           block.preds
-        else
-          List.filter
-            (fun pred -> LabelSet.mem pred reachable)
-            block.preds
       in
       if Sys.getenv_opt "TOYC_DEBUG_MEM2REG_REACHABLE" <> None then
         Printf.eprintf
@@ -4006,21 +3987,11 @@ let mem2reg_func ?(optimistic_loop_phi = false) ?(preserve_loop_phi_shape = fals
         let debug_phi =
           Sys.getenv_opt "TOYC_DEBUG_MEM2REG_EDGE_COPY" <> None
         in
-        (* v51 early-shape bridge: the old high-performing pipeline kept the
-           freshly lowered PHI/edge-copy structure intact until loop
-           canonicalization / diamond splitting had consumed it.  Item4 added
-           self-trivial PHI elimination here; that is semantically useful, but
-           doing it in the first mem2reg pass can erase exactly the recurrence
-           shape used by split_counted_diamond_loops_func.  Allow callers to
-           preserve this representation in the early analysis pass only. *)
         let before_compact =
-          if preserve_loop_phi_shape then
+          mem2reg_eliminate_trivial_phi_temps
+            ~debug:debug_phi
             before_phi_elim
-          else
-            mem2reg_eliminate_trivial_phi_temps
-              ~debug:debug_phi
-              before_phi_elim
-              safe_substitutions
+            safe_substitutions
         in
         if debug_phi then begin
           let uses = temp_use_counts before_compact in
@@ -4069,11 +4040,8 @@ let mem2reg_func ?(optimistic_loop_phi = false) ?(preserve_loop_phi_shape = fals
             before_phi_elim.temp_count
         end;
         let promoted =
-          if preserve_loop_phi_shape then
-            before_compact
-          else
-            before_compact
-            |> compact_temp_ids_func ~debug_tag:"mem2reg"
+          before_compact
+          |> compact_temp_ids_func ~debug_tag:"mem2reg"
         in
         if IntSet.is_empty !failed then promoted else attempt promoted !failed
     end
@@ -28127,55 +28095,33 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       debug_lcssa_lite_report summaries globals current
     end
   in
-  (* v51: restore the early representation used by the old high-performing
-     step113 pipeline: conservative mem2reg, but preserve lowered loop-PHI edge
-     copies until loop canonicalization / diamond splitting has consumed them.
+  (* v54 diagnostic: reproduce the early IR handoff of the old high-performing
+     step113 pipeline as closely as possible.
 
-     This separates two concerns that item4 accidentally coupled:
-       - correctness: do NOT use optimistic loop-PHI promotion before trusted
-         recurrence analysis;
-       - performance: do NOT erase/compact the conservative PHI transport shape
-         before branch-loop splitting sees it.
+       old:
+         f
+         |> conservative mem2reg
+         |> promote_globals
+         |> loop canonicalization
 
-     Later/cascade mem2reg passes keep the normal aggressive cleanup. *)
-  let early_mem2reg =
-    mem2reg_func
-      ~preserve_loop_phi_shape:true
-      ~legacy_all_block_scope:true
-      f
+     Do not run the newer early single-def move propagation / DCE / temp
+     compaction before loop analysis.  Those transforms are semantically fine,
+     but they can destroy the lowered PHI/edge-copy and diamond shapes consumed
+     by split_counted_diamond_loops_func.  Later optimizer cleanup remains
+     unchanged. *)
+  let early_mem2reg = mem2reg_func f in
+  let promoted =
+    early_mem2reg
+    |> promote_globals_func summaries globals
   in
   if
     Sys.getenv_opt "TOYC_DEBUG_EARLY_MEM2REG_MODE" <> None
     || Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None
   then
     Printf.eprintf
-      "early-mem2reg-mode func=%s mode=conservative-preserve-shape-legacy-scope loops=%d\n%!"
+      "early-mem2reg-mode func=%s mode=conservative-legacy-handoff loops=%d\n%!"
       f.name
       (let _, _, headers = discover_natural_loops f in List.length headers);
-  let promoted_before_move_cleanup =
-    early_mem2reg |> promote_globals_func summaries globals
-  in
-  let promoted =
-    if Sys.getenv_opt "TOYC_DISABLE_EARLY_MEM2REG_MOVE_PROP" <> None then
-      promoted_before_move_cleanup
-    else
-      promoted_before_move_cleanup
-      |> propagate_singledef_moves_func
-      |> eliminate_dead_code_func
-           ~removable_calls summaries globals return_globals
-      |> compact_temp_ids_func
-           ~debug_tag:"early-post-mem2reg-move-prop"
-  in
-  if Sys.getenv_opt "TOYC_DEBUG_EARLY_MEM2REG_MOVE_PROP" <> None then begin
-    let before = metrics_of_func promoted_before_move_cleanup in
-    let after = metrics_of_func promoted in
-    Printf.eprintf
-      "early-mem2reg-move-cleanup func=%s instrs=%d->%d blocks=%d->%d temps=%d->%d\n%!"
-      promoted.name
-      before.instr_count after.instr_count
-      before.block_count after.block_count
-      promoted_before_move_cleanup.temp_count promoted.temp_count
-  end;
   let () = debug_lcssa_stage "promoted" promoted in
   let canonical =
     loop_canonicalize_func summaries globals promoted
