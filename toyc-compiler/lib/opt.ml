@@ -21139,6 +21139,34 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                   resolve_counted_carrier_orders
                     header loop get_block multi_defs def_instrs ivs reductions
                 in
+                (* item5 v44 correctness fallback, deliberately applied on top
+                   of the known-good v39 baseline only.
+
+                   Tail-recursion lowering evaluates recursive-call arguments
+                   before installing the next parameter values.  Later
+                   mem2reg/copy folding can erase that snapshot provenance, so
+                   an [include_updated=true] carrier progression in a synthetic
+                   tail-entry loop is not safe to close-form from instruction
+                   order alone.  Keep the already-lowered loop instead. *)
+                let tailrec_phase_unproven_reductions =
+                  if contains_substring f.entry "_tail_entry_" then
+                    List.filter
+                      (fun (reduction : counted_reduction) ->
+                        match reduction.step with
+                        | ReductionCarrierProgression
+                            { include_updated = true; _ } ->
+                            true
+                        | ReductionInvariant _
+                        | ReductionAffine _
+                        | ReductionQuadratic _
+                        | ReductionCubic _
+                        | ReductionCarrierProgression
+                            { include_updated = false; _ } ->
+                            false)
+                      reductions
+                  else
+                    []
+                in
 
                 (* item5 v37: consume resolved child-temp transfers as real
                    parent reductions.  The child trip count is materialized once
@@ -21448,6 +21476,26 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                     "counted-skip func=%s header=%s reason=incomplete_child_temp_composition composed=%d expected=%d"
                     f.name header !composed_children
                     (List.length nested_child_groups)
+                else if tailrec_phase_unproven_reductions <> [] then begin
+                  if debug_counted then
+                    List.iter
+                      (fun (reduction : counted_reduction) ->
+                        match reduction.step with
+                        | ReductionCarrierProgression
+                            { carrier_temp; include_updated; _ } ->
+                            debugf
+                              "counted-tailrec-phase-unproven func=%s header=%s carrier=%d include_updated=%b"
+                              f.name header carrier_temp include_updated
+                        | ReductionInvariant _
+                        | ReductionAffine _
+                        | ReductionQuadratic _
+                        | ReductionCubic _ ->
+                            ())
+                      tailrec_phase_unproven_reductions;
+                  debugf
+                    "counted-skip func=%s header=%s reason=tailrec_carrier_phase_unproven"
+                    f.name header
+                end
                 else if ambiguous_iv_carrier_reductions <> [] then begin
                   if debug_counted then
                     List.iter
