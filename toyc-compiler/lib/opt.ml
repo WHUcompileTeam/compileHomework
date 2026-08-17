@@ -9143,12 +9143,42 @@ let find_recurrence_loop_control_candidate
     (facts : recurrence_facts)
     multi_defs
     def_instrs =
+  let debug_control =
+    Sys.getenv_opt "TOYC_DEBUG_SCEV_CONTROL" <> None
+  in
+  let debugf fmt =
+    if debug_control then
+      Printf.ksprintf (fun msg -> Printf.eprintf "%s\n%!" msg) fmt
+    else
+      Printf.ksprintf (fun _ -> ()) fmt
+  in
+  let string_of_operand_local = function
+    | Tcg.Imm value -> Printf.sprintf "%Ld" value
+    | Tcg.Temp temp -> Printf.sprintf "t%d" temp
+  in
+  let string_of_recurrence_opt = function
+    | None -> "none"
+    | Some recurrence -> string_of_scalar_recurrence recurrence
+  in
+  let string_of_invariant_opt = function
+    | None -> "none"
+    | Some expr -> string_of_loop_inv_expr expr
+  in
   let loop = facts.recurrence_loop in
   let match_one label varying bound =
     let point = RecurrenceBlockExit label in
+    let varying_rec = recurrence_at facts point varying in
+    let bound_inv = recurrence_invariant_at facts point bound in
+    debugf
+      "scev-control-match header=%s label=%s varying=%s bound=%s varying_rec=%s bound_inv=%s"
+      facts.recurrence_header label
+      (string_of_operand_local varying)
+      (string_of_operand_local bound)
+      (string_of_recurrence_opt varying_rec)
+      (string_of_invariant_opt bound_inv);
     match
-      ( recurrence_at facts point varying,
-        recurrence_invariant_at facts point bound )
+      ( varying_rec,
+        bound_inv )
     with
     | Some
         ((ScalarAddRec _ | ScalarAffine _) as recurrence),
@@ -9178,6 +9208,13 @@ let find_recurrence_loop_control_candidate
            when
              LabelSet.mem if_true loop
              <> LabelSet.mem if_false loop ->
+             debugf
+               "scev-control-outward header=%s label=%s lhs=%s rhs=%s true=%s true_in=%b false=%s false_in=%b"
+               facts.recurrence_header label
+               (string_of_operand_local lhs)
+               (string_of_operand_local rhs)
+               if_true (LabelSet.mem if_true loop)
+               if_false (LabelSet.mem if_false loop);
              let true_in = LabelSet.mem if_true loop in
              let continue_op, inside_label, exit_label =
                if true_in then
@@ -9259,7 +9296,16 @@ let find_recurrence_loop_control_candidate
                         bound_expr);
                  candidate)
                matched
-         | Some _ | None ->
+         | Some (_op, lhs, rhs, if_true, if_false) ->
+             debugf
+               "scev-control-internal-branch header=%s label=%s lhs=%s rhs=%s true=%s true_in=%b false=%s false_in=%b"
+               facts.recurrence_header label
+               (string_of_operand_local lhs)
+               (string_of_operand_local rhs)
+               if_true (LabelSet.mem if_true loop)
+               if_false (LabelSet.mem if_false loop);
+             None
+         | None ->
              None)
 
 let proven_counted_control_of_recurrence_candidate
@@ -10109,6 +10155,220 @@ let find_counted_loop_control_semantic
     (proven_counted_control_of_recurrence_candidate
        header loop get_block facts)
 
+(* Recover direct logical AddRecs from a rotated linear counted loop.
+
+   [summarize_runtime_symbolic_affine_loops_func] already performs this
+   reconstruction locally for shapes such as
+
+       body(header):    x = x + c; jump control
+       control(latch):  if (i < bound) body else exit
+
+   After loop rotation the physical edge-copy/PHI shape can disappear, so the
+   general AddRec collector may miss [i] and other self-updated live values even
+   though the loop has a unique linear control path.  Counted elimination needs
+   the same facts.
+
+   Keep this deliberately structural and conservative:
+   - exactly one outward BranchCompare in the natural loop;
+   - the in-loop continuation reaches that compare through jump-only blocks;
+   - that chain covers the complete loop;
+   - only direct self Add/Sub updates with loop-invariant deltas are recovered;
+   - each recovered temp has exactly one such update in the loop body.
+
+   These AddRecs are only additional facts.  All existing counted-control,
+   trip-count, live-out and phase proofs still run afterwards. *)
+let recover_rotated_direct_addrecs_for_counted
+    header loop get_block
+    loop_defs multi_defs def_instrs
+    existing_addrecs =
+  let header_block : Cfg.block = get_block header in
+  let outside_preds =
+    List.filter
+      (fun pred -> not (LabelSet.mem pred loop))
+      header_block.preds
+  in
+  let internal_preds =
+    List.filter
+      (fun pred -> LabelSet.mem pred loop)
+      header_block.preds
+  in
+  match outside_preds, internal_preds with
+  | [ preheader_label ], _ :: _ ->
+      let loop_blocks =
+        LabelSet.elements loop |> List.map get_block
+      in
+      let outward_controls =
+        List.filter_map
+          (fun (block : Cfg.block) ->
+            match block.term with
+            | Cfg.BranchCompare
+                (_op, _lhs, _rhs, if_true, if_false) ->
+                let true_inside = LabelSet.mem if_true loop in
+                let false_inside = LabelSet.mem if_false loop in
+                if true_inside = false_inside then
+                  None
+                else
+                  let continue_label =
+                    if true_inside then if_true else if_false
+                  in
+                  Some (block, continue_label)
+            | Cfg.BranchZero _
+            | Cfg.BranchNonZero _
+            | Cfg.Jump _
+            | Cfg.Return _ ->
+                None)
+          loop_blocks
+      in
+      begin
+        match outward_controls with
+        | [ (control_block, continue_label) ] ->
+            let rec trace_chain visited labels_rev instrs label =
+              if label = control_block.label then
+                Some (visited, List.rev labels_rev, instrs)
+              else if
+                not (LabelSet.mem label loop)
+                || LabelSet.mem label visited
+              then
+                None
+              else
+                let block : Cfg.block = get_block label in
+                match block.term with
+                | Cfg.Jump next ->
+                    trace_chain
+                      (LabelSet.add label visited)
+                      (label :: labels_rev)
+                      (instrs @ block.body)
+                      next
+                | Cfg.BranchZero _
+                | Cfg.BranchNonZero _
+                | Cfg.BranchCompare _
+                | Cfg.Return _ ->
+                    None
+            in
+            let traced =
+              if continue_label = control_block.label then
+                Some (LabelSet.empty, [], [])
+              else
+                trace_chain
+                  LabelSet.empty [] [] continue_label
+            in
+            begin
+              match traced with
+              | Some (visited_body, _body_labels, prefix_instrs)
+                when
+                  LabelSet.equal
+                    (LabelSet.add control_block.label visited_body)
+                    loop ->
+                  let body_instrs =
+                    prefix_instrs @ control_block.body
+                  in
+                  let existing_temps =
+                    List.fold_left
+                      (fun acc (addrec : loop_addrec) ->
+                        IntSet.add addrec.addrec_phi_temp acc)
+                      IntSet.empty
+                      existing_addrecs
+                  in
+                  let step_of_direct_update = function
+                    | Tcg.Bin
+                        (dst, Add, Tcg.Temp lhs, rhs)
+                      when dst = lhs ->
+                        Option.map
+                          normalize_loop_inv_expr
+                          (lve_invariant_expr_of_operand
+                             loop_defs multi_defs
+                             def_instrs rhs)
+                    | Tcg.Bin
+                        (dst, Add, lhs, Tcg.Temp rhs)
+                      when dst = rhs ->
+                        Option.map
+                          normalize_loop_inv_expr
+                          (lve_invariant_expr_of_operand
+                             loop_defs multi_defs
+                             def_instrs lhs)
+                    | Tcg.Bin
+                        (dst, Sub, Tcg.Temp lhs, rhs)
+                      when dst = lhs ->
+                        Option.map
+                          (fun step ->
+                            normalize_loop_inv_expr
+                              (LveNeg step))
+                          (lve_invariant_expr_of_operand
+                             loop_defs multi_defs
+                             def_instrs rhs)
+                    | Tcg.Move _
+                    | Tcg.Un _
+                    | Tcg.Bin _
+                    | Tcg.Load _
+                    | Tcg.Store _
+                    | Tcg.Call _ ->
+                        None
+                  in
+                  let grouped =
+                    List.fold_left
+                      (fun table instr ->
+                        match defs_temp instr with
+                        | Some dst
+                          when not (IntSet.mem dst existing_temps) ->
+                            begin
+                              match step_of_direct_update instr with
+                              | Some step ->
+                                  let old =
+                                    Option.value
+                                      ~default:[]
+                                      (IntMap.find_opt dst table)
+                                  in
+                                  IntMap.add dst (step :: old) table
+                              | None ->
+                                  table
+                            end
+                        | Some _
+                        | None ->
+                            table)
+                      IntMap.empty
+                      body_instrs
+                  in
+                  IntMap.bindings grouped
+                  |> List.filter_map
+                       (fun (dst, steps) ->
+                         match steps with
+                         | [ step ] ->
+                             let addrec =
+                               {
+                                 addrec_phi_temp = dst;
+                                 addrec_outside_inputs =
+                                   [ (preheader_label, Tcg.Temp dst) ];
+                                 addrec_backedge_preds =
+                                   internal_preds;
+                                 addrec_step = step;
+                               }
+                             in
+                             if
+                               Sys.getenv_opt
+                                 "TOYC_DEBUG_COUNTED_LOOPS"
+                               <> None
+                             then
+                               Printf.eprintf
+                                 "counted-rotated-addrec header=%s control=%s phi=t%d step=%s\n%!"
+                                 header control_block.label dst
+                                 (string_of_loop_inv_expr step);
+                             Some addrec
+                         | []
+                         | _ :: _ :: _ ->
+                             None)
+              | Some _
+              | None ->
+                  []
+            end
+        | []
+        | _ :: _ :: _ ->
+            []
+      end
+  | [], _
+  | _ :: _ :: _, _
+  | _, [] ->
+      []
+
 let analyze_counted_loop_for_elimination
     header loop get_block temp_count blocks =
   let loop_defs, def_blocks, def_instrs, multi_defs =
@@ -10120,10 +10380,36 @@ let analyze_counted_loop_for_elimination
       header loop get_block
       def_blocks multi_defs def_instrs
   in
-  let recurrence_analysis =
+  let base_recurrence_analysis =
     build_loop_recurrence_analysis
       header loop get_block
       loop_defs multi_defs def_instrs
+  in
+  let rotated_direct_addrecs =
+    recover_rotated_direct_addrecs_for_counted
+      header loop get_block
+      loop_defs multi_defs def_instrs
+      base_recurrence_analysis.loop_recurrence_addrecs
+  in
+  let recurrence_analysis =
+    if rotated_direct_addrecs = [] then
+      base_recurrence_analysis
+    else
+      let combined_addrecs =
+        base_recurrence_analysis.loop_recurrence_addrecs
+        @ rotated_direct_addrecs
+      in
+      let combined_facts =
+        build_recurrence_facts
+          header loop get_block
+          loop_defs multi_defs def_instrs
+          combined_addrecs
+      in
+      {
+        base_recurrence_analysis with
+        loop_recurrence_addrecs = combined_addrecs;
+        loop_recurrence_facts = combined_facts;
+      }
   in
   let syntactic_ivs =
     recurrence_analysis.loop_recurrence_syntactic_ivs
@@ -21102,15 +21388,128 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                         || IntSet.mem iv.phi_temp live_t_exit)
                       ivs
                   in
-                  if
-                    List.exists
-                      (fun (iv : basic_induction_var) ->
-                        iv.phi_temp = info.control_iv.phi_temp)
+                  let with_control =
+                    if
+                      List.exists
+                        (fun (iv : basic_induction_var) ->
+                          iv.phi_temp = info.control_iv.phi_temp)
+                        syntactic_live
+                    then
                       syntactic_live
-                  then
-                    syntactic_live
-                  else
-                    info.control_iv :: syntactic_live
+                    else
+                      info.control_iv :: syntactic_live
+                  in
+
+                  (* v58: a split/rotated loop can lose the physical edge-copy
+                     shape required by [collect_basic_induction_vars] while the
+                     unified recurrence layer still proves a logical AddRec.
+
+                     Do NOT expose semantic IVs to the general reduction/carrier
+                     analysis.  Admit one only as a final live-out IV update,
+                     and only when:
+                       - the temp is live at the loop exit;
+                       - it is a constant-step scalar AddRec;
+                       - it is not already represented by a syntactic/control IV;
+                       - at the actual control-block exit its recurrence phase is
+                         exactly zero.
+
+                     The phase-zero condition is the key safety guard: the
+                     summary is entered from that control point, so
+                       final = current + trip * step
+                     is valid only when [phi_temp] denotes the logical current
+                     iteration value there. *)
+                  let represented =
+                    List.fold_left
+                      (fun acc (iv : basic_induction_var) ->
+                        IntSet.add iv.phi_temp acc)
+                      IntSet.empty
+                      with_control
+                  in
+                  let semantic_live =
+                    recurrence_facts.recurrence_addrecs
+                    |> List.filter_map
+                         (fun (addrec : loop_addrec) ->
+                           match loop_inv_expr_const_opt addrec.addrec_step with
+                           | None ->
+                               if debug_counted
+                                  && IntSet.mem addrec.addrec_phi_temp live_t_exit
+                               then
+                                 debugf
+                                   "counted-semantic-live-iv-reject func=%s header=%s phi=t%d reason=nonconstant-step step=%s"
+                                   f.name header addrec.addrec_phi_temp
+                                   (string_of_loop_inv_expr addrec.addrec_step);
+                               None
+                           | Some step ->
+                               let temp = addrec.addrec_phi_temp in
+                               if
+                                 IntSet.mem temp represented
+                                 || not (IntSet.mem temp live_t_exit)
+                               then
+                                 None
+                               else
+                                 match
+                                   recurrence_phase_at
+                                     recurrence_facts
+                                     addrec
+                                     (RecurrenceBlockExit info.control_label)
+                                 with
+                                 | RecurrencePhaseKnown 0 ->
+                                     (* v59: consume the already-proved logical
+                                        AddRec directly.
+
+                                        Do not call [basic_iv_of_scalar_addrec]
+                                        here.  That helper deliberately
+                                        re-derives physical outside-edge moves,
+                                        which split/rotated loops may no longer
+                                        carry even though [analyze_loop_addrecs]
+                                        has already proved the logical
+                                        recurrence.
+
+                                        For a live-out final update we only use
+                                          current + trip * step.
+                                        The current value is validated at the
+                                        exact summary-entry program point by the
+                                        phase-zero requirement below, so no
+                                        physical-PHI reconstruction is needed. *)
+                                     let iv : basic_induction_var =
+                                       {
+                                         phi_temp = temp;
+                                         outside_inputs =
+                                           addrec.addrec_outside_inputs;
+                                         backedge_preds =
+                                           addrec.addrec_backedge_preds;
+                                         step;
+                                         origin = `Semantic;
+                                       }
+                                     in
+                                     if debug_counted then
+                                       debugf
+                                         "counted-semantic-live-iv func=%s header=%s control=%s phi=t%d step=%Ld phase=0 source=direct-addrec outside=%d backedges=%d"
+                                         f.name header info.control_label
+                                         temp step
+                                         (List.length addrec.addrec_outside_inputs)
+                                         (List.length addrec.addrec_backedge_preds);
+                                     Some iv
+                                 | RecurrencePhaseKnown phase ->
+                                     if debug_counted then
+                                       debugf
+                                         "counted-semantic-live-iv-reject func=%s header=%s phi=t%d reason=phase phase=%d"
+                                         f.name header temp phase;
+                                     None
+                                 | RecurrencePhaseUnseen ->
+                                     if debug_counted then
+                                       debugf
+                                         "counted-semantic-live-iv-reject func=%s header=%s phi=t%d reason=phase-unseen"
+                                         f.name header temp;
+                                     None
+                                 | RecurrencePhaseConflict ->
+                                     if debug_counted then
+                                       debugf
+                                         "counted-semantic-live-iv-reject func=%s header=%s phi=t%d reason=phase-conflict"
+                                         f.name header temp;
+                                     None)
+                  in
+                  with_control @ semantic_live
                 in
                 let loop_live_defs =
                   IntSet.inter loop_defs live_t_exit
@@ -25574,7 +25973,8 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                  (List.length
                                     internal_preds);
                              Some addrec
-                         | [ _ ]
+                         | [ _ ] ->
+                             None
                          | []
                          | _ :: _ :: _ ->
                              None)
@@ -28674,22 +29074,9 @@ let optimize_func global_init summaries globals return_globals removable_calls (
         |> copy_coalesce_func summaries globals
       in
 
-      (* v61: diamond splitting creates two generated loop phases whose
-         recurrence/control facts often become fully recoverable only after the
-         late algebra/runtime-summary cleanup above.
-
-         The older post-summary counted retry is intentionally gated on
-           optimized_loop_count < canonical_loop_count
-         because it was designed for nested-summary follow-up.  A successful
-         diamond split does the opposite (typically one loop becomes two), so
-         that gate can never service the generated split loops.
-
-         Give only compiler-generated split CFGs one final counted-loop
-         opportunity at the mature late IR.  This does not weaken any counted
-         proof: [eliminate_counted_loops_func] performs the same control,
-         recurrence, trip-count, live-out, and phase checks as before.  If it
-         cannot eliminate anything, discard the analysis attempt and preserve
-         [late_runtime_cleaned] byte-for-byte. *)
+      (* v61.1: generated split loops may become classifiable only after the
+         late cleanup above.  Give those compiler-generated loops one final
+         counted-elimination opportunity without weakening any proof. *)
       let has_generated_split_loop (func : Cfg.func) =
         List.exists
           (fun (block : Cfg.block) ->
@@ -28756,12 +29143,6 @@ let optimize_func global_init summaries globals return_globals removable_calls (
           "late-runtime-cleaned"
           late_runtime_cleaned
       in
-      let () =
-        if late_split_counted <> late_runtime_cleaned then
-          debug_lcssa_stage
-            "late-split-counted-retry"
-            late_split_counted
-      in
       let with_hoisted_loop_bounds =
         hoist_unrolled_loop_branch_immediates_func summaries globals late_split_counted
       in
@@ -28778,7 +29159,6 @@ let optimize_func global_init summaries globals return_globals removable_calls (
         let fallbacks =
           [
             ("pre-final-merge", with_hoisted_loop_bounds);
-            ("late-split-counted-retry", late_split_counted);
             ("late-runtime-cleaned", late_runtime_cleaned);
             ("late-equiv-recanon", late_equiv_recanon);
             ("late-equiv-cleaned", late_equiv_cleaned);
