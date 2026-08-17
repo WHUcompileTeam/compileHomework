@@ -19888,14 +19888,23 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
       build_child_temp_summary_report
         summaries globals f lcssa_report
     in
+    (* Correctness-first rollout gate.  The compositional consumer is newer
+       than the analysis/reporting machinery and must not affect normal -opt
+       until the full smoke suite validates it.  Analysis stays on; only the
+       CFG-transforming consumer is opt-in for now. *)
+    let enable_nested_temp_composition =
+      Sys.getenv_opt "TOYC_ENABLE_NESTED_TEMP_COMPOSITION" <> None
+    in
     let composition_parent_headers =
-      child_temp_report.child_temp_transfer_links
-      |> List.filter_map
-           (fun link ->
-             match link.child_temp_transfer_link_resolved with
-             | Some _ -> Some link.child_temp_transfer_link_parent
-             | None -> None)
-      |> List.sort_uniq String.compare
+      if not enable_nested_temp_composition then []
+      else
+        child_temp_report.child_temp_transfer_links
+        |> List.filter_map
+             (fun link ->
+               match link.child_temp_transfer_link_resolved with
+               | Some _ -> Some link.child_temp_transfer_link_parent
+               | None -> None)
+        |> List.sort_uniq String.compare
     in
     (* Give a parent with a resolved child transfer one chance to consume the
        child summary before the ordinary child-first cascade rewrites the child.
@@ -20071,7 +20080,63 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                link.child_temp_transfer_link_child_source)
         child_temp_report.child_temp_direct_summaries
     in
+
+    (* item5 v39 correctness guard: a resolved child transfer says
+
+         child_out = child_in + delta
+
+       It is only legal to reinterpret that as a parent reduction
+
+         parent_carrier += delta
+
+       when the child's logical reduction value is seeded from that exact
+       parent carrier on every child entry edge.  v37/v38 proved the delta but
+       accidentally assumed this baseline continuity; that is true for the
+       focused affine test but not for arbitrary nested loops (and caused a
+       p07_loop wrong-code regression).  Recover the real lowered-PHI entry
+       sources and require exact carrier identity.  Failure is conservative:
+       the ordinary child-first cascade remains available. *)
+    let child_baseline_matches_parent_carrier link summary =
+      match
+        Hashtbl.find_opt
+          lcssa_report.lcssa_forest.loop_forest_infos
+          link.child_temp_transfer_link_child
+      with
+      | None -> false
+      | Some child_info ->
+          let child_loop = child_info.loop_info_blocks in
+          let reduction_temp =
+            summary.child_temp_summary_reduction_target
+          in
+          let probe_addrec =
+            {
+              addrec_phi_temp = reduction_temp;
+              addrec_outside_inputs = [];
+              addrec_backedge_preds = [];
+              addrec_step = LveConst 0L;
+            }
+          in
+          match
+            scalar_outside_inputs
+              link.child_temp_transfer_link_child
+              child_loop
+              get_block
+              probe_addrec
+          with
+          | Some (_ :: _ as inputs) ->
+              List.for_all
+                (fun (_, operand) ->
+                  operand =
+                    Tcg.Temp
+                      link.child_temp_transfer_link_parent_carrier)
+                inputs
+          | Some []
+          | None ->
+              false
+    in
     let eligible_child_groups parent_header =
+      if not enable_nested_temp_composition then []
+      else
       match
         Hashtbl.find_opt
           lcssa_report.lcssa_forest.loop_forest_infos
@@ -21096,6 +21161,20 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                     match summaries_for_links with
                     | [] -> ()
                     | (_, first_summary) :: _ ->
+                        let baseline_ok =
+                          List.for_all
+                            (fun (link, summary) ->
+                              child_baseline_matches_parent_carrier
+                                link summary)
+                            summaries_for_links
+                        in
+                        if not baseline_ok then begin
+                          if debug_counted then
+                            debugf
+                              "counted-nested-temp-compose-reject func=%s parent=%s child=%s reason=child-baseline-not-parent-carrier"
+                              f.name header child_header
+                        end
+                        else
                         let child_control =
                           first_summary.child_temp_summary_control
                         in
