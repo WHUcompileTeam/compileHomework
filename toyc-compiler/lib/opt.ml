@@ -3505,24 +3505,43 @@ let mem2reg_eliminate_trivial_phi_temps
     Cfg.rebuild_edges { f with blocks }
   end
 
-let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
+let mem2reg_func ?(optimistic_loop_phi = false) ?(preserve_loop_phi_shape = false) ?(legacy_all_block_scope = false) (f : Cfg.func) =
   let all_candidates = collect_local_ids f in
   let rec attempt (current : Cfg.func) candidates =
     if IntSet.is_empty candidates then current
     else begin
+      (* v52 early-scope A/B.
+         Pre-item4 mem2reg solved local liveness/forward environments over the
+         complete current CFG and all recorded predecessor edges.  Item4
+         changed that to entry-reachable blocks only.  Keep the modern
+         reachable-only behavior by default, but allow the first analysis pass
+         to reproduce the old scope without affecting later/cascade mem2reg. *)
       let reachable =
-        reachable_labels current.entry current.blocks
+        if legacy_all_block_scope then
+          List.fold_left
+            (fun acc (block : Cfg.block) ->
+              LabelSet.add block.label acc)
+            LabelSet.empty
+            current.blocks
+        else
+          reachable_labels current.entry current.blocks
       in
       let reachable_blocks =
-        List.filter
-          (fun (block : Cfg.block) ->
-            LabelSet.mem block.label reachable)
+        if legacy_all_block_scope then
           current.blocks
+        else
+          List.filter
+            (fun (block : Cfg.block) ->
+              LabelSet.mem block.label reachable)
+            current.blocks
       in
       let reachable_preds (block : Cfg.block) =
-        List.filter
-          (fun pred -> LabelSet.mem pred reachable)
+        if legacy_all_block_scope then
           block.preds
+        else
+          List.filter
+            (fun pred -> LabelSet.mem pred reachable)
+            block.preds
       in
       if Sys.getenv_opt "TOYC_DEBUG_MEM2REG_REACHABLE" <> None then
         Printf.eprintf
@@ -3987,11 +4006,21 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
         let debug_phi =
           Sys.getenv_opt "TOYC_DEBUG_MEM2REG_EDGE_COPY" <> None
         in
+        (* v51 early-shape bridge: the old high-performing pipeline kept the
+           freshly lowered PHI/edge-copy structure intact until loop
+           canonicalization / diamond splitting had consumed it.  Item4 added
+           self-trivial PHI elimination here; that is semantically useful, but
+           doing it in the first mem2reg pass can erase exactly the recurrence
+           shape used by split_counted_diamond_loops_func.  Allow callers to
+           preserve this representation in the early analysis pass only. *)
         let before_compact =
-          mem2reg_eliminate_trivial_phi_temps
-            ~debug:debug_phi
+          if preserve_loop_phi_shape then
             before_phi_elim
-            safe_substitutions
+          else
+            mem2reg_eliminate_trivial_phi_temps
+              ~debug:debug_phi
+              before_phi_elim
+              safe_substitutions
         in
         if debug_phi then begin
           let uses = temp_use_counts before_compact in
@@ -4040,8 +4069,11 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
             before_phi_elim.temp_count
         end;
         let promoted =
-          before_compact
-          |> compact_temp_ids_func ~debug_tag:"mem2reg"
+          if preserve_loop_phi_shape then
+            before_compact
+          else
+            before_compact
+            |> compact_temp_ids_func ~debug_tag:"mem2reg"
         in
         if IntSet.is_empty !failed then promoted else attempt promoted !failed
     end
@@ -5012,7 +5044,7 @@ let tailrec_elim_func (f : Cfg.func) =
     Cfg.rebuild_edges { f with entry = new_entry; temp_count = !next_temp; blocks }
   else f
 
-let loop_canonicalize_func _summaries _globals (f : Cfg.func) =
+let loop_canonicalize_func summaries globals (f : Cfg.func) =
   let next_preheader_id = ref 0 in
   let fresh_preheader_label () =
     let id = !next_preheader_id in
@@ -5032,6 +5064,7 @@ let loop_canonicalize_func _summaries _globals (f : Cfg.func) =
     Printf.sprintf ".L%s_canon_cmp_%d" f.label id
   in
   let rec apply (current : Cfg.func) =
+    let live_in_t, live_in_p = compute_liveness summaries globals current in
     let _, loops, headers = discover_natural_loops current in
     if headers = [] then current
     else
@@ -5071,6 +5104,31 @@ let loop_canonicalize_func _summaries _globals (f : Cfg.func) =
             Cfg.BranchCompare (op, lhs, rhs, if_true, if_false)
         | Cfg.Jump _ | Cfg.Return _ -> term
       in
+      let prune_jump_body (block : Cfg.block) next_label =
+        let live_t =
+          match Hashtbl.find_opt live_in_t next_label with
+          | Some live -> live
+          | None -> IntSet.empty
+        in
+        let live_p =
+          match Hashtbl.find_opt live_in_p next_label with
+          | Some live -> live
+          | None -> PlaceSet.empty
+        in
+        let kept_rev, _, _ =
+          List.fold_left
+            (fun (acc, live_t, live_p) instr ->
+              let kept, live_t, live_p = scan_simple_instr summaries globals instr live_t live_p in
+              let acc =
+                match kept with
+                | Some instr -> instr :: acc
+                | None -> acc
+              in
+              (acc, live_t, live_p))
+            ([], live_t, live_p) (List.rev block.body)
+        in
+        List.rev kept_rev
+      in
       let rec equivalent_linear_jump_chains seen_pairs a b =
         if a = b then Some a
         else if List.mem (a, b) seen_pairs || List.mem (b, a) seen_pairs then None
@@ -5079,22 +5137,11 @@ let loop_canonicalize_func _summaries _globals (f : Cfg.func) =
           let b_block : Cfg.block = get_block b in
           match (a_block.term, b_block.term) with
           | Cfg.Jump next_a, Cfg.Jump next_b ->
-              (* Path equivalence must be proved from the actual instruction
-                 streams, not from liveness-pruned bodies.
-
-                 In particular, promoted global/phi state may be carried through
-                 successor edges in ways that a local dead-code view does not
-                 faithfully capture.  Pruning the two arms independently before
-                 comparison can therefore erase distinct state updates and
-                 incorrectly fold a real conditional into one successor.
-
-                 Keep this transform deliberately conservative: only syntactically
-                 identical jump-chain bodies are equivalent. *)
-              if a_block.body <> b_block.body then None
+              let a_body = prune_jump_body a_block next_a in
+              let b_body = prune_jump_body b_block next_b in
+              if a_body <> b_body then None
               else if next_a = next_b then Some a
-              else
-                equivalent_linear_jump_chains
-                  ((a, b) :: seen_pairs) next_a next_b
+              else equivalent_linear_jump_chains ((a, b) :: seen_pairs) next_a next_b
           | _ -> None
       in
       let is_small_pure_control_body body =
@@ -5220,10 +5267,7 @@ let loop_canonicalize_func _summaries _globals (f : Cfg.func) =
                 if label = !current_entry then current_entry := prep_label
               end)
             loop;
-          if
-            Sys.getenv_opt "TOYC_DISABLE_CANON_EQUIV_CHAINS" = None
-          then begin
-            LabelSet.iter
+          LabelSet.iter
             (fun label ->
               let block : Cfg.block = get_block label in
               match branch_targets block.term with
@@ -5238,8 +5282,7 @@ let loop_canonicalize_func _summaries _globals (f : Cfg.func) =
                       update_block { block with term; succs = Cfg.successors term }
                   | None -> ())
               | Some _ | None -> ())
-            loop
-          end)
+            loop)
         headers;
       if !changed then
         let blocks = List.map get_block !block_order in
@@ -9132,42 +9175,12 @@ let find_recurrence_loop_control_candidate
     (facts : recurrence_facts)
     multi_defs
     def_instrs =
-  let debug_control =
-    Sys.getenv_opt "TOYC_DEBUG_SCEV_CONTROL" <> None
-  in
-  let debugf fmt =
-    if debug_control then
-      Printf.ksprintf (fun msg -> Printf.eprintf "%s\n%!" msg) fmt
-    else
-      Printf.ksprintf (fun _ -> ()) fmt
-  in
-  let string_of_operand_local = function
-    | Tcg.Imm value -> Printf.sprintf "%Ld" value
-    | Tcg.Temp temp -> Printf.sprintf "t%d" temp
-  in
-  let string_of_recurrence_opt = function
-    | None -> "none"
-    | Some recurrence -> string_of_scalar_recurrence recurrence
-  in
-  let string_of_invariant_opt = function
-    | None -> "none"
-    | Some expr -> string_of_loop_inv_expr expr
-  in
   let loop = facts.recurrence_loop in
   let match_one label varying bound =
     let point = RecurrenceBlockExit label in
-    let varying_rec = recurrence_at facts point varying in
-    let bound_inv = recurrence_invariant_at facts point bound in
-    debugf
-      "scev-control-match header=%s label=%s varying=%s bound=%s varying_rec=%s bound_inv=%s"
-      facts.recurrence_header label
-      (string_of_operand_local varying)
-      (string_of_operand_local bound)
-      (string_of_recurrence_opt varying_rec)
-      (string_of_invariant_opt bound_inv);
     match
-      ( varying_rec,
-        bound_inv )
+      ( recurrence_at facts point varying,
+        recurrence_invariant_at facts point bound )
     with
     | Some
         ((ScalarAddRec _ | ScalarAffine _) as recurrence),
@@ -9197,13 +9210,6 @@ let find_recurrence_loop_control_candidate
            when
              LabelSet.mem if_true loop
              <> LabelSet.mem if_false loop ->
-             debugf
-               "scev-control-outward header=%s label=%s lhs=%s rhs=%s true=%s true_in=%b false=%s false_in=%b"
-               facts.recurrence_header label
-               (string_of_operand_local lhs)
-               (string_of_operand_local rhs)
-               if_true (LabelSet.mem if_true loop)
-               if_false (LabelSet.mem if_false loop);
              let true_in = LabelSet.mem if_true loop in
              let continue_op, inside_label, exit_label =
                if true_in then
@@ -9285,16 +9291,7 @@ let find_recurrence_loop_control_candidate
                         bound_expr);
                  candidate)
                matched
-         | Some (_op, lhs, rhs, if_true, if_false) ->
-             debugf
-               "scev-control-internal-branch header=%s label=%s lhs=%s rhs=%s true=%s true_in=%b false=%s false_in=%b"
-               facts.recurrence_header label
-               (string_of_operand_local lhs)
-               (string_of_operand_local rhs)
-               if_true (LabelSet.mem if_true loop)
-               if_false (LabelSet.mem if_false loop);
-             None
-         | None ->
+         | Some _ | None ->
              None)
 
 let proven_counted_control_of_recurrence_candidate
@@ -9357,73 +9354,6 @@ let proven_counted_control_of_recurrence_candidate
                     kind;
                   })
                 (build_kind control_iv.step)
-
-          (* v63: loop rotation turns the canonical pre-test
-
-                 while (i < bound) { body; i = i + step; }
-
-             into a guarded body whose latch tests the post-step value:
-
-                 body;
-                 i = i + step;
-                 if (i < bound) goto body;
-
-             In the unified recurrence domain this appears as
-
-                 Affine(phi=i, step=step, scale=1, bias=step).
-
-             The counted backend already represents this exactly as
-             [CountUpLt(bound, bias)] and computes
-
-                 ceil((bound - bias - i) / step).
-
-             Keep the semantic extension deliberately narrow:
-               - only compiler-generated split loops;
-               - the control block is distinct from the rotated header;
-               - zero logical start;
-               - unit scale;
-               - positive LT recurrence;
-               - bias is exactly one recurrence step.
-
-             This is the post-step rotation identity, not a general affine
-             relaxation.  All existing trip/live/phase proofs still run. *)
-          | Some 1L, Some bias
-            when
-              contains_substring header "_split_"
-              && candidate.recurrence_control_label <> header
-              && candidate.recurrence_control_op = Lt
-              && control_iv.step > 0L
-              && bias = control_iv.step
-              && loop_inv_expr_const_opt
-                   spec.symbolic_trip_start
-                 = Some 0L ->
-              if
-                Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS"
-                <> None
-              then
-                Printf.eprintf
-                  "counted-semantic-rotated-control-hit header=%s control=%s phi=t%d step=%Ld bias=%Ld\n%!"
-                  header
-                  candidate.recurrence_control_label
-                  control_iv.phi_temp
-                  control_iv.step
-                  bias;
-              Some
-                {
-                  control_iv;
-                  control_label =
-                    candidate.recurrence_control_label;
-                  inside_label =
-                    candidate.recurrence_control_inside_label;
-                  exit_label =
-                    candidate.recurrence_control_exit_label;
-                  kind =
-                    CountUpLt
-                      ( candidate
-                          .recurrence_control_bound_operand,
-                        bias );
-                }
-
           | Some scale, Some bias
             when
               candidate.recurrence_control_op = Lt
@@ -10211,220 +10141,6 @@ let find_counted_loop_control_semantic
     (proven_counted_control_of_recurrence_candidate
        header loop get_block facts)
 
-(* Recover direct logical AddRecs from a rotated linear counted loop.
-
-   [summarize_runtime_symbolic_affine_loops_func] already performs this
-   reconstruction locally for shapes such as
-
-       body(header):    x = x + c; jump control
-       control(latch):  if (i < bound) body else exit
-
-   After loop rotation the physical edge-copy/PHI shape can disappear, so the
-   general AddRec collector may miss [i] and other self-updated live values even
-   though the loop has a unique linear control path.  Counted elimination needs
-   the same facts.
-
-   Keep this deliberately structural and conservative:
-   - exactly one outward BranchCompare in the natural loop;
-   - the in-loop continuation reaches that compare through jump-only blocks;
-   - that chain covers the complete loop;
-   - only direct self Add/Sub updates with loop-invariant deltas are recovered;
-   - each recovered temp has exactly one such update in the loop body.
-
-   These AddRecs are only additional facts.  All existing counted-control,
-   trip-count, live-out and phase proofs still run afterwards. *)
-let recover_rotated_direct_addrecs_for_counted
-    header loop get_block
-    loop_defs multi_defs def_instrs
-    existing_addrecs =
-  let header_block : Cfg.block = get_block header in
-  let outside_preds =
-    List.filter
-      (fun pred -> not (LabelSet.mem pred loop))
-      header_block.preds
-  in
-  let internal_preds =
-    List.filter
-      (fun pred -> LabelSet.mem pred loop)
-      header_block.preds
-  in
-  match outside_preds, internal_preds with
-  | [ preheader_label ], _ :: _ ->
-      let loop_blocks =
-        LabelSet.elements loop |> List.map get_block
-      in
-      let outward_controls =
-        List.filter_map
-          (fun (block : Cfg.block) ->
-            match block.term with
-            | Cfg.BranchCompare
-                (_op, _lhs, _rhs, if_true, if_false) ->
-                let true_inside = LabelSet.mem if_true loop in
-                let false_inside = LabelSet.mem if_false loop in
-                if true_inside = false_inside then
-                  None
-                else
-                  let continue_label =
-                    if true_inside then if_true else if_false
-                  in
-                  Some (block, continue_label)
-            | Cfg.BranchZero _
-            | Cfg.BranchNonZero _
-            | Cfg.Jump _
-            | Cfg.Return _ ->
-                None)
-          loop_blocks
-      in
-      begin
-        match outward_controls with
-        | [ (control_block, continue_label) ] ->
-            let rec trace_chain visited labels_rev instrs label =
-              if label = control_block.label then
-                Some (visited, List.rev labels_rev, instrs)
-              else if
-                not (LabelSet.mem label loop)
-                || LabelSet.mem label visited
-              then
-                None
-              else
-                let block : Cfg.block = get_block label in
-                match block.term with
-                | Cfg.Jump next ->
-                    trace_chain
-                      (LabelSet.add label visited)
-                      (label :: labels_rev)
-                      (instrs @ block.body)
-                      next
-                | Cfg.BranchZero _
-                | Cfg.BranchNonZero _
-                | Cfg.BranchCompare _
-                | Cfg.Return _ ->
-                    None
-            in
-            let traced =
-              if continue_label = control_block.label then
-                Some (LabelSet.empty, [], [])
-              else
-                trace_chain
-                  LabelSet.empty [] [] continue_label
-            in
-            begin
-              match traced with
-              | Some (visited_body, _body_labels, prefix_instrs)
-                when
-                  LabelSet.equal
-                    (LabelSet.add control_block.label visited_body)
-                    loop ->
-                  let body_instrs =
-                    prefix_instrs @ control_block.body
-                  in
-                  let existing_temps =
-                    List.fold_left
-                      (fun acc (addrec : loop_addrec) ->
-                        IntSet.add addrec.addrec_phi_temp acc)
-                      IntSet.empty
-                      existing_addrecs
-                  in
-                  let step_of_direct_update = function
-                    | Tcg.Bin
-                        (dst, Add, Tcg.Temp lhs, rhs)
-                      when dst = lhs ->
-                        Option.map
-                          normalize_loop_inv_expr
-                          (lve_invariant_expr_of_operand
-                             loop_defs multi_defs
-                             def_instrs rhs)
-                    | Tcg.Bin
-                        (dst, Add, lhs, Tcg.Temp rhs)
-                      when dst = rhs ->
-                        Option.map
-                          normalize_loop_inv_expr
-                          (lve_invariant_expr_of_operand
-                             loop_defs multi_defs
-                             def_instrs lhs)
-                    | Tcg.Bin
-                        (dst, Sub, Tcg.Temp lhs, rhs)
-                      when dst = lhs ->
-                        Option.map
-                          (fun step ->
-                            normalize_loop_inv_expr
-                              (LveNeg step))
-                          (lve_invariant_expr_of_operand
-                             loop_defs multi_defs
-                             def_instrs rhs)
-                    | Tcg.Move _
-                    | Tcg.Un _
-                    | Tcg.Bin _
-                    | Tcg.Load _
-                    | Tcg.Store _
-                    | Tcg.Call _ ->
-                        None
-                  in
-                  let grouped =
-                    List.fold_left
-                      (fun table instr ->
-                        match defs_temp instr with
-                        | Some dst
-                          when not (IntSet.mem dst existing_temps) ->
-                            begin
-                              match step_of_direct_update instr with
-                              | Some step ->
-                                  let old =
-                                    Option.value
-                                      ~default:[]
-                                      (IntMap.find_opt dst table)
-                                  in
-                                  IntMap.add dst (step :: old) table
-                              | None ->
-                                  table
-                            end
-                        | Some _
-                        | None ->
-                            table)
-                      IntMap.empty
-                      body_instrs
-                  in
-                  IntMap.bindings grouped
-                  |> List.filter_map
-                       (fun (dst, steps) ->
-                         match steps with
-                         | [ step ] ->
-                             let addrec =
-                               {
-                                 addrec_phi_temp = dst;
-                                 addrec_outside_inputs =
-                                   [ (preheader_label, Tcg.Temp dst) ];
-                                 addrec_backedge_preds =
-                                   internal_preds;
-                                 addrec_step = step;
-                               }
-                             in
-                             if
-                               Sys.getenv_opt
-                                 "TOYC_DEBUG_COUNTED_LOOPS"
-                               <> None
-                             then
-                               Printf.eprintf
-                                 "counted-rotated-addrec header=%s control=%s phi=t%d step=%s\n%!"
-                                 header control_block.label dst
-                                 (string_of_loop_inv_expr step);
-                             Some addrec
-                         | []
-                         | _ :: _ :: _ ->
-                             None)
-              | Some _
-              | None ->
-                  []
-            end
-        | []
-        | _ :: _ :: _ ->
-            []
-      end
-  | [], _
-  | _ :: _ :: _, _
-  | _, [] ->
-      []
-
 let analyze_counted_loop_for_elimination
     header loop get_block temp_count blocks =
   let loop_defs, def_blocks, def_instrs, multi_defs =
@@ -10436,36 +10152,10 @@ let analyze_counted_loop_for_elimination
       header loop get_block
       def_blocks multi_defs def_instrs
   in
-  let base_recurrence_analysis =
+  let recurrence_analysis =
     build_loop_recurrence_analysis
       header loop get_block
       loop_defs multi_defs def_instrs
-  in
-  let rotated_direct_addrecs =
-    recover_rotated_direct_addrecs_for_counted
-      header loop get_block
-      loop_defs multi_defs def_instrs
-      base_recurrence_analysis.loop_recurrence_addrecs
-  in
-  let recurrence_analysis =
-    if rotated_direct_addrecs = [] then
-      base_recurrence_analysis
-    else
-      let combined_addrecs =
-        base_recurrence_analysis.loop_recurrence_addrecs
-        @ rotated_direct_addrecs
-      in
-      let combined_facts =
-        build_recurrence_facts
-          header loop get_block
-          loop_defs multi_defs def_instrs
-          combined_addrecs
-      in
-      {
-        base_recurrence_analysis with
-        loop_recurrence_addrecs = combined_addrecs;
-        loop_recurrence_facts = combined_facts;
-      }
   in
   let syntactic_ivs =
     recurrence_analysis.loop_recurrence_syntactic_ivs
@@ -20577,59 +20267,11 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
         else None
       in
 
-      let strip_trailing_moves body =
-        let rec peel trailing = function
-          | (Tcg.Move _ as instr) :: rest -> peel (instr :: trailing) rest
-          | rest_rev -> (List.rev rest_rev, List.rev trailing)
-        in
-        peel [] (List.rev body)
-      in
-
       let match_arm label =
         let block : Cfg.block = get_block label in
-        let core_body, _trailing_moves = strip_trailing_moves block.body in
-        match (core_body, block.term) with
-        (* Single-step arm:
-             acc = acc + iv
-             acc = acc + C
-             acc = acc + inv *)
-        | ( [ Tcg.Load (loaded, (Tcg.Local _ as place));
-              Tcg.Bin (out_temp, Add, lhs, rhs);
-              Tcg.Store (stored_place, Tcg.Temp stored_temp) ],
-            Cfg.Jump join_label )
-          when stored_place = place
-               && stored_temp = out_temp
-               && loaded <> control_iv.phi_temp
-               && out_temp <> control_iv.phi_temp ->
-            if
-              add_is
-                (Tcg.Temp loaded)
-                (Tcg.Temp control_iv.phi_temp)
-                lhs rhs
-            then
-              Some
-                (place, Tcg.Imm 0L, 0L, true, join_label)
-            else
-              (match other_add_operand (Tcg.Temp loaded) lhs rhs with
-               | Some extra -> (
-                   match
-                     resolve_operand_before_loop
-                       loop_defs multi_defs def_instrs extra
-                   with
-                   | Some invariant
-                     when invariant <> Tcg.Temp control_iv.phi_temp ->
-                       Some
-                         (place, invariant, 0L, false, join_label)
-                   | Some _
-                   | None ->
-                       None)
-               | None ->
-                   None)
-
-        (* Existing simple arm, generalized to allow either
-             acc = acc + iv + bias
-           or
-             acc = acc + iv + invariant. *)
+        match (block.body, block.term) with
+        (* Existing simple arm:
+             acc = acc + iv + bias *)
         | ( [ Tcg.Load (loaded, (Tcg.Local _ as place));
               Tcg.Bin (mid, Add, lhs1, rhs1);
               Tcg.Bin (out_temp, Add, lhs2, rhs2);
@@ -20644,29 +20286,16 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                     (Tcg.Temp loaded)
                     (Tcg.Temp control_iv.phi_temp)
                     lhs1 rhs1 -> (
-            match other_add_operand (Tcg.Temp mid) lhs2 rhs2 with
-            | Some extra -> (
-                match
-                  resolve_operand_before_loop
-                    loop_defs multi_defs def_instrs extra
-                with
-                | Some invariant
-                  when invariant <> Tcg.Temp control_iv.phi_temp ->
-                    Some
-                      (place, invariant, 0L, true, join_label)
-                | Some _ -> None
-                | None -> (
-                    match (lhs2, rhs2) with
-                    | Tcg.Temp temp, Tcg.Imm bias when temp = mid ->
-                        Some
-                          (place, Tcg.Imm 0L, bias, true, join_label)
-                    | Tcg.Imm bias, Tcg.Temp temp when temp = mid ->
-                        Some
-                          (place, Tcg.Imm 0L, bias, true, join_label)
-                    | _ ->
-                        None))
-            | None ->
-                None)
+            let bias =
+              match (lhs2, rhs2) with
+              | Tcg.Temp temp, Tcg.Imm bias when temp = mid -> Some bias
+              | Tcg.Imm bias, Tcg.Temp temp when temp = mid -> Some bias
+              | _ -> None
+            in
+            Option.map
+              (fun bias ->
+                (place, Tcg.Imm 0L, bias, join_label))
+              bias)
 
         (* Same-accumulator nested piecewise arm:
              acc = acc + invariant + iv + bias
@@ -20719,7 +20348,7 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                      | Some invariant
                        when invariant <> Tcg.Temp control_iv.phi_temp ->
                          Some
-                           (place, invariant, bias, true, join_label)
+                           (place, invariant, bias, join_label)
                      | Some _
                      | None ->
                          None)
@@ -20734,865 +20363,26 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
         | _ -> None
       in
 
-      let debug_piecewise = debug_counted in
-      let debug_piecewise_reject reason =
-        if debug_piecewise then
-          debugf
-            "counted-piecewise-reject func=%s header=%s reason=%s"
-            f.name header reason
-      in
-
-      let debug_piecewise_arm label =
-        if debug_piecewise then
-          let block : Cfg.block = get_block label in
-          let core_body, trailing_moves = strip_trailing_moves block.body in
-          debugf
-            "counted-piecewise-arm func=%s header=%s arm=%s body=[%s] core=[%s] trailing=%d term=%s"
-            f.name
-            header
-            label
-            (String.concat "," (List.map instr_kind block.body))
-            (String.concat "," (List.map instr_kind core_body))
-            (List.length trailing_moves)
-            (term_kind block.term)
-      in
-
       let exact_join_update join_label =
         let block : Cfg.block = get_block join_label in
-        let iv_step_temp = function
-          | Tcg.Bin (next_temp, Add, Tcg.Temp src, Tcg.Imm 1L)
-          | Tcg.Bin (next_temp, Add, Tcg.Imm 1L, Tcg.Temp src)
-            when src = control_iv.phi_temp ->
-              Some next_temp
-          | Tcg.Move _
-          | Tcg.Bin _
-          | Tcg.Un _
-          | Tcg.Load _
-          | Tcg.Store _
-          | Tcg.Call _ ->
-              None
-        in
-        match block.term with
-        | Cfg.Jump next when next = header ->
-            let step_temps =
-              block.body
-              |> List.filter_map iv_step_temp
-              |> List.sort_uniq compare
-            in
-            (match step_temps with
-             | [ step_temp ] ->
-                 let has_phi_write =
-                   List.exists
-                     (function
-                       | Tcg.Move (dst, Tcg.Temp moved) ->
-                           dst = control_iv.phi_temp && moved = step_temp
-                       | Tcg.Move _
-                       | Tcg.Un _
-                       | Tcg.Bin _
-                       | Tcg.Load _
-                       | Tcg.Store _
-                       | Tcg.Call _ ->
-                           false)
-                     block.body
-                 in
-                 has_phi_write
-                 && List.for_all
-                      (function
-                        | Tcg.Move _ -> true
-                        | instr -> Option.is_some (iv_step_temp instr))
-                      block.body
-             | [] | _ :: _ :: _ -> false)
-        | Cfg.Jump _ ->
-            false
-        | Cfg.BranchZero _
-        | Cfg.BranchNonZero _
-        | Cfg.BranchCompare _
-        | Cfg.Return _ ->
-            false
-      in
-
-      let match_temp_arm label =
-        let block : Cfg.block = get_block label in
-        let core_body, trailing_moves = strip_trailing_moves block.body in
-        match block.term with
-        | Cfg.Jump join_label ->
-            let aliases =
-              trailing_moves
-              |> List.filter_map
-                   (function
-                     | Tcg.Move (dst, src) -> Some (dst, src)
-                     | Tcg.Un _
-                     | Tcg.Bin _
-                     | Tcg.Load _
-                     | Tcg.Store _
-                     | Tcg.Call _ ->
-                         None)
-            in
-            if List.length aliases = List.length trailing_moves then
-              Some (core_body, aliases, join_label)
-            else
-              None
-        | Cfg.BranchZero _
-        | Cfg.BranchNonZero _
-        | Cfg.BranchCompare _
-        | Cfg.Return _ ->
-            None
-      in
-
-      let join_temp_targets join_label =
-        let block : Cfg.block = get_block join_label in
-        block.body
-        |> List.filter_map
-             (function
-               | Tcg.Move (dst, Tcg.Temp src)
-                 when dst <> control_iv.phi_temp ->
-                   Some (dst, src)
-               | Tcg.Move _
-               | Tcg.Un _
-               | Tcg.Bin _
-               | Tcg.Load _
-               | Tcg.Store _
-               | Tcg.Call _ ->
-                   None)
-      in
-
-      let temp_piecewise_update_of_operand target core_body operand =
-        let rec flatten seen operand =
-          match operand with
-          | Tcg.Imm _ -> Some [ operand ]
-          | Tcg.Temp temp as operand ->
-              if IntSet.mem temp seen then None
-              else
-                match
-                  List.find_opt
-                    (function
-                      | Tcg.Bin (dst, Add, _, _)
-                      | Tcg.Move (dst, _) ->
-                          dst = temp
-                      | Tcg.Un _
-                      | Tcg.Load _
-                      | Tcg.Store _
-                      | Tcg.Call _
-                      | Tcg.Bin _ ->
-                          false)
-                    core_body
-                with
-                | Some (Tcg.Bin (_, Add, lhs, rhs)) -> (
-                    match
-                      flatten (IntSet.add temp seen) lhs,
-                      flatten (IntSet.add temp seen) rhs
-                    with
-                    | Some lhs_terms, Some rhs_terms ->
-                        Some (lhs_terms @ rhs_terms)
-                    | Some _, None
-                    | None, Some _
-                    | None, None ->
-                        None)
-                | Some (Tcg.Move (_, src)) ->
-                    flatten (IntSet.add temp seen) src
-                | Some (Tcg.Un _)
-                | Some (Tcg.Load _)
-                | Some (Tcg.Store _)
-                | Some (Tcg.Call _)
-                | Some (Tcg.Bin _)
-                | None ->
-                    Some [ operand ]
-        in
-        match flatten IntSet.empty operand with
-        | None -> None
-        | Some terms ->
-            let rec collect terms carrier_count iv_count invariant_opt bias =
-              match terms with
-              | [] ->
-                  if carrier_count <> 1 || iv_count > 1 then
-                    None
-                  else if iv_count = 0 && invariant_opt = None && bias = 0L then
-                    Some None
-                  else
-                    Some
-                      (Some
-                         ( Option.value ~default:(Tcg.Imm 0L) invariant_opt,
-                           bias,
-                           iv_count = 1 ))
-              | operand :: rest -> (
-                  match operand with
-                  | Tcg.Temp temp when temp = target ->
-                      collect rest (carrier_count + 1) iv_count invariant_opt bias
-                  | Tcg.Temp temp when temp = control_iv.phi_temp ->
-                      collect rest carrier_count (iv_count + 1) invariant_opt bias
-                  | Tcg.Imm imm ->
-                      collect rest carrier_count iv_count invariant_opt (i32 (Int64.add bias imm))
-                  | _ -> (
-                      match
-                        resolve_operand_before_loop
-                          loop_defs multi_defs def_instrs operand
-                      with
-                      | Some invariant
-                        when invariant <> Tcg.Temp target
-                             && invariant <> Tcg.Temp control_iv.phi_temp -> (
-                          match invariant_opt with
-                          | None ->
-                              collect rest carrier_count iv_count (Some invariant) bias
-                          | Some existing when existing = invariant ->
-                              collect rest carrier_count iv_count invariant_opt bias
-                          | Some _ ->
-                              None)
-                      | Some _
-                      | None ->
-                          None))
-            in
-            collect terms 0 0 None 0L
-      in
-
-      (* v77: one branch-carried scalar followed by one dependent
-         join reduction.
-
-           if (iv < K) x = x + A;
-           else        x = x + B;
-           sum = sum + x;       (* updated x *)
-           iv = iv + 1;
-
-         This is deliberately narrower than a general branch-aware summary:
-         - the ordinary counted-piecewise preconditions still require a
-           five-block, top-tested, unit-step threshold diamond;
-         - exactly one temp is selected by both arms and carried through the
-           join;
-         - both arm updates must be invariant constant/entry-invariant deltas
-           (no iv-dependent delta yet);
-         - exactly one second carried temp is updated in the join as
-             dep' = dep + selected_x'
-           and the join contains no other arithmetic besides that dependent
-           add and the exact iv + 1 update.
-
-         Summarize the two monotone phases sequentially.  Reusing
-         [ReductionCarrierProgression] is important: it already implements the
-         overflow-safe modular progression sum for an updated carrier.
-
-           prefix P:
-             dep += sum_{k=1..P} (x0 + k*A)
-             x   += P*A
-
-           suffix R:
-             dep += sum_{k=1..R} (xP + k*B)
-             x   += R*B
-      *)
-      let try_eliminate_dependent_temp_piecewise_threshold_loop
-          threshold_operand
-          then_label
-          else_label
-        =
-        match match_temp_arm then_label, match_temp_arm else_label with
-        | Some (then_core, then_aliases, then_join),
-          Some (else_core, else_aliases, else_join)
-          when then_join = else_join
-               && LabelSet.mem then_join loop
-               && List.mem then_join control_iv.backedge_preds ->
-            let join_block : Cfg.block = get_block then_join in
-            begin
-              match join_block.term with
-              | Cfg.Jump next when next = header ->
-                  let alias_lookup dst aliases =
-                    List.assoc_opt dst aliases
-                  in
-                  let join_moves =
-                    join_block.body
-                    |> List.filter_map
-                         (function
-                           | Tcg.Move (dst, Tcg.Temp src) ->
-                               Some (dst, src)
-                           | Tcg.Move _
-                           | Tcg.Un _
-                           | Tcg.Bin _
-                           | Tcg.Load _
-                           | Tcg.Store _
-                           | Tcg.Call _ ->
-                               None)
-                  in
-                  let arm_carriers =
-                    join_moves
-                    |> List.filter_map
-                         (fun (target, merge_temp) ->
-                           if target = control_iv.phi_temp then
-                             None
-                           else
-                             match
-                               alias_lookup merge_temp then_aliases,
-                               alias_lookup merge_temp else_aliases
-                             with
-                             | Some then_src, Some else_src ->
-                                 begin
-                                   match
-                                     temp_piecewise_update_of_operand
-                                       target then_core then_src,
-                                     temp_piecewise_update_of_operand
-                                       target else_core else_src
-                                   with
-                                   | Some then_step, Some else_step ->
-                                       Some
-                                         ( target,
-                                           merge_temp,
-                                           then_step,
-                                           else_step )
-                                   | _ ->
-                                       None
-                                 end
-                             | _ ->
-                                 None)
-                  in
-                  begin
-                    match arm_carriers with
-                    | [ (carrier, merge_temp, then_step, else_step) ] ->
-                        let step_expr = function
-                          | None ->
-                              Some zero_summary_expr
-                          | Some (invariant, bias, uses_iv) ->
-                              if uses_iv then
-                                None
-                              else
-                                let invariant_expr =
-                                  match invariant with
-                                  | Tcg.Imm 0L ->
-                                      zero_summary_expr
-                                  | operand ->
-                                      SummaryOperand operand
-                                in
-                                Some
-                                  (summary_expr_add
-                                     invariant_expr
-                                     (SummaryOperand (Tcg.Imm bias)))
-                        in
-                        begin
-                          match step_expr then_step, step_expr else_step with
-                          | Some then_expr, Some else_expr ->
-                              let add_is_dep_of_merge instr =
-                                match instr with
-                                | Tcg.Bin
-                                    ( out,
-                                      Add,
-                                      Tcg.Temp lhs,
-                                      Tcg.Temp rhs ) ->
-                                    if lhs = merge_temp then
-                                      Some (out, rhs)
-                                    else if rhs = merge_temp then
-                                      Some (out, lhs)
-                                    else
-                                      None
-                                | Tcg.Move _
-                                | Tcg.Un _
-                                | Tcg.Bin _
-                                | Tcg.Load _
-                                | Tcg.Store _
-                                | Tcg.Call _ ->
-                                    None
-                              in
-                              let dependent_candidates =
-                                join_block.body
-                                |> List.filter_map
-                                     (fun instr ->
-                                       match add_is_dep_of_merge instr with
-                                       | None ->
-                                           None
-                                       | Some (sum_temp, dep) ->
-                                           if
-                                             dep = carrier
-                                             || dep = control_iv.phi_temp
-                                           then
-                                             None
-                                           else if
-                                             List.exists
-                                               (fun (dst, src) ->
-                                                 dst = dep
-                                                 && src = sum_temp)
-                                               join_moves
-                                           then
-                                             Some (dep, sum_temp)
-                                           else
-                                             None)
-                                |> List.sort_uniq compare
-                              in
-                              let iv_step_temps =
-                                join_block.body
-                                |> List.filter_map
-                                     (function
-                                       | Tcg.Bin
-                                           ( next_temp,
-                                             Add,
-                                             Tcg.Temp src,
-                                             Tcg.Imm 1L )
-                                       | Tcg.Bin
-                                           ( next_temp,
-                                             Add,
-                                             Tcg.Imm 1L,
-                                             Tcg.Temp src )
-                                         when src =
-                                                control_iv.phi_temp ->
-                                           Some next_temp
-                                       | Tcg.Move _
-                                       | Tcg.Un _
-                                       | Tcg.Bin _
-                                       | Tcg.Load _
-                                       | Tcg.Store _
-                                       | Tcg.Call _ ->
-                                           None)
-                                |> List.sort_uniq compare
-                              in
-                              begin
-                                match
-                                  dependent_candidates,
-                                  iv_step_temps
-                                with
-                                | [ (dependent, dependent_next) ],
-                                  [ iv_next ] ->
-                                    let exact_join_instr = function
-                                      | Tcg.Bin
-                                          ( out,
-                                            Add,
-                                            Tcg.Temp lhs,
-                                            Tcg.Temp rhs )
-                                        when
-                                          out = dependent_next
-                                          && ((lhs = dependent
-                                               && rhs = merge_temp)
-                                              || (rhs = dependent
-                                                  && lhs = merge_temp)) ->
-                                          true
-                                      | Tcg.Bin
-                                          ( out,
-                                            Add,
-                                            Tcg.Temp src,
-                                            Tcg.Imm 1L )
-                                      | Tcg.Bin
-                                          ( out,
-                                            Add,
-                                            Tcg.Imm 1L,
-                                            Tcg.Temp src )
-                                        when
-                                          out = iv_next
-                                          && src =
-                                               control_iv.phi_temp ->
-                                          true
-                                      | Tcg.Move
-                                          ( dst,
-                                            Tcg.Temp src )
-                                        when
-                                          (dst = carrier
-                                           && src = merge_temp)
-                                          || (dst = dependent
-                                              && src =
-                                                   dependent_next)
-                                          || (dst =
-                                                control_iv.phi_temp
-                                              && src = iv_next) ->
-                                          true
-                                      | Tcg.Move _
-                                      | Tcg.Un _
-                                      | Tcg.Bin _
-                                      | Tcg.Load _
-                                      | Tcg.Store _
-                                      | Tcg.Call _ ->
-                                          false
-                                    in
-                                    if
-                                      not
-                                        (List.for_all
-                                           exact_join_instr
-                                           join_block.body)
-                                    then
-                                      None
-                                    else
-                                      let total_trip_instrs,
-                                          total_trip =
-                                        build_trip_count_instrs
-                                          fresh_temp
-                                          control_iv.phi_temp
-                                          control_iv.step
-                                          info.kind
-                                      in
-                                      let prefix_diff =
-                                        fresh_temp ()
-                                      in
-                                      let prefix_clamp_instrs,
-                                          prefix_nonnegative =
-                                        clamp_nonnegative_temp
-                                          fresh_temp prefix_diff
-                                      in
-                                      let min_delta =
-                                        fresh_temp ()
-                                      in
-                                      let choose_prefix =
-                                        fresh_temp ()
-                                      in
-                                      let selected_delta =
-                                        fresh_temp ()
-                                      in
-                                      let prefix_trip =
-                                        fresh_temp ()
-                                      in
-                                      let suffix_trip =
-                                        fresh_temp ()
-                                      in
-                                      let prefix_instrs =
-                                        [ simplify_simple_instr
-                                            (Tcg.Bin
-                                               ( prefix_diff,
-                                                 Sub,
-                                                 threshold_operand,
-                                                 Tcg.Temp
-                                                   control_iv.phi_temp )) ]
-                                        @ prefix_clamp_instrs
-                                        @ [ simplify_simple_instr
-                                              (Tcg.Bin
-                                                 ( min_delta,
-                                                   Sub,
-                                                   Tcg.Temp
-                                                     prefix_nonnegative,
-                                                   Tcg.Temp
-                                                     total_trip ));
-                                            simplify_simple_instr
-                                              (Tcg.Bin
-                                                 ( choose_prefix,
-                                                   Lt,
-                                                   Tcg.Temp
-                                                     prefix_nonnegative,
-                                                   Tcg.Temp
-                                                     total_trip ));
-                                            simplify_simple_instr
-                                              (Tcg.Bin
-                                                 ( selected_delta,
-                                                   Mul,
-                                                   Tcg.Temp
-                                                     min_delta,
-                                                   Tcg.Temp
-                                                     choose_prefix ));
-                                            simplify_simple_instr
-                                              (Tcg.Bin
-                                                 ( prefix_trip,
-                                                   Add,
-                                                   Tcg.Temp
-                                                     total_trip,
-                                                   Tcg.Temp
-                                                     selected_delta ));
-                                            simplify_simple_instr
-                                              (Tcg.Bin
-                                                 ( suffix_trip,
-                                                   Sub,
-                                                   Tcg.Temp
-                                                     total_trip,
-                                                   Tcg.Temp
-                                                     prefix_trip )) ]
-                                      in
-                                      let dependent_reduction step =
-                                        {
-                                          target =
-                                            ReductionTempTarget
-                                              dependent;
-                                          subtract = false;
-                                          step =
-                                            ReductionCarrierProgression
-                                              {
-                                                carrier_temp =
-                                                  carrier;
-                                                step_expr = step;
-                                                carrier_subtract =
-                                                  false;
-                                                include_updated =
-                                                  true;
-                                              };
-                                          carrier_temp = None;
-                                          alias_temps = [];
-                                        }
-                                      in
-                                      let carrier_reduction step =
-                                        {
-                                          target =
-                                            ReductionTempTarget
-                                              carrier;
-                                          subtract = false;
-                                          step =
-                                            ReductionInvariant step;
-                                          carrier_temp = None;
-                                          alias_temps = [];
-                                        }
-                                      in
-                                      let phase_updates trip step =
-                                        build_reduction_final_update
-                                          fresh_temp
-                                          trip
-                                          PlaceMap.empty
-                                          (dependent_reduction step)
-                                        @ build_reduction_final_update
-                                            fresh_temp
-                                            trip
-                                            PlaceMap.empty
-                                            (carrier_reduction step)
-                                      in
-                                      let updates =
-                                        phase_updates
-                                          prefix_trip then_expr
-                                        @ phase_updates
-                                            suffix_trip else_expr
-                                        @ build_iv_final_update
-                                            fresh_temp
-                                            total_trip
-                                            control_iv
-                                      in
-                                      if debug_piecewise then
-                                        debugf
-                                          "counted-piecewise-dependent-hit func=%s header=%s carrier=t%d dependent=t%d merge=t%d then=%s else=%s"
-                                          f.name
-                                          header
-                                          carrier
-                                          dependent
-                                          merge_temp
-                                          (string_of_child_summary_expr
-                                             then_expr)
-                                          (string_of_child_summary_expr
-                                             else_expr);
-                                      Some
-                                        ( total_trip_instrs,
-                                          prefix_instrs,
-                                          updates,
-                                          false,
-                                          "temp-dependent" )
-                                | _ ->
-                                    None
-                              end
-                          | _ ->
-                              None
-                        end
-                    | _ ->
-                        None
-                  end
-              | Cfg.Jump _
-              | Cfg.BranchZero _
-              | Cfg.BranchNonZero _
-              | Cfg.BranchCompare _
-              | Cfg.Return _ ->
-                  None
-            end
-        | _ ->
-            None
-      in
-
-      let try_eliminate_temp_piecewise_threshold_loop
-          threshold_operand
-          _threshold_static
-          _control_block
-          _inside_block
-          then_label
-          else_label
-        =
-        match match_temp_arm then_label, match_temp_arm else_label with
-        | Some (then_core, then_aliases, then_join), Some (else_core, else_aliases, else_join)
-          when then_join = else_join
-               && LabelSet.mem then_join loop
-               && exact_join_update then_join
-               && List.mem then_join control_iv.backedge_preds -> (
-            let carriers = join_temp_targets then_join in
-            let alias_lookup dst aliases = List.assoc_opt dst aliases in
-            let rec collect updates acc = function
-              | [] -> Some (List.rev acc)
-              | (target, alias_temp) :: rest -> (
-                  match
-                    alias_lookup alias_temp then_aliases,
-                    alias_lookup alias_temp else_aliases
-                  with
-                  | Some then_src, Some else_src -> (
-                      match
-                        temp_piecewise_update_of_operand target then_core then_src,
-                        temp_piecewise_update_of_operand target else_core else_src
-                      with
-                      | Some then_step, Some else_step ->
-                          collect
-                            updates
-                            ((target, then_step, else_step) :: acc)
-                            rest
-                      | _ -> None)
-                  | _ -> None)
-            in
-            match collect [] [] carriers with
-            | None ->
-                None
-            | Some target_updates ->
-                let has_real_change =
-                  List.exists
-                    (fun (_target, then_step, else_step) ->
-                      Option.is_some then_step || Option.is_some else_step)
-                    target_updates
-                in
-                if (not has_real_change) || carriers = [] then
-                  None
-                else
-                  let invariant_expr operand =
-                    match operand with
-                    | Tcg.Imm 0L -> zero_summary_expr
-                    | operand -> SummaryOperand operand
-                  in
-                  let temp_reductions target step subtract =
-                    match step with
-                    | None -> []
-                    | Some (invariant, bias, uses_iv) ->
-                        let invariant_reductions =
-                          let step_expr =
-                            if uses_iv then
-                              invariant_expr invariant
-                            else
-                              summary_expr_add
-                                (invariant_expr invariant)
-                                (SummaryOperand (Tcg.Imm bias))
-                          in
-                          if summary_expr_is_zero step_expr then
-                            []
-                          else
-                            [
-                              {
-                                target = ReductionTempTarget target;
-                                subtract;
-                                step = ReductionInvariant step_expr;
-                                carrier_temp = None;
-                                alias_temps = [];
-                              };
-                            ]
-                        in
-                        let affine_reductions =
-                          if uses_iv then
-                            [
-                              {
-                                target = ReductionTempTarget target;
-                                subtract;
-                                step =
-                                  ReductionAffine
-                                    {
-                                      iv = control_iv;
-                                      coeff = one_summary_expr;
-                                      bias = SummaryOperand (Tcg.Imm bias);
-                                    };
-                                carrier_temp = None;
-                                alias_temps = [];
-                              };
-                            ]
-                          else
-                            []
-                        in
-                        invariant_reductions @ affine_reductions
-                  in
-                  let total_trip_instrs, total_trip =
-                    build_trip_count_instrs
-                      fresh_temp
-                      control_iv.phi_temp
-                      control_iv.step
-                      info.kind
-                  in
-                  let prefix_diff = fresh_temp () in
-                  let prefix_clamp_instrs, prefix_nonnegative =
-                    clamp_nonnegative_temp fresh_temp prefix_diff
-                  in
-                  let min_delta = fresh_temp () in
-                  let choose_prefix = fresh_temp () in
-                  let selected_delta = fresh_temp () in
-                  let prefix_trip = fresh_temp () in
-                  let prefix_instrs =
-                    [ simplify_simple_instr
-                        (Tcg.Bin
-                           ( prefix_diff,
-                             Sub,
-                             threshold_operand,
-                             Tcg.Temp control_iv.phi_temp )) ]
-                    @ prefix_clamp_instrs
-                    @ [ simplify_simple_instr
-                          (Tcg.Bin
-                             ( min_delta,
-                               Sub,
-                               Tcg.Temp prefix_nonnegative,
-                               Tcg.Temp total_trip ));
-                        simplify_simple_instr
-                          (Tcg.Bin
-                             ( choose_prefix,
-                               Lt,
-                               Tcg.Temp prefix_nonnegative,
-                               Tcg.Temp total_trip ));
-                        simplify_simple_instr
-                          (Tcg.Bin
-                             ( selected_delta,
-                               Mul,
-                               Tcg.Temp min_delta,
-                               Tcg.Temp choose_prefix ));
-                        simplify_simple_instr
-                          (Tcg.Bin
-                             ( prefix_trip,
-                               Add,
-                               Tcg.Temp total_trip,
-                               Tcg.Temp selected_delta )) ]
-                  in
-                  let then_reductions =
-                    target_updates
-                    |> List.concat_map (fun (target, then_step, _else_step) ->
-                           temp_reductions target then_step false)
-                  in
-                  let else_all_reductions =
-                    target_updates
-                    |> List.concat_map (fun (target, _then_step, else_step) ->
-                           temp_reductions target else_step false)
-                  in
-                  let else_prefix_reductions =
-                    target_updates
-                    |> List.concat_map (fun (target, _then_step, else_step) ->
-                           temp_reductions target else_step true)
-                  in
-                  let all_reductions =
-                    then_reductions @ else_all_reductions @ else_prefix_reductions
-                  in
-                  let take count items =
-                    let rec loop n acc rest =
-                      if n = 0 then (List.rev acc, rest)
-                      else
-                        match rest with
-                        | item :: tail -> loop (n - 1) (item :: acc) tail
-                        | [] -> (List.rev acc, [])
-                    in
-                    loop count [] items
-                  in
-                  let then_reductions, remaining =
-                    take (List.length then_reductions) all_reductions
-                  in
-                  let else_all_reductions, else_prefix_reductions =
-                    let selected, rest =
-                      take (List.length else_all_reductions) remaining
-                    in
-                    (selected, rest)
-                  in
-                  let updates =
-                    List.concat_map
-                      (build_reduction_final_update
-                         fresh_temp
-                         prefix_trip
-                         PlaceMap.empty)
-                      then_reductions
-                    @ List.concat_map
-                        (build_reduction_final_update
-                           fresh_temp
-                           total_trip
-                           PlaceMap.empty)
-                        else_all_reductions
-                    @ List.concat_map
-                        (build_reduction_final_update
-                           fresh_temp
-                           prefix_trip
-                           PlaceMap.empty)
-                        else_prefix_reductions
-                    @ build_iv_final_update
-                        fresh_temp
-                        total_trip
-                        control_iv
-                  in
-                  Some
-                    ( total_trip_instrs,
-                      prefix_instrs,
-                      updates,
-                      false,
-                      "temp" ))
-        | _ ->
-            None
+        match (block.body, block.term) with
+        | ( [ Tcg.Bin (next_temp, Add, Tcg.Temp src, Tcg.Imm 1L);
+              Tcg.Move (dst, Tcg.Temp moved) ],
+            Cfg.Jump next )
+          when src = control_iv.phi_temp
+               && dst = control_iv.phi_temp
+               && moved = next_temp
+               && next = header ->
+            true
+        | ( [ Tcg.Bin (next_temp, Add, Tcg.Imm 1L, Tcg.Temp src);
+              Tcg.Move (dst, Tcg.Temp moved) ],
+            Cfg.Jump next )
+          when src = control_iv.phi_temp
+               && dst = control_iv.phi_temp
+               && moved = next_temp
+               && next = header ->
+            true
+        | _ -> false
       in
 
       let control_kind_supported =
@@ -21724,18 +20514,7 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
         || not control_kind_supported
         || info.control_label <> header
         || LabelSet.cardinal loop <> 5
-      then begin
-        debug_piecewise_reject
-          (Printf.sprintf
-             "precond calls=%b globals=%b step=%Ld control_kind=%b control_is_header=%b blocks=%d"
-             effects.has_call
-             (not (PlaceSet.is_empty modified_globals))
-             control_iv.step
-             control_kind_supported
-             (info.control_label = header)
-             (LabelSet.cardinal loop));
-        false
-      end
+      then false
       else
         let control_block : Cfg.block = get_block info.control_label in
         let inside_block : Cfg.block = get_block info.inside_label in
@@ -21743,89 +20522,14 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
         | ( [],
             [],
             Cfg.BranchCompare
-              (Lt, Tcg.Temp branch_iv, raw_threshold, then_label, else_label) )
+              (Lt, Tcg.Temp branch_iv, Tcg.Imm threshold, then_label, else_label) )
           when branch_iv = control_iv.phi_temp
                && then_label <> else_label
                && LabelSet.mem then_label loop
                && LabelSet.mem else_label loop -> (
-            match
-              resolve_operand_before_loop
-                loop_defs multi_defs def_instrs raw_threshold
-            with
-            | Some threshold_operand
-              when threshold_operand <> Tcg.Temp control_iv.phi_temp -> (
-                let threshold_static =
-                  operand_static_int64
-                    loop_defs multi_defs def_instrs threshold_operand
-                in
-                debug_piecewise_arm then_label;
-                debug_piecewise_arm else_label;
-                match
-                  (match
-                     try_eliminate_dependent_temp_piecewise_threshold_loop
-                       threshold_operand
-                       then_label
-                       else_label
-                   with
-                   | Some summary -> Some summary
-                   | None ->
-                       try_eliminate_temp_piecewise_threshold_loop
-                         threshold_operand
-                         threshold_static
-                         control_block
-                         inside_block
-                         then_label
-                         else_label)
-                with
-                | Some
-                    ( total_trip_instrs,
-                      prefix_instrs,
-                      updates,
-                      fast_piecewise,
-                      piecewise_mode ) ->
-                    let summary_label = fresh_summary_label () in
-                    let rewritten_term =
-                      rewrite_term_successor
-                        control_block.term
-                        ~from_label:info.inside_label
-                        ~to_label:summary_label
-                    in
-                    update_block
-                      {
-                        control_block with
-                        term = rewritten_term;
-                        succs = Cfg.successors rewritten_term;
-                      };
-                    Hashtbl.add
-                      current_blocks
-                      summary_label
-                      {
-                        Cfg.label = summary_label;
-                        body =
-                          total_trip_instrs
-                          @ prefix_instrs
-                          @ updates;
-                        term = Cfg.Jump info.exit_label;
-                        preds = [];
-                        succs = [ info.exit_label ];
-                      };
-                    debugf
-                      "counted-piecewise-apply func=%s header=%s summary=%s threshold=%s then=%s else=%s fast=%b mode=%s"
-                      f.name
-                      header
-                      summary_label
-                      (string_of_operand threshold_operand)
-                      then_label
-                      else_label
-                      fast_piecewise
-                      piecewise_mode;
-                    new_blocks_rev := summary_label :: !new_blocks_rev;
-                    changed := true;
-                    true
-                | None ->
-                match (match_arm then_label, match_arm else_label) with
-            | ( Some (then_place, then_invariant, then_bias, then_uses_iv, then_join),
-                Some (else_place, else_invariant, else_bias, else_uses_iv, else_join) )
+            match (match_arm then_label, match_arm else_label) with
+            | ( Some (then_place, then_invariant, then_bias, then_join),
+                Some (else_place, else_invariant, else_bias, else_join) )
               when then_join = else_join
                    && LabelSet.mem then_join loop
                    && exact_join_update then_join
@@ -21856,15 +20560,11 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                    piecewise transform: no arbitrary branch effects and no
                    dynamic-bound algebra are admitted here. *)
                 let same_place_static_summary () =
-                  if
-                    then_place <> else_place
-                    || not then_uses_iv
-                    || not else_uses_iv
-                  then
+                  if then_place <> else_place then
                     None
                   else
-                    match (known_control_init (), info.kind, threshold_static) with
-                    | Some init_value, CountUpLt (bound_operand, 0L), Some threshold -> (
+                    match (known_control_init (), info.kind) with
+                    | Some init_value, CountUpLt (bound_operand, 0L) -> (
                         match
                           operand_static_int64
                             loop_defs multi_defs def_instrs bound_operand
@@ -21995,22 +20695,22 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                         | Some _
                         | None ->
                             None)
-                    | Some _, CountUpLt (_, _), _
-                    | Some _, CountUpLe _, _
-                    | Some _, CountDownGt _, _
-                    | Some _, CountDownGe _, _
-                    | Some _, CountUpLtScaled _, _
-                    | Some _, CountUpLeScaled _, _
-                    | Some _, CountDownGtScaled _, _
-                    | Some _, CountDownGeScaled _, _
-                    | None, CountUpLt _, _
-                    | None, CountUpLe _, _
-                    | None, CountDownGt _, _
-                    | None, CountDownGe _, _
-                    | None, CountUpLtScaled _, _
-                    | None, CountUpLeScaled _, _
-                    | None, CountDownGtScaled _, _
-                    | None, CountDownGeScaled _, _ ->
+                    | Some _, CountUpLt (_, _)
+                    | Some _, CountUpLe _
+                    | Some _, CountDownGt _
+                    | Some _, CountDownGe _
+                    | Some _, CountUpLtScaled _
+                    | Some _, CountUpLeScaled _
+                    | Some _, CountDownGtScaled _
+                    | Some _, CountDownGeScaled _
+                    | None, CountUpLt _
+                    | None, CountUpLe _
+                    | None, CountDownGt _
+                    | None, CountDownGe _
+                    | None, CountUpLtScaled _
+                    | None, CountUpLeScaled _
+                    | None, CountDownGtScaled _
+                    | None, CountDownGeScaled _ ->
                         None
                 in
 
@@ -22036,10 +20736,10 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                   let prefix_instrs =
                     [ simplify_simple_instr
                         (Tcg.Bin
-                            ( prefix_diff,
-                              Sub,
-                              threshold_operand,
-                              Tcg.Temp control_iv.phi_temp )) ]
+                           ( prefix_diff,
+                             Sub,
+                             Tcg.Imm threshold,
+                             Tcg.Temp control_iv.phi_temp )) ]
                     @ prefix_clamp_instrs
                     @ [ simplify_simple_instr
                           (Tcg.Bin
@@ -22067,125 +20767,56 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                                Tcg.Temp selected_delta )) ]
                   in
 
-                  let invariant_expr operand =
-                    match operand with
-                    | Tcg.Imm 0L -> zero_summary_expr
-                    | operand -> SummaryOperand operand
-                  in
-
-                  let arm_reductions (place, invariant, bias, uses_iv, _join_label) subtract =
-                    let invariant_reductions =
-                      let step_expr =
-                        if uses_iv then
-                          invariant_expr invariant
-                        else
-                          summary_expr_add
-                            (invariant_expr invariant)
-                            (SummaryOperand (Tcg.Imm bias))
-                      in
-                      if summary_expr_is_zero step_expr then
-                        []
-                      else
-                        [
+                  let affine place bias subtract =
+                    {
+                      target = ReductionPlaceTarget place;
+                      subtract;
+                      step =
+                        ReductionAffine
                           {
-                            target = ReductionPlaceTarget place;
-                            subtract;
-                            step = ReductionInvariant step_expr;
-                            carrier_temp = None;
-                            alias_temps = [];
+                            iv = control_iv;
+                            coeff = one_summary_expr;
+                            bias = SummaryOperand (Tcg.Imm bias);
                           };
-                        ]
-                    in
-                    let affine_reductions =
-                      if uses_iv then
-                        [
-                          {
-                            target = ReductionPlaceTarget place;
-                            subtract;
-                            step =
-                              ReductionAffine
-                                {
-                                  iv = control_iv;
-                                  coeff = one_summary_expr;
-                                  bias = SummaryOperand (Tcg.Imm bias);
-                                };
-                            carrier_temp = None;
-                            alias_temps = [];
-                          };
-                        ]
-                      else
-                        []
-                    in
-                    invariant_reductions @ affine_reductions
+                      carrier_temp = None;
+                      alias_temps = [];
+                    }
                   in
-
-                  let then_reductions =
-                    arm_reductions
-                      (then_place, then_invariant, then_bias, then_uses_iv, then_join)
-                      false
-                  in
-                  let else_all_reductions =
-                    arm_reductions
-                      (else_place, else_invariant, else_bias, else_uses_iv, else_join)
-                      false
-                  in
-                  let else_prefix_reductions =
-                    arm_reductions
-                      (else_place, else_invariant, else_bias, else_uses_iv, else_join)
-                      true
-                  in
-                  let all_reductions =
-                    then_reductions
-                    @ else_all_reductions
-                    @ else_prefix_reductions
-                  in
+                  let then_reduction = affine then_place then_bias false in
+                  let else_all_reduction = affine else_place else_bias false in
+                  let else_prefix_reduction = affine else_place else_bias true in
                   let reductions, carrier_preloads =
                     materialize_place_reduction_carriers
                       fresh_temp
-                      all_reductions
+                      [ then_reduction;
+                        else_all_reduction;
+                        else_prefix_reduction ]
                   in
                   let place_carriers =
                     place_carriers_of_reductions reductions
                   in
-                  let take count items =
-                    let rec loop n acc rest =
-                      if n = 0 then (List.rev acc, rest)
-                      else
-                        match rest with
-                        | item :: tail -> loop (n - 1) (item :: acc) tail
-                        | [] -> (List.rev acc, [])
-                    in
-                    loop count [] items
-                  in
-                  let then_reductions, remaining =
-                    take (List.length then_reductions) reductions
-                  in
-                  let else_all_reductions, else_prefix_reductions =
-                    let selected, rest =
-                      take (List.length else_all_reductions) remaining
-                    in
-                    (selected, rest)
+                  let then_reduction, else_all_reduction, else_prefix_reduction =
+                    match reductions with
+                    | [ a; b; c ] -> (a, b, c)
+                    | _ -> assert false
                   in
                   let updates =
                     carrier_preloads
-                    @ List.concat_map
-                        (build_reduction_final_update
-                           fresh_temp
-                           prefix_trip
-                           place_carriers)
-                        then_reductions
-                    @ List.concat_map
-                        (build_reduction_final_update
-                           fresh_temp
-                           total_trip
-                           place_carriers)
-                        else_all_reductions
-                    @ List.concat_map
-                        (build_reduction_final_update
-                           fresh_temp
-                           prefix_trip
-                           place_carriers)
-                        else_prefix_reductions
+                    @ build_reduction_final_update
+                        fresh_temp
+                        prefix_trip
+                        place_carriers
+                        then_reduction
+                    @ build_reduction_final_update
+                        fresh_temp
+                        total_trip
+                        place_carriers
+                        else_all_reduction
+                    @ build_reduction_final_update
+                        fresh_temp
+                        prefix_trip
+                        place_carriers
+                        else_prefix_reduction
                     @ build_iv_final_update
                         fresh_temp
                         total_trip
@@ -22323,13 +20954,13 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                   match same_place_static_summary () with
                   | Some updates ->
                       Some ([], [], updates, true, "same-place-static")
-                  | None ->
+                  | None
+                    when then_invariant = Tcg.Imm 0L
+                         && else_invariant = Tcg.Imm 0L ->
                       let total_trip_instrs, prefix_instrs, updates, fast_piecewise =
-                        match (known_control_init (), info.kind, threshold_static) with
-                        | Some init_value, CountUpLt (bound, 0L), Some threshold
+                        match (known_control_init (), info.kind) with
+                        | Some init_value, CountUpLt (bound, 0L)
                           when then_place <> else_place
-                               && then_uses_iv
-                               && else_uses_iv
                                && init_value >= 0L
                                && threshold >= init_value ->
                             let prefix_cap =
@@ -22348,6 +20979,8 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                           updates,
                           fast_piecewise,
                           "legacy" )
+                  | None ->
+                      None
                 in
 
                 (match selected_summary with
@@ -22386,11 +21019,11 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                     succs = [ info.exit_label ];
                   };
                 debugf
-                  "counted-piecewise-apply func=%s header=%s summary=%s threshold=%s then=%s:%Ld else=%s:%Ld fast=%b mode=%s then_inv=%s else_inv=%s"
+                  "counted-piecewise-apply func=%s header=%s summary=%s threshold=%Ld then=%s:%Ld else=%s:%Ld fast=%b mode=%s then_inv=%s else_inv=%s"
                   f.name
                   header
                   summary_label
-                  (string_of_operand threshold_operand)
+                  threshold
                   (string_of_place then_place)
                   then_bias
                   (string_of_place else_place)
@@ -22402,1918 +21035,8 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                 new_blocks_rev := summary_label :: !new_blocks_rev;
                 changed := true;
                 true)
-            | _ ->
-                debug_piecewise_reject "arm-shape";
-                false)
-            | Some _
-            | None ->
-                debug_piecewise_reject "threshold-not-invariant";
-                false)
-        | _ ->
-            debug_piecewise_reject
-              (Printf.sprintf
-                 "control-shape control_body=%d inside_body=%d inside_term=%s"
-                 (List.length control_block.body)
-                 (List.length inside_block.body)
-                 (term_kind inside_block.term));
-            false
-      in
-
-    (* v78: summarize one rotated, pure scalar "state-machine" loop whose
-       outer IV threshold selects between two monotone threshold transfers.
-
-       Canonical late shape:
-
-         control/header:
-           if iv < bound -> body else exit
-
-         body:
-           if iv < K -> phase_a_root else phase_b_root
-
-         phase_a_root:
-           cmp = x + ca;
-           if cmp < La -> a_true else a_false
-           ...
-           xa = x + Sa_low / x + Sa_high
-           -> a_join
-
-         phase_b_root:
-           cmp = x + cb;
-           if cmp < Lb -> b_true else b_false
-           ...
-           xb = x + Sb_low / x + Sb_high
-           -> b_join
-
-         a_join/b_join -> join
-         join:
-           iv = iv + 1;
-           x = selected_x;
-           -> control
-
-       Each inner condition is equivalent to [x < C], where
-         C = L - c.
-       With positive low-side step and nonnegative high-side step, and in the
-       absence of i32 wrap, each transfer changes side at most once.  The
-       remaining loop therefore has at most four arithmetic phases.
-
-       Correctness guard:
-       ToyC arithmetic is i32.  Wrap could destroy monotonicity and make a
-       threshold become true again.  Do NOT assume no overflow.  Redirect the
-       control's loop-back edge through a runtime guard.  The fast summary is
-       used only when
-         - iv, bound, outer K, and x are nonnegative;
-         - x stays below INT32_MAX - max(compare_bias) for every remaining
-           iteration.
-       Otherwise jump back to the original body and execute the source loop.
-       All guard arithmetic itself is non-trapping; division uses a positive
-       compile-time constant. *)
-    (* v81: one-phase monotone state recurrence.
-
-         Recognize the single-loop form that remains after either source
-         simplification or late CFG-call inlining:
-
-             while (iv < bound) {
-               if (x + bias < limit)
-                 x = x + low_step;
-               else
-                 x = x + high_step;
-               iv = iv + 1;
-             }
-
-         Accepted CFG representations are deliberately narrow:
-         - 5 blocks: top-tested control + root + two arms + join;
-         - 4 blocks: rotated/coalesced root + two arms + control/join.
-
-         Only [iv] and [x] may be loop-defined values live at loop exit.
-         The fast path is runtime-guarded against signed-i32 wrap, preserving
-         the monotonic-threshold proof.  Failure of any proof leaves the
-         original loop untouched. *)
-    let counted_contains_substring haystack needle =
-      let hlen = String.length haystack in
-      let nlen = String.length needle in
-      let rec search i =
-        if i + nlen > hlen then
-          false
-        else if String.sub haystack i nlen = needle then
-          true
-        else
-          search (i + 1)
-      in
-      nlen = 0 || search 0
-    in
-
-    let try_eliminate_single_monotone_state_loop
-        header
-        loop
-        (info : counted_loop_info)
-        effects
-        loop_defs
-        multi_defs
-        def_instrs
-      =
-      let int32_max = 2_147_483_647L in
-      let nblocks = LabelSet.cardinal loop in
-      let modified_globals =
-        global_places effects.modified_places
-      in
-      if
-        effects.has_call
-        || not (PlaceSet.is_empty modified_globals)
-        || not (PlaceSet.is_empty effects.modified_places)
-        || info.control_iv.step <> 1L
-        || (nblocks <> 4 && nblocks <> 5)
-      then
-        false
-      else
-        match info.kind with
-        | CountUpLt (raw_bound, 0L) ->
-            begin
-              match
-                resolve_operand_before_loop
-                  loop_defs multi_defs def_instrs raw_bound
-              with
-              | None ->
-                  false
-              | Some bound_operand ->
-                  let control : Cfg.block =
-                    get_block info.control_label
-                  in
-                  let root : Cfg.block =
-                    get_block info.inside_label
-                  in
-
-                  let exact_control_term =
-                    match control.term with
-                    | Cfg.BranchCompare
-                        ( Lt,
-                          Tcg.Temp iv,
-                          _,
-                          inside_label,
-                          exit_label )
-                      when
-                        iv = info.control_iv.phi_temp
-                        && inside_label = info.inside_label
-                        && exit_label = info.exit_label ->
-                        true
-                    | Cfg.Jump _
-                    | Cfg.BranchZero _
-                    | Cfg.BranchNonZero _
-                    | Cfg.BranchCompare _
-                    | Cfg.Return _ ->
-                        false
-                  in
-
-                  let affine_path_delta carrier instrs =
-                    let value_of env = function
-                      | Tcg.Imm value ->
-                          Some (0, i32 value)
-                      | Tcg.Temp temp ->
-                          begin
-                            match IntMap.find_opt temp env with
-                            | Some value -> Some value
-                            | None when temp = carrier ->
-                                Some (1, 0L)
-                            | None -> None
-                          end
-                    in
-                    let rec scan env = function
-                      | [] ->
-                          begin
-                            match IntMap.find_opt carrier env with
-                            | Some (1, bias) -> Some bias
-                            | Some _
-                            | None -> Some 0L
-                          end
-                      | instr :: rest ->
-                          begin
-                            match instr with
-                            | Tcg.Move (dst, src) ->
-                                let env =
-                                  match value_of env src with
-                                  | Some value ->
-                                      IntMap.add dst value env
-                                  | None ->
-                                      IntMap.remove dst env
-                                in
-                                scan env rest
-                            | Tcg.Bin (dst, Add, lhs, rhs) ->
-                                let env =
-                                  match value_of env lhs, value_of env rhs with
-                                  | Some (lc, lb), Some (rc, rb) ->
-                                      IntMap.add
-                                        dst
-                                        (lc + rc, i32 (Int64.add lb rb))
-                                        env
-                                  | _ ->
-                                      IntMap.remove dst env
-                                in
-                                scan env rest
-                            | Tcg.Un _
-                            | Tcg.Bin _
-                            | Tcg.Load _
-                            | Tcg.Store _
-                            | Tcg.Call _ ->
-                                None
-                          end
-                    in
-                    scan
-                      (IntMap.singleton carrier (1, 0L))
-                      instrs
-                  in
-
-                  let exact_iv_plus_one body =
-                    let direct = ref 0 in
-                    let staged_defs = ref [] in
-                    let staged_copies = ref [] in
-                    let structurally_ok =
-                      List.for_all
-                        (function
-                          | Tcg.Bin
-                              ( dst,
-                                Add,
-                                Tcg.Temp src,
-                                Tcg.Imm 1L )
-                          | Tcg.Bin
-                              ( dst,
-                                Add,
-                                Tcg.Imm 1L,
-                                Tcg.Temp src )
-                            when src = info.control_iv.phi_temp ->
-                              if dst = info.control_iv.phi_temp then
-                                incr direct
-                              else
-                                staged_defs := dst :: !staged_defs;
-                              true
-                          | Tcg.Move
-                              (dst, Tcg.Temp src)
-                            when dst = info.control_iv.phi_temp ->
-                              staged_copies := src :: !staged_copies;
-                              true
-                          | Tcg.Move _
-                          | Tcg.Bin (_, Add, _, _) ->
-                              true
-                          | Tcg.Un _
-                          | Tcg.Bin _
-                          | Tcg.Load _
-                          | Tcg.Store _
-                          | Tcg.Call _ ->
-                              false)
-                        body
-                    in
-                    structurally_ok
-                    &&
-                    match
-                      !direct,
-                      List.sort_uniq compare !staged_defs,
-                      List.sort_uniq compare !staged_copies
-                    with
-                    | 1, [], [] ->
-                        true
-                    | 0, [ next_temp ], [ copied_temp ] ->
-                        next_temp = copied_temp
-                    | _ ->
-                        false
-                  in
-
-                  let emit_min lhs rhs =
-                    let delta = fresh_temp () in
-                    let choose_lhs = fresh_temp () in
-                    let selected_delta = fresh_temp () in
-                    let result = fresh_temp () in
-                    ( [ simplify_simple_instr
-                          (Tcg.Bin
-                             ( delta,
-                               Sub,
-                               Tcg.Temp lhs,
-                               Tcg.Temp rhs ));
-                        simplify_simple_instr
-                          (Tcg.Bin
-                             ( choose_lhs,
-                               Lt,
-                               Tcg.Temp lhs,
-                               Tcg.Temp rhs ));
-                        simplify_simple_instr
-                          (Tcg.Bin
-                             ( selected_delta,
-                               Mul,
-                               Tcg.Temp delta,
-                               Tcg.Temp choose_lhs ));
-                        simplify_simple_instr
-                          (Tcg.Bin
-                             ( result,
-                               Add,
-                               Tcg.Temp rhs,
-                               Tcg.Temp selected_delta )) ],
-                      result )
-                  in
-
-                  let emit_delta trip amount =
-                    if amount = 0L then
-                      ([], None)
-                    else if amount = 1L then
-                      ([], Some (Tcg.Temp trip))
-                    else
-                      let dst = fresh_temp () in
-                      ( [ simplify_simple_instr
-                            (Tcg.Bin
-                               ( dst,
-                                 Mul,
-                                 Tcg.Temp trip,
-                                 Tcg.Imm amount )) ],
-                        Some (Tcg.Temp dst) )
-                  in
-
-                  let emit_transfer
-                      trip
-                      carrier
-                      threshold
-                      low_step
-                      high_step
-                    =
-                    let threshold_diff = fresh_temp () in
-                    let clamp_instrs, positive_diff =
-                      clamp_nonnegative_temp
-                        fresh_temp threshold_diff
-                    in
-                    let cross_instrs, cross_trip =
-                      build_nonnegative_ceil_div
-                        fresh_temp positive_diff low_step
-                    in
-                    let min_instrs, low_trip =
-                      emit_min trip cross_trip
-                    in
-                    let high_trip = fresh_temp () in
-                    let low_delta_instrs, low_delta =
-                      emit_delta low_trip low_step
-                    in
-                    let high_delta_instrs, high_delta =
-                      emit_delta high_trip high_step
-                    in
-                    let add_delta = function
-                      | None -> []
-                      | Some delta ->
-                          [ simplify_simple_instr
-                              (Tcg.Bin
-                                 ( carrier,
-                                   Add,
-                                   Tcg.Temp carrier,
-                                   delta )) ]
-                    in
-                    [ simplify_simple_instr
-                        (Tcg.Bin
-                           ( threshold_diff,
-                             Sub,
-                             Tcg.Imm threshold,
-                             Tcg.Temp carrier )) ]
-                    @ clamp_instrs
-                    @ cross_instrs
-                    @ min_instrs
-                    @ [ simplify_simple_instr
-                          (Tcg.Bin
-                             ( high_trip,
-                               Sub,
-                               Tcg.Temp trip,
-                               Tcg.Temp low_trip )) ]
-                    @ low_delta_instrs
-                    @ add_delta low_delta
-                    @ high_delta_instrs
-                    @ add_delta high_delta
-                  in
-
-                  let emit_bool_and lhs rhs =
-                    let dst = fresh_temp () in
-                    ( [ simplify_simple_instr
-                          (Tcg.Bin
-                             ( dst,
-                               Mul,
-                               Tcg.Temp lhs,
-                               Tcg.Temp rhs )) ],
-                      dst )
-                  in
-
-                  if not exact_control_term then
-                    false
-                  else
-                    match root.body, root.term with
-                    | [ Tcg.Bin
-                          ( cmp_temp,
-                            Add,
-                            Tcg.Temp carrier,
-                            Tcg.Imm raw_bias ) ],
-                      Cfg.BranchCompare
-                        ( Lt,
-                          Tcg.Temp branch_temp,
-                          Tcg.Imm raw_limit,
-                          true_label,
-                          false_label )
-                    | [ Tcg.Bin
-                          ( cmp_temp,
-                            Add,
-                            Tcg.Imm raw_bias,
-                            Tcg.Temp carrier ) ],
-                      Cfg.BranchCompare
-                        ( Lt,
-                          Tcg.Temp branch_temp,
-                          Tcg.Imm raw_limit,
-                          true_label,
-                          false_label )
-                      when cmp_temp = branch_temp ->
-                        let bias = i32 raw_bias in
-                        let limit = i32 raw_limit in
-                        let threshold = Int64.sub limit bias in
-                        if
-                          bias < 0L
-                          || threshold < 0L
-                          || threshold > int32_max
-                          || not (LabelSet.mem true_label loop)
-                          || not (LabelSet.mem false_label loop)
-                        then
-                          false
-                        else
-                          let true_block : Cfg.block =
-                            get_block true_label
-                          in
-                          let false_block : Cfg.block =
-                            get_block false_label
-                          in
-                          begin
-                            match true_block.term, false_block.term with
-                            | Cfg.Jump true_join,
-                              Cfg.Jump false_join
-                              when true_join = false_join ->
-                                let join_label = true_join in
-                                if not (LabelSet.mem join_label loop) then
-                                  false
-                                else
-                                  let join_block : Cfg.block =
-                                    get_block join_label
-                                  in
-                                  let tail_body, tail_term_ok =
-                                    if join_label = info.control_label then
-                                      (control.body, true)
-                                    else
-                                      match join_block.term with
-                                      | Cfg.Jump next
-                                        when next = info.control_label ->
-                                          (join_block.body, true)
-                                      | Cfg.Jump iv_update_label
-                                        when
-                                          counted_contains_substring
-                                            header "_cfg_inline_"
-                                          && counted_contains_substring
-                                               iv_update_label "_canon_cmp_"
-                                          && counted_contains_substring
-                                               info.control_label
-                                               "_cfg_inline_cont_" ->
-                                          let iv_update_block : Cfg.block =
-                                            get_block iv_update_label
-                                          in
-                                          begin
-                                            match iv_update_block.term with
-                                            | Cfg.Jump next
-                                              when
-                                                next = info.control_label
-                                                && iv_update_block.preds
-                                                   = [ join_label ]
-                                                && control.preds
-                                                   = [ iv_update_label ] ->
-                                                ( join_block.body
-                                                  @ iv_update_block.body,
-                                                  true )
-                                            | Cfg.Jump _
-                                            | Cfg.BranchZero _
-                                            | Cfg.BranchNonZero _
-                                            | Cfg.BranchCompare _
-                                            | Cfg.Return _ ->
-                                                (join_block.body, false)
-                                          end
-                                      | Cfg.Jump _
-                                      | Cfg.BranchZero _
-                                      | Cfg.BranchNonZero _
-                                      | Cfg.BranchCompare _
-                                      | Cfg.Return _ ->
-                                          (join_block.body, false)
-                                  in
-                                  if
-                                    not tail_term_ok
-                                    || not (exact_iv_plus_one tail_body)
-                                    || List.length true_block.body > 2
-                                    || List.length false_block.body > 2
-                                    || List.length tail_body > 3
-                                  then
-                                    false
-                                  else
-                                    let true_delta =
-                                      affine_path_delta
-                                        carrier
-                                        (root.body
-                                         @ true_block.body
-                                         @ tail_body)
-                                    in
-                                    let false_delta =
-                                      affine_path_delta
-                                        carrier
-                                        (root.body
-                                         @ false_block.body
-                                         @ tail_body)
-                                    in
-                                    begin
-                                      match true_delta, false_delta with
-                                      | Some low_step,
-                                        Some high_step
-                                        when
-                                          low_step > 0L
-                                          && high_step >= 0L ->
-                                          let live_in_t, _live_in_p =
-                                            compute_liveness
-                                              summaries
-                                              globals
-                                              {
-                                                f with
-                                                blocks =
-                                                  current_block_list ();
-                                              }
-                                          in
-                                          let live_t_exit =
-                                            table_find_or_empty
-                                              live_in_t
-                                              info.exit_label
-                                              IntSet.empty
-                                          in
-                                          let loop_live_defs =
-                                            IntSet.inter
-                                              loop_defs
-                                              live_t_exit
-                                          in
-                                          let allowed_live =
-                                            IntSet.add
-                                              carrier
-                                              (IntSet.singleton
-                                                 info.control_iv.phi_temp)
-                                          in
-                                          if
-                                            not
-                                              (IntSet.subset
-                                                 loop_live_defs
-                                                 allowed_live)
-                                          then begin
-                                            if debug_counted then
-                                              debugf
-                                                "counted-single-monotone-reject func=%s header=%s reason=extra-live live={%s} allowed={%s}"
-                                                f.name
-                                                header
-                                                (string_of_intset
-                                                   loop_live_defs)
-                                                (string_of_intset
-                                                   allowed_live);
-                                            false
-                                          end
-                                          else
-                                            let max_step =
-                                              Int64.max
-                                                low_step high_step
-                                            in
-                                            let safe_top =
-                                              Int64.sub
-                                                int32_max bias
-                                            in
-                                            if
-                                              max_step <= 0L
-                                              || safe_top < 0L
-                                            then
-                                              false
-                                            else
-                                              let trip_instrs,
-                                                  trip_temp =
-                                                build_trip_count_instrs
-                                                  fresh_temp
-                                                  info.control_iv.phi_temp
-                                                  info.control_iv.step
-                                                  info.kind
-                                              in
-
-                                              let iv_nonneg =
-                                                fresh_temp ()
-                                              in
-                                              let bound_nonneg =
-                                                fresh_temp ()
-                                              in
-                                              let carrier_nonneg =
-                                                fresh_temp ()
-                                              in
-                                              let carrier_safe =
-                                                fresh_temp ()
-                                              in
-                                              let capacity =
-                                                fresh_temp ()
-                                              in
-                                              let allowed_iters =
-                                                fresh_temp ()
-                                              in
-                                              let trip_safe =
-                                                fresh_temp ()
-                                              in
-                                              let base_guard =
-                                                [ simplify_simple_instr
-                                                    (Tcg.Bin
-                                                       ( iv_nonneg,
-                                                         Ge,
-                                                         Tcg.Temp
-                                                           info.control_iv.phi_temp,
-                                                         Tcg.Imm 0L ));
-                                                  simplify_simple_instr
-                                                    (Tcg.Bin
-                                                       ( bound_nonneg,
-                                                         Ge,
-                                                         bound_operand,
-                                                         Tcg.Imm 0L ));
-                                                  simplify_simple_instr
-                                                    (Tcg.Bin
-                                                       ( carrier_nonneg,
-                                                         Ge,
-                                                         Tcg.Temp carrier,
-                                                         Tcg.Imm 0L ));
-                                                  simplify_simple_instr
-                                                    (Tcg.Bin
-                                                       ( carrier_safe,
-                                                         Le,
-                                                         Tcg.Temp carrier,
-                                                         Tcg.Imm safe_top ));
-                                                  simplify_simple_instr
-                                                    (Tcg.Bin
-                                                       ( capacity,
-                                                         Sub,
-                                                         Tcg.Imm safe_top,
-                                                         Tcg.Temp carrier ));
-                                                  simplify_simple_instr
-                                                    (Tcg.Bin
-                                                       ( allowed_iters,
-                                                         Div,
-                                                         Tcg.Temp capacity,
-                                                         Tcg.Imm max_step ));
-                                                  simplify_simple_instr
-                                                    (Tcg.Bin
-                                                       ( trip_safe,
-                                                         Le,
-                                                         Tcg.Temp trip_temp,
-                                                         Tcg.Temp
-                                                           allowed_iters )) ]
-                                              in
-                                              let and1_i, and1 =
-                                                emit_bool_and
-                                                  iv_nonneg bound_nonneg
-                                              in
-                                              let and2_i, and2 =
-                                                emit_bool_and
-                                                  carrier_nonneg carrier_safe
-                                              in
-                                              let and3_i, and3 =
-                                                emit_bool_and
-                                                  and1 and2
-                                              in
-                                              let and4_i, guard_temp =
-                                                emit_bool_and
-                                                  and3 trip_safe
-                                              in
-                                              let guard_instrs =
-                                                trip_instrs
-                                                @ base_guard
-                                                @ and1_i
-                                                @ and2_i
-                                                @ and3_i
-                                                @ and4_i
-                                              in
-                                              let summary_instrs =
-                                                emit_transfer
-                                                  trip_temp
-                                                  carrier
-                                                  threshold
-                                                  low_step
-                                                  high_step
-                                                @ build_iv_final_update
-                                                    fresh_temp
-                                                    trip_temp
-                                                    info.control_iv
-                                              in
-                                              let guard_label =
-                                                fresh_summary_label ()
-                                              in
-                                              let summary_label =
-                                                fresh_summary_label ()
-                                              in
-                                              let rewritten_term =
-                                                rewrite_term_successor
-                                                  control.term
-                                                  ~from_label:
-                                                    info.inside_label
-                                                  ~to_label:
-                                                    guard_label
-                                              in
-                                              update_block
-                                                {
-                                                  control with
-                                                  term =
-                                                    rewritten_term;
-                                                  succs =
-                                                    Cfg.successors
-                                                      rewritten_term;
-                                                };
-                                              Hashtbl.add
-                                                current_blocks
-                                                guard_label
-                                                {
-                                                  Cfg.label =
-                                                    guard_label;
-                                                  body =
-                                                    guard_instrs;
-                                                  term =
-                                                    Cfg.BranchNonZero
-                                                      ( Tcg.Temp
-                                                          guard_temp,
-                                                        summary_label,
-                                                        info.inside_label );
-                                                  preds = [];
-                                                  succs =
-                                                    [ summary_label;
-                                                      info.inside_label ];
-                                                };
-                                              Hashtbl.add
-                                                current_blocks
-                                                summary_label
-                                                {
-                                                  Cfg.label =
-                                                    summary_label;
-                                                  body =
-                                                    summary_instrs;
-                                                  term =
-                                                    Cfg.Jump
-                                                      info.exit_label;
-                                                  preds = [];
-                                                  succs =
-                                                    [ info.exit_label ];
-                                                };
-                                              new_blocks_rev :=
-                                                summary_label
-                                                :: guard_label
-                                                :: !new_blocks_rev;
-                                              changed := true;
-                                              if debug_counted then
-                                                debugf
-                                                  "counted-single-monotone-hit func=%s header=%s blocks=%d carrier=t%d threshold=%Ld low=%Ld high=%Ld guard=%s summary=%s"
-                                                  f.name
-                                                  header
-                                                  nblocks
-                                                  carrier
-                                                  threshold
-                                                  low_step
-                                                  high_step
-                                                  guard_label
-                                                  summary_label;
-                                              true
-                                      | _ ->
-                                          false
-                                    end
-                            | _ ->
-                                false
-                          end
-                    | _ ->
-                        false
-            end
-        | CountUpLt _
-        | CountUpLe _
-        | CountDownGt _
-        | CountDownGe _
-        | CountUpLtScaled _
-        | CountUpLeScaled _
-        | CountDownGtScaled _
-        | CountDownGeScaled _ ->
-            false
-      in
-
-    let try_eliminate_monotone_state_piecewise_loop
-        header
-        loop
-        (info : counted_loop_info)
-        effects
-        loop_defs
-        multi_defs
-        def_instrs
-      =
-      let debug_hit fmt =
-        if debug_counted then
-          Printf.ksprintf
-            (fun msg -> debugf "%s" msg)
-            fmt
-        else
-          Printf.ksprintf (fun _ -> ()) fmt
-      in
-      let int32_max = 2_147_483_647L in
-
-      let resolved_before_loop operand =
-        resolve_operand_before_loop
-          loop_defs multi_defs def_instrs operand
-      in
-
-      (* v79: resolve one path as [carrier + constant] by scanning
-         instructions in program order.  This deliberately supports both the
-         PHI-lowered early form (add -> move -> merge) and the late
-         copy-coalesced form (direct carrier update / compare-temp reuse). *)
-      let constant_delta_after carrier instrs result_operand =
-        let value_of_operand env = function
-          | Tcg.Imm value ->
-              Some (0, i32 value)
-          | Tcg.Temp temp ->
-              begin
-                match IntMap.find_opt temp env with
-                | Some value -> Some value
-                | None when temp = carrier -> Some (1, 0L)
-                | None -> None
-              end
-        in
-        let rec scan env = function
-          | [] ->
-              begin
-                match value_of_operand env result_operand with
-                | Some (1, bias) -> Some bias
-                | Some _
-                | None -> None
-              end
-          | instr :: rest ->
-              begin
-                match instr with
-                | Tcg.Move (dst, src) ->
-                    begin
-                      match value_of_operand env src with
-                      | Some value ->
-                          scan (IntMap.add dst value env) rest
-                      | None ->
-                          None
-                    end
-                | Tcg.Bin (dst, Add, lhs, rhs) ->
-                    begin
-                      match
-                        value_of_operand env lhs,
-                        value_of_operand env rhs
-                      with
-                      | Some (lc, lb), Some (rc, rb) ->
-                          scan
-                            (IntMap.add
-                               dst
-                               ( lc + rc,
-                                 i32 (Int64.add lb rb) )
-                               env)
-                            rest
-                      | _ ->
-                          None
-                    end
-                | Tcg.Un _
-                | Tcg.Bin _
-                | Tcg.Load _
-                | Tcg.Store _
-                | Tcg.Call _ ->
-                    None
-              end
-        in
-        scan IntMap.empty instrs
-      in
-
-      let parse_inner_transfer root_label =
-        if not (LabelSet.mem root_label loop) then
-          None
-        else
-          let root : Cfg.block = get_block root_label in
-          match root.body, root.term with
-          | [ cmp_instr ],
-            Cfg.BranchCompare
-              ( Lt,
-                Tcg.Temp branch_cmp_temp,
-                Tcg.Imm raw_limit,
-                true_label,
-                false_label ) ->
-              begin
-                match cmp_instr with
-                | Tcg.Bin
-                    ( cmp_temp,
-                      Add,
-                      Tcg.Temp carrier,
-                      Tcg.Imm raw_bias )
-                | Tcg.Bin
-                    ( cmp_temp,
-                      Add,
-                      Tcg.Imm raw_bias,
-                      Tcg.Temp carrier )
-                  when cmp_temp = branch_cmp_temp ->
-                    let cmp_bias = i32 raw_bias in
-                    let limit = i32 raw_limit in
-                    let threshold = Int64.sub limit cmp_bias in
-                    if
-                      cmp_bias < 0L
-                      || threshold < 0L
-                      || threshold > int32_max
-                      || not (LabelSet.mem true_label loop)
-                      || not (LabelSet.mem false_label loop)
-                    then
-                      None
-                    else
-                      let parse_child child_label =
-                        let child : Cfg.block =
-                          get_block child_label
-                        in
-                        match child.term with
-                        | Cfg.Jump join_label ->
-                            Some (child.body, join_label)
-                        | Cfg.BranchZero _
-                        | Cfg.BranchNonZero _
-                        | Cfg.BranchCompare _
-                        | Cfg.Return _ ->
-                            None
-                      in
-                      begin
-                        match
-                          parse_child true_label,
-                          parse_child false_label
-                        with
-                        | Some (true_body, true_join),
-                          Some (false_body, false_join)
-                          when true_join = false_join ->
-                            let inner_join : Cfg.block =
-                              get_block true_join
-                            in
-                            let selected_operand,
-                                result_temp,
-                                outer_join_opt =
-                              match
-                                inner_join.body,
-                                inner_join.term
-                              with
-                              | [], Cfg.Jump outer_join ->
-                                  ( Tcg.Temp carrier,
-                                    carrier,
-                                    Some outer_join )
-                              | [ Tcg.Move
-                                    ( final_temp,
-                                      Tcg.Temp selected_temp ) ],
-                                Cfg.Jump outer_join ->
-                                  ( Tcg.Temp selected_temp,
-                                    final_temp,
-                                    Some outer_join )
-                              | _ ->
-                                  (Tcg.Temp carrier, carrier, None)
-                            in
-                            begin
-                              match outer_join_opt with
-                              | None -> None
-                              | Some outer_join ->
-                                  begin
-                                    match
-                                      constant_delta_after
-                                        carrier
-                                        (root.body @ true_body)
-                                        selected_operand,
-                                      constant_delta_after
-                                        carrier
-                                        (root.body @ false_body)
-                                        selected_operand
-                                    with
-                                    | Some low_step,
-                                      Some high_step
-                                      when
-                                        low_step > 0L
-                                        && high_step >= 0L ->
-                                        Some
-                                          ( carrier,
-                                            result_temp,
-                                            true_join,
-                                            outer_join,
-                                            threshold,
-                                            low_step,
-                                            high_step,
-                                            cmp_bias )
-                                    | _ ->
-                                        None
-                                  end
-                            end
-                        | _ ->
-                            None
-                      end
-                | Tcg.Move _
-                | Tcg.Un _
-                | Tcg.Bin _
-                | Tcg.Load _
-                | Tcg.Store _
-                | Tcg.Call _ ->
-                    None
-              end
-          | _ ->
-              None
-      in
-
-      let exact_outer_join
-          outer_join
-          carrier
-          result_temp
-        =
-        let exact_direct_control_update (block : Cfg.block) =
-          result_temp = carrier
-          &&
-          match block.body, block.term with
-          | [ Tcg.Bin
-                ( dst,
-                  Add,
-                  Tcg.Temp src,
-                  Tcg.Imm 1L ) ],
-            Cfg.BranchCompare
-              ( Lt,
-                Tcg.Temp cmp_iv,
-                _bound,
-                inside_label,
-                exit_label )
-          | [ Tcg.Bin
-                ( dst,
-                  Add,
-                  Tcg.Imm 1L,
-                  Tcg.Temp src ) ],
-            Cfg.BranchCompare
-              ( Lt,
-                Tcg.Temp cmp_iv,
-                _bound,
-                inside_label,
-                exit_label )
-            when
-              dst = info.control_iv.phi_temp
-              && src = info.control_iv.phi_temp
-              && cmp_iv = info.control_iv.phi_temp
-              && inside_label = info.inside_label
-              && exit_label = info.exit_label ->
-              true
-          | _ ->
-              false
-        in
-        let block : Cfg.block = get_block outer_join in
-        if outer_join = info.control_label then
-          (* Late CFG-inline/coalesced form:
-               arm-join -> control
-             and [control] itself performs iv += 1 before the bound test. *)
-          exact_direct_control_update block
-        else
-          match block.term with
-          | Cfg.Jump next
-            when next = info.control_label
-                 && List.mem outer_join
-                      info.control_iv.backedge_preds ->
-              let direct_iv_updates = ref 0 in
-              let staged_iv_defs = ref [] in
-              let iv_copy_sources = ref [] in
-              let carrier_copies = ref 0 in
-              let recognized =
-                List.for_all
-                  (function
-                    | Tcg.Bin
-                        ( dst,
-                          Add,
-                          Tcg.Temp src,
-                          Tcg.Imm 1L )
-                    | Tcg.Bin
-                        ( dst,
-                          Add,
-                          Tcg.Imm 1L,
-                          Tcg.Temp src )
-                      when src = info.control_iv.phi_temp ->
-                        if dst = info.control_iv.phi_temp then
-                          incr direct_iv_updates
-                        else
-                          staged_iv_defs := dst :: !staged_iv_defs;
-                        true
-                    | Tcg.Move
-                        (dst, Tcg.Temp src)
-                      when dst = info.control_iv.phi_temp ->
-                        iv_copy_sources :=
-                          src :: !iv_copy_sources;
-                        true
-                    | Tcg.Move
-                        (dst, Tcg.Temp src)
-                      when
-                        dst = carrier
-                        && src = result_temp ->
-                        incr carrier_copies;
-                        true
-                    | Tcg.Move _
-                    | Tcg.Un _
-                    | Tcg.Bin _
-                    | Tcg.Load _
-                    | Tcg.Store _
-                    | Tcg.Call _ ->
-                        false)
-                  block.body
-              in
-              if not recognized then
-                false
-              else
-                let iv_ok =
-                  match
-                    !direct_iv_updates,
-                    List.sort_uniq compare !staged_iv_defs,
-                    List.sort_uniq compare !iv_copy_sources
-                  with
-                  | 1, [], [] ->
-                      true
-                  | 0, [ next_temp ], [ copied_temp ] ->
-                      next_temp = copied_temp
-                  | _ ->
-                      false
-                in
-                let carrier_ok =
-                  if result_temp = carrier then
-                    !carrier_copies = 0
-                  else
-                    !carrier_copies = 1
-                in
-                iv_ok && carrier_ok
-          | Cfg.Jump _
-          | Cfg.BranchZero _
-          | Cfg.BranchNonZero _
-          | Cfg.BranchCompare _
-          | Cfg.Return _ ->
-              false
-      in
-
-      let emit_min_nonnegative lhs rhs =
-        let delta = fresh_temp () in
-        let choose_lhs = fresh_temp () in
-        let selected_delta = fresh_temp () in
-        let result = fresh_temp () in
-        ( [ simplify_simple_instr
-              (Tcg.Bin
-                 ( delta,
-                   Sub,
-                   Tcg.Temp lhs,
-                   Tcg.Temp rhs ));
-            simplify_simple_instr
-              (Tcg.Bin
-                 ( choose_lhs,
-                   Lt,
-                   Tcg.Temp lhs,
-                   Tcg.Temp rhs ));
-            simplify_simple_instr
-              (Tcg.Bin
-                 ( selected_delta,
-                   Mul,
-                   Tcg.Temp delta,
-                   Tcg.Temp choose_lhs ));
-            simplify_simple_instr
-              (Tcg.Bin
-                 ( result,
-                   Add,
-                   Tcg.Temp rhs,
-                   Tcg.Temp selected_delta )) ],
-          result )
-      in
-
-      let emit_const_delta trip_temp amount =
-        let amount = i32 amount in
-        if amount = 0L then
-          ([], Tcg.Imm 0L)
-        else if amount = 1L then
-          ([], Tcg.Temp trip_temp)
-        else
-          let delta = fresh_temp () in
-          ( [ simplify_simple_instr
-                (Tcg.Bin
-                   ( delta,
-                     Mul,
-                     Tcg.Temp trip_temp,
-                     Tcg.Imm amount )) ],
-            Tcg.Temp delta )
-      in
-
-      let emit_state_transfer
-          trip_temp
-          carrier
-          threshold
-          low_step
-          high_step
-        =
-        let threshold_diff = fresh_temp () in
-        let clamp_instrs, positive_diff =
-          clamp_nonnegative_temp
-            fresh_temp threshold_diff
-        in
-        let cross_instrs, cross_trip =
-          build_nonnegative_ceil_div
-            fresh_temp positive_diff low_step
-        in
-        let min_instrs, low_trip =
-          emit_min_nonnegative
-            trip_temp cross_trip
-        in
-        let high_trip = fresh_temp () in
-        let low_delta_instrs, low_delta =
-          emit_const_delta low_trip low_step
-        in
-        let low_update =
-          match low_delta with
-          | Tcg.Imm 0L -> []
-          | _ ->
-              [ simplify_simple_instr
-                  (Tcg.Bin
-                     ( carrier,
-                       Add,
-                       Tcg.Temp carrier,
-                       low_delta )) ]
-        in
-        let high_delta_instrs, high_delta =
-          emit_const_delta high_trip high_step
-        in
-        let high_update =
-          match high_delta with
-          | Tcg.Imm 0L -> []
-          | _ ->
-              [ simplify_simple_instr
-                  (Tcg.Bin
-                     ( carrier,
-                       Add,
-                       Tcg.Temp carrier,
-                       high_delta )) ]
-        in
-        [ simplify_simple_instr
-            (Tcg.Bin
-               ( threshold_diff,
-                 Sub,
-                 Tcg.Imm threshold,
-                 Tcg.Temp carrier )) ]
-        @ clamp_instrs
-        @ cross_instrs
-        @ min_instrs
-        @ [ simplify_simple_instr
-              (Tcg.Bin
-                 ( high_trip,
-                   Sub,
-                   Tcg.Temp trip_temp,
-                   Tcg.Temp low_trip )) ]
-        @ low_delta_instrs
-        @ low_update
-        @ high_delta_instrs
-        @ high_update
-      in
-
-      let emit_and lhs rhs =
-        let dst = fresh_temp () in
-        ( [ simplify_simple_instr
-              (Tcg.Bin
-                 ( dst,
-                   Mul,
-                   Tcg.Temp lhs,
-                   Tcg.Temp rhs )) ],
-          dst )
-      in
-
-      let modified_globals =
-        global_places effects.modified_places
-      in
-      if
-        effects.has_call
-        || not (PlaceSet.is_empty modified_globals)
-        || not (PlaceSet.is_empty effects.modified_places)
-        || info.control_iv.step <> 1L
-        || (let n = LabelSet.cardinal loop in n <> 10 && n <> 11)
-      then begin
-        if debug_counted then
-          debugf
-            "counted-monotone-state-piecewise-reject func=%s header=%s reason=precond calls=%b places=%d step=%Ld control=%s blocks=%d"
-            f.name
-            header
-            effects.has_call
-            (PlaceSet.cardinal effects.modified_places)
-            info.control_iv.step
-            info.control_label
-            (LabelSet.cardinal loop);
-        false
-      end
-      else begin
-        if debug_counted then
-          debugf
-            "counted-monotone-state-piecewise-probe func=%s header=%s control=%s control_is_header=%b inside=%s blocks=%d"
-            f.name
-            header
-            info.control_label
-            (info.control_label = header)
-            info.inside_label
-            (LabelSet.cardinal loop);
-        match info.kind with
-        | CountUpLt (raw_bound, 0L) ->
-            begin
-              match resolved_before_loop raw_bound with
-              | None ->
-                  false
-              | Some bound_operand ->
-                  let control_block : Cfg.block =
-                    get_block info.control_label
-                  in
-                  let inside_block : Cfg.block =
-                    get_block info.inside_label
-                  in
-                  let control_layout_ok =
-                    if info.control_label = header then
-                      control_block.body = []
-                    else
-                      match control_block.body with
-                      | [ Tcg.Bin
-                            ( dst,
-                              Add,
-                              Tcg.Temp src,
-                              Tcg.Imm 1L ) ]
-                      | [ Tcg.Bin
-                            ( dst,
-                              Add,
-                              Tcg.Imm 1L,
-                              Tcg.Temp src ) ]
-                        when
-                          dst = info.control_iv.phi_temp
-                          && src = info.control_iv.phi_temp ->
-                          true
-                      | _ ->
-                          false
-                  in
-                  begin
-                    match
-                      inside_block.body,
-                      inside_block.term
-                    with
-                    | [],
-                      Cfg.BranchCompare
-                        ( Lt,
-                          Tcg.Temp outer_iv,
-                          raw_outer_threshold,
-                          first_root,
-                          second_root )
-                      when
-                        control_layout_ok
-                        && outer_iv =
-                          info.control_iv.phi_temp
-                        && LabelSet.mem first_root loop
-                        && LabelSet.mem second_root loop ->
-                        begin
-                          let resolved_outer =
-                            resolved_before_loop
-                              raw_outer_threshold
-                          in
-                          let first_transfer =
-                            parse_inner_transfer first_root
-                          in
-                          let second_transfer =
-                            parse_inner_transfer second_root
-                          in
-                          if debug_counted then
-                            debugf
-                              "counted-monotone-state-piecewise-shape func=%s header=%s outer=%b first=%b second=%b first_root=%s second_root=%s"
-                              f.name
-                              header
-                              (Option.is_some resolved_outer)
-                              (Option.is_some first_transfer)
-                              (Option.is_some second_transfer)
-                              first_root
-                              second_root;
-                          match
-                            resolved_outer,
-                            first_transfer,
-                            second_transfer
-                          with
-                          | Some outer_threshold,
-                            Some
-                              ( carrier_a,
-                                result_a,
-                                _inner_join_a,
-                                outer_join_a,
-                                threshold_a,
-                                low_a,
-                                high_a,
-                                cmp_bias_a ),
-                            Some
-                              ( carrier_b,
-                                result_b,
-                                _inner_join_b,
-                                outer_join_b,
-                                threshold_b,
-                                low_b,
-                                high_b,
-                                cmp_bias_b )
-                            when
-                              carrier_a = carrier_b
-                              && result_a = result_b
-                              && outer_join_a = outer_join_b
-                              && exact_outer_join
-                                   outer_join_a
-                                   carrier_a
-                                   result_a ->
-                              let carrier = carrier_a in
-                              let max_step =
-                                List.fold_left
-                                  Int64.max
-                                  1L
-                                  [ low_a;
-                                    high_a;
-                                    low_b;
-                                    high_b ]
-                              in
-                              let max_cmp_bias =
-                                Int64.max
-                                  cmp_bias_a
-                                  cmp_bias_b
-                              in
-                              let safe_top =
-                                Int64.sub
-                                  int32_max
-                                  max_cmp_bias
-                              in
-                              if
-                                safe_top < 0L
-                                || max_step <= 0L
-                              then
-                                false
-                              else
-                                let total_instrs, total_trip =
-                                  build_trip_count_instrs
-                                    fresh_temp
-                                    info.control_iv.phi_temp
-                                    info.control_iv.step
-                                    info.kind
-                                in
-
-                                (* prefix =
-                                     min(total,
-                                         max(K - iv, 0)) *)
-                                let prefix_diff =
-                                  fresh_temp ()
-                                in
-                                let prefix_clamp_instrs,
-                                    prefix_nonnegative =
-                                  clamp_nonnegative_temp
-                                    fresh_temp prefix_diff
-                                in
-                                let prefix_min_instrs,
-                                    prefix_trip =
-                                  emit_min_nonnegative
-                                    total_trip
-                                    prefix_nonnegative
-                                in
-                                let suffix_trip =
-                                  fresh_temp ()
-                                in
-                                let prefix_instrs =
-                                  [ simplify_simple_instr
-                                      (Tcg.Bin
-                                         ( prefix_diff,
-                                           Sub,
-                                           outer_threshold,
-                                           Tcg.Temp
-                                             info.control_iv.phi_temp )) ]
-                                  @ prefix_clamp_instrs
-                                  @ prefix_min_instrs
-                                  @ [ simplify_simple_instr
-                                        (Tcg.Bin
-                                           ( suffix_trip,
-                                             Sub,
-                                             Tcg.Temp total_trip,
-                                             Tcg.Temp prefix_trip )) ]
-                                in
-
-                                (* Fast-path monotonicity / no-wrap proof. *)
-                                let iv_nonneg =
-                                  fresh_temp ()
-                                in
-                                let bound_nonneg =
-                                  fresh_temp ()
-                                in
-                                let outer_nonneg =
-                                  fresh_temp ()
-                                in
-                                let carrier_nonneg =
-                                  fresh_temp ()
-                                in
-                                let carrier_below_safe_top =
-                                  fresh_temp ()
-                                in
-                                let capacity =
-                                  fresh_temp ()
-                                in
-                                let allowed_iters =
-                                  fresh_temp ()
-                                in
-                                let trip_safe =
-                                  fresh_temp ()
-                                in
-                                let guard_instrs0 =
-                                  [ simplify_simple_instr
-                                      (Tcg.Bin
-                                         ( iv_nonneg,
-                                           Ge,
-                                           Tcg.Temp
-                                             info.control_iv.phi_temp,
-                                           Tcg.Imm 0L ));
-                                    simplify_simple_instr
-                                      (Tcg.Bin
-                                         ( bound_nonneg,
-                                           Ge,
-                                           bound_operand,
-                                           Tcg.Imm 0L ));
-                                    simplify_simple_instr
-                                      (Tcg.Bin
-                                         ( outer_nonneg,
-                                           Ge,
-                                           outer_threshold,
-                                           Tcg.Imm 0L ));
-                                    simplify_simple_instr
-                                      (Tcg.Bin
-                                         ( carrier_nonneg,
-                                           Ge,
-                                           Tcg.Temp carrier,
-                                           Tcg.Imm 0L ));
-                                    simplify_simple_instr
-                                      (Tcg.Bin
-                                         ( carrier_below_safe_top,
-                                           Le,
-                                           Tcg.Temp carrier,
-                                           Tcg.Imm safe_top ));
-                                    simplify_simple_instr
-                                      (Tcg.Bin
-                                         ( capacity,
-                                           Sub,
-                                           Tcg.Imm safe_top,
-                                           Tcg.Temp carrier ));
-                                    simplify_simple_instr
-                                      (Tcg.Bin
-                                         ( allowed_iters,
-                                           Div,
-                                           Tcg.Temp capacity,
-                                           Tcg.Imm max_step ));
-                                    simplify_simple_instr
-                                      (Tcg.Bin
-                                         ( trip_safe,
-                                           Le,
-                                           Tcg.Temp total_trip,
-                                           Tcg.Temp allowed_iters )) ]
-                                in
-                                let and1_instrs, and1 =
-                                  emit_and iv_nonneg
-                                    bound_nonneg
-                                in
-                                let and2_instrs, and2 =
-                                  emit_and outer_nonneg
-                                    carrier_nonneg
-                                in
-                                let and3_instrs, and3 =
-                                  emit_and
-                                    carrier_below_safe_top
-                                    trip_safe
-                                in
-                                let and4_instrs, and4 =
-                                  emit_and and1 and2
-                                in
-                                let and5_instrs, guard_temp =
-                                  emit_and and4 and3
-                                in
-                                let guard_instrs =
-                                  total_instrs
-                                  @ guard_instrs0
-                                  @ and1_instrs
-                                  @ and2_instrs
-                                  @ and3_instrs
-                                  @ and4_instrs
-                                  @ and5_instrs
-                                in
-
-                                let summary_instrs =
-                                  prefix_instrs
-                                  @ emit_state_transfer
-                                      prefix_trip
-                                      carrier
-                                      threshold_a
-                                      low_a
-                                      high_a
-                                  @ emit_state_transfer
-                                      suffix_trip
-                                      carrier
-                                      threshold_b
-                                      low_b
-                                      high_b
-                                  @ build_iv_final_update
-                                      fresh_temp
-                                      total_trip
-                                      info.control_iv
-                                in
-                                let guard_label =
-                                  fresh_summary_label ()
-                                in
-                                let summary_label =
-                                  fresh_summary_label ()
-                                in
-                                let rewritten_term =
-                                  rewrite_term_successor
-                                    control_block.term
-                                    ~from_label:info.inside_label
-                                    ~to_label:guard_label
-                                in
-                                update_block
-                                  {
-                                    control_block with
-                                    term = rewritten_term;
-                                    succs =
-                                      Cfg.successors
-                                        rewritten_term;
-                                  };
-                                Hashtbl.add
-                                  current_blocks
-                                  guard_label
-                                  {
-                                    Cfg.label = guard_label;
-                                    body = guard_instrs;
-                                    term =
-                                      Cfg.BranchNonZero
-                                        ( Tcg.Temp guard_temp,
-                                          summary_label,
-                                          info.inside_label );
-                                    preds = [];
-                                    succs =
-                                      [ summary_label;
-                                        info.inside_label ];
-                                  };
-                                Hashtbl.add
-                                  current_blocks
-                                  summary_label
-                                  {
-                                    Cfg.label = summary_label;
-                                    body = summary_instrs;
-                                    term =
-                                      Cfg.Jump info.exit_label;
-                                    preds = [];
-                                    succs =
-                                      [ info.exit_label ];
-                                  };
-                                new_blocks_rev :=
-                                  summary_label
-                                  :: guard_label
-                                  :: !new_blocks_rev;
-                                changed := true;
-                                debug_hit
-                                  "counted-monotone-state-piecewise-hit func=%s header=%s control=%s carrier=t%d outer=%s bound=%s phase1=(C=%Ld,low=%Ld,high=%Ld) phase2=(C=%Ld,low=%Ld,high=%Ld) guard=%s summary=%s"
-                                  f.name
-                                  header
-                                  info.control_label
-                                  carrier
-                                  (string_of_operand
-                                     outer_threshold)
-                                  (string_of_operand
-                                     bound_operand)
-                                  threshold_a
-                                  low_a
-                                  high_a
-                                  threshold_b
-                                  low_b
-                                  high_b
-                                  guard_label
-                                  summary_label;
-                                true
-                          | _ ->
-                              false
-                        end
-                    | _ ->
-                        false
-                  end
-            end
-        | CountUpLt _
-        | CountUpLe _
-        | CountDownGt _
-        | CountDownGe _
-        | CountUpLtScaled _
-        | CountUpLeScaled _
-        | CountDownGtScaled _
-        | CountDownGeScaled _ ->
-            false
-      end
-      in
-
-    let recover_late_single_monotone_info
-        header
-        loop
-      =
-      (* Local recovery for the late CFG-inline rotated form:
-
-             root
-            /    \
-          arm    arm
-            \    /
-             join
-               |
-          canon_cmp: iv = iv + 1
-               |
-          inline_cont:
-             iv < bound
-             /       \
-           root      exit
-
-         The natural loop has six blocks, but the monotone-state core
-         understood by v81 is the four-block root/arms/join diamond.
-         We prove the two tail blocks explicitly and then pass only that
-         four-block core to v81.
-
-         This does NOT relax the global induction-variable classifier. *)
-      if
-        LabelSet.cardinal loop <> 6
-        || not
-             (counted_contains_substring
-                header "_cfg_inline_")
-      then
-        None
-      else
-        let root : Cfg.block = get_block header in
-        match root.term with
-        | Cfg.BranchCompare
-            ( Lt,
-              _state_lhs,
-              _state_rhs,
-              true_label,
-              false_label )
-          when
-            LabelSet.mem true_label loop
-            && LabelSet.mem false_label loop ->
-            let true_block : Cfg.block =
-              get_block true_label
-            in
-            let false_block : Cfg.block =
-              get_block false_label
-            in
-            begin
-              match
-                true_block.term,
-                false_block.term
-              with
-              | Cfg.Jump true_join,
-                Cfg.Jump false_join
-                when
-                  true_join = false_join
-                  && LabelSet.mem true_join loop ->
-                  let join_label = true_join in
-                  let join_block : Cfg.block =
-                    get_block join_label
-                  in
-                  begin
-                    match join_block.term with
-                    | Cfg.Jump iv_update_label
-                      when
-                        LabelSet.mem iv_update_label loop
-                        && counted_contains_substring
-                             iv_update_label
-                             "_canon_cmp_" ->
-                        let iv_update_block : Cfg.block =
-                          get_block iv_update_label
-                        in
-                        begin
-                          match
-                            iv_update_block.body,
-                            iv_update_block.term
-                          with
-                          | [ Tcg.Bin
-                                ( iv_dst,
-                                  Add,
-                                  Tcg.Temp iv_src,
-                                  Tcg.Imm 1L ) ],
-                            Cfg.Jump control_label
-                          | [ Tcg.Bin
-                                ( iv_dst,
-                                  Add,
-                                  Tcg.Imm 1L,
-                                  Tcg.Temp iv_src ) ],
-                            Cfg.Jump control_label
-                            when
-                              iv_dst = iv_src
-                              && LabelSet.mem
-                                   control_label loop
-                              && counted_contains_substring
-                                   control_label
-                                   "_cfg_inline_cont_" ->
-                              let control_block : Cfg.block =
-                                get_block control_label
-                              in
-                              begin
-                                match
-                                  control_block.body,
-                                  control_block.term
-                                with
-                                | [],
-                                  Cfg.BranchCompare
-                                    ( Lt,
-                                      Tcg.Temp control_iv,
-                                      bound,
-                                      inside_label,
-                                      exit_label )
-                                  when
-                                    control_iv = iv_dst
-                                    && inside_label = header
-                                    && not
-                                         (LabelSet.mem
-                                            exit_label loop)
-                                    && iv_update_block.preds
-                                       = [ join_label ]
-                                    && control_block.preds
-                                       = [ iv_update_label ]
-                                    && true_block.preds
-                                       = [ header ]
-                                    && false_block.preds
-                                       = [ header ]
-                                    && List.length
-                                         join_block.preds = 2
-                                    && List.mem
-                                         true_label
-                                         join_block.preds
-                                    && List.mem
-                                         false_label
-                                         join_block.preds
-                                    && List.length root.preds = 2
-                                    && List.mem
-                                         control_label
-                                         root.preds ->
-                                    let outside_preds =
-                                      List.filter
-                                        (fun pred ->
-                                          pred <> control_label)
-                                        root.preds
-                                    in
-                                    begin
-                                      match outside_preds with
-                                      | [ outside_pred ]
-                                        when
-                                          not
-                                            (LabelSet.mem
-                                               outside_pred
-                                               loop) ->
-                                          let core_loop =
-                                            List.fold_left
-                                              (fun acc label ->
-                                                LabelSet.add
-                                                  label acc)
-                                              LabelSet.empty
-                                              [ header;
-                                                true_label;
-                                                false_label;
-                                                join_label ]
-                                          in
-                                          let recovered_iv :
-                                              basic_induction_var =
-                                            {
-                                              phi_temp =
-                                                control_iv;
-                                              outside_inputs =
-                                                [ ( outside_pred,
-                                                    Tcg.Temp
-                                                      control_iv ) ];
-                                              backedge_preds =
-                                                [ control_label ];
-                                              step = 1L;
-                                              origin = `Semantic;
-                                            }
-                                          in
-                                          let recovered_info :
-                                              counted_loop_info =
-                                            {
-                                              control_iv =
-                                                recovered_iv;
-                                              control_label;
-                                              inside_label =
-                                                header;
-                                              exit_label;
-                                              kind =
-                                                CountUpLt
-                                                  (bound, 0L);
-                                            }
-                                          in
-                                          Some
-                                            ( core_loop,
-                                              recovered_info )
-                                      | _ ->
-                                          None
-                                    end
-                                | _ ->
-                                    None
-                              end
-                          | _ ->
-                              None
-                        end
-                    | Cfg.Jump _
-                    | Cfg.BranchZero _
-                    | Cfg.BranchNonZero _
-                    | Cfg.BranchCompare _
-                    | Cfg.Return _ ->
-                        None
-                  end
-              | _ ->
-                  None
-            end
-        | Cfg.Jump _
-        | Cfg.BranchZero _
-        | Cfg.BranchNonZero _
-        | Cfg.BranchCompare _
-        | Cfg.Return _ ->
-            None
+            | _ -> false)
+        | _ -> false
     in
 
     List.iter
@@ -24346,51 +21069,9 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
         in
         match control with
         | None ->
-            let recovered_and_applied =
-              match
-                recover_late_single_monotone_info
-                  header loop
-              with
-              | None ->
-                  false
-              | Some
-                  ( recovered_loop,
-                    recovered_info ) ->
-                  if
-                    try_eliminate_single_monotone_state_loop
-                      header
-                      recovered_loop
-                      recovered_info
-                      effects
-                      loop_defs
-                      multi_defs
-                      def_instrs
-                  then begin
-                    debugf
-                      "counted-local-livethrough-recover-hit func=%s header=%s iv=t%d control=%s natural_blocks=%d core_blocks=%d"
-                      f.name
-                      header
-                      recovered_info.control_iv.phi_temp
-                      recovered_info.control_label
-                      (LabelSet.cardinal loop)
-                      (LabelSet.cardinal
-                         recovered_loop);
-                    true
-                  end else begin
-                    debugf
-                      "counted-local-livethrough-recover-reject func=%s header=%s"
-                      f.name header;
-                    false
-                  end
-            in
-            if not recovered_and_applied then
-              debugf
-                "counted-skip func=%s header=%s reason=classify term=%s ivs=%d preds=%d"
-                f.name
-                header
-                (term_kind header_block.term)
-                (List.length ivs)
-                (List.length header_block.preds)
+            debugf "counted-skip func=%s header=%s reason=classify term=%s ivs=%d preds=%d"
+              f.name header (term_kind header_block.term) (List.length ivs)
+              (List.length header_block.preds)
         | Some info -> (
             let nested_child_groups =
               eligible_child_groups header
@@ -24417,50 +21098,25 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
               debugf
                 "counted-nested-temp-shape-hit func=%s header=%s children=%d"
                 f.name header (List.length nested_child_groups);
-            let piecewise_threshold_applied =
-              if
-                try_eliminate_single_monotone_state_loop
-                  header
-                  loop
-                  info
-                  effects
-                  loop_defs
-                  multi_defs
-                  def_instrs
-              then
-                true
-              else if
-                try_eliminate_monotone_state_piecewise_loop
-                  header
-                  loop
-                  info
-                  effects
-                  loop_defs
-                  multi_defs
-                  def_instrs
-              then
-                true
-              else
-                try_eliminate_piecewise_threshold_loop
-                  header
-                  loop
-                  info
-                  effects
-                  loop_defs
-                  multi_defs
-                  def_instrs
-            in
-            match (piecewise_threshold_applied, plain_shape_supported || nested_shape_supported) with
-            | true, _ ->
-                ()
-            | false, false ->
-                begin
+            match plain_shape_supported || nested_shape_supported with
+            | false ->
+                if
+                  not
+                    (try_eliminate_piecewise_threshold_loop
+                       header
+                       loop
+                       info
+                       effects
+                       loop_defs
+                       multi_defs
+                       def_instrs)
+                then begin
                   debugf
                     "counted-skip func=%s header=%s reason=nonlinear_path"
                     f.name header;
                   dump_nonlinear_shape header loop info
                 end
-            | false, true ->
+            | true ->
                 let live_in_t, live_in_p =
                   compute_liveness summaries globals { f with blocks = blocks_snapshot }
                 in
@@ -24478,128 +21134,15 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                         || IntSet.mem iv.phi_temp live_t_exit)
                       ivs
                   in
-                  let with_control =
-                    if
-                      List.exists
-                        (fun (iv : basic_induction_var) ->
-                          iv.phi_temp = info.control_iv.phi_temp)
-                        syntactic_live
-                    then
+                  if
+                    List.exists
+                      (fun (iv : basic_induction_var) ->
+                        iv.phi_temp = info.control_iv.phi_temp)
                       syntactic_live
-                    else
-                      info.control_iv :: syntactic_live
-                  in
-
-                  (* v58: a split/rotated loop can lose the physical edge-copy
-                     shape required by [collect_basic_induction_vars] while the
-                     unified recurrence layer still proves a logical AddRec.
-
-                     Do NOT expose semantic IVs to the general reduction/carrier
-                     analysis.  Admit one only as a final live-out IV update,
-                     and only when:
-                       - the temp is live at the loop exit;
-                       - it is a constant-step scalar AddRec;
-                       - it is not already represented by a syntactic/control IV;
-                       - at the actual control-block exit its recurrence phase is
-                         exactly zero.
-
-                     The phase-zero condition is the key safety guard: the
-                     summary is entered from that control point, so
-                       final = current + trip * step
-                     is valid only when [phi_temp] denotes the logical current
-                     iteration value there. *)
-                  let represented =
-                    List.fold_left
-                      (fun acc (iv : basic_induction_var) ->
-                        IntSet.add iv.phi_temp acc)
-                      IntSet.empty
-                      with_control
-                  in
-                  let semantic_live =
-                    recurrence_facts.recurrence_addrecs
-                    |> List.filter_map
-                         (fun (addrec : loop_addrec) ->
-                           match loop_inv_expr_const_opt addrec.addrec_step with
-                           | None ->
-                               if debug_counted
-                                  && IntSet.mem addrec.addrec_phi_temp live_t_exit
-                               then
-                                 debugf
-                                   "counted-semantic-live-iv-reject func=%s header=%s phi=t%d reason=nonconstant-step step=%s"
-                                   f.name header addrec.addrec_phi_temp
-                                   (string_of_loop_inv_expr addrec.addrec_step);
-                               None
-                           | Some step ->
-                               let temp = addrec.addrec_phi_temp in
-                               if
-                                 IntSet.mem temp represented
-                                 || not (IntSet.mem temp live_t_exit)
-                               then
-                                 None
-                               else
-                                 match
-                                   recurrence_phase_at
-                                     recurrence_facts
-                                     addrec
-                                     (RecurrenceBlockExit info.control_label)
-                                 with
-                                 | RecurrencePhaseKnown 0 ->
-                                     (* v59: consume the already-proved logical
-                                        AddRec directly.
-
-                                        Do not call [basic_iv_of_scalar_addrec]
-                                        here.  That helper deliberately
-                                        re-derives physical outside-edge moves,
-                                        which split/rotated loops may no longer
-                                        carry even though [analyze_loop_addrecs]
-                                        has already proved the logical
-                                        recurrence.
-
-                                        For a live-out final update we only use
-                                          current + trip * step.
-                                        The current value is validated at the
-                                        exact summary-entry program point by the
-                                        phase-zero requirement below, so no
-                                        physical-PHI reconstruction is needed. *)
-                                     let iv : basic_induction_var =
-                                       {
-                                         phi_temp = temp;
-                                         outside_inputs =
-                                           addrec.addrec_outside_inputs;
-                                         backedge_preds =
-                                           addrec.addrec_backedge_preds;
-                                         step;
-                                         origin = `Semantic;
-                                       }
-                                     in
-                                     if debug_counted then
-                                       debugf
-                                         "counted-semantic-live-iv func=%s header=%s control=%s phi=t%d step=%Ld phase=0 source=direct-addrec outside=%d backedges=%d"
-                                         f.name header info.control_label
-                                         temp step
-                                         (List.length addrec.addrec_outside_inputs)
-                                         (List.length addrec.addrec_backedge_preds);
-                                     Some iv
-                                 | RecurrencePhaseKnown phase ->
-                                     if debug_counted then
-                                       debugf
-                                         "counted-semantic-live-iv-reject func=%s header=%s phi=t%d reason=phase phase=%d"
-                                         f.name header temp phase;
-                                     None
-                                 | RecurrencePhaseUnseen ->
-                                     if debug_counted then
-                                       debugf
-                                         "counted-semantic-live-iv-reject func=%s header=%s phi=t%d reason=phase-unseen"
-                                         f.name header temp;
-                                     None
-                                 | RecurrencePhaseConflict ->
-                                     if debug_counted then
-                                       debugf
-                                         "counted-semantic-live-iv-reject func=%s header=%s phi=t%d reason=phase-conflict"
-                                         f.name header temp;
-                                     None)
-                  in
-                  with_control @ semantic_live
+                  then
+                    syntactic_live
+                  else
+                    info.control_iv :: syntactic_live
                 in
                 let loop_live_defs =
                   IntSet.inter loop_defs live_t_exit
@@ -27838,11 +24381,6 @@ let simplify_counted_loop_guards_func _summaries _globals (f : Cfg.func) =
               (fun label ->
                 if label <> info.control_label then
                   let block : Cfg.block = get_current label in
-                let should_fold_branch if_true if_false =
-                  not
-                    (LabelSet.mem if_true loop
-                     && LabelSet.mem if_false loop)
-                in
                 let fold_branch op lhs rhs if_true if_false =
                   let try_fold op lhs rhs =
                     match
@@ -27864,32 +24402,29 @@ let simplify_counted_loop_guards_func _summaries _globals (f : Cfg.func) =
                 in
                 match block.term with
                 | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) -> (
-                    if should_fold_branch if_true if_false then
-                      match fold_branch op lhs rhs if_true if_false with
-                      | Some term ->
-                          changed := true;
-                          Hashtbl.replace current_blocks label { block with term; succs = Cfg.successors term }
-                      | None -> ())
+                    match fold_branch op lhs rhs if_true if_false with
+                    | Some term ->
+                        changed := true;
+                        Hashtbl.replace current_blocks label { block with term; succs = Cfg.successors term }
+                    | None -> ())
                 | Cfg.BranchZero (cond, if_zero, if_nonzero) -> (
-                    if should_fold_branch if_nonzero if_zero then
-                      match resolve_compare_operand_in_block block multi_defs def_instrs cond with
-                      | Some (op, lhs, rhs) -> (
-                          match fold_branch op lhs rhs if_nonzero if_zero with
-                          | Some term ->
-                              changed := true;
-                              Hashtbl.replace current_blocks label { block with term; succs = Cfg.successors term }
-                          | None -> ())
-                      | None -> ())
+                    match resolve_compare_operand_in_block block multi_defs def_instrs cond with
+                    | Some (op, lhs, rhs) -> (
+                        match fold_branch op lhs rhs if_nonzero if_zero with
+                        | Some term ->
+                            changed := true;
+                            Hashtbl.replace current_blocks label { block with term; succs = Cfg.successors term }
+                        | None -> ())
+                    | None -> ())
                 | Cfg.BranchNonZero (cond, if_nonzero, if_zero) -> (
-                    if should_fold_branch if_nonzero if_zero then
-                      match resolve_compare_operand_in_block block multi_defs def_instrs cond with
-                      | Some (op, lhs, rhs) -> (
-                          match fold_branch op lhs rhs if_nonzero if_zero with
-                          | Some term ->
-                              changed := true;
-                              Hashtbl.replace current_blocks label { block with term; succs = Cfg.successors term }
-                          | None -> ())
-                      | None -> ())
+                    match resolve_compare_operand_in_block block multi_defs def_instrs cond with
+                    | Some (op, lhs, rhs) -> (
+                        match fold_branch op lhs rhs if_nonzero if_zero with
+                        | Some term ->
+                            changed := true;
+                            Hashtbl.replace current_blocks label { block with term; succs = Cfg.successors term }
+                        | None -> ())
+                    | None -> ())
                 | Cfg.Jump _ | Cfg.Return _ -> ())
               loop)
       loops;
@@ -27900,25 +24435,6 @@ let simplify_counted_loop_guards_func _summaries _globals (f : Cfg.func) =
        Cfg.rebuild_edges { f with blocks }
 
 let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
-  (* v74 safety rollback.
-
-     The structural diamond splitter was meant to create two simpler counted
-     loops out of
-
-       while (i < N) {
-         if (i < K) A else B;
-         i = i + 1;
-       }
-
-     but recent hidden-live/runtime-summary interactions regressed into
-     non-terminating optimized code on simple piecewise cases
-     (see [diamond_split_piecewise.tc]).
-
-     Until the split CFG is re-proven against the later counted/LVE passes,
-     keep this pass disabled and let the existing counted / piecewise-summary
-     machinery handle these loops conservatively.  Correctness first. *)
-  f
-  (*
   let block_map, loops, headers = discover_natural_loops f in
   let next_temp = ref f.temp_count in
   let fresh_temp () =
@@ -28024,41 +24540,6 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
         | Gt | Ge -> true
         | Lt | Le -> false
         | Eq | Ne | Add | Sub | Mul | Div | Mod | LAnd | LOr -> false
-    in
-    let exact_join_update header phi_temp (block : Cfg.block) =
-      match (block.body, block.term) with
-      | ( [ Tcg.Bin (next_temp, Add, Tcg.Temp src, Tcg.Imm 1L);
-            Tcg.Move (dst, Tcg.Temp moved) ],
-          Cfg.Jump next )
-        when src = phi_temp
-             && dst = phi_temp
-             && moved = next_temp
-             && next = header ->
-          true
-      | ( [ Tcg.Bin (next_temp, Add, Tcg.Imm 1L, Tcg.Temp src);
-            Tcg.Move (dst, Tcg.Temp moved) ],
-          Cfg.Jump next )
-        when src = phi_temp
-             && dst = phi_temp
-             && moved = next_temp
-             && next = header ->
-          true
-      | _ -> false
-    in
-    let should_leave_piecewise_threshold_loop_intact
-        header
-        (info : counted_loop_info)
-        join_a
-        join_b
-      =
-      info.control_label = header
-      && info.control_iv.step = 1L
-      && join_a = join_b
-      && Hashtbl.mem block_map join_a
-      && exact_join_update
-           header
-           info.control_iv.phi_temp
-           (Hashtbl.find block_map join_a)
     in
     let prefix_limit_of_split loop_defs multi_defs def_instrs kind split_op operand bias =
       let delta =
@@ -28197,22 +24678,13 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
                            collapse_pure_scalar_connector loop LabelSet.empty branch_b,
                            branch_compare_shape_in_block split_block multi_defs def_instrs split_block.term,
                            outer_limit_of_kind loop_defs multi_defs def_instrs info.kind )
-                        with
-                        | Some join_a, Some join_b, Some (split_op0, lhs, rhs, if_true, if_false), Some outer_limit
-                          when join_a = join_b -> (
-                            if
-                              should_leave_piecewise_threshold_loop_intact
-                                header
-                                info
-                                join_a
-                                join_b
-                            then
-                              ()
-                            else
-                            let join_label = join_a in
-                            let split_info =
-                              match
-                                ( iv_bias_of_operand_in_block
+                       with
+                       | Some join_a, Some join_b, Some (split_op0, lhs, rhs, if_true, if_false), Some outer_limit
+                         when join_a = join_b -> (
+                           let join_label = join_a in
+                           let split_info =
+                             match
+                               ( iv_bias_of_operand_in_block
                                    split_block
                                    multi_defs
                                    def_instrs
@@ -28487,7 +24959,6 @@ let split_counted_diamond_loops_func _summaries _globals (f : Cfg.func) =
       f
     with
     | Applied next -> next
-  *)
 
 (* -------------------------------------------------------------------------- *)
 (* step112 fix6: late equivalent-diamond folding                              *)
@@ -28661,62 +25132,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
         doms def_blocks multi_defs
         [ preheader_label ] operand
     in
-
-    (* v64: diamond splitting materializes the prefix-loop bound into one temp
-       on mutually exclusive incoming paths:
-
-           take_outer:  bound_tmp = outer
-           take_prefix: bound_tmp = prefix
-                       \ /
-                    preheader
-
-       Such a temp is intentionally multi-defined, so the generic LVE
-       availability predicate rejects it unconditionally.  For the runtime
-       summary guard, however, the value is safe to read after the preheader
-       exactly when every incoming edge has an unambiguous reaching Move for
-       that temp.
-
-       Keep this proof local to runtime-summary bound operands.  It does not
-       relax general multi-def availability. *)
-    let path_merged_move_available_at_preheader preheader_label temp =
-      let preheader : Cfg.block = get_block preheader_label in
-      preheader.preds <> []
-      && List.for_all
-           (fun pred ->
-             match
-               reaching_move_cases_on_edge
-                 get_block
-                 ~stop_label:preheader_label
-                 ~pred_label:pred
-                 temp
-             with
-             | Some cases -> cases <> []
-             | None -> false)
-           preheader.preds
-    in
-
-    let runtime_bound_available
-        def_blocks multi_defs preheader_label operand =
-      if
-        operand_available_at_preheader
-          def_blocks multi_defs preheader_label operand
-      then
-        true
-      else
-        match operand with
-        | Tcg.Imm _ -> true
-        | Tcg.Temp temp
-          when IntSet.mem temp multi_defs
-               && path_merged_move_available_at_preheader
-                    preheader_label temp ->
-            if Sys.getenv_opt "TOYC_DEBUG_LVE_SUMMARY" <> None then
-              Printf.eprintf
-                "lve-runtime-path-merged-bound preheader=%s temp=t%d result=available\n%!"
-                preheader_label temp;
-            true
-        | Tcg.Temp _ ->
-            false
-    in
     let next_temp = ref f.temp_count in
     let fresh_temp () =
       let temp = !next_temp in
@@ -28783,73 +25198,12 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
             name
             (String.concat "," (List.map string_of_lve_operand args))
     in
-    let string_of_runtime_term = function
-      | Cfg.Jump label ->
-          Printf.sprintf "jump(%s)" label
-      | Cfg.BranchZero (operand, zero_label, nonzero_label) ->
-          Printf.sprintf
-            "branch_zero(%s,%s,%s)"
-            (string_of_lve_operand operand)
-            zero_label
-            nonzero_label
-      | Cfg.BranchNonZero (operand, nonzero_label, zero_label) ->
-          Printf.sprintf
-            "branch_nonzero(%s,%s,%s)"
-            (string_of_lve_operand operand)
-            nonzero_label
-            zero_label
-      | Cfg.BranchCompare
-          (op, lhs, rhs, yes_label, no_label) ->
-          Printf.sprintf
-            "branch_cmp(%s,%s,%s,%s,%s)"
-            (string_of_binop op)
-            (string_of_lve_operand lhs)
-            (string_of_lve_operand rhs)
-            yes_label
-            no_label
-      | Cfg.Return value ->
-          Printf.sprintf
-            "return(%s)"
-            (match value with
-             | None -> ""
-             | Some operand -> string_of_lve_operand operand)
-    in
-    let dump_runtime_nonlinear_cfg header loop =
-      if debug then begin
-        Printf.eprintf
-          "lve-runtime-nonlinear-cfg func=%s header=%s blocks=%d loop=[%s]\n%!"
-          f.name
-          header
-          (LabelSet.cardinal loop)
-          (String.concat "," (LabelSet.elements loop));
-        LabelSet.elements loop
-        |> List.iter (fun label ->
-               let block : Cfg.block = get_block label in
-               Printf.eprintf
-                 "lve-runtime-nonlinear-block func=%s header=%s label=%s preds=[%s] succs=[%s] body=[%s] term=%s\n%!"
-                 f.name
-                 header
-                 label
-                 (String.concat "," block.preds)
-                 (String.concat "," block.succs)
-                 (block.body
-                  |> List.mapi
-                       (fun index instr ->
-                         Printf.sprintf
-                           "%d:%s"
-                           index
-                           (string_of_simple_instr instr))
-                  |> String.concat ";")
-                 (string_of_runtime_term block.term))
-      end
-    in
-    let reaching_seed_values_on_edge ~header ~pred_label temp =
+    let reaching_seed_on_edge ~header ~pred_label temp =
       match
         reaching_move_cases_on_edge
           get_block ~stop_label:header ~pred_label temp
       with
-      | None ->
-          None
+      | None -> None
       | Some cases ->
           let values =
             cases
@@ -28858,14 +25212,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                    resolve_chain_operand
                      case.reaching_chain case.reaching_source)
           in
-          if values = [] then None else Some values
-    in
-    let reaching_seed_on_edge ~header ~pred_label temp =
-      match
-        reaching_seed_values_on_edge ~header ~pred_label temp
-      with
-      | None -> None
-      | Some values ->
           (match values with
            | [] -> None
            | first :: rest
@@ -28954,7 +25300,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
           in
           (match traced with
            | None ->
-               dump_runtime_nonlinear_cfg control_block.label loop;
                Error
                  (Printf.sprintf
                     "body-chain-not-linear continue=%s control=%s"
@@ -29058,22 +25403,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
 
     List.iter
       (fun discovered_header ->
-        (* v72: all loop/dominator/liveness/definition analyses above are
-           snapshots of the input CFG.  A successful runtime-summary rewrite
-           mutates [current_blocks], so applying a second summary in the same
-           traversal would consume stale analyses and stale natural-loop sets.
-
-           This is especially dangerous for diamond-split pre/post siblings:
-           summarizing one sibling inserts synthetic fallback/guard blocks,
-           then the other sibling can be rewritten using predecessor/liveness
-           facts that no longer describe the mutated CFG.
-
-           Serialize rewrites: at most one runtime loop summary per invocation.
-           The caller's next optimization round will invoke this pass again on
-           a rebuilt CFG and recompute every analysis from scratch. *)
-        if !changed then
-          ()
-        else
         let loop =
           table_find_or_empty
             loops discovered_header LabelSet.empty
@@ -30169,6 +26498,17 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                           reaching_seed_on_edge
                             ~header ~pred_label:preheader_label iv_temp
                         in
+                        (if debug then
+                           Printf.eprintf
+                             "lve-runtime-summary-candidate func=%s header=%s iv=t%d scale=%s bias=%s step=%s bound=%s init=%s\n%!"
+                             f.name header iv_temp
+                             (string_of_loop_inv_expr control_scale)
+                             (string_of_loop_inv_expr control_bias)
+                             (string_of_loop_inv_expr step_expr)
+                             (string_of_lve_operand bound_operand)
+                             (match initial_iv with
+                              | Some operand -> string_of_lve_operand operand
+                              | None -> "<unknown>"));
                         let initial_iv_expr =
                           Option.bind initial_iv invariant_expr
                         in
@@ -30181,242 +26521,45 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                           | None ->
                               false
                         in
-
-                        (* v65: a split-post loop can be entered in two legal
-                           ways: directly from the split dispatch, or after the
-                           split-pre loop reaches its boundary.  The two
-                           incoming edge-copy seeds for the IV are therefore
-                           intentionally different, so requiring one common
-                           SCEV start rejects the exact CFG produced by the
-                           diamond splitter.
-
-                           For the very narrow rotated split-post shape
-                             control = iv + step
-                             iv += positive_constant_step
-                           prove that every preheader->header path has a
-                           reaching edge-copy seed, then snapshot the current
-                           IV on the summary path.  That runtime value is the
-                           exact path-specific loop start.  The snapshot is a
-                           fresh temp only; every failed runtime proof still
-                           falls back to the untouched original loop. *)
-                        let dynamic_start_seed_values =
-                          if
-                            contains_substring header "_split_post_"
-                            && initial_iv = None
-                            && loop_inv_expr_equal
-                                 control_scale scalar_inv_one
-                            && loop_inv_expr_equal
-                                 control_bias step_expr
-                          then
-                            match loop_inv_expr_const_opt step_expr with
-                            | Some step when step > 0L ->
-                                reaching_seed_values_on_edge
-                                  ~header
-                                  ~pred_label:preheader_label
-                                  iv_temp
-                            | Some _
-                            | None ->
-                                None
-                          else
-                            None
-                        in
-                        (* v66: after loop rotation, [preheader_label] is a
-                           synthetic rotate guard.  Requiring a reaching
-                           mem2reg Move for [iv_temp] is unnecessarily strict:
-                           the guard itself already reads the current IV to
-                           decide whether the post loop executes.
-
-                           This is a stronger local proof of availability:
-                             - this is exactly a compiler-generated rotate guard;
-                             - its branch has one successor inside this loop and
-                               one outside, with the inside edge entering
-                               [header];
-                             - the guard condition uses [iv_temp];
-                             - the guard body does not redefine [iv_temp].
-
-                           Therefore the value observed by the guard on the
-                           taken edge is exactly the path-specific pre-body
-                           start.  Snapshotting it in the summary values block
-                           preserves both direct->post and pre->bridge->post
-                           entries without guessing a common seed. *)
-                        let dynamic_start_rotate_guard =
-                          is_rotate_guard_label preheader_label
-                          && last_def_of_temp preheader iv_temp = None
-                          && IntSet.mem
-                               iv_temp
-                               (add_term_use_temps
-                                  IntSet.empty preheader.term)
-                          &&
-                          match
-                            classify_loop_rotate_targets
-                              loop preheader.term
-                          with
-                          | Some (inside_label, _outside_label) ->
-                              inside_label = header
-                          | None ->
-                              false
-                        in
-                        let dynamic_start_snapshot =
-                          match dynamic_start_seed_values with
-                          | Some (_ :: _) ->
-                              Some (fresh_temp ())
-                          | Some [] ->
-                              None
-                          | None when dynamic_start_rotate_guard ->
-                              Some (fresh_temp ())
-                          | None ->
-                              None
-                        in
-                        let () =
-                          if debug && contains_substring header "_split_post_" then
-                            Printf.eprintf
-                              "lve-runtime-dynamic-post-gate func=%s header=%s preheader=%s init-none=%b scale-one=%b bias-step=%b step=%s seed=%s rotate-guard=%b\n%!"
-                              f.name header preheader_label
-                              (initial_iv = None)
-                              (loop_inv_expr_equal control_scale scalar_inv_one)
-                              (loop_inv_expr_equal control_bias step_expr)
-                              (string_of_loop_inv_expr step_expr)
-                              (match dynamic_start_seed_values with
-                               | Some values -> Printf.sprintf "some:%d" (List.length values)
-                               | None -> "none")
-                              dynamic_start_rotate_guard
-                        in
-                        (if debug then
-                           Printf.eprintf
-                             "lve-runtime-summary-candidate func=%s header=%s iv=t%d scale=%s bias=%s step=%s bound=%s init=%s\n%!"
-                             f.name header iv_temp
-                             (string_of_loop_inv_expr control_scale)
-                             (string_of_loop_inv_expr control_bias)
-                             (string_of_loop_inv_expr step_expr)
-                             (string_of_lve_operand bound_operand)
-                             (match initial_iv, dynamic_start_snapshot with
-                              | Some operand, _ ->
-                                  string_of_lve_operand operand
-                              | None, Some snapshot ->
-                                  Printf.sprintf
-                                    "<dynamic-current:t%d>" snapshot
-                              | None, None ->
-                                  "<unknown>"));
                         let semantic_start_agrees =
-                          match dynamic_start_snapshot with
-                          | Some _ ->
-                              true
-                          | None ->
-                              match
-                                (symbolic_trip_spec, initial_iv_expr)
-                              with
-                              | Some spec, Some expr ->
-                                  loop_inv_expr_equal
-                                    spec.symbolic_trip_start
-                                    (normalize_loop_inv_expr expr)
-                              | Some _, None ->
-                                  false
-                              | None, _ ->
-                                  initial_zero
+                          match
+                            (symbolic_trip_spec, initial_iv_expr)
+                          with
+                          | Some spec, Some expr ->
+                              loop_inv_expr_equal
+                                spec.symbolic_trip_start
+                                (normalize_loop_inv_expr expr)
+                          | Some _, None ->
+                              false
+                          | None, _ ->
+                              initial_zero
                         in
                         if not semantic_start_agrees then
                           reject header
                             "initial-iv-scev-start-mismatch"
                         else
-                          let () =
-                            match dynamic_start_snapshot with
-                            | Some snapshot when debug ->
-                                Printf.eprintf
-                                  "lve-runtime-dynamic-post-start func=%s header=%s iv=t%d snapshot=t%d proof=%s incoming-cases=%d\n%!"
-                                  f.name header iv_temp snapshot
-                                  (if dynamic_start_rotate_guard
-                                   then "rotate-guard-use"
-                                   else "reaching-seed")
-                                  (match dynamic_start_seed_values with
-                                   | Some values -> List.length values
-                                   | None -> 0)
-                            | Some _
-                            | None ->
-                                ()
-                          in
-                          let summary_start_expr =
-                            match dynamic_start_snapshot with
-                            | Some snapshot ->
-                                LveOperand (Tcg.Temp snapshot)
-                            | None ->
-                                match symbolic_trip_spec with
-                                | Some spec ->
-                                    spec.symbolic_trip_start
-                                | None ->
-                                    scalar_inv_zero
-                          in
                           let proof_control_start_expr =
-                            match dynamic_start_snapshot with
-                            | Some snapshot ->
-                                normalize_loop_inv_expr
-                                  (LveAdd
-                                     ( LveMul
-                                         ( control_scale,
-                                           LveOperand
-                                             (Tcg.Temp snapshot) ),
-                                       control_bias ))
+                            match symbolic_trip_spec with
+                            | Some spec ->
+                                symbolic_trip_control_start spec
                             | None ->
-                                match symbolic_trip_spec with
-                                | Some spec ->
-                                    symbolic_trip_control_start spec
-                                | None ->
-                                    control_bias
+                                control_bias
                           in
                           let control_start_available =
-                            match dynamic_start_snapshot with
-                            | Some _ ->
-                                true
-                            | None ->
-                                lve_expr_available_before_preds
-                                  doms def_blocks multi_defs
-                                  [ preheader_label ]
-                                  proof_control_start_expr
+                            lve_expr_available_before_preds
+                              doms def_blocks multi_defs
+                              [ preheader_label ]
+                              proof_control_start_expr
                           in
                           let step_available =
                             lve_expr_available_before_preds
                               doms def_blocks multi_defs
                               [ preheader_label ] step_expr
                           in
-                          let rotate_guard_bound_available =
-                            match bound_operand with
-                            | Tcg.Imm _ ->
-                                true
-                            | Tcg.Temp temp ->
-                                is_rotate_guard_label preheader_label
-                                && last_def_of_temp preheader temp = None
-                                && IntSet.mem
-                                     temp
-                                     (add_term_use_temps
-                                        IntSet.empty preheader.term)
-                                &&
-                                match
-                                  classify_loop_rotate_targets
-                                    loop preheader.term
-                                with
-                                | Some (inside_label, _outside_label) ->
-                                    inside_label = header
-                                | None ->
-                                    false
-                          in
                           let bound_available =
-                            runtime_bound_available
+                            operand_available_at_preheader
                               def_blocks multi_defs preheader_label
                               bound_operand
-                            || rotate_guard_bound_available
-                          in
-                          let () =
-                            if
-                              debug
-                              && rotate_guard_bound_available
-                              && not
-                                   (runtime_bound_available
-                                      def_blocks multi_defs
-                                      preheader_label bound_operand)
-                            then
-                              Printf.eprintf
-                                "lve-runtime-rotate-guard-bound func=%s header=%s preheader=%s bound=%s result=available\n%!"
-                                f.name header preheader_label
-                                (string_of_lve_operand bound_operand)
                           in
                           let scale_available =
                             lve_expr_available_before_preds
@@ -30519,77 +26662,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                               List.filter
                                 (fun (_, dst, _) -> dst <> iv_temp)
                                 self_adds
-                            in
-                            let () =
-                              if debug then begin
-                                let live_exit_diag =
-                                  table_find_or_empty
-                                    live_in_t exit_label IntSet.empty
-                                in
-                                let loop_live_defs_diag =
-                                  IntSet.inter loop_defs live_exit_diag
-                                in
-                                let body_string =
-                                  body_indexed
-                                  |> List.map
-                                       (fun (index, instr) ->
-                                         Printf.sprintf
-                                           "%d:%s"
-                                           index
-                                           (string_of_simple_instr instr))
-                                  |> String.concat ";"
-                                in
-                                Printf.eprintf
-                                  "lve-runtime-body func=%s header=%s iv=t%d live-out={%s} instrs=[%s]\n%!"
-                                  f.name header iv_temp
-                                  (String.concat ","
-                                     (List.map string_of_int
-                                        (IntSet.elements
-                                           loop_live_defs_diag)))
-                                  body_string;
-                                IntSet.iter
-                                  (fun temp ->
-                                    let defs =
-                                      body_indexed
-                                      |> List.filter_map
-                                           (fun (index, instr) ->
-                                             match defs_temp instr with
-                                             | Some dst when dst = temp ->
-                                                 Some
-                                                   (Printf.sprintf
-                                                      "%d:%s"
-                                                      index
-                                                      (string_of_simple_instr
-                                                         instr))
-                                             | Some _
-                                             | None ->
-                                                 None)
-                                      |> String.concat ";"
-                                    in
-                                    Printf.eprintf
-                                      "lve-runtime-live-def func=%s header=%s temp=t%d multi=%b defs=[%s]\n%!"
-                                      f.name header temp
-                                      (IntSet.mem temp multi_defs)
-                                      defs)
-                                  loop_live_defs_diag
-                              end
-                            in
-                            let () =
-                              if debug then begin
-                                let show_one (index, dst, operand) =
-                                  Printf.sprintf
-                                    "%d:t%d+=%s"
-                                    index dst
-                                    (string_of_lve_operand operand)
-                                in
-                                Printf.eprintf
-                                  "lve-runtime-reduction-shape func=%s header=%s iv=t%d self-adds=[%s] non-iv=[%s]\n%!"
-                                  f.name header iv_temp
-                                  (String.concat ";"
-                                     (List.map show_one self_adds))
-                                  (String.concat ";"
-                                     (List.map show_one non_iv))
-                              end
                             in
 
                             (* Phase-aware direct affine reduction analysis.
@@ -30854,96 +26926,40 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                   None
                             in
 
-                            let match_direct_reductions () =
-                              let rec collect seen_accs acc = function
-                                | [] ->
-                                    if acc = [] then None
-                                    else Some (List.rev acc)
-                                | (acc_index, acc_temp, delta_operand) :: rest ->
-                                    if acc_temp = iv_temp then begin
-                                      if debug then
-                                        Printf.eprintf
-                                          "lve-runtime-multi-reduction-reject func=%s header=%s acc=t%d reason=is-control-iv\n%!"
-                                          f.name header acc_temp;
-                                      None
-                                    end
-                                    else if IntSet.mem acc_temp seen_accs then begin
-                                      if debug then
-                                        Printf.eprintf
-                                          "lve-runtime-multi-reduction-reject func=%s header=%s acc=t%d reason=duplicate-accumulator\n%!"
-                                          f.name header acc_temp;
-                                      None
-                                    end
-                                    else
-                                      match
-                                        direct_delta_affine_of_operand
-                                          acc_index IntSet.empty
-                                          delta_operand
-                                      with
-                                      | None ->
-                                          if debug then
-                                            Printf.eprintf
-                                              "lve-runtime-multi-reduction-reject func=%s header=%s acc=t%d index=%d delta=%s reason=delta-not-affine\n%!"
-                                              f.name header acc_temp acc_index
-                                              (string_of_lve_operand
-                                                 delta_operand);
-                                          None
-                                      | Some (delta_scale, delta_bias) ->
-                                          let delta_scale =
-                                            normalize_loop_inv_expr delta_scale
-                                          in
-                                          let delta_bias =
-                                            normalize_loop_inv_expr delta_bias
-                                          in
-                                          let scale_available =
-                                            lve_expr_available_before_preds
-                                              doms def_blocks multi_defs
-                                              [ preheader_label ] delta_scale
-                                          in
-                                          let bias_available =
-                                            lve_expr_available_before_preds
-                                              doms def_blocks multi_defs
-                                              [ preheader_label ] delta_bias
-                                          in
-                                          if
-                                            not scale_available
-                                            || not bias_available
-                                          then begin
-                                            if debug then
-                                              Printf.eprintf
-                                                "lve-runtime-multi-reduction-reject func=%s header=%s acc=t%d index=%d delta=%s reason=operand-unavailable scale=%s scale-ok=%b bias=%s bias-ok=%b\n%!"
-                                                f.name header acc_temp acc_index
-                                                (string_of_lve_operand
-                                                   delta_operand)
-                                                (string_of_loop_inv_expr
-                                                   delta_scale)
-                                                scale_available
-                                                (string_of_loop_inv_expr
-                                                   delta_bias)
-                                                bias_available;
-                                            None
-                                          end
-                                          else begin
-                                            if debug then
-                                              Printf.eprintf
-                                                "lve-runtime-multi-reduction-hit func=%s header=%s acc=t%d index=%d delta=%s scale=%s bias=%s\n%!"
-                                                f.name header acc_temp acc_index
-                                                (string_of_lve_operand
-                                                   delta_operand)
-                                                (string_of_loop_inv_expr
-                                                   delta_scale)
-                                                (string_of_loop_inv_expr
-                                                   delta_bias);
-                                            collect
-                                              (IntSet.add acc_temp seen_accs)
-                                              ( ( acc_temp,
-                                                  delta_scale,
-                                                  delta_bias )
-                                                :: acc )
-                                              rest
-                                          end
-                              in
-                              collect IntSet.empty [] non_iv
+                            let match_direct_reduction () =
+                              match non_iv with
+                              | [ (acc_index, acc_temp, delta_operand) ]
+                                when acc_temp <> iv_temp ->
+                                  Option.bind
+                                    (direct_delta_affine_of_operand
+                                       acc_index IntSet.empty delta_operand)
+                                    (fun (delta_scale, delta_bias) ->
+                                      let delta_scale =
+                                        normalize_loop_inv_expr delta_scale
+                                      in
+                                      let delta_bias =
+                                        normalize_loop_inv_expr delta_bias
+                                      in
+                                      let scale_available =
+                                        lve_expr_available_before_preds
+                                          doms def_blocks multi_defs
+                                          [ preheader_label ] delta_scale
+                                      in
+                                      let bias_available =
+                                        lve_expr_available_before_preds
+                                          doms def_blocks multi_defs
+                                          [ preheader_label ] delta_bias
+                                      in
+                                      if scale_available && bias_available then
+                                        Some
+                                          (`DirectAffine
+                                            ( acc_temp,
+                                              delta_scale,
+                                              delta_bias ))
+                                      else
+                                        None)
+                              | _ ->
+                                  None
                             in
 
                             let match_move_accumulator_carrier () =
@@ -31064,322 +27080,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                  (i1, dst1, other1))
                                       | _ -> None
                                     in
-                            (* v71: recover affine live recurrences from
-                               the final write to a live-out temp, even when
-                               temporary SSA-like values hide the self-add.
-
-                               For one chosen live temp [acc], recursively expand
-                               only definitions earlier in the same linear body
-                               and represent the RHS as
-
-                                 c_acc * acc_old
-                                 + scale * iv_pre
-                                 + bias.
-
-                               Other loop-live temps are never expanded, which
-                               rejects coupled recurrences.  Add/Sub and unary
-                               +/- are allowed; multiplication is deliberately
-                               not accepted in this fallback.  A live temp is
-                               summarized only as either
-
-                                 acc' = acc + scale * iv + bias
-
-                               or, on a compiler-generated rotated split loop
-                               where the fast summary path executes at least one
-                               source iteration,
-
-                                 live' = loop-invariant-value.
-
-                               This directly covers the observed two_live IR:
-                                 post: t3' = t3 + t4 + 2
-                                 pre : t1' = t1 + t4 + 1; t3' = 0. *)
-                            let hidden_live_exit =
-                              table_find_or_empty
-                                live_in_t exit_label IntSet.empty
-                            in
-                            let hidden_loop_live_defs =
-                              IntSet.inter loop_defs hidden_live_exit
-                            in
-                            let hidden_add
-                                (lhs_acc, lhs_scale, lhs_bias)
-                                (rhs_acc, rhs_scale, rhs_bias) =
-                              ( Int64.add lhs_acc rhs_acc,
-                                normalize_loop_inv_expr
-                                  (LveAdd (lhs_scale, rhs_scale)),
-                                normalize_loop_inv_expr
-                                  (LveAdd (lhs_bias, rhs_bias)) )
-                            in
-                            let hidden_neg (acc_coeff, scale, bias) =
-                              ( Int64.neg acc_coeff,
-                                normalize_loop_inv_expr (LveNeg scale),
-                                normalize_loop_inv_expr (LveNeg bias) )
-                            in
-                            let hidden_sub lhs rhs =
-                              hidden_add lhs (hidden_neg rhs)
-                            in
-                            let rec hidden_live_affine_of_operand
-                                target use_index seen operand =
-                              match operand with
-                              | Tcg.Imm value ->
-                                  Some
-                                    ( 0L,
-                                      LveConst 0L,
-                                      LveConst value )
-                              | Tcg.Temp temp when temp = target ->
-                                  Some
-                                    ( 1L,
-                                      LveConst 0L,
-                                      LveConst 0L )
-                              | Tcg.Temp temp when temp = iv_temp ->
-                                  let phase_bias =
-                                    if use_index > iv_update_index then
-                                      step_expr
-                                    else
-                                      LveConst 0L
-                                  in
-                                  Some
-                                    ( 0L,
-                                      LveConst 1L,
-                                      normalize_loop_inv_expr phase_bias )
-                              | Tcg.Temp temp as operand ->
-                                  if
-                                    IntSet.mem temp hidden_loop_live_defs
-                                  then
-                                    None
-                                  else
-                                    match
-                                      lve_invariant_expr_of_operand
-                                        loop_defs multi_defs def_instrs operand
-                                    with
-                                    | Some invariant ->
-                                        Some
-                                          ( 0L,
-                                            LveConst 0L,
-                                            normalize_loop_inv_expr invariant )
-                                    | None ->
-                                        if IntSet.mem temp seen then
-                                          None
-                                        else
-                                          match
-                                            last_body_def_before
-                                              use_index temp
-                                          with
-                                          | Some (def_index, instr) ->
-                                              hidden_live_affine_of_instr
-                                                target def_index
-                                                (IntSet.add temp seen)
-                                                instr
-                                          | None ->
-                                              None
-                            and hidden_live_affine_of_instr
-                                target def_index seen = function
-                              | Tcg.Move (_, src)
-                              | Tcg.Un (_, UPlus, src) ->
-                                  hidden_live_affine_of_operand
-                                    target def_index seen src
-                              | Tcg.Un (_, UMinus, src) ->
-                                  Option.map
-                                    hidden_neg
-                                    (hidden_live_affine_of_operand
-                                       target def_index seen src)
-                              | Tcg.Bin (_, Add, lhs, rhs) ->
-                                  Option.bind
-                                    (hidden_live_affine_of_operand
-                                       target def_index seen lhs)
-                                    (fun lhs_form ->
-                                      Option.map
-                                        (hidden_add lhs_form)
-                                        (hidden_live_affine_of_operand
-                                           target def_index seen rhs))
-                              | Tcg.Bin (_, Sub, lhs, rhs) ->
-                                  Option.bind
-                                    (hidden_live_affine_of_operand
-                                       target def_index seen lhs)
-                                    (fun lhs_form ->
-                                      Option.map
-                                        (hidden_sub lhs_form)
-                                        (hidden_live_affine_of_operand
-                                           target def_index seen rhs))
-                              | Tcg.Un (_, UNot, _)
-                              | Tcg.Bin
-                                  (_,
-                                   (Mul | Div | Mod | Lt | Le | Gt | Ge
-                                   | Eq | Ne | LAnd | LOr),
-                                   _, _)
-                              | Tcg.Load _
-                              | Tcg.Store _
-                              | Tcg.Call _ ->
-                                  None
-                            in
-                            let hidden_single_body_def temp =
-                              body_indexed
-                              |> List.filter_map
-                                   (fun (index, instr) ->
-                                     match defs_temp instr with
-                                     | Some dst when dst = temp ->
-                                         Some (index, instr)
-                                     | Some _
-                                     | None ->
-                                         None)
-                              |> function
-                                   | [ one ] -> Some one
-                                   | []
-                                   | _ :: _ :: _ -> None
-                            in
-                            let hidden_fast_path_executes_body =
-                              contains_substring header "_split_"
-                              && loop_inv_expr_equal
-                                   control_scale scalar_inv_one
-                              && loop_inv_expr_equal
-                                   control_bias step_expr
-                              &&
-                              match loop_inv_expr_const_opt step_expr with
-                              | Some step -> step > 0L
-                              | None -> false
-                            in
-                            let match_hidden_live_affines () =
-                              let targets =
-                                hidden_loop_live_defs
-                                |> IntSet.remove iv_temp
-                                |> IntSet.elements
-                              in
-                              let rec collect reductions overwrites = function
-                                | [] ->
-                                    let reductions = List.rev reductions in
-                                    let overwrites = List.rev overwrites in
-                                    let has_iv_dependent_reduction =
-                                      List.exists
-                                        (fun (_acc, scale, _bias) ->
-                                          not
-                                            (loop_inv_expr_equal
-                                               scale scalar_inv_zero))
-                                        reductions
-                                    in
-                                    (* v73 safety narrowing.
-
-                                       The hidden-live fallback exists to recover
-                                       recurrence structure obscured by temporary
-                                       values, especially
-
-                                         acc' = acc + A*iv + B
-
-                                       and path-final invariant overwrites.  A
-                                       hidden *constant-only* recurrence
-
-                                         acc' = acc + B
-
-                                       is not needed by the two_live case and
-                                       was the first new shape that triggered the
-                                       diamond_split_piecewise non-termination
-                                       regression.
-
-                                       Keep the newly proven capability narrow:
-                                       require either an IV-dependent hidden
-                                       recurrence or at least one invariant
-                                       overwrite.  Constant-only hidden updates
-                                       remain on the original loop path until a
-                                       dedicated proof/CFG treatment exists. *)
-                                    if
-                                      reductions = []
-                                      || (not has_iv_dependent_reduction
-                                          && overwrites = [])
-                                    then begin
-                                      if
-                                        debug
-                                        && reductions <> []
-                                        && overwrites = []
-                                      then
-                                        Printf.eprintf
-                                          "lve-runtime-hidden-summary-reject func=%s header=%s reason=constant-only-hidden-recurrence\n%!"
-                                          f.name header;
-                                      None
-                                    end else
-                                      Some (reductions, overwrites)
-                                | target :: rest ->
-                                    begin
-                                      match hidden_single_body_def target with
-                                      | None ->
-                                          None
-                                      | Some (def_index, instr) ->
-                                          begin
-                                            match
-                                              hidden_live_affine_of_instr
-                                                target def_index
-                                                IntSet.empty instr
-                                            with
-                                            | None ->
-                                                None
-                                            | Some
-                                                ( acc_coeff,
-                                                  delta_scale,
-                                                  delta_bias ) ->
-                                                let delta_scale =
-                                                  normalize_loop_inv_expr
-                                                    delta_scale
-                                                in
-                                                let delta_bias =
-                                                  normalize_loop_inv_expr
-                                                    delta_bias
-                                                in
-                                                let scale_available =
-                                                  lve_expr_available_before_preds
-                                                    doms def_blocks multi_defs
-                                                    [ preheader_label ]
-                                                    delta_scale
-                                                in
-                                                let bias_available =
-                                                  lve_expr_available_before_preds
-                                                    doms def_blocks multi_defs
-                                                    [ preheader_label ]
-                                                    delta_bias
-                                                in
-                                                if
-                                                  Int64.equal acc_coeff 1L
-                                                  && scale_available
-                                                  && bias_available
-                                                then begin
-                                                  if debug then
-                                                    Printf.eprintf
-                                                      "lve-runtime-hidden-affine-reduction func=%s header=%s iv=t%d acc=t%d scale=%s bias=%s\n%!"
-                                                      f.name header iv_temp target
-                                                      (string_of_loop_inv_expr
-                                                         delta_scale)
-                                                      (string_of_loop_inv_expr
-                                                         delta_bias);
-                                                  collect
-                                                    ( ( target,
-                                                        delta_scale,
-                                                        delta_bias )
-                                                      :: reductions )
-                                                    overwrites rest
-                                                end
-                                                else if
-                                                  Int64.equal acc_coeff 0L
-                                                  && loop_inv_expr_equal
-                                                       delta_scale
-                                                       scalar_inv_zero
-                                                  && bias_available
-                                                  && hidden_fast_path_executes_body
-                                                then begin
-                                                  if debug then
-                                                    Printf.eprintf
-                                                      "lve-runtime-hidden-invariant-overwrite func=%s header=%s temp=t%d value=%s\n%!"
-                                                      f.name header target
-                                                      (string_of_loop_inv_expr
-                                                         delta_bias);
-                                                  collect reductions
-                                                    ((target, delta_bias)
-                                                     :: overwrites)
-                                                    rest
-                                                end
-                                                else
-                                                  None
-                                          end
-                                    end
-                              in
-                              collect [] [] targets
-                            in
-
                             let reduction_shape =
                               match match_move_accumulator_carrier () with
                               | Some (acc_temp, derived_temp, delta_operand) ->
@@ -31389,9 +27089,9 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                         derived_temp,
                                         delta_operand ))
                               | None ->
-                                  (match match_direct_reductions () with
-                                   | Some reductions ->
-                                       Some (`DirectAffines reductions)
+                                  (match match_direct_reduction () with
+                                   | Some _ as direct ->
+                                       direct
                                    | None ->
                                        (match match_pair () with
                                         | Some
@@ -31402,18 +27102,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                   derived_temp,
                                                   delta_operand ))
                                         | None ->
-                                            (if
-                                               contains_substring header "_split_"
-                                               || contains_substring
-                                                    control_block.label "_split_"
-                                             then
-                                               Option.map
-                                                 (fun (reductions, overwrites) ->
-                                                   `LiveAffines
-                                                     (reductions, overwrites))
-                                                 (match_hidden_live_affines ())
-                                             else
-                                               None)))
+                                            None))
                             in
                             match reduction_shape with
                             | None ->
@@ -31421,51 +27110,21 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                   "no-runtime-affine-reduction"
                             | Some reduction_shape ->
                                 (match reduction_shape with
-                                 | `DirectAffines reductions when debug ->
-                                     List.iter
-                                       (fun (acc, scale, bias) ->
-                                         Printf.eprintf
-                                           "lve-runtime-direct-affine-reduction func=%s header=%s iv=t%d acc=t%d scale=%s bias=%s step=%s\n%!"
-                                           f.name header iv_temp acc
-                                           (string_of_loop_inv_expr scale)
-                                           (string_of_loop_inv_expr bias)
-                                           (string_of_lve_operand step_operand))
-                                       reductions
-                                 | `LiveAffines
-                                     (reductions, overwrites) when debug ->
-                                     List.iter
-                                       (fun (acc, scale, bias) ->
-                                         Printf.eprintf
-                                           "lve-runtime-hidden-affine-summary-reduction func=%s header=%s iv=t%d acc=t%d scale=%s bias=%s step=%s\n%!"
-                                           f.name header iv_temp acc
-                                           (string_of_loop_inv_expr scale)
-                                           (string_of_loop_inv_expr bias)
-                                           (string_of_lve_operand step_operand))
-                                       reductions;
-                                     List.iter
-                                       (fun (temp, value) ->
-                                         Printf.eprintf
-                                           "lve-runtime-hidden-overwrite-summary func=%s header=%s temp=t%d value=%s\n%!"
-                                           f.name header temp
-                                           (string_of_loop_inv_expr value))
-                                       overwrites
-                                 | `DirectAffines _
-                                 | `LiveAffines _
+                                 | `DirectAffine (acc, scale, bias) when debug ->
+                                     Printf.eprintf
+                                        "lve-runtime-direct-affine-reduction func=%s header=%s iv=t%d acc=t%d scale=%s bias=%s step=%s\n%!"
+                                        f.name header iv_temp acc
+                                        (string_of_loop_inv_expr scale)
+                                        (string_of_loop_inv_expr bias)
+                                        (string_of_lve_operand step_operand)
+                                 | `DirectAffine _
                                  | `Carrier _ ->
                                      ());
-                                let acc_temps =
+                                let acc_temp =
                                   match reduction_shape with
-                                  | `Carrier (acc, _, _) ->
-                                      [ acc ]
-                                  | `DirectAffines reductions ->
-                                      List.map
-                                        (fun (acc, _, _) -> acc)
-                                        reductions
-                                  | `LiveAffines (reductions, overwrites) ->
-                                      (List.map
-                                         (fun (acc, _, _) -> acc)
-                                         reductions)
-                                      @ (List.map fst overwrites)
+                                  | `Carrier (acc, _, _)
+                                  | `DirectAffine (acc, _, _) ->
+                                      acc
                                 in
                                 let live_exit =
                                   table_find_or_empty
@@ -31475,11 +27134,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                   IntSet.inter loop_defs live_exit
                                 in
                                 let supported_live_temps =
-                                  List.fold_left
-                                    (fun supported acc ->
-                                      IntSet.add acc supported)
-                                    (IntSet.singleton iv_temp)
-                                    acc_temps
+                                  IntSet.add iv_temp (IntSet.singleton acc_temp)
                                 in
                                 let supported_live_temps,
                                     reconstruction_order,
@@ -31527,6 +27182,13 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                     ( emit_loop_inv_expr
                                                         fresh_temp temp complex,
                                                       Tcg.Temp temp )
+                                              in
+                                              let summary_start_expr =
+                                                match symbolic_trip_spec with
+                                                | Some spec ->
+                                                    spec.symbolic_trip_start
+                                                | None ->
+                                                    scalar_inv_zero
                                               in
                                               let build_reduction_apply_body
                                                   trip =
@@ -31594,7 +27256,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                 in
                                                 match reduction_shape with
                                                 | `Carrier
-                                                    ( acc_temp,
+                                                    ( _,
                                                       derived_temp,
                                                       delta_operand ) ->
                                                     let
@@ -31646,7 +27308,24 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                                 Tcg.Temp
                                                                   total_delta )) ]
                                                     @ reconstruction_instrs
-                                                | `DirectAffines reductions ->
+                                                | `DirectAffine
+                                                    ( _,
+                                                      delta_scale,
+                                                      delta_bias ) ->
+                                                    let
+                                                      scale_prep,
+                                                      scale_operand
+                                                    =
+                                                      materialize_summary_inv_expr
+                                                        delta_scale
+                                                    in
+                                                    let
+                                                      bias_prep,
+                                                      bias_operand
+                                                    =
+                                                      materialize_summary_inv_expr
+                                                        delta_bias
+                                                    in
                                                     let
                                                       start_prep,
                                                       start_operand
@@ -31661,294 +27340,80 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                       build_triangle_number_instrs
                                                         fresh_temp summary_trip
                                                     in
-                                                    let
-                                                      build_one
-                                                        ( acc_temp,
-                                                          delta_scale,
-                                                          delta_bias )
-                                                      =
-                                                      let
-                                                        scale_prep,
-                                                        scale_operand
-                                                      =
-                                                        materialize_summary_inv_expr
-                                                          delta_scale
-                                                      in
-                                                      let
-                                                        bias_prep,
-                                                        bias_operand
-                                                      =
-                                                        materialize_summary_inv_expr
-                                                          delta_bias
-                                                      in
-                                                      let start_scaled =
-                                                        fresh_temp ()
-                                                      in
-                                                      let effective_bias =
-                                                        fresh_temp ()
-                                                      in
-                                                      let step_triangle =
-                                                        fresh_temp ()
-                                                      in
-                                                      let series_delta =
-                                                        fresh_temp ()
-                                                      in
-                                                      let base_delta =
-                                                        fresh_temp ()
-                                                      in
-                                                      let total_delta =
-                                                        fresh_temp ()
-                                                      in
-                                                      scale_prep
-                                                      @ bias_prep
-                                                      @ [ simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( start_scaled,
-                                                                 Mul,
-                                                                 start_operand,
-                                                                 scale_operand ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( effective_bias,
-                                                                 Add,
-                                                                 Tcg.Temp
-                                                                   start_scaled,
-                                                                 bias_operand ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( step_triangle,
-                                                                 Mul,
-                                                                 Tcg.Temp
-                                                                   triangle,
-                                                                 step_operand ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( series_delta,
-                                                                 Mul,
-                                                                 Tcg.Temp
-                                                                   step_triangle,
-                                                                 scale_operand ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( base_delta,
-                                                                 Mul,
-                                                                 Tcg.Temp
-                                                                   summary_trip,
-                                                                 Tcg.Temp
-                                                                   effective_bias ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( total_delta,
-                                                                 Add,
-                                                                 Tcg.Temp
-                                                                   base_delta,
-                                                                 Tcg.Temp
-                                                                   series_delta ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( acc_temp,
-                                                                 Add,
-                                                                 Tcg.Temp
-                                                                   acc_temp,
-                                                                 Tcg.Temp
-                                                                   total_delta )) ]
+                                                    let start_scaled =
+                                                      fresh_temp ()
+                                                    in
+                                                    let effective_bias =
+                                                      fresh_temp ()
+                                                    in
+                                                    let step_triangle =
+                                                      fresh_temp ()
+                                                    in
+                                                    let series_delta =
+                                                      fresh_temp ()
+                                                    in
+                                                    let base_delta =
+                                                      fresh_temp ()
+                                                    in
+                                                    let total_delta =
+                                                      fresh_temp ()
                                                     in
                                                     iv_update_instrs
+                                                    @ scale_prep
+                                                    @ bias_prep
                                                     @ start_prep
                                                     @ triangle_instrs
-                                                    @ List.concat_map
-                                                        build_one reductions
+                                                    @ [ simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( start_scaled,
+                                                               Mul,
+                                                               start_operand,
+                                                               scale_operand ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( effective_bias,
+                                                               Add,
+                                                               Tcg.Temp
+                                                                 start_scaled,
+                                                               bias_operand ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( step_triangle,
+                                                               Mul,
+                                                               Tcg.Temp
+                                                                 triangle,
+                                                               step_operand ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( series_delta,
+                                                               Mul,
+                                                               Tcg.Temp
+                                                                 step_triangle,
+                                                               scale_operand ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                              ( base_delta,
+                                                                Mul,
+                                                                Tcg.Temp summary_trip,
+                                                                Tcg.Temp
+                                                                  effective_bias ));
+                                                        simplify_simple_instr
+                                                          (Tcg.Bin
+                                                             ( total_delta,
+                                                               Add,
+                                                               Tcg.Temp
+                                                                 base_delta,
+                                                               Tcg.Temp
+                                                                 series_delta ));
+                                                         simplify_simple_instr
+                                                           (Tcg.Bin
+                                                              ( acc_temp,
+                                                                Add,
+                                                                Tcg.Temp
+                                                                  acc_temp,
+                                                                Tcg.Temp
+                                                                  total_delta )) ]
                                                     @ reconstruction_instrs
-                                                | `LiveAffines
-                                                    (reductions, overwrites) ->
-                                                    let
-                                                      start_prep,
-                                                      start_operand
-                                                    =
-                                                      materialize_summary_inv_expr
-                                                        summary_start_expr
-                                                    in
-                                                    let
-                                                      triangle_instrs,
-                                                      triangle
-                                                    =
-                                                      build_triangle_number_instrs
-                                                        fresh_temp summary_trip
-                                                    in
-                                                    let
-                                                      build_one
-                                                        ( acc_temp,
-                                                          delta_scale,
-                                                          delta_bias )
-                                                      =
-                                                      let
-                                                        scale_prep,
-                                                        scale_operand
-                                                      =
-                                                        materialize_summary_inv_expr
-                                                          delta_scale
-                                                      in
-                                                      let
-                                                        bias_prep,
-                                                        bias_operand
-                                                      =
-                                                        materialize_summary_inv_expr
-                                                          delta_bias
-                                                      in
-                                                      let start_scaled =
-                                                        fresh_temp ()
-                                                      in
-                                                      let effective_bias =
-                                                        fresh_temp ()
-                                                      in
-                                                      let step_triangle =
-                                                        fresh_temp ()
-                                                      in
-                                                      let series_delta =
-                                                        fresh_temp ()
-                                                      in
-                                                      let base_delta =
-                                                        fresh_temp ()
-                                                      in
-                                                      let total_delta =
-                                                        fresh_temp ()
-                                                      in
-                                                      scale_prep
-                                                      @ bias_prep
-                                                      @ [ simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( start_scaled,
-                                                                 Mul,
-                                                                 start_operand,
-                                                                 scale_operand ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( effective_bias,
-                                                                 Add,
-                                                                 Tcg.Temp
-                                                                   start_scaled,
-                                                                 bias_operand ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( step_triangle,
-                                                                 Mul,
-                                                                 Tcg.Temp
-                                                                   triangle,
-                                                                 step_operand ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( series_delta,
-                                                                 Mul,
-                                                                 Tcg.Temp
-                                                                   step_triangle,
-                                                                 scale_operand ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( base_delta,
-                                                                 Mul,
-                                                                 Tcg.Temp
-                                                                   summary_trip,
-                                                                 Tcg.Temp
-                                                                   effective_bias ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( total_delta,
-                                                                 Add,
-                                                                 Tcg.Temp
-                                                                   base_delta,
-                                                                 Tcg.Temp
-                                                                   series_delta ));
-                                                          simplify_simple_instr
-                                                            (Tcg.Bin
-                                                               ( acc_temp,
-                                                                 Add,
-                                                                 Tcg.Temp
-                                                                   acc_temp,
-                                                                 Tcg.Temp
-                                                                   total_delta )) ]
-                                                    in
-                                                    let
-                                                      build_overwrite
-                                                        (temp, value)
-                                                      =
-                                                      let prep, operand =
-                                                        materialize_summary_inv_expr
-                                                          value
-                                                      in
-                                                      prep
-                                                      @ [ simplify_simple_instr
-                                                            (Tcg.Move
-                                                               (temp, operand)) ]
-                                                    in
-                                                    iv_update_instrs
-                                                    @ start_prep
-                                                    @ triangle_instrs
-                                                    @ List.concat_map
-                                                        build_one reductions
-                                                    @ List.concat_map
-                                                        build_overwrite
-                                                        overwrites
-                                                    @ reconstruction_instrs
-                                              in
-                                              let reduction_accs_string =
-                                                String.concat ","
-                                                  (List.map string_of_int
-                                                     acc_temps)
-                                              in
-                                              let reduction_shape_string =
-                                                match reduction_shape with
-                                                | `Carrier
-                                                    (_, derived, delta) ->
-                                                    Printf.sprintf
-                                                      "carrier:t%d+=%s"
-                                                      derived
-                                                      (string_of_lve_operand
-                                                         delta)
-                                                | `DirectAffines reductions ->
-                                                    reductions
-                                                    |> List.map
-                                                         (fun (acc, scale, bias) ->
-                                                           Printf.sprintf
-                                                             "t%d:scale=%s,bias=%s"
-                                                             acc
-                                                             (string_of_loop_inv_expr
-                                                                scale)
-                                                             (string_of_loop_inv_expr
-                                                                bias))
-                                                    |> String.concat ";"
-                                                    |> Printf.sprintf
-                                                         "direct-affines:[%s]"
-                                                | `LiveAffines
-                                                    (reductions, overwrites) ->
-                                                    let reduction_text =
-                                                      reductions
-                                                      |> List.map
-                                                           (fun
-                                                             (acc, scale, bias) ->
-                                                             Printf.sprintf
-                                                               "t%d:scale=%s,bias=%s"
-                                                               acc
-                                                               (string_of_loop_inv_expr
-                                                                  scale)
-                                                               (string_of_loop_inv_expr
-                                                                  bias))
-                                                      |> String.concat ";"
-                                                    in
-                                                    let overwrite_text =
-                                                      overwrites
-                                                      |> List.map
-                                                           (fun (temp, value) ->
-                                                             Printf.sprintf
-                                                               "t%d:=%s"
-                                                               temp
-                                                               (string_of_loop_inv_expr
-                                                                  value))
-                                                      |> String.concat ";"
-                                                    in
-                                                    Printf.sprintf
-                                                      "live-affines:[%s]|overwrite:[%s]"
-                                                      reduction_text
-                                                      overwrite_text
                                               in
                                               let use_affine_runtime_proof =
                                                 match symbolic_trip_family with
@@ -32091,19 +27556,9 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                 materialize_inv_expr
                                                   proof_control_start_expr
                                               in
-                                              let dynamic_start_prep =
-                                                match dynamic_start_snapshot with
-                                                | Some snapshot ->
-                                                    [ Tcg.Move
-                                                        ( snapshot,
-                                                          Tcg.Temp iv_temp ) ]
-                                                | None ->
-                                                    []
-                                              in
                                               let values_body =
                                                 step_prep
                                                 @ scale_prep
-                                                @ dynamic_start_prep
                                                 @ control_start_prep
                                               in
                                               let values_term =
@@ -32358,7 +27813,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                               changed := true;
                                               if debug then
                                                 Printf.eprintf
-                                                  "lve-runtime-invariant-affine-summary func=%s header=%s iv=t%d scale=%s bias=%s control-start=%s accs={%s} reduction=%s step=%s bound=%s fallback=%s\n%!"
+                                                  "lve-runtime-invariant-affine-summary func=%s header=%s iv=t%d scale=%s bias=%s control-start=%s acc=t%d reduction=%s step=%s bound=%s fallback=%s\n%!"
                                                   f.name header iv_temp
                                                   (string_of_loop_inv_expr
                                                      control_scale)
@@ -32366,12 +27821,28 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                      control_bias)
                                                   (string_of_loop_inv_expr
                                                      proof_control_start_expr)
-                                                  reduction_accs_string
-                                                  reduction_shape_string
-                                                  (string_of_lve_operand
-                                                     step_operand)
-                                                  (string_of_lve_operand
-                                                     bound_operand)
+                                                  acc_temp
+                                                  (match reduction_shape with
+                                                   | `Carrier
+                                                       (_, derived, delta) ->
+                                                       Printf.sprintf
+                                                         "carrier:t%d+=%s"
+                                                         derived
+                                                         (string_of_lve_operand
+                                                            delta)
+                                                   | `DirectAffine
+                                                        (_, scale, bias) ->
+                                                        Printf.sprintf
+                                                          "direct-affine:scale=%s,bias=%s"
+                                                          (string_of_loop_inv_expr
+                                                             scale)
+                                                          (string_of_loop_inv_expr
+                                                             bias)
+                                                  )
+                                                   (string_of_lve_operand
+                                                      step_operand)
+                                                   (string_of_lve_operand
+                                                      bound_operand)
                                                   header
                                             end else begin
                                               (if scev_debug then
@@ -32526,15 +27997,31 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                               changed := true;
                                               if debug then
                                                 Printf.eprintf
-                                                  "lve-runtime-summary func=%s header=%s blocks=%d iv=t%d accs={%s} reduction=%s step=%s bound=%s fallback=%s\n%!"
+                                                  "lve-runtime-summary func=%s header=%s blocks=%d iv=t%d acc=t%d reduction=%s step=%s bound=%s fallback=%s\n%!"
                                                   f.name header
                                                   (LabelSet.cardinal loop)
                                                   iv_temp
-                                                  reduction_accs_string
-                                                  reduction_shape_string
-                                                  (string_of_lve_operand step_operand)
-                                                  (string_of_lve_operand bound_operand)
-                                                  header
+                                                  acc_temp
+                                                  (match reduction_shape with
+                                                   | `Carrier
+                                                       (_, derived, delta) ->
+                                                       Printf.sprintf
+                                                         "carrier:t%d+=%s"
+                                                         derived
+                                                         (string_of_lve_operand
+                                                            delta)
+                                                   | `DirectAffine
+                                                        (_, scale, bias) ->
+                                                        Printf.sprintf
+                                                          "direct-affine:scale=%s,bias=%s"
+                                                          (string_of_loop_inv_expr
+                                                             scale)
+                                                          (string_of_loop_inv_expr
+                                                             bias)
+                                                  )
+                                                   (string_of_lve_operand step_operand)
+                                                   (string_of_lve_operand bound_operand)
+                                                   header
                                              end)
       | _ -> reject header "outside-predecessor-count")
       headers;
@@ -32640,72 +28127,31 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       debug_lcssa_lite_report summaries globals current
     end
   in
-  (* v48 experimental hybrid early mem2reg.
+  (* v51: restore the early representation used by the old high-performing
+     step113 pipeline: conservative mem2reg, but preserve lowered loop-PHI edge
+     copies until loop canonicalization / diamond splitting has consumed them.
 
-     v46 established that making *all* early loop PHIs optimistic is unsound
-     for the current counted-loop provenance model:
+     This separates two concerns that item4 accidentally coupled:
+       - correctness: do NOT use optimistic loop-PHI promotion before trusted
+         recurrence analysis;
+       - performance: do NOT erase/compact the conservative PHI transport shape
+         before branch-loop splitting sees it.
 
-       tailrec_acc_sum        21 -> 15
-       nest3_rect_small       14 -> 95
-
-     But keeping every function conservative also causes a large p07_loop
-     regression, because ordinary one-level loops never expose their scalar
-     IV/reduction PHIs early enough.
-
-     Recover that performance without re-opening the two known unsafe classes:
-       - a true nested natural-loop forest stays conservative;
-       - a synthetic tail-recursion entry stays conservative;
-       - otherwise, when explicitly enabled, use optimistic loop-PHI mem2reg.
-
-     Note that "multiple loops" is NOT treated as nested: two sequential sibling
-     loops may still use the optimistic path.  We test actual containment of one
-     natural-loop header in another natural-loop body. *)
-  (* v49 submission behavior: the evaluator only sees the repository and does
-     not provide feature-enable environment variables.  Make the already-gated
-     hybrid policy the default, while retaining an explicit disable switch for
-     local rollback/debugging. *)
-  let enable_hybrid_early_optimistic_mem2reg =
-    Sys.getenv_opt "TOYC_DISABLE_HYBRID_EARLY_OPTIMISTIC_MEM2REG" = None
-  in
-  let _, early_loops, early_headers = discover_natural_loops f in
-  let has_nested_natural_loop =
-    List.exists
-      (fun parent_header ->
-        let parent_loop =
-          table_find_or_empty early_loops parent_header LabelSet.empty
-        in
-        List.exists
-          (fun child_header ->
-            child_header <> parent_header
-            && LabelSet.mem child_header parent_loop)
-          early_headers)
-      early_headers
-  in
-  let synthetic_tail_entry =
-    contains_substring f.entry "_tail_entry_"
-  in
-  let use_early_optimistic_mem2reg =
-    enable_hybrid_early_optimistic_mem2reg
-    && not has_nested_natural_loop
-    && not synthetic_tail_entry
-  in
+     Later/cascade mem2reg passes keep the normal aggressive cleanup. *)
   let early_mem2reg =
-    if use_early_optimistic_mem2reg then
-      mem2reg_func ~optimistic_loop_phi:true f
-    else
-      mem2reg_func f
+    mem2reg_func
+      ~preserve_loop_phi_shape:true
+      ~legacy_all_block_scope:true
+      f
   in
   if
     Sys.getenv_opt "TOYC_DEBUG_EARLY_MEM2REG_MODE" <> None
     || Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None
   then
     Printf.eprintf
-      "early-mem2reg-mode func=%s mode=%s nested=%b tail-entry=%b loops=%d\n%!"
+      "early-mem2reg-mode func=%s mode=conservative-preserve-shape-legacy-scope loops=%d\n%!"
       f.name
-      (if use_early_optimistic_mem2reg then "optimistic" else "conservative")
-      has_nested_natural_loop
-      synthetic_tail_entry
-      (List.length early_headers);
+      (let _, _, headers = discover_natural_loops f in List.length headers);
   let promoted_before_move_cleanup =
     early_mem2reg |> promote_globals_func summaries globals
   in
@@ -33162,7 +28608,6 @@ let optimize_func global_init summaries globals return_globals removable_calls (
         |> eliminate_dead_code_func
              ~removable_calls summaries globals return_globals
         |> copy_coalesce_func summaries globals
-        |> stop_after "late_pre_summary_input"
       in
       let () =
         debug_lcssa_stage
@@ -33172,7 +28617,6 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       let late_pre_runtime_summarized =
         summarize_runtime_symbolic_affine_loops_func
           summaries globals late_pre_summary_input
-        |> stop_after "late_pre_runtime_summary"
       in
       let () =
         debug_lcssa_stage
@@ -33184,30 +28628,22 @@ let optimize_func global_init summaries globals return_globals removable_calls (
         |> eliminate_dead_code_func
              ~removable_calls summaries globals return_globals
         |> copy_coalesce_func summaries globals
-        |> stop_after "late_pre_runtime_cleaned"
       in
       let late_lve_sr =
         loop_evolution_strength_reduce_func late_pre_runtime_cleaned
-        |> stop_after "late_lve_sr"
       in
       let late_dce =
         eliminate_dead_code_func ~removable_calls summaries globals return_globals late_lve_sr
-        |> stop_after "late_dce"
       in
-      let late_coalesced =
-        copy_coalesce_func summaries globals late_dce
-        |> stop_after "late_coalesced"
-      in
+      let late_coalesced = copy_coalesce_func summaries globals late_dce in
       let late_equiv_branches =
         fold_late_equivalent_diamonds_func late_coalesced
-        |> stop_after "late_equiv_branches"
       in
       let late_equiv_cleaned =
         late_equiv_branches
         |> eliminate_dead_code_func
              ~removable_calls summaries globals return_globals
         |> copy_coalesce_func summaries globals
-        |> stop_after "late_equiv_cleaned"
       in
       let late_equiv_recanon =
         late_equiv_cleaned
@@ -33217,74 +28653,16 @@ let optimize_func global_init summaries globals return_globals removable_calls (
         |> eliminate_dead_code_func
              ~removable_calls summaries globals return_globals
         |> copy_coalesce_func summaries globals
-        |> stop_after "late_equiv_recanon"
       in
       let late_runtime_summarized =
         summarize_runtime_symbolic_affine_loops_func
           summaries globals late_equiv_recanon
-        |> stop_after "late_runtime_summary"
       in
       let late_runtime_cleaned =
         late_runtime_summarized
         |> eliminate_dead_code_func
              ~removable_calls summaries globals return_globals
         |> copy_coalesce_func summaries globals
-        |> stop_after "late_runtime_cleaned"
-      in
-
-      (* v61.1: generated split loops may become classifiable only after the
-         late cleanup above.  Give those compiler-generated loops one final
-         counted-elimination opportunity without weakening any proof. *)
-      let has_generated_split_loop (func : Cfg.func) =
-        List.exists
-          (fun (block : Cfg.block) ->
-            contains_substring block.label "_split_pre_"
-            || contains_substring block.label "_split_post_")
-          func.blocks
-      in
-      let late_split_counted =
-        if not (has_generated_split_loop late_runtime_cleaned) then
-          late_runtime_cleaned
-        else
-          let retry_candidate =
-            eliminate_counted_loops_func
-              global_init summaries globals late_runtime_cleaned
-          in
-          if retry_candidate = late_runtime_cleaned then begin
-            if Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None then
-              Printf.eprintf
-                "counted-late-split-retry func=%s result=no-followup loops=%d\n%!"
-                late_runtime_cleaned.name
-                (let _, _, headers =
-                   discover_natural_loops late_runtime_cleaned
-                 in
-                 List.length headers);
-            late_runtime_cleaned
-          end else begin
-            let cleaned =
-              retry_candidate
-              |> thread_and_prune_func
-              |> simplify_cfg_func
-              |> const_propagate_func global_init summaries globals
-              |> eliminate_dead_code_func
-                   ~removable_calls summaries globals return_globals
-            in
-            if Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None then
-              Printf.eprintf
-                "counted-late-split-retry func=%s result=applied loops=%d->%d blocks=%d->%d\n%!"
-                late_runtime_cleaned.name
-                (let _, _, headers =
-                   discover_natural_loops late_runtime_cleaned
-                 in
-                 List.length headers)
-                (let _, _, headers =
-                   discover_natural_loops cleaned
-                 in
-                 List.length headers)
-                (List.length late_runtime_cleaned.blocks)
-                (List.length cleaned.blocks);
-            cleaned
-          end
       in
       if Sys.getenv_opt "TOYC_DEBUG_LATE_ALGEBRA" <> None then begin
         let before = metrics_of_func late_promoted in
@@ -33302,81 +28680,10 @@ let optimize_func global_init summaries globals return_globals removable_calls (
           late_runtime_cleaned
       in
       let with_hoisted_loop_bounds =
-        hoist_unrolled_loop_branch_immediates_func summaries globals late_split_counted
-        |> stop_after "hoisted_loop_bounds"
-      in
-      let final_candidate0 =
-        final_linear_merge_func with_hoisted_loop_bounds
-        |> stop_after "final_linear_merge"
-      in
-
-      (* Experimental final retry for CFG-inline generated loop shapes.
-         Late branch inlining feeds the expanded caller through [optimize_func],
-         but the ordinary counted-loop stage runs before late copy coalescing
-         and final linear merging.  Some pure scalar state-machine loops become
-         recognizable only here.
-
-         Keep the retry narrowly gated to functions that still contain
-         compiler-generated CFG-inline blocks. *)
-      let has_cfg_inline_blocks =
-        List.exists
-          (fun (block : Cfg.block) ->
-            contains_substring block.label "_cfg_inline_")
-          final_candidate0.blocks
+        hoist_unrolled_loop_branch_immediates_func summaries globals late_runtime_cleaned
       in
       let final_candidate =
-        if
-          Sys.getenv_opt
-            "TOYC_DISABLE_FINAL_INLINE_COUNTED_RETRY"
-          <> None
-          || not has_cfg_inline_blocks
-        then
-          final_candidate0
-        else
-          let cleanup_counted_retry candidate =
-            candidate
-            |> thread_and_prune_func
-            |> simplify_cfg_func
-            |> const_propagate_func global_init summaries globals
-            |> eliminate_dead_code_func
-                 ~removable_calls summaries globals return_globals
-            |> copy_coalesce_func summaries globals
-            |> final_linear_merge_func
-          in
-
-          let rec retry_counted_rounds rounds candidate applied =
-            if rounds = 0 then
-              (candidate, applied)
-            else
-              let retried =
-                eliminate_counted_loops_func
-                  global_init summaries globals candidate
-              in
-              if retried = candidate then
-                (candidate, applied)
-              else
-                let cleaned =
-                  cleanup_counted_retry retried
-                in
-                retry_counted_rounds
-                  (rounds - 1)
-                  cleaned
-                  (applied + 1)
-          in
-
-          let final_retried, applied_rounds =
-            retry_counted_rounds 3 final_candidate0 0
-          in
-
-          if Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None then
-            Printf.eprintf
-              "counted-final-inline-retry func=%s rounds=%d blocks=%d->%d\n%!"
-              final_candidate0.name
-              applied_rounds
-              (List.length final_candidate0.blocks)
-              (List.length final_retried.blocks);
-
-          final_retried
+        final_linear_merge_func with_hoisted_loop_bounds
       in
       if cfg_targets_valid final_candidate then final_candidate
       else begin
@@ -34368,21 +29675,13 @@ let small_leaf_inline_candidate (f : Cfg.func) : Cfg.func option =
           (fun acc (param : Tcg.var) -> IntSet.add param.id acc)
           IntSet.empty f.params
       in
-      let allow_effectful_globals =
-        Sys.getenv_opt "TOYC_DISABLE_EFFECTFUL_HOT_INLINE" = None
-      in
       let instr_safe = function
         | Tcg.Move _ | Tcg.Un _ -> true
         | Tcg.Bin (_, (Div | Mod), _, _) -> false
         | Tcg.Bin _ -> true
         | Tcg.Load (_, Tcg.Local id) -> IntSet.mem id param_ids
-        | Tcg.Load (_, Tcg.Global _) ->
-            allow_effectful_globals
-        | Tcg.Store (Tcg.Global _, _) ->
-            allow_effectful_globals
-        | Tcg.Store (Tcg.Local _, _)
-        | Tcg.Call _ ->
-            false
+        | Tcg.Load (_, Tcg.Global _) -> false
+        | Tcg.Store _ | Tcg.Call _ -> false
       in
       let term_safe = function
         | Cfg.Return (Some _) -> true
@@ -34658,28 +29957,9 @@ let inline_small_hot_calls_program
           let before = metrics_of_func f in
           let expanded = metrics_of_func inlined in
           let cleaned =
-            match Sys.getenv_opt "TOYC_EFFECT_INLINE_CLEANUP_STAGE" with
-            | Some "raw" ->
-                inlined
-            | Some "mem2reg" ->
-                mem2reg_func inlined
-            | Some "gprom" ->
-                inlined
-                |> mem2reg_func
-                |> promote_globals_func summaries globals
-            | Some "canonical" ->
-                inlined
-                |> mem2reg_func
-                |> promote_globals_func summaries globals
-                |> loop_canonicalize_func summaries globals
-            | Some "full"
-            | None ->
-                optimize_func
-                  global_init summaries globals return_globals removable_calls
-                  inlined
-            | Some mode ->
-                failwith
-                  ("unknown TOYC_EFFECT_INLINE_CLEANUP_STAGE=" ^ mode)
+            optimize_func
+              global_init summaries globals return_globals removable_calls
+              inlined
           in
           if cfg_targets_valid cleaned then begin
             if Sys.getenv_opt "TOYC_DEBUG_CFG_INLINE" <> None then
@@ -35119,28 +30399,6 @@ let rewrite_late_scalar_calls_func
 let inline_late_scalar_calls_program
     global_init summaries globals return_global_demands removable_calls
     (funcs : Cfg.func list) =
-  let conservative_cleanup rewritten return_globals =
-    let candidate =
-      rewritten
-      |> const_propagate_func global_init summaries globals
-      |> algebra_canonicalize_func
-      |> general_linear_canonicalize_func
-      |> factor_common_mul_func
-      |> eliminate_dead_code_func
-           ~removable_calls summaries globals return_globals
-      |> fold_branch_tails_func summaries globals
-      |> thread_and_prune_func
-      |> simplify_cfg_func
-      |> final_linear_merge_func
-    in
-    if cfg_targets_valid candidate then candidate
-    else begin
-      debug_cfg_validation
-        "late-scalar-inline-conservative-cleanup"
-        candidate;
-      rewritten
-    end
-  in
   let rec iterate fuel current =
     if fuel = 0 then current
     else
@@ -35163,12 +30421,9 @@ let inline_late_scalar_calls_program
                   | None -> globals
                 in
                 let cleaned =
-                  if function_has_natural_loop rewritten then
-                    conservative_cleanup rewritten return_globals
-                  else
-                    optimize_func
-                      global_init summaries globals return_globals removable_calls
-                      rewritten
+                  optimize_func
+                    global_init summaries globals return_globals removable_calls
+                    rewritten
                 in
                 debug_cfg_validation "late-scalar-inline-cleanup" cleaned;
                 cleaned
@@ -35664,17 +30919,6 @@ let fold_constant_calls_program
 let late_whole_program_constantization_enabled () =
   Sys.getenv_opt "TOYC_ENABLE_LATE_CONST_WHOLE_PROGRAM" <> None
 
-
-(* -------------------------------------------------------------------------- *)
-(* Experimental zero-argument whole-function constant evaluation              *)
-(*                                                                            *)
-(* After late inlining/promotion a formerly effectful-looking function may    *)
-(* become a completely local deterministic CFG.  Reuse [constant_eval_func]   *)
-(* rather than trying to symbolically summarize branches/loops.               *)
-(*                                                                            *)
-(* Safety is inherited from [constant_eval_func]: executed global accesses,   *)
-(* nested calls, unsupported/trapping operations, unknown values, or budget   *)
-(* exhaustion all return [None], leaving the function unchanged.              *)
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
   last_liveness_cache := None;
@@ -35745,47 +30989,6 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let optimized_funcs =
     fold_trivial_calls_program
       global_init summaries globals return_global_demands removable_calls
-      optimized_funcs
-  in
-  let optimized_funcs =
-    if Sys.getenv_opt "TOYC_DISABLE_ZERO_ARG_CONST_EVAL" = None then
-      let debug =
-        Sys.getenv_opt "TOYC_DEBUG_ZERO_ARG_CONST_EVAL" <> None
-      in
-      List.map
-        (fun (f : Cfg.func) ->
-          if f.ret <> TInt || f.params <> [] then
-            f
-          else
-            match constant_eval_func f [] with
-            | None ->
-                f
-            | Some value ->
-                let value = i32 value in
-                let folded_block =
-                  {
-                    Cfg.label = f.entry;
-                    body = [];
-                    term = Cfg.Return (Some (Tcg.Imm value));
-                    preds = [];
-                    succs = [];
-                  }
-                in
-                let folded =
-                  Cfg.rebuild_edges
-                    {
-                      f with
-                      temp_count = 0;
-                      blocks = [ folded_block ];
-                    }
-                in
-                if debug then
-                  Printf.eprintf
-                    "zero-arg-const-eval func=%s value=%Ld blocks=%d->1\n%!"
-                    f.name value (List.length f.blocks);
-                folded)
-        optimized_funcs
-    else
       optimized_funcs
   in
   { Cfg.funcs = optimized_funcs }
