@@ -28503,7 +28503,7 @@ let optimize_func global_init summaries globals return_globals removable_calls (
          chance.
 
          Retry counted elimination only when:
-           1. explicitly enabled for rollout testing;
+           1. the retry has not been explicitly disabled for local rollback;
            2. the conservative normal rounds have already reduced the natural
               loop count, proving that this is genuinely a *post-summary*
               promotion rather than the unsafe original optimistic view;
@@ -28517,8 +28517,13 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       in
       let canonical_loop_count = natural_loop_count canonical in
       let optimized_loop_count = natural_loop_count optimized in
+      (* v50 submission behavior: post-summary retry is part of the default
+         optimization path.  The external evaluator only receives the repository,
+         so feature-enable environment variables would otherwise leave this
+         optimization permanently disabled.  Keep only a disable switch for
+         local A/B rollback. *)
       let enable_post_summary_counted_retry =
-        Sys.getenv_opt "TOYC_ENABLE_POST_SUMMARY_COUNTED_RETRY" <> None
+        Sys.getenv_opt "TOYC_DISABLE_POST_SUMMARY_COUNTED_RETRY" = None
       in
       let post_summary_counted_retry_eligible =
         enable_post_summary_counted_retry
