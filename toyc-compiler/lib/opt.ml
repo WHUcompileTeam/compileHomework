@@ -17389,13 +17389,25 @@ type child_temp_carrier_link = {
   child_temp_link_direct_summary_found : bool;
 }
 
+(* item5 v45: a child-temp transfer may carry either the original
+   child-invariant step or an affine step in the child's control IV.  Keep the
+   existing transfer record/link plumbing so v44 invariant composition remains
+   unchanged; only the semantic payload is generalized. *)
+type child_temp_transfer_step =
+  | ChildTempTransferInvariant of summary_expr
+  | ChildTempTransferAffine of {
+      iv : basic_induction_var;
+      coeff : summary_expr;
+      bias : summary_expr;
+    }
+
 type child_temp_invariant_transfer = {
   child_temp_transfer_header : Tcg.label;
   child_temp_transfer_parent : Tcg.label option;
   child_temp_transfer_depth : int;
   child_temp_transfer_target : Tcg.temp;
   child_temp_transfer_trip : child_scalar_trip_semantics;
-  child_temp_transfer_step_expr : summary_expr;
+  child_temp_transfer_step : child_temp_transfer_step;
   child_temp_transfer_subtract : bool;
 }
 
@@ -18908,36 +18920,54 @@ let build_child_temp_summary_report
                                      child_header source_temp;
                                })))
   in
+  (* item5 v45: v44 only exported [ReductionInvariant] through a
+     parent-child temp carrier.  That left a real hole for three-level nests:
+     the inner loop could have a valid direct affine summary, yet the carrier
+     link remained unresolved.  Export affine summaries only when their IV is
+     exactly the child control IV; this is the narrow case for which the child
+     trip/start semantics below are sufficient and keeps quadratic/cubic/
+     carrier-progression out of the correctness surface. *)
   let invariant_transfers =
     direct_summaries
     |> List.filter_map
          (fun summary ->
+           let make_transfer step =
+             Some
+               {
+                 child_temp_transfer_header =
+                   summary.child_temp_summary_header;
+                 child_temp_transfer_parent =
+                   summary.child_temp_summary_parent;
+                 child_temp_transfer_depth =
+                   summary.child_temp_summary_depth;
+                 child_temp_transfer_target =
+                   summary.child_temp_summary_target;
+                 child_temp_transfer_trip =
+                   {
+                     child_trip_phi_temp =
+                       summary.child_temp_summary_control.control_iv.phi_temp;
+                     child_trip_step =
+                       summary.child_temp_summary_control.control_iv.step;
+                     child_trip_kind =
+                       summary.child_temp_summary_control.kind;
+                   };
+                 child_temp_transfer_step = step;
+                 child_temp_transfer_subtract =
+                   summary.child_temp_summary_reduction.subtract;
+               }
+           in
            match summary.child_temp_summary_reduction.step with
            | ReductionInvariant step_expr ->
-               Some
-                 {
-                   child_temp_transfer_header =
-                     summary.child_temp_summary_header;
-                   child_temp_transfer_parent =
-                     summary.child_temp_summary_parent;
-                   child_temp_transfer_depth =
-                     summary.child_temp_summary_depth;
-                   child_temp_transfer_target =
-                     summary.child_temp_summary_target;
-                   child_temp_transfer_trip =
-                     {
-                       child_trip_phi_temp =
-                         summary.child_temp_summary_control.control_iv.phi_temp;
-                       child_trip_step =
-                         summary.child_temp_summary_control.control_iv.step;
-                       child_trip_kind =
-                         summary.child_temp_summary_control.kind;
-                     };
-                   child_temp_transfer_step_expr =
-                     step_expr;
-                   child_temp_transfer_subtract =
-                     summary.child_temp_summary_reduction.subtract;
-                 }
+               make_transfer
+                 (ChildTempTransferInvariant step_expr)
+           | ReductionAffine { iv; coeff; bias }
+             when
+               iv.phi_temp =
+                 summary.child_temp_summary_control.control_iv.phi_temp
+               && iv.step =
+                    summary.child_temp_summary_control.control_iv.step ->
+               make_transfer
+                 (ChildTempTransferAffine { iv; coeff; bias })
            | ReductionAffine _
            | ReductionQuadratic _
            | ReductionCubic _
@@ -18983,22 +19013,37 @@ let build_child_temp_summary_report
       transfer_links;
   }
 
+let string_of_child_temp_transfer_step = function
+  | ChildTempTransferInvariant step_expr ->
+      Printf.sprintf "invariant:%s"
+        (string_of_child_summary_expr step_expr)
+  | ChildTempTransferAffine { iv; coeff; bias } ->
+      Printf.sprintf "affine:iv=t%d,coeff=%s,bias=%s"
+        iv.phi_temp
+        (string_of_child_summary_expr coeff)
+        (string_of_child_summary_expr bias)
+
 let string_of_child_temp_invariant_delta
     (transfer : child_temp_invariant_transfer) =
   let trip =
     string_of_child_trip_semantics
       transfer.child_temp_transfer_trip
   in
-  let step =
-    string_of_child_summary_expr
-      transfer.child_temp_transfer_step_expr
-  in
-  if step = "0" then "0"
-  else if step = "1" then trip
-  else if step = "-1" then
-    Printf.sprintf "-(%s)" trip
-  else
-    Printf.sprintf "(%s*%s)" trip step
+  match transfer.child_temp_transfer_step with
+  | ChildTempTransferInvariant step_expr ->
+      let step = string_of_child_summary_expr step_expr in
+      if step = "0" then "0"
+      else if step = "1" then trip
+      else if step = "-1" then
+        Printf.sprintf "-(%s)" trip
+      else
+        Printf.sprintf "(%s*%s)" trip step
+  | ChildTempTransferAffine { iv; coeff; bias } ->
+      Printf.sprintf
+        "sum-affine(trip=%s,iv=t%d,coeff=%s,bias=%s)"
+        trip iv.phi_temp
+        (string_of_child_summary_expr coeff)
+        (string_of_child_summary_expr bias)
 
 let debug_child_temp_summary_report
     summaries globals
@@ -19058,8 +19103,8 @@ let debug_child_temp_summary_report
           transfer.child_temp_transfer_target
           (string_of_child_trip_semantics
              transfer.child_temp_transfer_trip)
-          (string_of_child_summary_expr
-             transfer.child_temp_transfer_step_expr)
+          (string_of_child_temp_transfer_step
+             transfer.child_temp_transfer_step)
           (string_of_child_temp_invariant_delta transfer)
           (if transfer.child_temp_transfer_subtract
            then "temp_out=temp_in-delta"
@@ -21250,6 +21295,130 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                               let child_trip_factor =
                                 SummaryOperand (Tcg.Temp child_trip_temp)
                               in
+                              (* item5 v45: an affine child reduction
+
+                                   x += coeff * child_iv + bias
+
+                                 contributes, for N child iterations starting at
+                                 S with child stride d,
+
+                                   N * (coeff*S + bias)
+                                   + C(N,2) * coeff*d.
+
+                                 N, S and C(N,2) are parent-invariant here (the
+                                 existing start/bound proof above established
+                                 that), while [coeff]/[bias] may themselves be
+                                 linear in a parent IV.  Reuse the parent linear
+                                 algebra rather than materializing a child delta
+                                 once and accidentally freezing a parent-IV
+                                 dependent value. *)
+                              let needs_affine_triangle =
+                                List.exists
+                                  (fun (link, _) ->
+                                    match
+                                      link.child_temp_transfer_link_resolved
+                                    with
+                                    | Some transfer ->
+                                        (match transfer.child_temp_transfer_step with
+                                         | ChildTempTransferAffine _ -> true
+                                         | ChildTempTransferInvariant _ -> false)
+                                    | None -> false)
+                                  summaries_for_links
+                              in
+                              let affine_triangle_instrs, affine_triangle_factor =
+                                if needs_affine_triangle then
+                                  let instrs, triangle_temp =
+                                    build_triangle_number_instrs
+                                      fresh_temp child_trip_temp
+                                  in
+                                  ( instrs,
+                                    Some
+                                      (SummaryOperand
+                                         (Tcg.Temp triangle_temp)) )
+                                else
+                                  ([], None)
+                              in
+                              let parent_linear_of_expr expr =
+                                linear_expr_of_parent_summary_expr
+                                  invariant_loaded_places
+                                  loop_defs
+                                  def_blocks
+                                  get_block
+                                  loop_stable_phis
+                                  multi_defs
+                                  def_instrs
+                                  ivs
+                                  exit_block
+                                  expr
+                              in
+                              let apply_transfer_sign transfer parent_step =
+                                if transfer.child_temp_transfer_subtract then
+                                  linear_expr_neg parent_step
+                                else
+                                  parent_step
+                              in
+                              let parent_step_of_transfer transfer =
+                                match transfer.child_temp_transfer_step with
+                                | ChildTempTransferInvariant step_expr ->
+                                    Option.bind
+                                      (parent_linear_of_expr step_expr)
+                                      (fun linear_step ->
+                                        Option.map
+                                          (apply_transfer_sign transfer)
+                                          (linear_expr_mul_invariant
+                                             child_trip_factor
+                                             linear_step))
+                                | ChildTempTransferAffine { iv; coeff; bias } ->
+                                    if
+                                      iv.phi_temp <>
+                                        child_control.control_iv.phi_temp
+                                    then
+                                      None
+                                    else
+                                      Option.bind
+                                        affine_triangle_factor
+                                        (fun triangle_factor ->
+                                          Option.bind
+                                            (parent_linear_of_expr coeff)
+                                            (fun linear_coeff ->
+                                              Option.bind
+                                                (parent_linear_of_expr bias)
+                                                (fun linear_bias ->
+                                                  let child_start_factor =
+                                                    SummaryOperand
+                                                      (Tcg.Temp start_temp)
+                                                  in
+                                                  Option.bind
+                                                    (linear_expr_mul_invariant
+                                                       child_start_factor
+                                                       linear_coeff)
+                                                    (fun scaled_start ->
+                                                      Option.bind
+                                                        (linear_expr_add
+                                                           scaled_start
+                                                           linear_bias)
+                                                        (fun base_step ->
+                                                          Option.bind
+                                                            (linear_expr_mul_invariant
+                                                               child_trip_factor
+                                                               base_step)
+                                                            (fun base_delta ->
+                                                              let series_factor =
+                                                                summary_expr_scale
+                                                                  iv.step
+                                                                  triangle_factor
+                                                              in
+                                                              Option.bind
+                                                                (linear_expr_mul_invariant
+                                                                   series_factor
+                                                                   linear_coeff)
+                                                                (fun series_delta ->
+                                                                  Option.map
+                                                                    (apply_transfer_sign transfer)
+                                                                    (linear_expr_add
+                                                                       base_delta
+                                                                       series_delta))))))))
+                              in
                               let composed =
                                 summaries_for_links
                                 |> List.filter_map
@@ -21260,64 +21429,44 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                                        | None -> None
                                        | Some transfer ->
                                            Option.bind
-                                             (linear_expr_of_parent_summary_expr
-                                                invariant_loaded_places
-                                                loop_defs
-                                                def_blocks
-                                                get_block
-                                                loop_stable_phis
-                                                multi_defs
-                                                def_instrs
-                                                ivs
-                                                exit_block
-                                                transfer.child_temp_transfer_step_expr)
-                                             (fun linear_step ->
-                                               let linear_step =
-                                                 if
-                                                   transfer.child_temp_transfer_subtract
-                                                 then linear_expr_neg linear_step
-                                                 else linear_step
-                                               in
+                                             (parent_step_of_transfer transfer)
+                                             (fun parent_step ->
                                                Option.bind
-                                                 (linear_expr_mul_invariant
-                                                    child_trip_factor
-                                                    linear_step)
-                                                 (fun parent_step ->
-                                                   Option.bind
-                                                     (reduction_step_of_linear_expr
-                                                        parent_step)
-                                                     (fun step ->
-                                                       let target_temp =
-                                                         link.child_temp_transfer_link_parent_carrier
-                                                       in
-                                                       if
-                                                         List.exists
-                                                           (fun (iv : basic_induction_var) ->
-                                                             iv.phi_temp = target_temp)
-                                                           ivs
-                                                         || List.exists
-                                                              (reduction_targets_temp target_temp)
-                                                              reductions
-                                                       then
-                                                         None
-                                                       else
-                                                         Some
-                                                           {
-                                                             target =
-                                                               ReductionTempTarget
-                                                                 target_temp;
-                                                             subtract = false;
-                                                             step;
-                                                             carrier_temp = None;
-                                                             alias_temps = [];
-                                                           }))))
+                                                 (reduction_step_of_linear_expr
+                                                    parent_step)
+                                                 (fun step ->
+                                                   let target_temp =
+                                                     link.child_temp_transfer_link_parent_carrier
+                                                   in
+                                                   if
+                                                     List.exists
+                                                       (fun (iv : basic_induction_var) ->
+                                                         iv.phi_temp = target_temp)
+                                                       ivs
+                                                     || List.exists
+                                                          (reduction_targets_temp target_temp)
+                                                          reductions
+                                                   then
+                                                     None
+                                                   else
+                                                     Some
+                                                       {
+                                                         target =
+                                                           ReductionTempTarget
+                                                             target_temp;
+                                                         subtract = false;
+                                                         step;
+                                                         carrier_temp = None;
+                                                         alias_temps = [];
+                                                       })))
                               in
                               if List.length composed = List.length links then begin
                                 nested_prelude_rev :=
                                   List.rev_append
                                     (start_instrs
                                      @ bound_instrs
-                                     @ child_trip_instrs)
+                                     @ child_trip_instrs
+                                     @ affine_triangle_instrs)
                                     !nested_prelude_rev;
                                 nested_reductions_rev :=
                                   List.rev_append composed !nested_reductions_rev;
