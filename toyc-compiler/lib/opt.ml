@@ -10317,6 +10317,105 @@ let counted_loop_shape_supported header loop get_block entry_label =
   in
   walk LabelSet.empty entry_label
 
+
+(* item5 v37: parent-side structural view for a fully summarized immediate
+   child loop.  The original CFG is not rewritten here.  For the purpose of
+   deciding whether the enclosing counted loop has a single semantic path, an
+   eligible child header is treated as an atomic edge to its dedicated exit.
+
+   Correctness does NOT come from this helper alone: callers must only provide
+   bypasses for children whose externally visible effects are all represented
+   by resolved child-temp summaries. *)
+let counted_loop_shape_supported_with_child_bypasses
+    header loop get_block entry_label child_bypasses =
+  let child_exit label = List.assoc_opt label child_bypasses in
+  let rec collapse_empty_successor seen label =
+    if label = header then Some header
+    else if LabelSet.mem label seen || not (LabelSet.mem label loop) then None
+    else
+      match child_exit label with
+      | Some exit when LabelSet.mem exit loop -> Some exit
+      | Some _ -> None
+      | None ->
+          let block : Cfg.block = get_block label in
+          match (block.body, block.term) with
+          | _, Cfg.Jump next when transparent_loop_connector block ->
+              collapse_empty_successor (LabelSet.add label seen) next
+          | [], _ -> (
+              match branch_term_outcomes block.term with
+              | Some (a, b) -> (
+                  match
+                    ( collapse_empty_successor (LabelSet.add label seen) a,
+                      collapse_empty_successor (LabelSet.add label seen) b )
+                  with
+                  | Some next_a, Some next_b when next_a = next_b -> Some next_a
+                  | _ -> None)
+              | None -> Some label)
+          | _ -> Some label
+  in
+  let rec equivalent_linear_branches seen_pairs a b =
+    if a = b then Some (LabelSet.empty, a)
+    else if List.mem (a, b) seen_pairs || List.mem (b, a) seen_pairs then None
+    else if not (LabelSet.mem a loop) || not (LabelSet.mem b loop) then None
+    else
+      match child_exit a, child_exit b with
+      | Some exit_a, Some exit_b when exit_a = exit_b ->
+          Some (LabelSet.of_list [ a; b ], exit_a)
+      | _ ->
+          let a_block : Cfg.block = get_block a in
+          let b_block : Cfg.block = get_block b in
+          if a_block.body <> b_block.body then None
+          else
+            match (a_block.term, b_block.term) with
+            | Cfg.Jump next_a, Cfg.Jump next_b ->
+                if next_a = next_b then
+                  Some (LabelSet.of_list [ a; b ], next_a)
+                else
+                  Option.map
+                    (fun (seen_labels, next) ->
+                      (LabelSet.add a (LabelSet.add b seen_labels), next))
+                    (equivalent_linear_branches ((a, b) :: seen_pairs) next_a next_b)
+            | _ -> None
+  in
+  let rec walk seen label =
+    if label = header then true
+    else if LabelSet.mem label seen || not (LabelSet.mem label loop) then false
+    else
+      let seen = LabelSet.add label seen in
+      match child_exit label with
+      | Some exit when LabelSet.mem exit loop -> walk seen exit
+      | Some _ -> false
+      | None ->
+          let block : Cfg.block = get_block label in
+          match block.succs with
+          | [ next ] -> walk seen next
+          | _ -> (
+              match branch_term_outcomes block.term with
+              | Some (a, b)
+                when LabelSet.mem a loop && LabelSet.mem b loop -> (
+                  match equivalent_linear_branches [] a b with
+                  | Some (branch_seen, next) ->
+                      walk (LabelSet.union seen branch_seen) next
+                  | None -> (
+                      match
+                        ( collapse_empty_successor seen a,
+                          collapse_empty_successor seen b )
+                      with
+                      | Some next_a, Some next_b when next_a = next_b ->
+                          walk seen next_a
+                      | _ -> false))
+              | Some (a, b) when block.body = [] -> (
+                  match
+                    ( collapse_empty_successor seen a,
+                      collapse_empty_successor seen b )
+                  with
+                  | Some next_a, Some next_b when next_a = next_b ->
+                      walk seen next_a
+                  | _ -> false)
+              | Some _ | None -> false)
+  in
+  child_bypasses <> [] && walk LabelSet.empty entry_label
+
 let clamp_nonnegative_temp fresh_temp temp =
   let keep = fresh_temp () in
   let clamped = fresh_temp () in
@@ -11310,6 +11409,56 @@ let linear_expr_mul lhs rhs =
   | LinearCubic _, LinearQuadratic _
   | LinearCubic _, LinearCubic _ ->
       None
+
+
+let reduction_step_of_linear_expr = function
+  | LinearInvariant expr ->
+      if summary_expr_is_zero expr then None
+      else Some (ReductionInvariant expr)
+  | LinearAffine { iv; coeff; bias } ->
+      if summary_expr_is_zero coeff then
+        if summary_expr_is_zero bias then None
+        else Some (ReductionInvariant bias)
+      else
+        Some (ReductionAffine { iv; coeff; bias })
+  | LinearQuadratic { iv; quad; triangle; coeff; bias } ->
+      if summary_expr_is_zero quad && summary_expr_is_zero triangle then
+        if summary_expr_is_zero coeff then
+          if summary_expr_is_zero bias then None
+          else Some (ReductionInvariant bias)
+        else
+          Some (ReductionAffine { iv; coeff; bias })
+      else
+        Some (ReductionQuadratic { iv; quad; triangle; coeff; bias })
+  | LinearCubic { iv; choose3; triangle; coeff; bias } ->
+      if summary_expr_is_zero choose3 then
+        if summary_expr_is_zero triangle then
+          if summary_expr_is_zero coeff then
+            if summary_expr_is_zero bias then None
+            else Some (ReductionInvariant bias)
+          else
+            Some (ReductionAffine { iv; coeff; bias })
+        else
+          Some
+            (ReductionQuadratic
+               { iv; quad = zero_summary_expr; triangle; coeff; bias })
+      else
+        Some (ReductionCubic { iv; choose3; triangle; coeff; bias })
+
+let counted_kind_with_bound kind bound =
+  match kind with
+  | CountUpLt (_, bias) -> CountUpLt (bound, bias)
+  | CountUpLe (_, bias) -> CountUpLe (bound, bias)
+  | CountDownGt (_, bias) -> CountDownGt (bound, bias)
+  | CountDownGe (_, bias) -> CountDownGe (bound, bias)
+  | CountUpLtScaled (_, scale, bias) ->
+      CountUpLtScaled (bound, scale, bias)
+  | CountUpLeScaled (_, scale, bias) ->
+      CountUpLeScaled (bound, scale, bias)
+  | CountDownGtScaled (_, scale, bias) ->
+      CountDownGtScaled (bound, scale, bias)
+  | CountDownGeScaled (_, scale, bias) ->
+      CountDownGeScaled (bound, scale, bias)
 
 let summary_expr_of_operand_with_bases
     base_temps
@@ -12419,6 +12568,108 @@ let last_store_of_place place (block : Cfg.block) =
       | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> ())
     block.body;
   !last
+
+(* item5 v37: reinterpret a child-local invariant summary expression in the
+   enclosing parent loop.  An operand that was invariant in the child may be a
+   parent induction variable; the existing linear-expression algebra is then
+   able to lift the child effect into a parent invariant/affine/quadratic/cubic
+   reduction without adding a second closed-form engine. *)
+let rec linear_expr_of_parent_summary_expr
+    invariant_loaded_places
+    loop_defs
+    def_blocks
+    get_block
+    loop_stable_phis
+    multi_defs
+    def_instrs
+    ivs
+    (block : Cfg.block) = function
+  | SummaryOperand operand ->
+      (* Preserve the operand as observed in the child body before consulting
+         [resolve_block_operand] on the child exit.  The exit may contain the
+         enclosing IV's later backedge copy; resolving through that block first
+         would accidentally turn "use old i" into "use updated i". *)
+      begin
+        match
+          List.find_opt
+            (fun (iv : basic_induction_var) ->
+              resolves_to_induction_temp
+                multi_defs def_instrs iv.phi_temp operand)
+            ivs
+        with
+        | Some iv ->
+            Some
+              (LinearAffine
+                 {
+                   iv;
+                   coeff = one_summary_expr;
+                   bias = zero_summary_expr;
+                 })
+        | None ->
+            linear_expr_of_operand
+              invariant_loaded_places
+              loop_defs
+              def_blocks
+              get_block
+              loop_stable_phis
+              multi_defs
+              def_instrs
+              ivs
+              block
+              operand
+      end
+  | SummaryPlace place ->
+      if PlaceSet.mem place invariant_loaded_places then
+        Some (LinearInvariant (SummaryPlace place))
+      else
+        None
+  | SummaryUn (UPlus, expr) ->
+      linear_expr_of_parent_summary_expr
+        invariant_loaded_places loop_defs def_blocks get_block
+        loop_stable_phis multi_defs def_instrs ivs block expr
+  | SummaryUn (UMinus, expr) ->
+      Option.map linear_expr_neg
+        (linear_expr_of_parent_summary_expr
+           invariant_loaded_places loop_defs def_blocks get_block
+           loop_stable_phis multi_defs def_instrs ivs block expr)
+  | SummaryUn (UNot, _) ->
+      None
+  | SummaryBin (Add, lhs, rhs) ->
+      Option.bind
+        (linear_expr_of_parent_summary_expr
+           invariant_loaded_places loop_defs def_blocks get_block
+           loop_stable_phis multi_defs def_instrs ivs block lhs)
+        (fun lhs ->
+          Option.bind
+            (linear_expr_of_parent_summary_expr
+               invariant_loaded_places loop_defs def_blocks get_block
+               loop_stable_phis multi_defs def_instrs ivs block rhs)
+            (linear_expr_add lhs))
+  | SummaryBin (Sub, lhs, rhs) ->
+      Option.bind
+        (linear_expr_of_parent_summary_expr
+           invariant_loaded_places loop_defs def_blocks get_block
+           loop_stable_phis multi_defs def_instrs ivs block lhs)
+        (fun lhs ->
+          Option.bind
+            (linear_expr_of_parent_summary_expr
+               invariant_loaded_places loop_defs def_blocks get_block
+               loop_stable_phis multi_defs def_instrs ivs block rhs)
+            (linear_expr_sub lhs))
+  | SummaryBin (Mul, lhs, rhs) ->
+      Option.bind
+        (linear_expr_of_parent_summary_expr
+           invariant_loaded_places loop_defs def_blocks get_block
+           loop_stable_phis multi_defs def_instrs ivs block lhs)
+        (fun lhs ->
+          Option.bind
+            (linear_expr_of_parent_summary_expr
+               invariant_loaded_places loop_defs def_blocks get_block
+               loop_stable_phis multi_defs def_instrs ivs block rhs)
+            (linear_expr_mul lhs))
+  | SummaryBin
+      ((Div | Mod | Lt | Le | Gt | Ge | Eq | Ne | LAnd | LOr), _, _) ->
+      None
 
 let reduction_update_of_place
     invariant_loaded_places
@@ -16352,7 +16603,14 @@ let term_uses_temp temp = function
 type lcssa_temp_write_origin =
   | LcssaTempExclusive
   | LcssaTempChildOnly
+  | LcssaTempChildCarrier
   | LcssaTempMixed
+
+type lcssa_temp_child_carrier = {
+  lcssa_carrier_child_header : Tcg.label;
+  lcssa_carrier_exit_block : Tcg.label;
+  lcssa_carrier_source_temp : int;
+}
 
 type lcssa_lite_liveout = {
   lcssa_loop_header : Tcg.label;
@@ -16362,6 +16620,7 @@ type lcssa_lite_liveout = {
   lcssa_def_blocks : Tcg.label list;
   lcssa_exclusive_def_blocks : Tcg.label list;
   lcssa_child_def_headers : Tcg.label list;
+  lcssa_child_exit_carriers : lcssa_temp_child_carrier list;
   lcssa_temp_write_origin : lcssa_temp_write_origin;
   lcssa_live_exit_targets : Tcg.label list;
   lcssa_outside_use_blocks : Tcg.label list;
@@ -16458,7 +16717,134 @@ let temp_outside_use_blocks temp loop (f : Cfg.func) =
 let lcssa_string_of_temp_write_origin = function
   | LcssaTempExclusive -> "exclusive"
   | LcssaTempChildOnly -> "child-only"
+  | LcssaTempChildCarrier -> "child-carrier"
   | LcssaTempMixed -> "mixed"
+
+let identity_source_temp_for_def
+    temp
+    (block : Cfg.block) =
+  let defs =
+    List.filter
+      (fun instr -> defs_temp instr = Some temp)
+      block.body
+  in
+  match defs with
+  | [ Tcg.Move (dst, Tcg.Temp source) ]
+    when dst = temp && source <> temp ->
+      Some source
+  | [ Tcg.Un (dst, UPlus, Tcg.Temp source) ]
+    when dst = temp && source <> temp ->
+      Some source
+  | [ Tcg.Move _ ]
+  | [ Tcg.Un _ ]
+  | [ Tcg.Bin _ ]
+  | [ Tcg.Load _ ]
+  | [ Tcg.Store _ ]
+  | [ Tcg.Call _ ]
+  | []
+  | _ :: _ :: _ ->
+      None
+
+let child_exit_carrier_for_def_block
+    (forest : loop_forest)
+    (parent_info : loop_forest_info)
+    live_in_t
+    temp
+    def_block_label =
+  let def_block =
+    get_block_exn
+      forest.loop_forest_block_map
+      def_block_label
+  in
+  match identity_source_temp_for_def temp def_block with
+  | None ->
+      None
+  | Some source_temp ->
+      let candidates =
+        parent_info.loop_info_children
+        |> List.filter_map
+             (fun child_header ->
+               match
+                 Hashtbl.find_opt
+                   forest.loop_forest_infos
+                   child_header
+               with
+               | None ->
+                   None
+               | Some child_info ->
+                   if
+                     not
+                       (List.mem
+                          def_block_label
+                          child_info.loop_info_exit_targets)
+                   then
+                     None
+                   else
+                     let child_source_defs =
+                       temp_def_blocks_in_loop
+                         source_temp
+                         child_info.loop_info_blocks
+                         (get_block_exn
+                            forest.loop_forest_block_map)
+                     in
+                     let source_live_at_exit =
+                       IntSet.mem
+                         source_temp
+                         (table_find_or_empty
+                            live_in_t
+                            def_block_label
+                            IntSet.empty)
+                     in
+                     if
+                       child_source_defs <> []
+                       && source_live_at_exit
+                     then
+                       Some
+                         {
+                           lcssa_carrier_child_header =
+                             child_header;
+                           lcssa_carrier_exit_block =
+                             def_block_label;
+                           lcssa_carrier_source_temp =
+                             source_temp;
+                         }
+                     else
+                       None)
+      in
+      match candidates with
+      | [ carrier ] ->
+          Some carrier
+      | []
+      | _ :: _ :: _ ->
+          None
+
+let child_exit_carriers_for_temp
+    forest parent_info live_in_t temp exclusive_def_blocks =
+  let carriers =
+    exclusive_def_blocks
+    |> List.filter_map
+         (child_exit_carrier_for_def_block
+            forest parent_info live_in_t temp)
+  in
+  if
+    carriers <> []
+    && List.length carriers = List.length exclusive_def_blocks
+  then
+    let child_headers =
+      carriers
+      |> List.map
+           (fun carrier ->
+             carrier.lcssa_carrier_child_header)
+      |> List.sort_uniq String.compare
+    in
+    match child_headers with
+    | [ _ ] ->
+        carriers
+    | []
+    | _ :: _ :: _ ->
+        []
+  else
+    []
 
 let child_loops_defining_temp
     (forest : loop_forest)
@@ -16655,18 +17041,33 @@ let build_lcssa_lite_report
                     child_loops_defining_temp
                       forest loop_info temp
                   in
+                  let child_exit_carriers =
+                    if child_def_headers = [] then
+                      child_exit_carriers_for_temp
+                        forest
+                        loop_info
+                        live_in_t
+                        temp
+                        exclusive_def_blocks
+                    else
+                      []
+                  in
                   let write_origin =
                     match
                       exclusive_def_blocks,
-                      child_def_headers
+                      child_def_headers,
+                      child_exit_carriers
                     with
-                    | _ :: _, [] ->
+                    | _ :: _, [], _ :: _ ->
+                        LcssaTempChildCarrier
+                    | _ :: _, [], [] ->
                         LcssaTempExclusive
-                    | [], _ :: _ ->
+                    | [], _ :: _, [] ->
                         LcssaTempChildOnly
-                    | _ :: _, _ :: _ ->
+                    | _ :: _, _ :: _, _
+                    | [], _ :: _, _ :: _ ->
                         LcssaTempMixed
-                    | [], [] ->
+                    | [], [], _ ->
                         (* [temp] was discovered from definitions in the full
                            natural loop.  Reaching this case means the hierarchy
                            metadata does not assign those definitions to either
@@ -16685,7 +17086,9 @@ let build_lcssa_lite_report
                   in
                   let child_effect_candidate =
                     structural_candidate
-                    && write_origin = LcssaTempChildOnly
+                    &&
+                    (write_origin = LcssaTempChildOnly
+                     || write_origin = LcssaTempChildCarrier)
                   in
                   let item =
                     {
@@ -16700,6 +17103,8 @@ let build_lcssa_lite_report
                         exclusive_def_blocks;
                       lcssa_child_def_headers =
                         child_def_headers;
+                      lcssa_child_exit_carriers =
+                        child_exit_carriers;
                       lcssa_temp_write_origin =
                         write_origin;
                       lcssa_live_exit_targets =
@@ -16961,6 +17366,58 @@ type child_scalar_summary_report = {
     parent_child_runtime_guard_proof list;
 }
 
+type child_temp_direct_summary = {
+  child_temp_summary_header : Tcg.label;
+  child_temp_summary_parent : Tcg.label option;
+  child_temp_summary_depth : int;
+  (* LCSSA-visible value exported by the child loop. *)
+  child_temp_summary_target : Tcg.temp;
+  (* Logical loop-carried temp actually recognized by counted-reduction
+     analysis.  With edge-copy phi lowering this need not be the same temp as
+     [child_temp_summary_target]. *)
+  child_temp_summary_reduction_target : Tcg.temp;
+  child_temp_summary_control : counted_loop_info;
+  child_temp_summary_reduction : counted_reduction;
+}
+
+type child_temp_carrier_link = {
+  child_temp_link_parent_header : Tcg.label;
+  child_temp_link_child_header : Tcg.label;
+  child_temp_link_exit_block : Tcg.label;
+  child_temp_link_parent_carrier : Tcg.temp;
+  child_temp_link_child_source : Tcg.temp;
+  child_temp_link_direct_summary_found : bool;
+}
+
+type child_temp_invariant_transfer = {
+  child_temp_transfer_header : Tcg.label;
+  child_temp_transfer_parent : Tcg.label option;
+  child_temp_transfer_depth : int;
+  child_temp_transfer_target : Tcg.temp;
+  child_temp_transfer_trip : child_scalar_trip_semantics;
+  child_temp_transfer_step_expr : summary_expr;
+  child_temp_transfer_subtract : bool;
+}
+
+type child_temp_transfer_link = {
+  child_temp_transfer_link_parent : Tcg.label;
+  child_temp_transfer_link_child : Tcg.label;
+  child_temp_transfer_link_exit_block : Tcg.label;
+  child_temp_transfer_link_parent_carrier : Tcg.temp;
+  child_temp_transfer_link_child_source : Tcg.temp;
+  child_temp_transfer_link_resolved :
+    child_temp_invariant_transfer option;
+}
+
+type child_temp_summary_report = {
+  child_temp_direct_summaries : child_temp_direct_summary list;
+  child_temp_carrier_links : child_temp_carrier_link list;
+  child_temp_invariant_transfers :
+    child_temp_invariant_transfer list;
+  child_temp_transfer_links :
+    child_temp_transfer_link list;
+}
+
 let string_of_child_operand = function
   | Tcg.Imm value -> Int64.to_string value
   | Tcg.Temp temp -> Printf.sprintf "t%d" temp
@@ -17036,6 +17493,32 @@ let string_of_child_reduction_step = function
         carrier_temp
         (string_of_child_summary_expr step_expr)
         carrier_subtract include_updated
+
+let rec child_summary_expr_temps = function
+  | SummaryOperand (Tcg.Imm _) ->
+      IntSet.empty
+  | SummaryOperand (Tcg.Temp temp) ->
+      IntSet.singleton temp
+  | SummaryPlace _ ->
+      IntSet.empty
+  | SummaryUn (_, expr) ->
+      child_summary_expr_temps expr
+  | SummaryBin (_, lhs, rhs) ->
+      IntSet.union
+        (child_summary_expr_temps lhs)
+        (child_summary_expr_temps rhs)
+
+let string_of_child_reduction_target = function
+  | ReductionTempTarget temp ->
+      Printf.sprintf "t%d" temp
+  | ReductionPlaceTarget place ->
+      lcssa_string_of_place place
+
+let string_of_child_reduction (reduction : counted_reduction) =
+  Printf.sprintf "%s:%s%s"
+    (string_of_child_reduction_target reduction.target)
+    (if reduction.subtract then "-" else "+")
+    (string_of_child_reduction_step reduction.step)
 
 let string_of_child_counted_kind = function
   | CountUpLt (bound, bias) ->
@@ -17309,6 +17792,25 @@ let reduction_targets_place place
       target = place
   | ReductionTempTarget _ ->
       false
+
+let reduction_targets_temp temp
+    (reduction : counted_reduction) =
+  match reduction.target with
+  | ReductionTempTarget target ->
+      target = temp
+  | ReductionPlaceTarget _ ->
+      false
+
+let direct_temp_candidates_of_lcssa_info
+    (info : lcssa_lite_loop_info) =
+  info.lcssa_info_temp_liveouts
+  |> List.filter_map
+       (fun item ->
+         if item.lcssa_direct_temp_effect_candidate then
+           Some item.lcssa_temp
+         else
+           None)
+  |> List.sort_uniq compare
 
 let direct_place_candidates_of_lcssa_info
     (info : lcssa_lite_loop_info) =
@@ -17807,6 +18309,808 @@ let build_child_scalar_summary_report
       runtime_guard_proofs;
   }
 
+let build_child_temp_summary_report
+    summaries globals
+    (f : Cfg.func)
+    (lcssa_report : lcssa_lite_report) =
+  let forest = lcssa_report.lcssa_forest in
+  let get_block =
+    get_block_exn forest.loop_forest_block_map
+  in
+  let blocks_snapshot = f.blocks in
+  let headers_bottom_up =
+    forest.loop_forest_headers
+    |> List.filter_map
+         (fun header ->
+           match
+             Hashtbl.find_opt
+               forest.loop_forest_infos header
+           with
+           | Some info ->
+               Some (header, info.loop_info_depth)
+           | None ->
+               None)
+    |> List.sort
+         (fun (header_a, depth_a)
+              (header_b, depth_b) ->
+           let by_depth = compare depth_b depth_a in
+           if by_depth <> 0 then by_depth
+           else String.compare header_a header_b)
+    |> List.map fst
+  in
+  let direct_summaries_rev = ref [] in
+  List.iter
+    (fun header ->
+      match
+        Hashtbl.find_opt lcssa_report.lcssa_infos header,
+        Hashtbl.find_opt forest.loop_forest_infos header
+      with
+      | Some lcssa_info, Some loop_info ->
+          let direct_temps =
+            direct_temp_candidates_of_lcssa_info
+              lcssa_info
+          in
+          if direct_temps <> [] then begin
+            let loop = loop_info.loop_info_blocks in
+            let
+              ( loop_defs,
+                def_blocks,
+                def_instrs,
+                multi_defs,
+                loop_stable_phis,
+                ivs,
+                control,
+                recurrence_facts ) =
+              analyze_counted_loop_for_elimination
+                header loop get_block
+                f.temp_count blocks_snapshot
+            in
+            match control with
+            | None ->
+                ()
+            | Some control ->
+                let effects =
+                  collect_loop_effects
+                    summaries globals loop blocks_snapshot
+                in
+                let invariant_loaded_places =
+                  PlaceSet.diff
+                    (local_places (locals_in_func f))
+                    (local_places effects.modified_places)
+                in
+                let live_in_t, _ =
+                  compute_liveness summaries globals f
+                in
+                let live_t_exit =
+                  table_find_or_empty
+                    live_in_t control.exit_label IntSet.empty
+                in
+                let excluded_temps =
+                  List.fold_left
+                    (fun acc (iv : basic_induction_var) ->
+                      IntSet.add iv.phi_temp acc)
+                    IntSet.empty ivs
+                in
+                let logical_phis =
+                  recover_logical_loop_phis
+                    header loop get_block multi_defs
+                in
+
+                (* item5 v36: a live-out basic IV is itself a perfectly valid
+                   child effect, even though ordinary counted-reduction
+                   discovery deliberately excludes IV temps.  Keep this bridge
+                   narrow: only a UNIQUE non-control basic IV may use it, and
+                   only while the value is genuinely defined by / live out of
+                   this child loop.  We do NOT relax [excluded_temps]. *)
+                let non_control_iv_for_liveout liveout_temp =
+                  let matches =
+                    ivs
+                    |> List.filter
+                         (fun (iv : basic_induction_var) ->
+                           iv.phi_temp = liveout_temp
+                           && iv.phi_temp
+                              <> control.control_iv.phi_temp
+                           && iv.step <> 0L)
+                  in
+                  match matches with
+                  | [ iv ] ->
+                      Some iv
+                  | []
+                  | _ :: _ :: _ ->
+                      None
+                in
+                let iv_liveout_bridge_available liveout_temp =
+                  IntSet.mem liveout_temp loop_defs
+                  && IntSet.mem liveout_temp live_t_exit
+                  && Option.is_some
+                       (non_control_iv_for_liveout liveout_temp)
+                in
+                let reduction_targets_for_liveout liveout_temp =
+                  let bridged =
+                    logical_phis
+                    |> List.filter_map
+                         (fun phi ->
+                           if
+                             phi.logical_backedge_cases <> []
+                             && List.for_all
+                                  (fun case ->
+                                    resolves_to_temp
+                                      multi_defs def_instrs
+                                      liveout_temp
+                                      case.logical_source)
+                                  phi.logical_backedge_cases
+                           then
+                             Some phi.logical_phi_temp
+                           else
+                             None)
+                    |> List.sort_uniq compare
+                  in
+                  let direct =
+                    if
+                      IntSet.mem liveout_temp loop_defs
+                      && IntSet.mem liveout_temp live_t_exit
+                      && not
+                           (IntSet.mem
+                              liveout_temp excluded_temps)
+                    then
+                      [ liveout_temp ]
+                    else
+                      []
+                  in
+                  let iv_bridge =
+                    if iv_liveout_bridge_available liveout_temp
+                    then [ liveout_temp ]
+                    else []
+                  in
+                  List.sort_uniq compare
+                    (direct @ bridged @ iv_bridge)
+                in
+                let liveout_target_map =
+                  List.map
+                    (fun liveout_temp ->
+                      ( liveout_temp,
+                        reduction_targets_for_liveout
+                          liveout_temp ))
+                    direct_temps
+                in
+                let requested_temps =
+                  List.fold_left
+                    (fun acc (_, targets) ->
+                      List.fold_left
+                        (fun acc target ->
+                          if
+                            IntSet.mem target excluded_temps
+                          then acc
+                          else IntSet.add target acc)
+                        acc targets)
+                    IntSet.empty liveout_target_map
+                in
+                let reductions =
+                  collect_counted_reductions
+                    ~recurrence_facts
+                    header
+                    loop
+                    invariant_loaded_places
+                    loop_defs
+                    get_block
+                    def_blocks
+                    loop_stable_phis
+                    multi_defs
+                    def_instrs
+                    ivs
+                    excluded_temps
+                    requested_temps
+                    PlaceSet.empty
+                in
+                let reductions, _ =
+                  resolve_counted_carrier_orders
+                    header loop get_block
+                    multi_defs def_instrs ivs reductions
+                in
+
+                (* item5 v36: ordinary reduction discovery intentionally skips
+                   IV temps.  If a live-out has no already-matched ordinary /
+                   logical-phi reduction, synthesize the exact recurrence that
+                   [basic_induction_var] has already proved:
+
+                       x_out = x_in + trip * step
+
+                   Use magnitude + [subtract] so the representation matches
+                   normal invariant reductions for both +step and -step. *)
+                let iv_liveout_reductions =
+                  liveout_target_map
+                  |> List.filter_map
+                       (fun (liveout_temp, target_candidates) ->
+                         let already_matched =
+                           List.exists
+                             (fun target ->
+                               List.exists
+                                 (reduction_targets_temp target)
+                                 reductions)
+                             target_candidates
+                         in
+                         if already_matched then
+                           None
+                         else
+                           match
+                             non_control_iv_for_liveout liveout_temp
+                           with
+                           | Some (iv : basic_induction_var)
+                             when
+                               iv_liveout_bridge_available
+                                 liveout_temp ->
+                               let subtract = iv.step < 0L in
+                               let magnitude =
+                                 if subtract
+                                 then Int64.neg iv.step
+                                 else iv.step
+                               in
+                               Some
+                                 {
+                                   target =
+                                     ReductionTempTarget
+                                       liveout_temp;
+                                   subtract;
+                                   step =
+                                     ReductionInvariant
+                                       (SummaryOperand
+                                          (Tcg.Imm magnitude));
+                                   carrier_temp = None;
+                                   alias_temps = [];
+                                 }
+                           | Some _
+                           | None ->
+                               None)
+                in
+                let reductions =
+                  reductions @ iv_liveout_reductions
+                in
+                if
+                  Sys.getenv_opt "TOYC_DEBUG_LCSSA_LITE"
+                  <> None
+                then
+                  List.iter
+                    (fun (reduction : counted_reduction) ->
+                      match reduction.target with
+                      | ReductionTempTarget temp ->
+                          Printf.eprintf
+                            "child-temp-iv-liveout-bridge func=%s header=%s temp=t%d reduction=%s\n%!"
+                            f.name header temp
+                            (string_of_child_reduction reduction)
+                      | ReductionPlaceTarget _ ->
+                          ())
+                    iv_liveout_reductions;
+
+                (* item5 v35: audit the exact mature counted-loop support path
+                   used by elimination itself.  This is intentionally separate
+                   from the experimental liveout->logical-phi bridge above. *)
+                let lcssa_exit_labels =
+                  match
+                    Hashtbl.find_opt
+                      lcssa_report.lcssa_infos header
+                  with
+                  | None ->
+                      []
+                  | Some info ->
+                      info.lcssa_info_temp_liveouts
+                      |> List.filter
+                           (fun item ->
+                             List.mem
+                               item.lcssa_temp
+                               direct_temps)
+                      |> List.concat_map
+                           (fun item ->
+                             item.lcssa_live_exit_targets)
+                      |> List.sort_uniq String.compare
+                in
+                let mature_live_temps =
+                  List.fold_left
+                    (fun acc exit_label ->
+                      IntSet.union acc
+                        (table_find_or_empty
+                           live_in_t exit_label
+                           IntSet.empty))
+                    IntSet.empty
+                    lcssa_exit_labels
+                in
+                let mature_loop_live_defs =
+                  IntSet.inter loop_defs mature_live_temps
+                in
+                let mature_reductions =
+                  collect_counted_reductions
+                    ~recurrence_facts
+                    header
+                    loop
+                    invariant_loaded_places
+                    loop_defs
+                    get_block
+                    def_blocks
+                    loop_stable_phis
+                    multi_defs
+                    def_instrs
+                    ivs
+                    excluded_temps
+                    mature_loop_live_defs
+                    PlaceSet.empty
+                in
+                let mature_reductions, _ =
+                  resolve_counted_carrier_orders
+                    header loop get_block
+                    multi_defs def_instrs ivs
+                    mature_reductions
+                in
+                let mature_reduction_temps =
+                  List.fold_left
+                    (fun acc
+                         (reduction : counted_reduction) ->
+                      let acc =
+                        match reduction.target with
+                        | ReductionTempTarget temp ->
+                            IntSet.add temp acc
+                        | ReductionPlaceTarget _ ->
+                            acc
+                      in
+                      add_reduction_alias_temps
+                        acc reduction)
+                    IntSet.empty
+                    mature_reductions
+                in
+                let mature_supported =
+                  IntSet.fold
+                    (fun temp acc ->
+                      if
+                        operand_available_before_loop
+                          loop_defs multi_defs
+                          def_instrs
+                          (Tcg.Temp temp)
+                      then
+                        IntSet.add temp acc
+                      else
+                        acc)
+                    mature_loop_live_defs
+                    mature_reduction_temps
+                in
+                let mature_supported =
+                  IntSet.union mature_supported
+                    (IntSet.inter
+                       mature_loop_live_defs
+                       loop_stable_phis)
+                in
+                let
+                  ( mature_supported,
+                    _,
+                    mature_reconstruction_exprs ) =
+                  collect_reconstructible_live_temps
+                    invariant_loaded_places
+                    loop_defs
+                    get_block
+                    def_blocks
+                    loop_stable_phis
+                    multi_defs
+                    def_instrs
+                    mature_supported
+                    mature_loop_live_defs
+                in
+                if
+                  Sys.getenv_opt
+                    "TOYC_DEBUG_LCSSA_LITE"
+                  <> None
+                then begin
+                  let render_temps temps =
+                    IntSet.elements temps
+                    |> List.map
+                         (Printf.sprintf "t%d")
+                    |> String.concat ","
+                  in
+                  let render_reductions =
+                    mature_reductions
+                    |> List.map
+                         string_of_child_reduction
+                    |> String.concat ","
+                  in
+                  Printf.eprintf
+                    "child-temp-counted-audit func=%s header=%s control-exit=%s lcssa-exits={%s} loop-defs={%s} multi-defs={%s} stable-phis={%s} excluded={%s} mature-live={%s} mature-loop-live={%s} reductions={%s} supported={%s}\n%!"
+                    f.name
+                    header
+                    control.exit_label
+                    (String.concat "," lcssa_exit_labels)
+                    (render_temps loop_defs)
+                    (render_temps multi_defs)
+                    (render_temps loop_stable_phis)
+                    (render_temps excluded_temps)
+                    (render_temps mature_live_temps)
+                    (render_temps mature_loop_live_defs)
+                    render_reductions
+                    (render_temps mature_supported);
+                  List.iter
+                    (fun liveout_temp ->
+                      let in_loop_defs =
+                        IntSet.mem
+                          liveout_temp loop_defs
+                      in
+                      let at_control_exit =
+                        IntSet.mem
+                          liveout_temp live_t_exit
+                      in
+                      let at_lcssa_exit =
+                        IntSet.mem
+                          liveout_temp mature_live_temps
+                      in
+                      let excluded =
+                        IntSet.mem
+                          liveout_temp excluded_temps
+                      in
+                      let supported =
+                        IntSet.mem
+                          liveout_temp mature_supported
+                      in
+                      let reconstruction =
+                        IntMap.find_opt
+                          liveout_temp
+                          mature_reconstruction_exprs
+                      in
+                      let reconstruction_text =
+                        match reconstruction with
+                        | None ->
+                            "<none>"
+                        | Some expr ->
+                            string_of_child_summary_expr
+                              expr
+                      in
+                      let reconstruction_temps =
+                        match reconstruction with
+                        | None ->
+                            IntSet.empty
+                        | Some expr ->
+                            child_summary_expr_temps expr
+                      in
+                      let reduction_dependencies =
+                        IntSet.inter
+                          reconstruction_temps
+                          mature_reduction_temps
+                      in
+                      Printf.eprintf
+                        "child-temp-liveout-audit func=%s header=%s liveout=t%d loop-def=%b control-live=%b lcssa-live=%b excluded=%b iv-bridge=%b multi-def=%b stable-phi=%b supported=%b reconstruction=%s reconstruction-temps={%s} reduction-deps={%s}\n%!"
+                        f.name
+                        header
+                        liveout_temp
+                        in_loop_defs
+                        at_control_exit
+                        at_lcssa_exit
+                        excluded
+                        (iv_liveout_bridge_available
+                           liveout_temp)
+                        (IntSet.mem
+                           liveout_temp multi_defs)
+                        (IntSet.mem
+                           liveout_temp loop_stable_phis)
+                        supported
+                        reconstruction_text
+                        (render_temps
+                           reconstruction_temps)
+                        (render_temps
+                           reduction_dependencies))
+                    direct_temps
+                end;
+                List.iter
+                  (fun (liveout_temp, target_candidates) ->
+                    let matched =
+                      target_candidates
+                      |> List.filter_map
+                           (fun target ->
+                             match
+                               List.find_opt
+                                 (reduction_targets_temp target)
+                                 reductions
+                             with
+                             | Some reduction ->
+                                 Some (target, reduction)
+                             | None ->
+                                 None)
+                    in
+                    if
+                      Sys.getenv_opt
+                        "TOYC_DEBUG_LCSSA_LITE"
+                      <> None
+                    then
+                      Printf.eprintf
+                        "child-temp-reduction-map func=%s header=%s liveout=t%d candidates={%s} matched={%s}\n%!"
+                        f.name header liveout_temp
+                        (target_candidates
+                         |> List.map
+                              (Printf.sprintf "t%d")
+                         |> String.concat ",")
+                        (matched
+                         |> List.map
+                              (fun (target, _) ->
+                                Printf.sprintf "t%d" target)
+                         |> String.concat ",");
+                    match matched with
+                    | [ (reduction_target, reduction) ] ->
+                        direct_summaries_rev :=
+                          {
+                            child_temp_summary_header =
+                              header;
+                            child_temp_summary_parent =
+                              loop_info.loop_info_parent;
+                            child_temp_summary_depth =
+                              loop_info.loop_info_depth;
+                            child_temp_summary_target =
+                              liveout_temp;
+                            child_temp_summary_reduction_target =
+                              reduction_target;
+                            child_temp_summary_control =
+                              control;
+                            child_temp_summary_reduction =
+                              reduction;
+                          }
+                          :: !direct_summaries_rev
+                    | []
+                    | _ :: _ :: _ ->
+                        ())
+                  liveout_target_map
+          end
+      | None, _
+      | _, None ->
+          ())
+    headers_bottom_up;
+  let direct_summaries =
+    List.rev !direct_summaries_rev
+  in
+  let direct_summary_exists child_header source_temp =
+    List.exists
+      (fun summary ->
+        summary.child_temp_summary_header = child_header
+        && summary.child_temp_summary_target = source_temp)
+      direct_summaries
+  in
+  let carrier_links =
+    forest.loop_forest_headers
+    |> List.concat_map
+         (fun parent_header ->
+           match
+             Hashtbl.find_opt
+               lcssa_report.lcssa_infos parent_header
+           with
+           | None ->
+               []
+           | Some info ->
+               info.lcssa_info_temp_liveouts
+               |> List.concat_map
+                    (fun item ->
+                      if
+                        not item.lcssa_child_temp_effect_candidate
+                      then
+                        []
+                      else
+                        item.lcssa_child_exit_carriers
+                        |> List.map
+                             (fun carrier ->
+                               let child_header =
+                                 carrier.lcssa_carrier_child_header
+                               in
+                               let source_temp =
+                                 carrier.lcssa_carrier_source_temp
+                               in
+                               {
+                                 child_temp_link_parent_header =
+                                   parent_header;
+                                 child_temp_link_child_header =
+                                   child_header;
+                                 child_temp_link_exit_block =
+                                   carrier.lcssa_carrier_exit_block;
+                                 child_temp_link_parent_carrier =
+                                   item.lcssa_temp;
+                                 child_temp_link_child_source =
+                                   source_temp;
+                                 child_temp_link_direct_summary_found =
+                                   direct_summary_exists
+                                     child_header source_temp;
+                               })))
+  in
+  let invariant_transfers =
+    direct_summaries
+    |> List.filter_map
+         (fun summary ->
+           match summary.child_temp_summary_reduction.step with
+           | ReductionInvariant step_expr ->
+               Some
+                 {
+                   child_temp_transfer_header =
+                     summary.child_temp_summary_header;
+                   child_temp_transfer_parent =
+                     summary.child_temp_summary_parent;
+                   child_temp_transfer_depth =
+                     summary.child_temp_summary_depth;
+                   child_temp_transfer_target =
+                     summary.child_temp_summary_target;
+                   child_temp_transfer_trip =
+                     {
+                       child_trip_phi_temp =
+                         summary.child_temp_summary_control.control_iv.phi_temp;
+                       child_trip_step =
+                         summary.child_temp_summary_control.control_iv.step;
+                       child_trip_kind =
+                         summary.child_temp_summary_control.kind;
+                     };
+                   child_temp_transfer_step_expr =
+                     step_expr;
+                   child_temp_transfer_subtract =
+                     summary.child_temp_summary_reduction.subtract;
+                 }
+           | ReductionAffine _
+           | ReductionQuadratic _
+           | ReductionCubic _
+           | ReductionCarrierProgression _ ->
+               None)
+  in
+  let find_transfer child_header source_temp =
+    List.find_opt
+      (fun transfer ->
+        transfer.child_temp_transfer_header = child_header
+        && transfer.child_temp_transfer_target = source_temp)
+      invariant_transfers
+  in
+  let transfer_links =
+    carrier_links
+    |> List.map
+         (fun link ->
+           {
+             child_temp_transfer_link_parent =
+               link.child_temp_link_parent_header;
+             child_temp_transfer_link_child =
+               link.child_temp_link_child_header;
+             child_temp_transfer_link_exit_block =
+               link.child_temp_link_exit_block;
+             child_temp_transfer_link_parent_carrier =
+               link.child_temp_link_parent_carrier;
+             child_temp_transfer_link_child_source =
+               link.child_temp_link_child_source;
+             child_temp_transfer_link_resolved =
+               find_transfer
+                 link.child_temp_link_child_header
+                 link.child_temp_link_child_source;
+           })
+  in
+  {
+    child_temp_direct_summaries =
+      direct_summaries;
+    child_temp_carrier_links =
+      carrier_links;
+    child_temp_invariant_transfers =
+      invariant_transfers;
+    child_temp_transfer_links =
+      transfer_links;
+  }
+
+let string_of_child_temp_invariant_delta
+    (transfer : child_temp_invariant_transfer) =
+  let trip =
+    string_of_child_trip_semantics
+      transfer.child_temp_transfer_trip
+  in
+  let step =
+    string_of_child_summary_expr
+      transfer.child_temp_transfer_step_expr
+  in
+  if step = "0" then "0"
+  else if step = "1" then trip
+  else if step = "-1" then
+    Printf.sprintf "-(%s)" trip
+  else
+    Printf.sprintf "(%s*%s)" trip step
+
+let debug_child_temp_summary_report
+    summaries globals
+    (f : Cfg.func)
+    (lcssa_report : lcssa_lite_report) =
+  if Sys.getenv_opt "TOYC_DEBUG_LCSSA_LITE" <> None then begin
+    let report =
+      build_child_temp_summary_report
+        summaries globals f lcssa_report
+    in
+    List.iter
+      (fun summary ->
+        let reduction =
+          summary.child_temp_summary_reduction
+        in
+        Printf.eprintf
+          "child-temp-direct func=%s header=%s depth=%d parent=%s temp=t%d reduction-target=t%d control-iv=t%d outside-inputs=%d iv-step=%Ld control=%s subtract=%b reduction=%s\n%!"
+          f.name
+          summary.child_temp_summary_header
+          summary.child_temp_summary_depth
+          (match summary.child_temp_summary_parent with
+           | Some parent -> parent
+           | None -> "<root>")
+          summary.child_temp_summary_target
+          summary.child_temp_summary_reduction_target
+          summary.child_temp_summary_control.control_iv.phi_temp
+          (List.length
+             summary.child_temp_summary_control.control_iv.outside_inputs)
+          summary.child_temp_summary_control.control_iv.step
+          (string_of_child_counted_kind
+             summary.child_temp_summary_control.kind)
+          reduction.subtract
+          (string_of_child_reduction_step reduction.step))
+      report.child_temp_direct_summaries;
+    List.iter
+      (fun link ->
+        Printf.eprintf
+          "child-temp-carrier-link func=%s parent=%s child=%s exit=%s carrier=t%d source=t%d direct-summary-found=%b\n%!"
+          f.name
+          link.child_temp_link_parent_header
+          link.child_temp_link_child_header
+          link.child_temp_link_exit_block
+          link.child_temp_link_parent_carrier
+          link.child_temp_link_child_source
+          link.child_temp_link_direct_summary_found)
+      report.child_temp_carrier_links;
+    List.iter
+      (fun transfer ->
+        Printf.eprintf
+          "child-temp-transfer func=%s header=%s depth=%d parent=%s temp=t%d trip=%s step=%s delta=%s update=%s\n%!"
+          f.name
+          transfer.child_temp_transfer_header
+          transfer.child_temp_transfer_depth
+          (match transfer.child_temp_transfer_parent with
+           | Some parent -> parent
+           | None -> "<root>")
+          transfer.child_temp_transfer_target
+          (string_of_child_trip_semantics
+             transfer.child_temp_transfer_trip)
+          (string_of_child_summary_expr
+             transfer.child_temp_transfer_step_expr)
+          (string_of_child_temp_invariant_delta transfer)
+          (if transfer.child_temp_transfer_subtract
+           then "temp_out=temp_in-delta"
+           else "temp_out=temp_in+delta"))
+      report.child_temp_invariant_transfers;
+    List.iter
+      (fun link ->
+        match link.child_temp_transfer_link_resolved with
+        | None ->
+            Printf.eprintf
+              "parent-child-temp-transfer func=%s parent=%s child=%s exit=%s carrier=t%d source=t%d resolved=false\n%!"
+              f.name
+              link.child_temp_transfer_link_parent
+              link.child_temp_transfer_link_child
+              link.child_temp_transfer_link_exit_block
+              link.child_temp_transfer_link_parent_carrier
+              link.child_temp_transfer_link_child_source
+        | Some transfer ->
+            Printf.eprintf
+              "parent-child-temp-transfer func=%s parent=%s child=%s exit=%s carrier=t%d source=t%d resolved=true delta=%s carrier-update=%s\n%!"
+              f.name
+              link.child_temp_transfer_link_parent
+              link.child_temp_transfer_link_child
+              link.child_temp_transfer_link_exit_block
+              link.child_temp_transfer_link_parent_carrier
+              link.child_temp_transfer_link_child_source
+              (string_of_child_temp_invariant_delta transfer)
+              (if transfer.child_temp_transfer_subtract
+               then "carrier_out=child_in-delta"
+               else "carrier_out=child_in+delta"))
+      report.child_temp_transfer_links;
+    Printf.eprintf
+      "child-temp-summary func=%s direct=%d carrier-links=%d resolved-carrier-links=%d invariant-transfers=%d resolved-transfers=%d\n%!"
+      f.name
+      (List.length report.child_temp_direct_summaries)
+      (List.length report.child_temp_carrier_links)
+      (List.fold_left
+         (fun count link ->
+           if link.child_temp_link_direct_summary_found
+           then count + 1
+           else count)
+         0 report.child_temp_carrier_links)
+      (List.length report.child_temp_invariant_transfers)
+      (List.fold_left
+         (fun count link ->
+           match link.child_temp_transfer_link_resolved with
+           | Some _ -> count + 1
+           | None -> count)
+         0 report.child_temp_transfer_links)
+  end
+
 let debug_child_scalar_summary_report
     summaries globals
     (f : Cfg.func)
@@ -17993,7 +19297,7 @@ let debug_lcssa_lite_report
             List.iter
               (fun item ->
                 Printf.eprintf
-                  "lcssa-lite-temp-liveout func=%s header=%s depth=%d temp=t%d origin=%s defs={%s} exclusive-defs={%s} child-definers={%s} live-exits={%s} outside-uses={%s} materializable=%b direct-effect=%b child-effect=%b\n%!"
+                  "lcssa-lite-temp-liveout func=%s header=%s depth=%d temp=t%d origin=%s defs={%s} exclusive-defs={%s} child-definers={%s} child-carriers={%s} live-exits={%s} outside-uses={%s} materializable=%b direct-effect=%b child-effect=%b\n%!"
                   f.name
                   item.lcssa_loop_header
                   item.lcssa_loop_depth
@@ -18005,6 +19309,15 @@ let debug_lcssa_lite_report
                      item.lcssa_exclusive_def_blocks)
                   (String.concat ","
                      item.lcssa_child_def_headers)
+                  (String.concat ","
+                     (List.map
+                        (fun carrier ->
+                          Printf.sprintf
+                            "%s:%s:t%d"
+                            carrier.lcssa_carrier_child_header
+                            carrier.lcssa_carrier_exit_block
+                            carrier.lcssa_carrier_source_temp)
+                        item.lcssa_child_exit_carriers))
                   (String.concat "," item.lcssa_live_exit_targets)
                   (String.concat "," item.lcssa_outside_use_blocks)
                   item.lcssa_single_exit_materializable
@@ -18046,6 +19359,8 @@ let debug_lcssa_lite_report
       report.lcssa_direct_place_effect_count
       report.lcssa_child_place_effect_count;
     debug_child_scalar_summary_report
+      summaries globals f report;
+    debug_child_temp_summary_report
       summaries globals f report
   end
 
@@ -18164,8 +19479,21 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
     in
     let changed = ref false in
     let current_entry = ref f.entry in
+    (* item5 v38: when a parent is summarized compositionally, its resolved
+       child loop is immediately bypassed by the new parent summary.  The
+       original [headers] list was discovered before any mutation, so without
+       this guard we would later revisit that now-unreachable child using stale
+       loop/CFG facts and emit a second, dead counted summary.  Besides wasting
+       temps/blocks, doing transforms from stale structural facts is a bad
+       invariant for future non-leaf composition. *)
+    let suppressed_headers = ref LabelSet.empty in
     List.iter
       (fun header ->
+        if LabelSet.mem header !suppressed_headers then
+          debugf
+            "counted-nested-temp-skip-stale-child func=%s header=%s"
+            f.name header
+        else begin
         let loop = table_find_or_empty loops header LabelSet.empty in
         let header_block : Cfg.block = get_block header in
         let blocks_snapshot = current_block_list () in
@@ -18563,6 +19891,36 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
   let _, loops, headers = discover_natural_loops f in
   if headers = [] then f
   else
+    (* item5 v37: unlike the v36 debug-only use, build the LCSSA/temp summary
+       reports as a real input to counted-loop elimination.  No CFG mutation is
+       performed by these analyses. *)
+    let lcssa_report =
+      build_lcssa_lite_report summaries globals f
+    in
+    let child_temp_report =
+      build_child_temp_summary_report
+        summaries globals f lcssa_report
+    in
+    let composition_parent_headers =
+      child_temp_report.child_temp_transfer_links
+      |> List.filter_map
+           (fun link ->
+             match link.child_temp_transfer_link_resolved with
+             | Some _ -> Some link.child_temp_transfer_link_parent
+             | None -> None)
+      |> List.sort_uniq String.compare
+    in
+    (* Give a parent with a resolved child transfer one chance to consume the
+       child summary before the ordinary child-first cascade rewrites the child.
+       Preserve the original relative order inside both partitions. *)
+    let headers =
+      List.filter
+        (fun header -> List.mem header composition_parent_headers)
+        headers
+      @ List.filter
+          (fun header -> not (List.mem header composition_parent_headers))
+          headers
+    in
     let current_blocks = Hashtbl.create (List.length f.blocks + List.length headers) in
     List.iter (fun (block : Cfg.block) -> Hashtbl.add current_blocks block.label block) f.blocks;
     let get_block = get_block_exn current_blocks in
@@ -18700,6 +20058,105 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
        The matcher below is intentionally narrow: five loop blocks, an empty
        branch block, two exact local-place reduction arms, one exact IV update
        join, positive unit IV step, and no calls/global writes. *)
+
+    (* item5 v37: a child may be collapsed in the parent structural view only
+       when every child live-out is represented by a resolved temp transfer and
+       the child has no externally visible place/call/global effect.  This is a
+       deliberately strict completeness gate. *)
+    let resolved_links_for_parent parent_header =
+      child_temp_report.child_temp_transfer_links
+      |> List.filter
+           (fun link ->
+             link.child_temp_transfer_link_parent = parent_header
+             && Option.is_some
+                  link.child_temp_transfer_link_resolved)
+    in
+    let direct_summary_for_link link =
+      List.find_opt
+        (fun summary ->
+          summary.child_temp_summary_header =
+            link.child_temp_transfer_link_child
+          && summary.child_temp_summary_target =
+               link.child_temp_transfer_link_child_source)
+        child_temp_report.child_temp_direct_summaries
+    in
+    let eligible_child_groups parent_header =
+      match
+        Hashtbl.find_opt
+          lcssa_report.lcssa_forest.loop_forest_infos
+          parent_header
+      with
+      | None -> []
+      | Some parent_info ->
+          parent_info.loop_info_children
+          |> List.filter_map
+               (fun child_header ->
+                 match
+                   Hashtbl.find_opt
+                     lcssa_report.lcssa_forest.loop_forest_infos
+                     child_header,
+                   Hashtbl.find_opt
+                     lcssa_report.lcssa_infos
+                     child_header
+                 with
+                 | Some child_info, Some child_lcssa
+                   when child_info.loop_info_children = []
+                        && child_lcssa.lcssa_info_dedicated_exits
+                        && child_lcssa.lcssa_info_place_liveouts = [] ->
+                     let links =
+                       resolved_links_for_parent parent_header
+                       |> List.filter
+                            (fun link ->
+                              link.child_temp_transfer_link_child =
+                                child_header)
+                     in
+                     let covered_temps =
+                       links
+                       |> List.map
+                            (fun link ->
+                              link.child_temp_transfer_link_child_source)
+                       |> List.sort_uniq compare
+                     in
+                     let required_temps =
+                       child_lcssa.lcssa_info_temp_liveouts
+                       |> List.map (fun item -> item.lcssa_temp)
+                       |> List.sort_uniq compare
+                     in
+                     let child_effects =
+                       collect_loop_effects
+                         summaries globals
+                         child_info.loop_info_blocks f.blocks
+                     in
+                     let no_global_effect =
+                       PlaceSet.is_empty
+                         (global_places child_effects.modified_places)
+                     in
+                     let all_summaries_present =
+                       links <> []
+                       && List.for_all
+                            (fun link ->
+                              Option.is_some
+                                (direct_summary_for_link link))
+                            links
+                     in
+                     if
+                       covered_temps = required_temps
+                       && all_summaries_present
+                       && not child_effects.has_call
+                       && no_global_effect
+                     then
+                       match child_lcssa.lcssa_info_exit_targets with
+                       | [ exit_label ] ->
+                           Some (child_header, exit_label, links)
+                       | [] | _ :: _ :: _ -> None
+                     else
+                       None
+                 | Some _, Some _
+                 | Some _, None
+                 | None, _ ->
+                     None)
+    in
+
     let try_eliminate_piecewise_threshold_loop
         header
         loop
@@ -19523,7 +20980,30 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
               f.name header (term_kind header_block.term) (List.length ivs)
               (List.length header_block.preds)
         | Some info -> (
-            match counted_loop_shape_supported info.control_label loop get_block info.inside_label with
+            let nested_child_groups =
+              eligible_child_groups header
+            in
+            let nested_child_bypasses =
+              List.map
+                (fun (child_header, exit_label, _) ->
+                  (child_header, exit_label))
+                nested_child_groups
+            in
+            let plain_shape_supported =
+              counted_loop_shape_supported
+                info.control_label loop get_block info.inside_label
+            in
+            let nested_shape_supported =
+              (not plain_shape_supported)
+              && counted_loop_shape_supported_with_child_bypasses
+                   info.control_label loop get_block info.inside_label
+                   nested_child_bypasses
+            in
+            if nested_shape_supported then
+              debugf
+                "counted-nested-temp-shape-hit func=%s header=%s children=%d"
+                f.name header (List.length nested_child_groups);
+            match plain_shape_supported || nested_shape_supported with
             | false ->
                 if
                   not
@@ -19598,6 +21078,177 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                   resolve_counted_carrier_orders
                     header loop get_block multi_defs def_instrs ivs reductions
                 in
+
+                (* item5 v37: consume resolved child-temp transfers as real
+                   parent reductions.  The child trip count is materialized once
+                   in the eventual parent summary body.  The child's invariant
+                   step is reinterpreted in the parent loop; e.g. a child-local
+                   invariant [i] becomes a parent affine term. *)
+                let nested_prelude_rev = ref [] in
+                let nested_reductions_rev = ref [] in
+                let composed_children = ref 0 in
+                List.iter
+                  (fun (child_header, exit_label, links) ->
+                    let summaries_for_links =
+                      links
+                      |> List.filter_map
+                           (fun link ->
+                             Option.map
+                               (fun summary -> (link, summary))
+                               (direct_summary_for_link link))
+                    in
+                    match summaries_for_links with
+                    | [] -> ()
+                    | (_, first_summary) :: _ ->
+                        let child_control =
+                          first_summary.child_temp_summary_control
+                        in
+                        let start_expr =
+                          common_parent_invariant_entry_expr
+                            loop_defs multi_defs def_instrs
+                            child_control.control_iv
+                        in
+                        let bound_expr =
+                          parent_invariant_expr_of_operand
+                            loop_defs multi_defs def_instrs
+                            (counted_kind_bound_operand
+                               child_control.kind)
+                        in
+                        begin
+                          match start_expr, bound_expr with
+                          | Some start_expr, Some bound_expr ->
+                              let start_temp = fresh_temp () in
+                              let bound_temp = fresh_temp () in
+                              let start_instrs =
+                                emit_loop_inv_expr
+                                  fresh_temp start_temp start_expr
+                              in
+                              let bound_instrs =
+                                emit_loop_inv_expr
+                                  fresh_temp bound_temp bound_expr
+                              in
+                              let child_kind =
+                                counted_kind_with_bound
+                                  child_control.kind
+                                  (Tcg.Temp bound_temp)
+                              in
+                              let child_trip_instrs, child_trip_temp =
+                                build_trip_count_instrs
+                                  fresh_temp
+                                  start_temp
+                                  child_control.control_iv.step
+                                  child_kind
+                              in
+                              let exit_block : Cfg.block =
+                                get_block exit_label
+                              in
+                              let child_trip_factor =
+                                SummaryOperand (Tcg.Temp child_trip_temp)
+                              in
+                              let composed =
+                                summaries_for_links
+                                |> List.filter_map
+                                     (fun (link, _) ->
+                                       match
+                                         link.child_temp_transfer_link_resolved
+                                       with
+                                       | None -> None
+                                       | Some transfer ->
+                                           Option.bind
+                                             (linear_expr_of_parent_summary_expr
+                                                invariant_loaded_places
+                                                loop_defs
+                                                def_blocks
+                                                get_block
+                                                loop_stable_phis
+                                                multi_defs
+                                                def_instrs
+                                                ivs
+                                                exit_block
+                                                transfer.child_temp_transfer_step_expr)
+                                             (fun linear_step ->
+                                               let linear_step =
+                                                 if
+                                                   transfer.child_temp_transfer_subtract
+                                                 then linear_expr_neg linear_step
+                                                 else linear_step
+                                               in
+                                               Option.bind
+                                                 (linear_expr_mul_invariant
+                                                    child_trip_factor
+                                                    linear_step)
+                                                 (fun parent_step ->
+                                                   Option.bind
+                                                     (reduction_step_of_linear_expr
+                                                        parent_step)
+                                                     (fun step ->
+                                                       let target_temp =
+                                                         link.child_temp_transfer_link_parent_carrier
+                                                       in
+                                                       if
+                                                         List.exists
+                                                           (fun (iv : basic_induction_var) ->
+                                                             iv.phi_temp = target_temp)
+                                                           ivs
+                                                         || List.exists
+                                                              (reduction_targets_temp target_temp)
+                                                              reductions
+                                                       then
+                                                         None
+                                                       else
+                                                         Some
+                                                           {
+                                                             target =
+                                                               ReductionTempTarget
+                                                                 target_temp;
+                                                             subtract = false;
+                                                             step;
+                                                             carrier_temp = None;
+                                                             alias_temps = [];
+                                                           }))))
+                              in
+                              if List.length composed = List.length links then begin
+                                nested_prelude_rev :=
+                                  List.rev_append
+                                    (start_instrs
+                                     @ bound_instrs
+                                     @ child_trip_instrs)
+                                    !nested_prelude_rev;
+                                nested_reductions_rev :=
+                                  List.rev_append composed !nested_reductions_rev;
+                                incr composed_children;
+                                if debug_counted then
+                                  List.iter
+                                    (fun (reduction : counted_reduction) ->
+                                      debugf
+                                        "counted-nested-temp-compose func=%s parent=%s child=%s target=%s reduction=%s"
+                                        f.name header child_header
+                                        (string_of_child_reduction_target
+                                           reduction.target)
+                                        (string_of_child_reduction reduction))
+                                    composed
+                              end
+                              else if debug_counted then
+                                debugf
+                                  "counted-nested-temp-compose-reject func=%s parent=%s child=%s reason=step-not-parent-linear resolved=%d expected=%d"
+                                  f.name header child_header
+                                  (List.length composed)
+                                  (List.length links)
+                          | None, _ ->
+                              if debug_counted then
+                                debugf
+                                  "counted-nested-temp-compose-reject func=%s parent=%s child=%s reason=child-start-not-parent-invariant"
+                                  f.name header child_header
+                          | _, None ->
+                              if debug_counted then
+                                debugf
+                                  "counted-nested-temp-compose-reject func=%s parent=%s child=%s reason=child-bound-not-parent-invariant"
+                                  f.name header child_header
+                        end)
+                  nested_child_groups;
+                let nested_prelude = List.rev !nested_prelude_rev in
+                let nested_reductions = List.rev !nested_reductions_rev in
+                let reductions = reductions @ nested_reductions in
                 let all_updates =
                   (List.map (fun iv -> CountedIv iv) live_ivs)
                   @ List.map (fun reduction -> CountedReduction reduction) reductions
@@ -19714,7 +21365,15 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                   (List.length reductions)
                   (string_of_intset supported_live_temps)
                   (string_of_place_mirrors place_mirrors);
-                if ambiguous_iv_carrier_reductions <> [] then begin
+                if
+                  nested_shape_supported
+                  && !composed_children <> List.length nested_child_groups
+                then
+                  debugf
+                    "counted-skip func=%s header=%s reason=incomplete_child_temp_composition composed=%d expected=%d"
+                    f.name header !composed_children
+                    (List.length nested_child_groups)
+                else if ambiguous_iv_carrier_reductions <> [] then begin
                   if debug_counted then
                     List.iter
                       (fun (reduction : counted_reduction) ->
@@ -19776,7 +21435,8 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                       info.kind
                   in
                   let build_updates effective_trip =
-                    carrier_preloads
+                    nested_prelude
+                    @ carrier_preloads
                     @ List.concat_map
                         (build_reduction_final_update fresh_temp effective_trip place_carriers)
                         reductions
@@ -19917,10 +21577,24 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                     debugf
                       "counted-zero-trip-elide func=%s header=%s summary=%s masked=false"
                       f.name header summary_label;
+                  if nested_shape_supported then
+                    debugf
+                      "counted-nested-temp-apply func=%s header=%s summary=%s children=%d composed-reductions=%d prelude=%d"
+                      f.name header summary_label
+                      !composed_children
+                      (List.length nested_reductions)
+                      (List.length nested_prelude);
                   debugf "counted-apply func=%s header=%s summary=%s updates=%d" f.name header
                     summary_label (List.length all_updates);
+                  if nested_shape_supported && !composed_children > 0 then
+                    List.iter
+                      (fun (child_header, _, _) ->
+                        suppressed_headers :=
+                          LabelSet.add child_header !suppressed_headers)
+                      nested_child_groups;
                   new_blocks_rev := summary_label :: !new_blocks_rev;
                   changed := true))
+        end)
       headers;
     if !changed then
       let ordered_labels = List.map (fun (block : Cfg.block) -> block.label) f.blocks in
