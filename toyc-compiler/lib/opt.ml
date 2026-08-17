@@ -2639,6 +2639,97 @@ let rewrite_term_temps rename = function
   | Cfg.Return None -> Cfg.Return None
   | Cfg.Return (Some value) -> Cfg.Return (Some (rewrite_operand_temp rename value))
 
+(* Remove temp-id holes left by speculative/provisional analyses.
+
+   In particular, optimistic mem2reg may allocate a phi temp while solving the
+   forward fixed point, then discover that the final incoming values are all
+   equal and therefore emit no phi edge copies at all.  The temp is absent from
+   the final IR but still contributes to [temp_count].
+
+   This pass does NOT coalesce values and does NOT change def/use structure: it
+   merely renumbers every temp that actually occurs in the CFG to a dense
+   0..N-1 range.  That makes it safe to run immediately after mem2reg without
+   turning edge-copy SSA into multi-definition temps. *)
+let compact_temp_ids_func ?(debug_tag = "") (f : Cfg.func) =
+  let used = ref IntSet.empty in
+  let note_operand = function
+    | Tcg.Temp temp -> used := IntSet.add temp !used
+    | Tcg.Imm _ -> ()
+  in
+  let note_instr instr =
+    begin
+      match defs_temp instr with
+      | Some temp -> used := IntSet.add temp !used
+      | None -> ()
+    end;
+    match instr with
+    | Tcg.Move (_, src)
+    | Tcg.Un (_, _, src) ->
+        note_operand src
+    | Tcg.Bin (_, _, lhs, rhs) ->
+        note_operand lhs;
+        note_operand rhs
+    | Tcg.Load _ ->
+        ()
+    | Tcg.Store (_, value) ->
+        note_operand value
+    | Tcg.Call (_, _, args) ->
+        List.iter note_operand args
+  in
+  let note_term = function
+    | Cfg.Jump _
+    | Cfg.Return None ->
+        ()
+    | Cfg.BranchZero (cond, _, _)
+    | Cfg.BranchNonZero (cond, _, _)
+    | Cfg.Return (Some cond) ->
+        note_operand cond
+    | Cfg.BranchCompare (_, lhs, rhs, _, _) ->
+        note_operand lhs;
+        note_operand rhs
+  in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter note_instr block.body;
+      note_term block.term)
+    f.blocks;
+  let used_count = IntSet.cardinal !used in
+  if used_count = f.temp_count then f
+  else begin
+    let dense = Hashtbl.create (max 8 used_count) in
+    IntSet.elements !used
+    |> List.iteri
+         (fun next old ->
+           Hashtbl.add dense old next);
+    let rename temp =
+      match Hashtbl.find_opt dense temp with
+      | Some dense_temp -> dense_temp
+      | None -> temp
+    in
+    let blocks =
+      List.map
+        (fun (block : Cfg.block) ->
+          let body =
+            List.map (rewrite_instr_temps rename) block.body
+          in
+          let term = rewrite_term_temps rename block.term in
+          {
+            block with
+            body;
+            term;
+            succs = Cfg.successors term;
+          })
+        f.blocks
+    in
+    if Sys.getenv_opt "TOYC_DEBUG_MEM2REG_COMPACT" <> None then
+      Printf.eprintf
+        "mem2reg-temp-compact func=%s tag=%s temps=%d->%d removed=%d\n%!"
+        f.name debug_tag f.temp_count used_count
+        (f.temp_count - used_count);
+    Cfg.rebuild_edges
+      { f with temp_count = used_count; blocks }
+  end
+
 let copy_coalesce_func summaries globals (f : Cfg.func) =
   let debug_coalesce = Sys.getenv_opt "TOYC_DEBUG_COALESCE" <> None in
   if f.temp_count <= 1 then begin
@@ -3207,7 +3298,11 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
         let blocks =
           place_edge_copies fresh_edge_label promoted_blocks (List.rev !edge_copies_rev)
         in
-        let promoted = Cfg.rebuild_edges { current with temp_count = !next_temp; blocks } in
+        let promoted =
+          Cfg.rebuild_edges
+            { current with temp_count = !next_temp; blocks }
+          |> compact_temp_ids_func ~debug_tag:"mem2reg"
+        in
         if IntSet.is_empty !failed then promoted else attempt promoted !failed
     end
   in
