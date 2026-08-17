@@ -22701,86 +22701,128 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
           carrier
           result_temp
         =
-        let block : Cfg.block = get_block outer_join in
-        match block.term with
-        | Cfg.Jump next
-          when next = info.control_label
-               && List.mem outer_join
-                    info.control_iv.backedge_preds ->
-            let direct_iv_updates = ref 0 in
-            let staged_iv_defs = ref [] in
-            let iv_copy_sources = ref [] in
-            let carrier_copies = ref 0 in
-            let recognized =
-              List.for_all
-                (function
-                  | Tcg.Bin
-                      ( dst,
-                        Add,
-                        Tcg.Temp src,
-                        Tcg.Imm 1L )
-                  | Tcg.Bin
-                      ( dst,
-                        Add,
-                        Tcg.Imm 1L,
-                        Tcg.Temp src )
-                    when src = info.control_iv.phi_temp ->
-                      if dst = info.control_iv.phi_temp then
-                        incr direct_iv_updates
-                      else
-                        staged_iv_defs := dst :: !staged_iv_defs;
-                      true
-                  | Tcg.Move
-                      (dst, Tcg.Temp src)
-                    when dst = info.control_iv.phi_temp ->
-                      iv_copy_sources :=
-                        src :: !iv_copy_sources;
-                      true
-                  | Tcg.Move
-                      (dst, Tcg.Temp src)
-                    when
-                      dst = carrier
-                      && src = result_temp ->
-                      incr carrier_copies;
-                      true
-                  | Tcg.Move _
-                  | Tcg.Un _
-                  | Tcg.Bin _
-                  | Tcg.Load _
-                  | Tcg.Store _
-                  | Tcg.Call _ ->
-                      false)
-                block.body
-            in
-            if not recognized then
+        let exact_direct_control_update (block : Cfg.block) =
+          result_temp = carrier
+          &&
+          match block.body, block.term with
+          | [ Tcg.Bin
+                ( dst,
+                  Add,
+                  Tcg.Temp src,
+                  Tcg.Imm 1L ) ],
+            Cfg.BranchCompare
+              ( Lt,
+                Tcg.Temp cmp_iv,
+                _bound,
+                inside_label,
+                exit_label )
+          | [ Tcg.Bin
+                ( dst,
+                  Add,
+                  Tcg.Imm 1L,
+                  Tcg.Temp src ) ],
+            Cfg.BranchCompare
+              ( Lt,
+                Tcg.Temp cmp_iv,
+                _bound,
+                inside_label,
+                exit_label )
+            when
+              dst = info.control_iv.phi_temp
+              && src = info.control_iv.phi_temp
+              && cmp_iv = info.control_iv.phi_temp
+              && inside_label = info.inside_label
+              && exit_label = info.exit_label ->
+              true
+          | _ ->
               false
-            else
-              let iv_ok =
-                match
-                  !direct_iv_updates,
-                  List.sort_uniq compare !staged_iv_defs,
-                  List.sort_uniq compare !iv_copy_sources
-                with
-                | 1, [], [] ->
-                    true
-                | 0, [ next_temp ], [ copied_temp ] ->
-                    next_temp = copied_temp
-                | _ ->
-                    false
+        in
+        let block : Cfg.block = get_block outer_join in
+        if outer_join = info.control_label then
+          (* Late CFG-inline/coalesced form:
+               arm-join -> control
+             and [control] itself performs iv += 1 before the bound test. *)
+          exact_direct_control_update block
+        else
+          match block.term with
+          | Cfg.Jump next
+            when next = info.control_label
+                 && List.mem outer_join
+                      info.control_iv.backedge_preds ->
+              let direct_iv_updates = ref 0 in
+              let staged_iv_defs = ref [] in
+              let iv_copy_sources = ref [] in
+              let carrier_copies = ref 0 in
+              let recognized =
+                List.for_all
+                  (function
+                    | Tcg.Bin
+                        ( dst,
+                          Add,
+                          Tcg.Temp src,
+                          Tcg.Imm 1L )
+                    | Tcg.Bin
+                        ( dst,
+                          Add,
+                          Tcg.Imm 1L,
+                          Tcg.Temp src )
+                      when src = info.control_iv.phi_temp ->
+                        if dst = info.control_iv.phi_temp then
+                          incr direct_iv_updates
+                        else
+                          staged_iv_defs := dst :: !staged_iv_defs;
+                        true
+                    | Tcg.Move
+                        (dst, Tcg.Temp src)
+                      when dst = info.control_iv.phi_temp ->
+                        iv_copy_sources :=
+                          src :: !iv_copy_sources;
+                        true
+                    | Tcg.Move
+                        (dst, Tcg.Temp src)
+                      when
+                        dst = carrier
+                        && src = result_temp ->
+                        incr carrier_copies;
+                        true
+                    | Tcg.Move _
+                    | Tcg.Un _
+                    | Tcg.Bin _
+                    | Tcg.Load _
+                    | Tcg.Store _
+                    | Tcg.Call _ ->
+                        false)
+                  block.body
               in
-              let carrier_ok =
-                if result_temp = carrier then
-                  !carrier_copies = 0
-                else
-                  !carrier_copies = 1
-              in
-              iv_ok && carrier_ok
-        | Cfg.Jump _
-        | Cfg.BranchZero _
-        | Cfg.BranchNonZero _
-        | Cfg.BranchCompare _
-        | Cfg.Return _ ->
-            false
+              if not recognized then
+                false
+              else
+                let iv_ok =
+                  match
+                    !direct_iv_updates,
+                    List.sort_uniq compare !staged_iv_defs,
+                    List.sort_uniq compare !iv_copy_sources
+                  with
+                  | 1, [], [] ->
+                      true
+                  | 0, [ next_temp ], [ copied_temp ] ->
+                      next_temp = copied_temp
+                  | _ ->
+                      false
+                in
+                let carrier_ok =
+                  if result_temp = carrier then
+                    !carrier_copies = 0
+                  else
+                    !carrier_copies = 1
+                in
+                iv_ok && carrier_ok
+          | Cfg.Jump _
+          | Cfg.BranchZero _
+          | Cfg.BranchNonZero _
+          | Cfg.BranchCompare _
+          | Cfg.Return _ ->
+              false
       in
 
       let emit_min_nonnegative lhs rhs =
@@ -22921,7 +22963,7 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
         || not (PlaceSet.is_empty modified_globals)
         || not (PlaceSet.is_empty effects.modified_places)
         || info.control_iv.step <> 1L
-        || LabelSet.cardinal loop <> 11
+        || (let n = LabelSet.cardinal loop in n <> 10 && n <> 11)
       then begin
         if debug_counted then
           debugf
@@ -22958,14 +23000,34 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                   let inside_block : Cfg.block =
                     get_block info.inside_label
                   in
+                  let control_layout_ok =
+                    if info.control_label = header then
+                      control_block.body = []
+                    else
+                      match control_block.body with
+                      | [ Tcg.Bin
+                            ( dst,
+                              Add,
+                              Tcg.Temp src,
+                              Tcg.Imm 1L ) ]
+                      | [ Tcg.Bin
+                            ( dst,
+                              Add,
+                              Tcg.Imm 1L,
+                              Tcg.Temp src ) ]
+                        when
+                          dst = info.control_iv.phi_temp
+                          && src = info.control_iv.phi_temp ->
+                          true
+                      | _ ->
+                          false
+                  in
                   begin
                     match
-                      control_block.body,
                       inside_block.body,
                       inside_block.term
                     with
                     | [],
-                      [],
                       Cfg.BranchCompare
                         ( Lt,
                           Tcg.Temp outer_iv,
@@ -22973,7 +23035,8 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                           first_root,
                           second_root )
                       when
-                        outer_iv =
+                        control_layout_ok
+                        && outer_iv =
                           info.control_iv.phi_temp
                         && LabelSet.mem first_root loop
                         && LabelSet.mem second_root loop ->
@@ -32253,9 +32316,64 @@ let optimize_func global_init summaries globals return_globals removable_calls (
         hoist_unrolled_loop_branch_immediates_func summaries globals late_split_counted
         |> stop_after "hoisted_loop_bounds"
       in
-      let final_candidate =
+      let final_candidate0 =
         final_linear_merge_func with_hoisted_loop_bounds
         |> stop_after "final_linear_merge"
+      in
+
+      (* Experimental final retry for CFG-inline generated loop shapes.
+         Late branch inlining feeds the expanded caller through [optimize_func],
+         but the ordinary counted-loop stage runs before late copy coalescing
+         and final linear merging.  Some pure scalar state-machine loops become
+         recognizable only here.
+
+         Keep the retry narrowly gated to functions that still contain
+         compiler-generated CFG-inline blocks. *)
+      let has_cfg_inline_blocks =
+        List.exists
+          (fun (block : Cfg.block) ->
+            contains_substring block.label "_cfg_inline_")
+          final_candidate0.blocks
+      in
+      let final_candidate =
+        if
+          Sys.getenv_opt
+            "TOYC_ENABLE_EXPERIMENTAL_FINAL_INLINE_COUNTED_RETRY"
+          = None
+          || not has_cfg_inline_blocks
+        then
+          final_candidate0
+        else
+          let retried =
+            eliminate_counted_loops_func
+              global_init summaries globals final_candidate0
+          in
+          if retried = final_candidate0 then begin
+            if Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None then
+              Printf.eprintf
+                "counted-final-inline-retry func=%s result=no-followup blocks=%d\n%!"
+                final_candidate0.name
+                (List.length final_candidate0.blocks);
+            final_candidate0
+          end else begin
+            let cleaned =
+              retried
+              |> thread_and_prune_func
+              |> simplify_cfg_func
+              |> const_propagate_func global_init summaries globals
+              |> eliminate_dead_code_func
+                   ~removable_calls summaries globals return_globals
+              |> copy_coalesce_func summaries globals
+              |> final_linear_merge_func
+            in
+            if Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None then
+              Printf.eprintf
+                "counted-final-inline-retry func=%s result=applied blocks=%d->%d\n%!"
+                final_candidate0.name
+                (List.length final_candidate0.blocks)
+                (List.length cleaned.blocks);
+            cleaned
+          end
       in
       if cfg_targets_valid final_candidate then final_candidate
       else begin
