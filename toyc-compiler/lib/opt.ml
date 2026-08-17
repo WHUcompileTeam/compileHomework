@@ -31450,6 +31450,145 @@ let fold_constant_calls_program
   in
   iterate 4 funcs
 
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v21: safe late constant-call folding                                *)
+(*                                                                            *)
+(* The older optional whole-program constantization pass already knows how   *)
+(* to interpret a direct call with immediate arguments through                *)
+(* [constant_eval_func], but its cleanup re-enters [optimize_func].  Item #7  *)
+(* has established that full late re-optimization is not a safe/idempotent    *)
+(* cleanup contract.  This pass therefore performs only the semantics-local    *)
+(* rewrite justified by successful interpretation:                            *)
+(*                                                                            *)
+(*   Call(Some dst, f, [Imm ...]) -> Move(dst, Imm result)                    *)
+(*   Call(None,     f, [Imm ...]) -> <removed>                               *)
+(*                                                                            *)
+(* A successful [constant_eval_func] run proves, for this concrete call path, *)
+(* termination within the hard evaluator budget and absence of global         *)
+(* loads/stores or nested calls.  Division/modulo by zero causes evaluation   *)
+(* failure, so potentially trapping calls are left untouched.  No DCE/GVN or  *)
+(* full optimize_func re-entry is performed afterwards.                       *)
+(* -------------------------------------------------------------------------- *)
+
+let item7_collect_immediate_args (args : Tcg.operand list) =
+  let rec collect acc = function
+    | [] -> Some (List.rev acc)
+    | Tcg.Imm value :: rest ->
+        collect (i32 value :: acc) rest
+    | Tcg.Temp _ :: _ ->
+        None
+  in
+  collect [] args
+
+let fold_safe_late_constant_calls_program (funcs : Cfg.func list) =
+  let debug =
+    Sys.getenv_opt "TOYC_DEBUG_ITEM7_CONST_CALL_FOLD" <> None
+  in
+  let total_value = ref 0 in
+  let total_void = ref 0 in
+  let rec iterate fuel current =
+    if fuel = 0 then current
+    else
+      let func_by_label =
+        Hashtbl.create (max 8 (List.length current))
+      in
+      List.iter
+        (fun (f : Cfg.func) ->
+          Hashtbl.replace func_by_label f.label f)
+        current;
+
+      let memo : (string, int64 option) Hashtbl.t =
+        Hashtbl.create 32
+      in
+      let eval_call callee args =
+        let key =
+          callee
+          ^ "("
+          ^ String.concat "," (List.map Int64.to_string args)
+          ^ ")"
+        in
+        match Hashtbl.find_opt memo key with
+        | Some result -> result
+        | None ->
+            let result =
+              match Hashtbl.find_opt func_by_label callee with
+              | Some callee_func ->
+                  constant_eval_func callee_func args
+              | None -> None
+            in
+            Hashtbl.replace memo key result;
+            result
+      in
+
+      let changed_any = ref false in
+      let next =
+        List.map
+          (fun (caller : Cfg.func) ->
+            let changed_func = ref false in
+            let blocks =
+              List.map
+                (fun (block : Cfg.block) ->
+                  let body =
+                    List.fold_right
+                      (fun instr acc ->
+                        match instr with
+                        | Tcg.Call (Some dst, callee, call_args) -> (
+                            match item7_collect_immediate_args call_args with
+                            | Some args -> (
+                                match eval_call callee args with
+                                | Some value ->
+                                    changed_any := true;
+                                    changed_func := true;
+                                    incr total_value;
+                                    if debug then
+                                      Printf.eprintf
+                                        "item7-const-call-fold caller=%s callee=%s site=%s kind=value argc=%d value=%Ld\n%!"
+                                        caller.name callee block.label
+                                        (List.length args) (i32 value);
+                                    Tcg.Move (dst, Tcg.Imm (i32 value)) :: acc
+                                | None -> instr :: acc)
+                            | None -> instr :: acc)
+                        | Tcg.Call (None, callee, call_args) -> (
+                            match item7_collect_immediate_args call_args with
+                            | Some args -> (
+                                match eval_call callee args with
+                                | Some _value ->
+                                    changed_any := true;
+                                    changed_func := true;
+                                    incr total_void;
+                                    if debug then
+                                      Printf.eprintf
+                                        "item7-const-call-fold caller=%s callee=%s site=%s kind=resultless argc=%d\n%!"
+                                        caller.name callee block.label
+                                        (List.length args);
+                                    acc
+                                | None -> instr :: acc)
+                            | None -> instr :: acc)
+                        | _ -> instr :: acc)
+                      block.body []
+                  in
+                  { block with body })
+                caller.blocks
+            in
+            if !changed_func then
+              Cfg.rebuild_edges { caller with blocks }
+            else
+              caller)
+          current
+      in
+      if !changed_any && next <> current then
+        iterate (fuel - 1) next
+      else
+        next
+  in
+  let result = iterate 4 funcs in
+  if debug then
+    Printf.eprintf
+      "item7-const-call-fold-summary value=%d resultless=%d total=%d\n%!"
+      !total_value !total_void (!total_value + !total_void);
+  result
+
 let late_whole_program_constantization_enabled () =
   Sys.getenv_opt "TOYC_ENABLE_LATE_CONST_WHOLE_PROGRAM" <> None
 
@@ -34016,6 +34155,318 @@ let item7_debug_profitability_feature_audit globals (funcs : Cfg.func list) =
       !oversize_total
   end
 
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v20: instruction-heavy acyclic inline benefit audit                  *)
+(*                                                                            *)
+(* Audit only.  v19 established that the remaining acyclic oversize residual  *)
+(* is not block-count sparse: it is semantic-ready but genuinely instruction- *)
+(* heavy.  Do not raise the 32-instruction budget blindly.  Instead measure   *)
+(* call-site heat and specialization leverage from immediate actual arguments. *)
+(*                                                                            *)
+(* [safe-const-*] is deliberately conservative: only single-definition temps   *)
+(* derived from immediate arguments through non-trapping Move/Un/Bin chains    *)
+(* are considered.  Div/Mod never contributes to this metric.                 *)
+(* -------------------------------------------------------------------------- *)
+
+let item7_v20_acyclic_semantic_shape (f : Cfg.func) =
+  let param_ids =
+    List.fold_left
+      (fun acc (param : Tcg.var) -> IntSet.add param.id acc)
+      IntSet.empty f.params
+  in
+  let local_store = ref false in
+  let nested_call = ref false in
+  let bad_local_load = ref false in
+  let void_return = ref false in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter
+        (function
+          | Tcg.Load (_, Tcg.Local id) when not (IntSet.mem id param_ids) ->
+              bad_local_load := true
+          | Tcg.Store (Tcg.Local _, _) -> local_store := true
+          | Tcg.Call _ -> nested_call := true
+          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> ())
+        block.body;
+      match block.term with
+      | Cfg.Return None -> void_return := true
+      | Cfg.Return (Some _)
+      | Cfg.Jump _
+      | Cfg.BranchZero _
+      | Cfg.BranchNonZero _
+      | Cfg.BranchCompare _ -> ())
+    f.blocks;
+  (!local_store, !nested_call, !bad_local_load, !void_return)
+
+let item7_v20_collect_const_args args =
+  let rec loop values imm_count = function
+    | [] -> (List.rev values, imm_count)
+    | Tcg.Imm value :: rest -> loop (Some value :: values) (imm_count + 1) rest
+    | Tcg.Temp _ :: rest -> loop (None :: values) imm_count rest
+  in
+  loop [] 0 args
+
+let item7_v20_safe_const_potential (callee : Cfg.func) args =
+  let const_values, imm_args = item7_v20_collect_const_args args in
+  let const_param_ids =
+    let rec collect acc params values =
+      match params, values with
+      | (param : Tcg.var) :: ps, Some _ :: vs ->
+          collect (IntSet.add param.id acc) ps vs
+      | _ :: ps, None :: vs -> collect acc ps vs
+      | [], [] -> acc
+      | _ -> acc
+    in
+    collect IntSet.empty callee.params const_values
+  in
+  let def_counts = Hashtbl.create (max 8 callee.temp_count) in
+  let note_def dst =
+    let old = match Hashtbl.find_opt def_counts dst with Some n -> n | None -> 0 in
+    Hashtbl.replace def_counts dst (old + 1)
+  in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter
+        (fun instr ->
+          match defs_temp instr with
+          | Some dst -> note_def dst
+          | None -> ())
+        block.body)
+    callee.blocks;
+  let unique_def dst =
+    match Hashtbl.find_opt def_counts dst with
+    | Some 1 -> true
+    | Some _ | None -> false
+  in
+  let foldable = ref IntSet.empty in
+  let operand_safe = function
+    | Tcg.Imm _ -> true
+    | Tcg.Temp temp -> IntSet.mem temp !foldable
+  in
+  let try_mark dst safe changed =
+    if safe && unique_def dst && not (IntSet.mem dst !foldable) then begin
+      foldable := IntSet.add dst !foldable;
+      changed := true
+    end
+  in
+  let rec fixed_point fuel =
+    if fuel <= 0 then ()
+    else begin
+      let changed = ref false in
+      List.iter
+        (fun (block : Cfg.block) ->
+          List.iter
+            (function
+              | Tcg.Load (dst, Tcg.Local id) ->
+                  try_mark dst (IntSet.mem id const_param_ids) changed
+              | Tcg.Move (dst, operand) ->
+                  try_mark dst (operand_safe operand) changed
+              | Tcg.Un (dst, _, operand) ->
+                  try_mark dst (operand_safe operand) changed
+              | Tcg.Bin (dst, (Div | Mod), _, _) ->
+                  ignore dst
+              | Tcg.Bin (dst, _, lhs, rhs) ->
+                  try_mark dst (operand_safe lhs && operand_safe rhs) changed
+              | Tcg.Load (_, Tcg.Global _)
+              | Tcg.Store _
+              | Tcg.Call _ -> ())
+            block.body)
+        callee.blocks;
+      if !changed then fixed_point (fuel - 1)
+    end
+  in
+  fixed_point (max 1 (callee.temp_count + 1));
+  let param_loads = ref 0 in
+  let const_param_loads = ref 0 in
+  let safe_const_instrs = ref 0 in
+  List.iter
+    (fun (block : Cfg.block) ->
+      List.iter
+        (fun instr ->
+          begin match instr with
+          | Tcg.Load (_, Tcg.Local id) ->
+              incr param_loads;
+              if IntSet.mem id const_param_ids then incr const_param_loads
+          | _ -> ()
+          end;
+          match defs_temp instr with
+          | Some dst when IntSet.mem dst !foldable -> incr safe_const_instrs
+          | Some _ | None -> ())
+        block.body)
+    callee.blocks;
+  let safe_const_branches = ref 0 in
+  List.iter
+    (fun (block : Cfg.block) ->
+      let safe =
+        match block.term with
+        | Cfg.BranchZero (cond, _, _)
+        | Cfg.BranchNonZero (cond, _, _) -> operand_safe cond
+        | Cfg.BranchCompare (_, lhs, rhs, _, _) ->
+            operand_safe lhs && operand_safe rhs
+        | Cfg.Return _ | Cfg.Jump _ -> false
+      in
+      if safe then incr safe_const_branches)
+    callee.blocks;
+  ( imm_args,
+    !param_loads,
+    !const_param_loads,
+    !safe_const_instrs,
+    !safe_const_branches )
+
+let item7_v20_constant_eval_possible (callee : Cfg.func) args =
+  let rec collect acc = function
+    | [] -> Some (List.rev acc)
+    | Tcg.Imm value :: rest -> collect (i32 value :: acc) rest
+    | Tcg.Temp _ :: _ -> None
+  in
+  match collect [] args with
+  | None -> false
+  | Some values ->
+      begin match constant_eval_func callee values with
+      | Some _ -> true
+      | None -> false
+      end
+
+let item7_debug_instruction_heavy_benefit globals (funcs : Cfg.func list) =
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_HEAVY_INLINE" <> None then begin
+    let fresh_summaries = compute_func_summaries globals funcs in
+    let views = Hashtbl.create (max 8 (List.length funcs)) in
+    List.iter
+      (fun (f : Cfg.func) ->
+        Hashtbl.replace views f.label (item7_profitability_view f))
+      funcs;
+    let total = ref 0 in
+    let semantic_ready = ref 0 in
+    let in_loop_total = ref 0 in
+    let any_const_arg = ref 0 in
+    let all_const_args = ref 0 in
+    let const_eval_total = ref 0 in
+    let safe_const_branch_total = ref 0 in
+    let no_specialization_leverage = ref 0 in
+    List.iter
+      (fun (caller : Cfg.func) ->
+        let caller_view = item7_profitability_view caller in
+        let live_in_t, _ = compute_liveness fresh_summaries globals caller_view in
+        let _, caller_loops, caller_headers = discover_natural_loops caller_view in
+        let same_callee_counts = item7_count_calls_by_callee caller_view in
+        List.iter
+          (fun (block : Cfg.block) ->
+            let loop_sizes =
+              List.filter_map
+                (fun header ->
+                  let loop = table_find_or_empty caller_loops header LabelSet.empty in
+                  if LabelSet.mem block.label loop then Some (LabelSet.cardinal loop)
+                  else None)
+                caller_headers
+            in
+            let loop_depth = List.length loop_sizes in
+            let min_loop_size =
+              match loop_sizes with
+              | [] -> 0
+              | size :: rest -> List.fold_left min size rest
+            in
+            let rec scan = function
+              | [] -> ()
+              | Tcg.Call (dst_opt, callee_label, args) :: suffix ->
+                  begin match Hashtbl.find_opt views callee_label with
+                  | None -> ()
+                  | Some _ when callee_label = caller_view.label -> ()
+                  | Some callee ->
+                      let
+                        ( blocks, instrs, branches, joins, returns,
+                          stores, divmods, nested_calls, _, _, cyclic, _, _ ) =
+                        item7_profitability_shape callee
+                      in
+                      let oversize =
+                        blocks > late_branch_inline_max_blocks
+                        || instrs > late_branch_inline_max_instrs
+                        || callee.temp_count > late_branch_inline_max_temps
+                      in
+                      if (not cyclic) && oversize && instrs > late_branch_inline_max_instrs then begin
+                        incr total;
+                        let ls, nc, bll, vr = item7_v20_acyclic_semantic_shape callee in
+                        let sem_ok =
+                          callee.ret = TInt && not ls && not nc && not bll && not vr
+                          && List.length args = List.length callee.params
+                        in
+                        if sem_ok then incr semantic_ready;
+                        let live_after =
+                          let live = ref (add_term_use_temps (live_out_t live_in_t block) block.term) in
+                          List.iter
+                            (fun suffix_instr ->
+                              begin match defs_temp suffix_instr with
+                              | Some dst -> live := IntSet.remove dst !live
+                              | None -> ()
+                              end;
+                              live := add_instr_use_temps !live suffix_instr)
+                            (List.rev suffix);
+                          !live
+                        in
+                        let result_live =
+                          match dst_opt with
+                          | Some dst when IntSet.mem dst live_after -> 1
+                          | Some _ | None -> 0
+                        in
+                        let live_across =
+                          match dst_opt with
+                          | Some dst -> IntSet.remove dst live_after
+                          | None -> live_after
+                        in
+                        let repeat =
+                          match Hashtbl.find_opt same_callee_counts callee_label with
+                          | Some n -> max 1 n | None -> 1
+                        in
+                        let clone_units = item7_cfg_clone_units callee.blocks in
+                        let
+                          (imm_args, param_loads, const_param_loads,
+                           safe_const_instrs, safe_const_branches) =
+                          item7_v20_safe_const_potential callee args
+                        in
+                        let all_const =
+                          args <> [] && imm_args = List.length args
+                        in
+                        let const_eval =
+                          sem_ok && all_const && item7_v20_constant_eval_possible callee args
+                        in
+                        if loop_depth > 0 then incr in_loop_total;
+                        if imm_args > 0 then incr any_const_arg;
+                        if all_const then incr all_const_args;
+                        if const_eval then incr const_eval_total;
+                        if safe_const_branches > 0 then incr safe_const_branch_total;
+                        if sem_ok && loop_depth = 0 && imm_args = 0
+                           && safe_const_instrs = 0 && safe_const_branches = 0
+                        then incr no_specialization_leverage;
+                        let family =
+                          if nested_calls > 0 then "nested"
+                          else if stores > 0 && divmods > 0 then "store-divmod"
+                          else if stores > 0 then "store"
+                          else if divmods > 0 then "divmod"
+                          else "other"
+                        in
+                        Printf.eprintf
+                          "item7-heavy-inline caller=%s callee=%s site=%s family=%s blocks=%d instrs=%d clone-units=%d temps=%d branches=%d joins=%d returns=%d repeat=%d in-loop=%d loop-depth=%d loop-size=%d live-across=%d result-live=%d args=%d imm-args=%d all-const=%d param-loads=%d const-param-loads=%d safe-const-instrs=%d safe-const-branches=%d const-eval=%d sem-ok=%d\n%!"
+                          caller_view.name callee.name block.label family
+                          blocks instrs clone_units callee.temp_count branches joins returns
+                          repeat (if loop_depth > 0 then 1 else 0) loop_depth min_loop_size
+                          (IntSet.cardinal live_across) result_live (List.length args) imm_args
+                          (if all_const then 1 else 0) param_loads const_param_loads
+                          safe_const_instrs safe_const_branches (if const_eval then 1 else 0)
+                          (if sem_ok then 1 else 0)
+                      end
+                  end;
+                  scan suffix
+              | _ :: suffix -> scan suffix
+            in
+            scan block.body)
+          caller_view.blocks)
+      funcs;
+    Printf.eprintf
+      "item7-heavy-inline-summary total=%d semantic-ready=%d in-loop=%d any-const-arg=%d all-const=%d const-eval=%d safe-const-branch=%d no-specialization-leverage=%d\n%!"
+      !total !semantic_ready !in_loop_total !any_const_arg !all_const_args
+      !const_eval_total !safe_const_branch_total !no_specialization_leverage
+  end
+
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
   last_liveness_cache := None;
@@ -34116,6 +34567,12 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   in
   let optimized_funcs =
     inline_late_divmod_sparse_oversize_cycle_calls_program optimized_funcs
+  in
+  let () =
+    item7_debug_instruction_heavy_benefit globals optimized_funcs
+  in
+  let optimized_funcs =
+    fold_safe_late_constant_calls_program optimized_funcs
   in
   item7_debug_inline_effect_capability summaries removable_calls globals optimized_funcs;
   { Cfg.funcs = optimized_funcs }
