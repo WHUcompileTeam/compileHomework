@@ -31208,6 +31208,7 @@ let fold_trivial_calls_program
 let constant_eval_call_budget = 100_000
 
 let constant_eval_func
+    ?(known_globals = PlaceMap.empty)
     (f : Cfg.func)
     (args : int64 list) =
   if List.length args <> List.length f.params then None
@@ -31279,7 +31280,12 @@ let constant_eval_func
               Hashtbl.replace locals id (i32 value);
               true
           | None -> false)
-      | Tcg.Load (_, Tcg.Global _)
+      | Tcg.Load (dst, (Tcg.Global _ as place)) -> (
+          match PlaceMap.find_opt place known_globals with
+          | Some value ->
+              set_temp dst value;
+              true
+          | None -> false)
       | Tcg.Store (Tcg.Global _, _)
       | Tcg.Call _ ->
           false
@@ -31465,8 +31471,9 @@ let fold_constant_calls_program
 (*   Call(None,     f, [Imm ...]) -> <removed>                               *)
 (*                                                                            *)
 (* A successful [constant_eval_func] run proves, for this concrete call path, *)
-(* termination within the hard evaluator budget and absence of global         *)
-(* loads/stores or nested calls.  Division/modulo by zero causes evaluation   *)
+(* termination within the hard evaluator budget and absence of global stores  *)
+(* or nested calls. Global loads are accepted only when supplied through the   *)
+(* v24 readonly-global environment. Division/modulo by zero causes evaluation  *)
 (* failure, so potentially trapping calls are left untouched.  No DCE/GVN or  *)
 (* full optimize_func re-entry is performed afterwards.                       *)
 (* -------------------------------------------------------------------------- *)
@@ -31481,7 +31488,9 @@ let item7_collect_immediate_args (args : Tcg.operand list) =
   in
   collect [] args
 
-let fold_safe_late_constant_calls_program (funcs : Cfg.func list) =
+let fold_safe_late_constant_calls_program
+    ?(known_globals = PlaceMap.empty)
+    (funcs : Cfg.func list) =
   let debug =
     Sys.getenv_opt "TOYC_DEBUG_ITEM7_CONST_CALL_FOLD" <> None
   in
@@ -31514,7 +31523,7 @@ let fold_safe_late_constant_calls_program (funcs : Cfg.func list) =
             let result =
               match Hashtbl.find_opt func_by_label callee with
               | Some callee_func ->
-                  constant_eval_func callee_func args
+                  constant_eval_func ~known_globals callee_func args
               | None -> None
             in
             Hashtbl.replace memo key result;
@@ -31588,6 +31597,51 @@ let fold_safe_late_constant_calls_program (funcs : Cfg.func list) =
       "item7-const-call-fold-summary value=%d resultless=%d total=%d\n%!"
       !total_value !total_void (!total_value + !total_void);
   result
+
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v24: readonly-global environment for safe constant-call evaluation   *)
+(*                                                                            *)
+(* A global may be supplied to the evaluator only when a fresh whole-program  *)
+(* effect fixed point proves that no current function can write it.  In that  *)
+(* case its value is permanently equal to the semantic global initializer, so *)
+(* treating Load(Global) as a compile-time constant is independent of call     *)
+(* order. Unknown callees are already worst-case in [compute_func_summaries], *)
+(* therefore they conservatively prevent globals from becoming readonly.      *)
+(* -------------------------------------------------------------------------- *)
+
+let item7_readonly_global_values
+    global_init
+    globals
+    (funcs : Cfg.func list) =
+  let fresh_summaries = compute_func_summaries globals funcs in
+  let written =
+    List.fold_left
+      (fun acc (f : Cfg.func) ->
+        match Hashtbl.find_opt fresh_summaries f.label with
+        | Some summary ->
+            PlaceSet.union acc summary.written_globals
+        | None ->
+            (* Missing summary must not make any global look readonly. *)
+            PlaceSet.union acc globals)
+      PlaceSet.empty funcs
+  in
+  PlaceSet.fold
+    (fun place acc ->
+      if PlaceSet.mem place written then acc
+      else
+        match PlaceMap.find_opt place global_init with
+        | Some (CpConst value) ->
+            PlaceMap.add place (i32 value) acc
+        | Some CpUndef | Some CpNac | None ->
+            acc)
+    globals PlaceMap.empty
+
+let item7_debug_readonly_global_values values =
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_READONLY_CONST_EVAL" <> None then
+    Printf.eprintf
+      "item7-readonly-global-env globals=%d\n%!"
+      (PlaceMap.cardinal values)
 
 let late_whole_program_constantization_enabled () =
   Sys.getenv_opt "TOYC_ENABLE_LATE_CONST_WHOLE_PROGRAM" <> None
@@ -34467,6 +34521,412 @@ let item7_debug_instruction_heavy_benefit globals (funcs : Cfg.func list) =
       !const_eval_total !safe_const_branch_total !no_specialization_leverage
   end
 
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v22: post-constant-fold residual call audit                           *)
+(*                                                                            *)
+(* Audit only.  v21 can completely erase calls whose concrete immediate       *)
+(* arguments are interpretable by [constant_eval_func], including CFGs that    *)
+(* would otherwise look like difficult multi-loop inline candidates.  Before   *)
+(* widening cyclic/nested inlining, classify what remains after that fold.     *)
+(* -------------------------------------------------------------------------- *)
+
+let item7_debug_post_const_residual _globals (funcs : Cfg.func list) =
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_POST_CONST_RESIDUAL" <> None then begin
+    let views = Hashtbl.create (max 8 (List.length funcs)) in
+    List.iter
+      (fun (f : Cfg.func) ->
+        Hashtbl.replace views f.label (item7_profitability_view f))
+      funcs;
+    let total = ref 0 in
+    let known = ref 0 in
+    let unknown = ref 0 in
+    let acyclic = ref 0 in
+    let cyclic = ref 0 in
+    let single_loop = ref 0 in
+    let multi_loop = ref 0 in
+    let nested = ref 0 in
+    let self_recursive = ref 0 in
+    let store_family = ref 0 in
+    let divmod_family = ref 0 in
+    let other_family = ref 0 in
+    let in_loop_calls = ref 0 in
+    let repeated = ref 0 in
+    let growth_heavy = ref 0 in
+    let all_const_failed = ref 0 in
+    let pure_cycle = ref 0 in
+    let pure_multi_loop = ref 0 in
+    List.iter
+      (fun (caller : Cfg.func) ->
+        let caller_view = item7_profitability_view caller in
+        let _, caller_loops, caller_headers = discover_natural_loops caller_view in
+        let same_callee_counts = item7_count_calls_by_callee caller_view in
+        List.iter
+          (fun (block : Cfg.block) ->
+            let call_in_loop =
+              List.exists
+                (fun header ->
+                  let loop = table_find_or_empty caller_loops header LabelSet.empty in
+                  LabelSet.mem block.label loop)
+                caller_headers
+            in
+            List.iter
+              (function
+                | Tcg.Call (dst_opt, callee_label, args) ->
+                    incr total;
+                    if call_in_loop then incr in_loop_calls;
+                    let repeat_sites =
+                      match Hashtbl.find_opt same_callee_counts callee_label with
+                      | Some n -> n
+                      | None -> 1
+                    in
+                    if repeat_sites > 1 then incr repeated;
+                    let imm_args =
+                      List.fold_left
+                        (fun n -> function Tcg.Imm _ -> n + 1 | Tcg.Temp _ -> n)
+                        0 args
+                    in
+                    let all_const = imm_args = List.length args in
+                    begin
+                      match Hashtbl.find_opt views callee_label with
+                      | None ->
+                          incr unknown;
+                          Printf.eprintf
+                            "item7-post-const-residual caller=%s callee=%s site=%s known=0 result=%d args=%d imm-args=%d all-const=%d in-loop=%d repeat=%d\n%!"
+                            caller_view.name callee_label block.label
+                            (match dst_opt with Some _ -> 1 | None -> 0)
+                            (List.length args) imm_args (if all_const then 1 else 0)
+                            (if call_in_loop then 1 else 0) repeat_sites
+                      | Some callee ->
+                          incr known;
+                          let
+                            ( blocks, instrs, branches, joins, returns,
+                              stores, divmods, nested_calls, global_loads,
+                              _local_loads, is_cyclic, loop_count,
+                              max_loop_blocks ) =
+                            item7_profitability_shape callee
+                          in
+                          let inline_shape = item7_inline_shape_of_func callee in
+                          let clone_units = item7_cfg_clone_units callee.blocks in
+                          let family =
+                            if nested_calls > 0 then "nested"
+                            else if stores > 0 && divmods > 0 then "store-divmod"
+                            else if stores > 0 then "store"
+                            else if divmods > 0 then "divmod"
+                            else "other"
+                          in
+                          if is_cyclic then begin
+                            incr cyclic;
+                            if loop_count = 1 then incr single_loop;
+                            if loop_count >= 2 then incr multi_loop
+                          end else incr acyclic;
+                          if nested_calls > 0 then incr nested;
+                          if callee_label = caller_view.label then incr self_recursive;
+                          if stores > 0 then incr store_family;
+                          if divmods > 0 then incr divmod_family;
+                          if stores = 0 && divmods = 0 && nested_calls = 0 then
+                            incr other_family;
+                          if clone_units > item7_inline_static_growth_instr_budget then
+                            incr growth_heavy;
+                          if all_const then begin
+                            let const_values = item7_collect_immediate_args args in
+                            let failed =
+                              match const_values with
+                              | Some values -> constant_eval_func callee values = None
+                              | None -> false
+                            in
+                            if failed then incr all_const_failed
+                          end;
+                          let pure_cycle_here =
+                            is_cyclic
+                            && nested_calls = 0
+                            && stores = 0
+                            && inline_shape.item7_nonparam_local_loads = 0
+                            && inline_shape.item7_void_returns = 0
+                          in
+                          if pure_cycle_here then begin
+                            incr pure_cycle;
+                            if loop_count >= 2 then incr pure_multi_loop
+                          end;
+                          Printf.eprintf
+                            "item7-post-const-residual caller=%s callee=%s site=%s known=1 family=%s result=%d args=%d imm-args=%d all-const=%d in-loop=%d repeat=%d blocks=%d instrs=%d clone-units=%d temps=%d branches=%d joins=%d returns=%d cyclic=%d loops=%d max-loop-blocks=%d nested=%d stores=%d divmods=%d gloads=%d bad-local-loads=%d void-ret=%d self=%d pure-cycle=%d growth-heavy=%d\n%!"
+                            caller_view.name callee.name block.label family
+                            (match dst_opt with Some _ -> 1 | None -> 0)
+                            (List.length args) imm_args (if all_const then 1 else 0)
+                            (if call_in_loop then 1 else 0) repeat_sites
+                            blocks instrs clone_units callee.temp_count branches joins
+                            returns (if is_cyclic then 1 else 0) loop_count
+                            max_loop_blocks nested_calls stores divmods global_loads
+                            inline_shape.item7_nonparam_local_loads
+                            inline_shape.item7_void_returns
+                            (if callee_label = caller_view.label then 1 else 0)
+                            (if pure_cycle_here then 1 else 0)
+                            (if clone_units > item7_inline_static_growth_instr_budget
+                             then 1 else 0)
+                    end
+                | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> ())
+              block.body)
+          caller_view.blocks)
+      funcs;
+    Printf.eprintf
+      "item7-post-const-residual-summary calls=%d known=%d unknown=%d acyclic=%d cyclic=%d single-loop=%d multi-loop=%d nested=%d self=%d store=%d divmod=%d other=%d in-loop=%d repeated=%d growth-heavy=%d all-const-failed=%d pure-cycle=%d pure-multi-loop=%d\n%!"
+      !total !known !unknown !acyclic !cyclic !single_loop !multi_loop !nested
+      !self_recursive !store_family !divmod_family !other_family !in_loop_calls
+      !repeated !growth_heavy !all_const_failed !pure_cycle !pure_multi_loop
+  end
+
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v23: explain why all-immediate residual calls fail constant eval      *)
+(*                                                                            *)
+(* Audit only. v21 already folds every all-immediate direct call for which      *)
+(* [constant_eval_func] succeeds. v22 showed that many residual calls still    *)
+(* have all-immediate arguments. This diagnostic evaluator mirrors the same    *)
+(* semantics but returns a failure reason, so the next production step can be  *)
+(* chosen from evidence rather than by widening inline thresholds.             *)
+(* -------------------------------------------------------------------------- *)
+
+type item7_const_eval_failure =
+  | Item7_ce_budget
+  | Item7_ce_missing_block
+  | Item7_ce_missing_temp
+  | Item7_ce_missing_local
+  | Item7_ce_global_load
+  | Item7_ce_global_store
+  | Item7_ce_nested_call
+  | Item7_ce_divzero
+  | Item7_ce_unop
+  | Item7_ce_binop
+  | Item7_ce_void_return
+
+let item7_string_of_const_eval_failure = function
+  | Item7_ce_budget -> "budget"
+  | Item7_ce_missing_block -> "missing-block"
+  | Item7_ce_missing_temp -> "missing-temp"
+  | Item7_ce_missing_local -> "missing-local"
+  | Item7_ce_global_load -> "global-load"
+  | Item7_ce_global_store -> "global-store"
+  | Item7_ce_nested_call -> "nested-call"
+  | Item7_ce_divzero -> "divzero"
+  | Item7_ce_unop -> "unop"
+  | Item7_ce_binop -> "binop"
+  | Item7_ce_void_return -> "void-return"
+
+let item7_constant_eval_func_with_reason
+    (f : Cfg.func)
+    (args : int64 list) =
+  if List.length args <> List.length f.params then
+    Error Item7_ce_missing_local
+  else
+    let blocks = Hashtbl.create (max 8 (List.length f.blocks)) in
+    List.iter
+      (fun (block : Cfg.block) ->
+        Hashtbl.replace blocks block.label block)
+      f.blocks;
+    let temps : (int, int64) Hashtbl.t =
+      Hashtbl.create (max 16 f.temp_count)
+    in
+    let locals : (int, int64) Hashtbl.t =
+      Hashtbl.create (max 8 (List.length f.params))
+    in
+    List.iter2
+      (fun (param : Tcg.var) value ->
+        Hashtbl.replace locals param.id (i32 value))
+      f.params args;
+    let budget = ref constant_eval_call_budget in
+    let consume () =
+      decr budget;
+      if !budget >= 0 then Ok () else Error Item7_ce_budget
+    in
+    let eval_operand = function
+      | Tcg.Imm value -> Ok (i32 value)
+      | Tcg.Temp temp ->
+          begin match Hashtbl.find_opt temps temp with
+          | Some value -> Ok value
+          | None -> Error Item7_ce_missing_temp
+          end
+    in
+    let set_temp temp value =
+      Hashtbl.replace temps temp (i32 value)
+    in
+    let exec_instr = function
+      | Tcg.Move (dst, src) ->
+          begin match eval_operand src with
+          | Ok value -> set_temp dst value; Ok ()
+          | Error reason -> Error reason
+          end
+      | Tcg.Un (dst, op, src) ->
+          begin match eval_operand src with
+          | Error reason -> Error reason
+          | Ok value ->
+              begin match fold_unop op value with
+              | Some result -> set_temp dst result; Ok ()
+              | None -> Error Item7_ce_unop
+              end
+          end
+      | Tcg.Bin (dst, op, lhs, rhs) ->
+          begin match eval_operand lhs, eval_operand rhs with
+          | Error reason, _ | _, Error reason -> Error reason
+          | Ok lhs_value, Ok rhs_value ->
+              begin match fold_binop op lhs_value rhs_value with
+              | Some result -> set_temp dst result; Ok ()
+              | None ->
+                  begin match op with
+                  | Div | Mod when i32 rhs_value = 0L -> Error Item7_ce_divzero
+                  | _ -> Error Item7_ce_binop
+                  end
+              end
+          end
+      | Tcg.Load (dst, Tcg.Local id) ->
+          begin match Hashtbl.find_opt locals id with
+          | Some value -> set_temp dst value; Ok ()
+          | None -> Error Item7_ce_missing_local
+          end
+      | Tcg.Store (Tcg.Local id, src) ->
+          begin match eval_operand src with
+          | Ok value -> Hashtbl.replace locals id (i32 value); Ok ()
+          | Error reason -> Error reason
+          end
+      | Tcg.Load (_, Tcg.Global _) -> Error Item7_ce_global_load
+      | Tcg.Store (Tcg.Global _, _) -> Error Item7_ce_global_store
+      | Tcg.Call _ -> Error Item7_ce_nested_call
+    in
+    let rec exec_body = function
+      | [] -> Ok ()
+      | instr :: rest ->
+          begin match consume () with
+          | Error reason -> Error reason
+          | Ok () ->
+              begin match exec_instr instr with
+              | Error reason -> Error reason
+              | Ok () -> exec_body rest
+              end
+          end
+    in
+    let rec run label =
+      match consume () with
+      | Error reason -> Error reason
+      | Ok () ->
+          begin match Hashtbl.find_opt blocks label with
+          | None -> Error Item7_ce_missing_block
+          | Some (block : Cfg.block) ->
+              begin match exec_body block.body with
+              | Error reason -> Error reason
+              | Ok () ->
+                  begin match block.term with
+                  | Cfg.Jump next -> run next
+                  | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
+                      begin match eval_operand cond with
+                      | Error reason -> Error reason
+                      | Ok value ->
+                          run (if i32 value = 0L then if_zero else if_nonzero)
+                      end
+                  | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
+                      begin match eval_operand cond with
+                      | Error reason -> Error reason
+                      | Ok value ->
+                          run (if i32 value <> 0L then if_nonzero else if_zero)
+                      end
+                  | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
+                      begin match eval_operand lhs, eval_operand rhs with
+                      | Error reason, _ | _, Error reason -> Error reason
+                      | Ok lhs_value, Ok rhs_value ->
+                          begin match fold_binop op lhs_value rhs_value with
+                          | Some result -> run (if truth result then if_true else if_false)
+                          | None ->
+                              begin match op with
+                              | Div | Mod when i32 rhs_value = 0L -> Error Item7_ce_divzero
+                              | _ -> Error Item7_ce_binop
+                              end
+                          end
+                      end
+                  | Cfg.Return (Some value) ->
+                      begin match eval_operand value with
+                      | Ok result -> Ok (i32 result)
+                      | Error reason -> Error reason
+                      end
+                  | Cfg.Return None -> Error Item7_ce_void_return
+                  end
+              end
+          end
+    in
+    run f.entry
+
+let item7_debug_const_eval_failure_reasons (funcs : Cfg.func list) =
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_CONST_EVAL_FAIL" <> None then begin
+    let views = Hashtbl.create (max 8 (List.length funcs)) in
+    List.iter
+      (fun (f : Cfg.func) ->
+        Hashtbl.replace views f.label (item7_profitability_view f))
+      funcs;
+    let total_all_const = ref 0 in
+    let unexpected_success = ref 0 in
+    let reason_counts : (string, int) Hashtbl.t = Hashtbl.create 16 in
+    let bump reason =
+      let key = item7_string_of_const_eval_failure reason in
+      let old = match Hashtbl.find_opt reason_counts key with Some n -> n | None -> 0 in
+      Hashtbl.replace reason_counts key (old + 1)
+    in
+    List.iter
+      (fun (caller : Cfg.func) ->
+        let caller_view = item7_profitability_view caller in
+        List.iter
+          (fun (block : Cfg.block) ->
+            List.iter
+              (function
+                | Tcg.Call (_dst_opt, callee_label, args) ->
+                    begin match item7_collect_immediate_args args with
+                    | None -> ()
+                    | Some values ->
+                        begin match Hashtbl.find_opt views callee_label with
+                        | None -> ()
+                        | Some callee ->
+                            incr total_all_const;
+                            let
+                              (blocks, instrs, branches, joins, _returns,
+                               stores, divmods, nested_calls, global_loads,
+                               _local_loads, is_cyclic, loop_count,
+                               max_loop_blocks) =
+                              item7_profitability_shape callee
+                            in
+                            begin match item7_constant_eval_func_with_reason callee values with
+                            | Ok value ->
+                                incr unexpected_success;
+                                Printf.eprintf
+                                  "item7-const-eval-fail caller=%s callee=%s site=%s result=unexpected-success value=%Ld blocks=%d instrs=%d branches=%d joins=%d cyclic=%d loops=%d max-loop-blocks=%d stores=%d divmods=%d nested=%d gloads=%d self=%d\n%!"
+                                  caller_view.name callee.name block.label value
+                                  blocks instrs branches joins (if is_cyclic then 1 else 0)
+                                  loop_count max_loop_blocks stores divmods nested_calls
+                                  global_loads (if callee_label = caller_view.label then 1 else 0)
+                            | Error reason ->
+                                bump reason;
+                                Printf.eprintf
+                                  "item7-const-eval-fail caller=%s callee=%s site=%s reason=%s blocks=%d instrs=%d branches=%d joins=%d cyclic=%d loops=%d max-loop-blocks=%d stores=%d divmods=%d nested=%d gloads=%d self=%d\n%!"
+                                  caller_view.name callee.name block.label
+                                  (item7_string_of_const_eval_failure reason)
+                                  blocks instrs branches joins (if is_cyclic then 1 else 0)
+                                  loop_count max_loop_blocks stores divmods nested_calls
+                                  global_loads (if callee_label = caller_view.label then 1 else 0)
+                            end
+                        end
+                    end
+                | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> ())
+              block.body)
+          caller_view.blocks)
+      funcs;
+    Printf.eprintf
+      "item7-const-eval-fail-summary total-all-const=%d unexpected-success=%d"
+      !total_all_const !unexpected_success;
+    List.iter
+      (fun key ->
+        let value = match Hashtbl.find_opt reason_counts key with Some n -> n | None -> 0 in
+        Printf.eprintf " %s=%d" key value)
+      [ "global-load"; "global-store"; "nested-call"; "divzero"; "budget";
+        "missing-temp"; "missing-local"; "missing-block"; "void-return";
+        "unop"; "binop" ];
+    Printf.eprintf "\n%!"
+  end
+
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
   last_liveness_cache := None;
@@ -34571,8 +35031,16 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let () =
     item7_debug_instruction_heavy_benefit globals optimized_funcs
   in
-  let optimized_funcs =
-    fold_safe_late_constant_calls_program optimized_funcs
+  let item7_readonly_globals =
+    item7_readonly_global_values global_init globals optimized_funcs
   in
+  let () = item7_debug_readonly_global_values item7_readonly_globals in
+  let optimized_funcs =
+    fold_safe_late_constant_calls_program
+      ~known_globals:item7_readonly_globals
+      optimized_funcs
+  in
+  let () = item7_debug_post_const_residual globals optimized_funcs in
+  let () = item7_debug_const_eval_failure_reasons optimized_funcs in
   item7_debug_inline_effect_capability summaries removable_calls globals optimized_funcs;
   { Cfg.funcs = optimized_funcs }
