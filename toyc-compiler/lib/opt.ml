@@ -16003,6 +16003,19 @@ type parent_child_composition_proof = {
   parent_comp_status : parent_child_composition_status;
 }
 
+type parent_child_runtime_guard_proof = {
+  parent_runtime_parent_header : Tcg.label;
+  parent_runtime_child_header : Tcg.label;
+  parent_runtime_place : Tcg.place;
+  parent_runtime_spec : symbolic_trip_spec;
+  parent_runtime_family : symbolic_trip_proof_family;
+  parent_runtime_guard_lhs : loop_inv_expr;
+  parent_runtime_guard_rhs : loop_inv_expr;
+  parent_runtime_fast_trip : loop_inv_expr;
+  parent_runtime_step_expr : summary_expr;
+  parent_runtime_subtract : bool;
+}
+
 type child_scalar_summary_report = {
   child_scalar_direct_summaries : child_scalar_direct_summary list;
   child_scalar_links : child_scalar_summary_link list;
@@ -16012,6 +16025,8 @@ type child_scalar_summary_report = {
     child_scalar_transfer_link list;
   child_scalar_parent_composition_proofs :
     parent_child_composition_proof list;
+  child_scalar_parent_runtime_guard_proofs :
+    parent_child_runtime_guard_proof list;
 }
 
 let string_of_child_operand = function
@@ -16339,6 +16354,21 @@ let string_of_parent_comp_status = function
       "needs-runtime-guard"
   | ParentComposeReject reason ->
       "reject:" ^ reason
+
+let string_of_parent_runtime_fast_delta
+    (proof : parent_child_runtime_guard_proof) =
+  let trip =
+    string_of_loop_inv_expr proof.parent_runtime_fast_trip
+  in
+  let step =
+    string_of_child_summary_expr proof.parent_runtime_step_expr
+  in
+  if step = "0" then "0"
+  else if step = "1" then trip
+  else if step = "-1" then
+    Printf.sprintf "-(%s)" trip
+  else
+    Printf.sprintf "(%s*%s)" trip step
 
 let reduction_targets_place place
     (reduction : counted_reduction) =
@@ -16716,6 +16746,121 @@ let build_child_scalar_summary_report
            | _, None ->
                None)
   in
+  let runtime_guard_proofs =
+    parent_composition_proofs
+    |> List.filter_map
+         (fun proof ->
+           match
+             proof.parent_comp_status,
+             proof.parent_comp_child_start,
+             proof.parent_comp_child_bound
+           with
+           | ParentComposeNeedsRuntimeGuard,
+             Some start_expr,
+             Some bound_expr ->
+               let child_summary =
+                 List.find_opt
+                   (fun summary ->
+                     summary.child_summary_header =
+                       proof.parent_comp_child_header
+                     &&
+                     summary.child_summary_place =
+                       proof.parent_comp_place)
+                   direct_summaries
+               in
+               let transfer =
+                 List.find_opt
+                   (fun transfer ->
+                     transfer.child_transfer_header =
+                       proof.parent_comp_child_header
+                     &&
+                     transfer.child_transfer_place =
+                       proof.parent_comp_place)
+                   invariant_transfers
+               in
+               begin
+                 match child_summary, transfer with
+                 | Some summary, Some transfer -> (
+                     match
+                       summary.child_summary_control.kind,
+                       loop_inv_expr_const_opt start_expr
+                     with
+                     | CountUpLt (_, bias),
+                       Some start_const
+                       when
+                         bias = 0L
+                         && start_const >= 0L
+                         && summary.child_summary_control.control_iv.step = 1L
+                         && proof.parent_comp_step_parent_invariant ->
+                         let spec =
+                           {
+                             symbolic_trip_start =
+                               normalize_loop_inv_expr start_expr;
+                             symbolic_trip_step =
+                               scalar_inv_one;
+                             symbolic_trip_scale =
+                               scalar_inv_one;
+                             symbolic_trip_bias =
+                               scalar_inv_zero;
+                             symbolic_trip_bound =
+                               normalize_loop_inv_expr bound_expr;
+                             symbolic_trip_op = Lt;
+                           }
+                         in
+                         begin
+                           match
+                             classify_symbolic_trip_proof_family spec
+                           with
+                           | None ->
+                               None
+                           | Some family ->
+                               let fast_trip =
+                                 normalize_loop_inv_expr
+                                   (LveAdd
+                                      ( bound_expr,
+                                        LveNeg start_expr ))
+                               in
+                               Some
+                                 {
+                                   parent_runtime_parent_header =
+                                     proof.parent_comp_parent_header;
+                                   parent_runtime_child_header =
+                                     proof.parent_comp_child_header;
+                                   parent_runtime_place =
+                                     proof.parent_comp_place;
+                                   parent_runtime_spec = spec;
+                                   parent_runtime_family = family;
+                                   parent_runtime_guard_lhs =
+                                     normalize_loop_inv_expr start_expr;
+                                   parent_runtime_guard_rhs =
+                                     normalize_loop_inv_expr bound_expr;
+                                   parent_runtime_fast_trip =
+                                     fast_trip;
+                                   parent_runtime_step_expr =
+                                     transfer.child_transfer_step_expr;
+                                   parent_runtime_subtract =
+                                     transfer.child_transfer_subtract;
+                                 }
+                         end
+                     | CountUpLt _, _
+                     | CountUpLe _, _
+                     | CountDownGt _, _
+                     | CountDownGe _, _
+                     | CountUpLtScaled _, _
+                     | CountUpLeScaled _, _
+                     | CountDownGtScaled _, _
+                     | CountDownGeScaled _, _ ->
+                         None)
+                 | None, _
+                 | _, None ->
+                     None
+               end
+           | ParentComposeReadyConstant, _, _
+           | ParentComposeReject _, _, _
+           | ParentComposeNeedsRuntimeGuard, None, _
+           | ParentComposeNeedsRuntimeGuard, _, None ->
+               None)
+  in
   {
     child_scalar_direct_summaries =
       direct_summaries;
@@ -16726,6 +16871,8 @@ let build_child_scalar_summary_report
       transfer_links;
     child_scalar_parent_composition_proofs =
       parent_composition_proofs;
+    child_scalar_parent_runtime_guard_proofs =
+      runtime_guard_proofs;
   }
 
 let debug_child_scalar_summary_report
@@ -16842,8 +16989,29 @@ let debug_child_scalar_summary_report
           (string_of_parent_comp_status
              proof.parent_comp_status))
       report.child_scalar_parent_composition_proofs;
+    List.iter
+      (fun proof ->
+        Printf.eprintf
+          "parent-runtime-guard-proof func=%s parent=%s child=%s place=%s family=%s guard=(%s<%s) fast-trip=%s slow-trip=0 fast-delta=%s fast-update=%s slow-update=identity\n%!"
+          f.name
+          proof.parent_runtime_parent_header
+          proof.parent_runtime_child_header
+          (lcssa_string_of_place proof.parent_runtime_place)
+          (string_of_symbolic_trip_proof_family
+             proof.parent_runtime_family)
+          (string_of_loop_inv_expr
+             proof.parent_runtime_guard_lhs)
+          (string_of_loop_inv_expr
+             proof.parent_runtime_guard_rhs)
+          (string_of_loop_inv_expr
+             proof.parent_runtime_fast_trip)
+          (string_of_parent_runtime_fast_delta proof)
+          (if proof.parent_runtime_subtract
+           then "place_out=place_in-fast-delta"
+           else "place_out=place_in+fast-delta"))
+      report.child_scalar_parent_runtime_guard_proofs;
     Printf.eprintf
-      "child-scalar-summary func=%s direct=%d links=%d resolved-links=%d invariant-transfers=%d resolved-transfers=%d parent-compose-proofs=%d\n%!"
+      "child-scalar-summary func=%s direct=%d links=%d resolved-links=%d invariant-transfers=%d resolved-transfers=%d parent-compose-proofs=%d runtime-guard-proofs=%d\n%!"
       f.name
       (List.length report.child_scalar_direct_summaries)
       (List.length report.child_scalar_links)
@@ -16862,6 +17030,8 @@ let debug_child_scalar_summary_report
          0 report.child_scalar_transfer_links)
       (List.length
          report.child_scalar_parent_composition_proofs)
+      (List.length
+         report.child_scalar_parent_runtime_guard_proofs)
   end
 
 let debug_lcssa_lite_report
@@ -25185,8 +25355,14 @@ let optimize_func global_init summaries globals return_globals removable_calls (
       debug_lcssa_lite_report summaries globals current
     end
   in
+  let early_mem2reg =
+    if Sys.getenv_opt "TOYC_DISABLE_EARLY_OPTIMISTIC_MEM2REG" <> None then
+      mem2reg_func f
+    else
+      mem2reg_func ~optimistic_loop_phi:true f
+  in
   let promoted =
-    f |> mem2reg_func |> promote_globals_func summaries globals
+    early_mem2reg |> promote_globals_func summaries globals
   in
   let () = debug_lcssa_stage "promoted" promoted in
   let canonical =
