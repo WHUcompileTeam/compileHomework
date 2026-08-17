@@ -19479,21 +19479,8 @@ let extract_counted_reductions_func summaries globals (f : Cfg.func) =
     in
     let changed = ref false in
     let current_entry = ref f.entry in
-    (* item5 v38: when a parent is summarized compositionally, its resolved
-       child loop is immediately bypassed by the new parent summary.  The
-       original [headers] list was discovered before any mutation, so without
-       this guard we would later revisit that now-unreachable child using stale
-       loop/CFG facts and emit a second, dead counted summary.  Besides wasting
-       temps/blocks, doing transforms from stale structural facts is a bad
-       invariant for future non-leaf composition. *)
-    let suppressed_headers = ref LabelSet.empty in
     List.iter
       (fun header ->
-        if LabelSet.mem header !suppressed_headers then
-          debugf
-            "counted-nested-temp-skip-stale-child func=%s header=%s"
-            f.name header
-        else begin
         let loop = table_find_or_empty loops header LabelSet.empty in
         let header_block : Cfg.block = get_block header in
         let blocks_snapshot = current_block_list () in
@@ -20030,6 +20017,10 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
     in
     let new_blocks_rev = ref [] in
     let changed = ref false in
+    (* item5 v38.1: a successful compositional parent summary bypasses its
+       immediate child loops.  [headers] was discovered before mutation, so
+       suppress those stale descendant headers later in this same pass. *)
+    let suppressed_headers = ref LabelSet.empty in
 
     (* Special-case a strict monotone threshold diamond:
 
@@ -20953,6 +20944,11 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
 
     List.iter
       (fun header ->
+        if LabelSet.mem header !suppressed_headers then
+          debugf
+            "counted-nested-temp-skip-stale-child func=%s header=%s"
+            f.name header
+        else
         let loop = table_find_or_empty loops header LabelSet.empty in
         let header_block : Cfg.block = get_block header in
         let blocks_snapshot = current_block_list () in
@@ -21594,7 +21590,6 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                       nested_child_groups;
                   new_blocks_rev := summary_label :: !new_blocks_rev;
                   changed := true))
-        end)
       headers;
     if !changed then
       let ordered_labels = List.map (fun (block : Cfg.block) -> block.label) f.blocks in
