@@ -23562,18 +23562,43 @@ let item6_canonical_adoption_audit (f : Cfg.func) =
 
 let algebra_canonicalize_func (f : Cfg.func) =
   let () = item6_canonical_adoption_audit f in
-  (* item6 v4: consume the shared canonical scalar identity only when it
-     proves an entire operation has a constant result.  Unlike v2/v2b this
-     does not reassociate or reify a canonical expression tree, so downstream
-     passes keep their preferred physical IR shapes. *)
+  (* item6 v4/v5: consume the shared canonical scalar identity only when it
+     proves an entire operation can collapse.  v4 folds semantic self-ops;
+     v5 extends the existing add/sub cancellation matcher to canonical-equal
+     operands.  Neither pass reassociates or reifies a canonical expression
+     tree, so downstream passes keep their preferred physical IR shapes. *)
   let semantic_analyze = make_linear_analyzer f in
-  let semantic_operand_equal lhs rhs =
-    canonical_scalar_key_equal
-      (semantic_analyze lhs)
-      (semantic_analyze rhs)
-  in
   let _, _, def_instrs, multi_defs =
     analyze_temp_defs_of_blocks f.temp_count f.blocks
+  in
+  let rec canonical_key_uses_only_unique_temps (_const, terms) =
+    List.for_all
+      (fun (atom, _coeff) -> canonical_atom_uses_only_unique_temps atom)
+      terms
+  and canonical_atom_uses_only_unique_temps = function
+    | CanonicalOperandAtom (Tcg.Temp temp) ->
+        not (IntSet.mem temp multi_defs)
+    | CanonicalOperandAtom (Tcg.Imm _)
+    | CanonicalPlaceAtom _ ->
+        true
+    | CanonicalUnaryAtom (_, inner) ->
+        canonical_key_uses_only_unique_temps inner
+    | CanonicalBinaryAtom (_, lhs, rhs) ->
+        canonical_key_uses_only_unique_temps lhs
+        && canonical_key_uses_only_unique_temps rhs
+  in
+  let semantic_operand_equal lhs rhs =
+    let lhs_form = semantic_analyze lhs in
+    let rhs_form = semantic_analyze rhs in
+    let lhs_key = canonical_scalar_key_of_form lhs_form in
+    let rhs_key = canonical_scalar_key_of_form rhs_form in
+    lhs_key = rhs_key
+    && canonical_key_uses_only_unique_temps lhs_key
+    && canonical_key_uses_only_unique_temps rhs_key
+  in
+  let semantic_only_equal lhs rhs =
+    not (operand_equal lhs rhs)
+    && semantic_operand_equal lhs rhs
   in
   let use_counts = temp_use_counts f.blocks in
   let use_count temp =
@@ -23677,28 +23702,42 @@ let algebra_canonicalize_func (f : Cfg.func) =
         Hashtbl.find_opt def_instrs temp
     | Tcg.Temp _ | Tcg.Imm _ -> None
   in
+  let cancel_match candidate expected =
+    if operand_equal candidate expected then Some false
+    else if semantic_only_equal candidate expected then Some true
+    else None
+  in
   let cancel_add_sub dst lhs rhs =
     (* i32 arithmetic is modulo 2^32, so these cancellations remain valid
-       even when the intermediate addition/subtraction wraps.  Only follow
-       unique temporary definitions; phi/multi-definition temporaries are
-       deliberately excluded. *)
+       even when the intermediate addition/subtraction wraps.  The carrier
+       temp itself still needs a unique definition.  v5 additionally permits
+       the cancelled operand to be a different temp/expression with the same
+       canonical scalar identity, but only when that identity contains no
+       multi-definition temp atoms. *)
     match unique_def_of_operand lhs with
-    | Some (Tcg.Bin (_, Add, a, b)) when operand_equal rhs a ->
-        Some (Tcg.Move (dst, b))
-    | Some (Tcg.Bin (_, Add, a, b)) when operand_equal rhs b ->
-        Some (Tcg.Move (dst, a))
-    | _ -> (
+    | Some (Tcg.Bin (_, Add, a, b)) -> (
+        match cancel_match rhs a with
+        | Some semantic -> Some (Tcg.Move (dst, b), semantic)
+        | None -> (
+            match cancel_match rhs b with
+            | Some semantic -> Some (Tcg.Move (dst, a), semantic)
+            | None -> None))
+    | Some _ | None -> (
         match unique_def_of_operand rhs with
-        | Some (Tcg.Bin (_, Sub, a, b)) when operand_equal lhs a ->
-            Some (Tcg.Move (dst, b))
-        | _ -> None)
+        | Some (Tcg.Bin (_, Sub, a, b)) -> (
+            match cancel_match lhs a with
+            | Some semantic -> Some (Tcg.Move (dst, b), semantic)
+            | None -> None)
+        | Some _ | None -> None)
   in
   let cancel_sub_add dst lhs rhs =
     let from_mid mid other =
       match unique_def_of_operand mid with
-      | Some (Tcg.Bin (_, Sub, a, b)) when operand_equal other b ->
-          Some (Tcg.Move (dst, a))
-      | _ -> None
+      | Some (Tcg.Bin (_, Sub, a, b)) -> (
+          match cancel_match other b with
+          | Some semantic -> Some (Tcg.Move (dst, a), semantic)
+          | None -> None)
+      | Some _ | None -> None
     in
     match from_mid lhs rhs with
     | Some _ as rewritten -> rewritten
@@ -23706,6 +23745,7 @@ let algebra_canonicalize_func (f : Cfg.func) =
   in
   let rewrites = ref 0 in
   let cancellation_rewrites = ref 0 in
+  let semantic_cancellation_rewrites = ref 0 in
   let semantic_self_rewrites = ref 0 in
   let semantic_self_fold = function
     | Tcg.Bin
@@ -23742,8 +23782,9 @@ let algebra_canonicalize_func (f : Cfg.func) =
           match initial with
       | Tcg.Bin (dst, Add, lhs, rhs) -> (
           match cancel_sub_add dst lhs rhs with
-          | Some rewritten ->
+          | Some (rewritten, semantic) ->
               incr cancellation_rewrites;
+              if semantic then incr semantic_cancellation_rewrites;
               rewritten
           | None ->
               let lhs, rhs =
@@ -23761,8 +23802,9 @@ let algebra_canonicalize_func (f : Cfg.func) =
               end)
       | Tcg.Bin (dst, Sub, lhs, rhs) -> (
           match cancel_add_sub dst lhs rhs with
-          | Some rewritten ->
+          | Some (rewritten, semantic) ->
               incr cancellation_rewrites;
+              if semantic then incr semantic_cancellation_rewrites;
               rewritten
           | None -> (
               match (lhs, rhs) with
@@ -23812,8 +23854,9 @@ let algebra_canonicalize_func (f : Cfg.func) =
   in
   if Sys.getenv_opt "TOYC_DEBUG_ALGEBRA" <> None then
     Printf.eprintf
-      "algebra func=%s rewrites=%d cancellations=%d semantic-self=%d\n%!"
-      f.name !rewrites !cancellation_rewrites !semantic_self_rewrites;
+      "algebra func=%s rewrites=%d cancellations=%d semantic-cancellations=%d semantic-self=%d\n%!"
+      f.name !rewrites !cancellation_rewrites
+      !semantic_cancellation_rewrites !semantic_self_rewrites;
   if
     Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" <> None
     && !semantic_self_rewrites > 0
@@ -23821,6 +23864,13 @@ let algebra_canonicalize_func (f : Cfg.func) =
     Printf.eprintf
       "item6-semantic-self func=%s rewrites=%d\n%!"
       f.name !semantic_self_rewrites;
+  if
+    Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" <> None
+    && !semantic_cancellation_rewrites > 0
+  then
+    Printf.eprintf
+      "item6-semantic-cancel func=%s rewrites=%d\n%!"
+      f.name !semantic_cancellation_rewrites;
   if !rewrites = 0 then f else Cfg.rebuild_edges { f with blocks }
 
 let general_linear_canonicalize_func (f : Cfg.func) =
