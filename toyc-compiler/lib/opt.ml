@@ -23562,15 +23562,15 @@ let item6_canonical_adoption_audit (f : Cfg.func) =
 
 let algebra_canonicalize_func (f : Cfg.func) =
   let () = item6_canonical_adoption_audit f in
-  (* item6 v4/v5/v6/v7: consume the shared canonical scalar identity only when
-     it proves an entire operation can collapse.  v4 folds semantic self-ops;
-     v5 extends the existing one-level add/sub cancellation matcher to
-     canonical-equal operands.  v6 additionally computes the canonical
-     remainder of a subtraction, but only materializes it when the whole
-     remainder collapses to a single Move (an existing temp or immediate).
-     v7 extends the same collapse-only rule to semantic zero/one identities
-     and branch conditions.  This deliberately avoids rebuilding/reassociating
-     expression trees, so downstream passes keep their preferred physical IR shapes. *)
+  (* item6 v11 sealed: consume the shared canonical scalar identity only when
+     it proves an entire arithmetic operation can collapse.  v4 folds semantic
+     self-ops; v5 extends one-level add/sub cancellation to canonical-equal
+     operands; v6 computes subtraction remainders but materializes only a whole
+     Move; v7a adds semantic zero/one identities.  Branch folding is deliberately
+     not performed here: the only production semantic branch consumer is the
+     isolated late-equiv pass below, preserving connected proof-guard chains.
+     No pass rebuilds/reassociates expression trees merely to enforce canonical
+     physical syntax. *)
   let semantic_analyze = make_linear_analyzer f in
   let _, _, def_instrs, multi_defs =
     analyze_temp_defs_of_blocks f.temp_count f.blocks
@@ -23792,7 +23792,6 @@ let algebra_canonicalize_func (f : Cfg.func) =
   let semantic_remainder_rewrites = ref 0 in
   let semantic_self_rewrites = ref 0 in
   let semantic_identity_rewrites = ref 0 in
-  let semantic_branch_rewrites = ref 0 in
   let semantic_identity_fold = function
     | Tcg.Bin (dst, Add, lhs, rhs) -> (
         match semantic_operand_constant lhs, semantic_operand_constant rhs with
@@ -23936,22 +23935,19 @@ let algebra_canonicalize_func (f : Cfg.func) =
     if rewritten <> instr then incr rewrites;
     rewritten
   in
-  let semantic_rewrite_term term = term in
   let blocks =
     List.map
       (fun (block : Cfg.block) ->
         let body = List.map rewrite_instr block.body in
-        let term = semantic_rewrite_term block.term in
-        { block with body; term; succs = Cfg.successors term })
+        { block with body })
       f.blocks
   in
   if Sys.getenv_opt "TOYC_DEBUG_ALGEBRA" <> None then
     Printf.eprintf
-      "algebra func=%s rewrites=%d cancellations=%d semantic-cancellations=%d semantic-remainders=%d semantic-self=%d semantic-identities=%d semantic-branches=%d\n%!"
+      "algebra func=%s rewrites=%d cancellations=%d semantic-cancellations=%d semantic-remainders=%d semantic-self=%d semantic-identities=%d\n%!"
       f.name !rewrites !cancellation_rewrites
       !semantic_cancellation_rewrites !semantic_remainder_rewrites
-      !semantic_self_rewrites !semantic_identity_rewrites
-      !semantic_branch_rewrites;
+      !semantic_self_rewrites !semantic_identity_rewrites;
   if
     Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" <> None
     && !semantic_self_rewrites > 0
@@ -23980,17 +23976,147 @@ let algebra_canonicalize_func (f : Cfg.func) =
     Printf.eprintf
       "item6-semantic-identity func=%s rewrites=%d\n%!"
       f.name !semantic_identity_rewrites;
-  if
-    Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" <> None
-    && !semantic_branch_rewrites > 0
+  if !rewrites = 0 then f
+  else Cfg.rebuild_edges { f with blocks }
+
+
+(* item6 v11 sealed: canonical semantic consumers are now limited to
+   collapse-only algebra plus isolated late-equiv branch folding.  Temporary
+   stage/detail audits from v10a/v10b/v10d have been removed; the retained
+   TOYC_DEBUG_ITEM6_ADOPTION counters describe only production consumers. *)
+(* item6 v10e: late-equiv semantic branch folding with candidate-component
+   preservation.  At this site the profitable opportunities are isolated
+   semantic-constant branches, while a high-value runtime-proof sequence can
+   expose several simultaneously foldable guard blocks connected directly in
+   the CFG.  Folding the latter destroys structure needed by later loop/LVE
+   consumers.  Keep this label-agnostic: collect every semantically decidable
+   branch first, connect candidates by CFG edges, and fold only candidates with
+   no candidate predecessor and no candidate successor (singleton components).
+   This preserves proof chains without depending on generated label names. *)
+let semantic_branch_fold_func ?(debug_tag = "late-equiv-isolated") (f : Cfg.func) =
+  let semantic_analyze = make_linear_analyzer f in
+  let _, _, _, multi_defs =
+    analyze_temp_defs_of_blocks f.temp_count f.blocks
+  in
+  let rec canonical_key_uses_only_unique_temps (_const, terms) =
+    List.for_all
+      (fun (atom, _coeff) -> canonical_atom_uses_only_unique_temps atom)
+      terms
+  and canonical_atom_uses_only_unique_temps = function
+    | CanonicalOperandAtom (Tcg.Temp temp) ->
+        not (IntSet.mem temp multi_defs)
+    | CanonicalOperandAtom (Tcg.Imm _)
+    | CanonicalPlaceAtom _ ->
+        true
+    | CanonicalUnaryAtom (_, inner) ->
+        canonical_key_uses_only_unique_temps inner
+    | CanonicalBinaryAtom (_, lhs, rhs) ->
+        canonical_key_uses_only_unique_temps lhs
+        && canonical_key_uses_only_unique_temps rhs
+  in
+  let semantic_operand_equal lhs rhs =
+    let lhs_form = semantic_analyze lhs in
+    let rhs_form = semantic_analyze rhs in
+    let lhs_key = canonical_scalar_key_of_form lhs_form in
+    let rhs_key = canonical_scalar_key_of_form rhs_form in
+    lhs_key = rhs_key
+    && canonical_key_uses_only_unique_temps lhs_key
+    && canonical_key_uses_only_unique_temps rhs_key
+  in
+  let semantic_operand_constant operand =
+    let form = semantic_analyze operand in
+    let key = canonical_scalar_key_of_form form in
+    if canonical_scalar_is_constant form
+       && canonical_key_uses_only_unique_temps key
+    then Some (i32 form.canonical_scalar_const)
+    else None
+  in
+  let semantic_compare_self_truth = function
+    | Eq | Le | Ge -> Some true
+    | Ne | Lt | Gt -> Some false
+    | Add | Sub | Mul | Div | Mod | LAnd | LOr -> None
+  in
+  let semantic_branch_target = function
+    | Cfg.BranchZero (cond, if_zero, if_nonzero) -> (
+        match semantic_operand_constant cond with
+        | Some value -> Some (if value = 0L then if_zero else if_nonzero)
+        | None -> None)
+    | Cfg.BranchNonZero (cond, if_nonzero, if_zero) -> (
+        match semantic_operand_constant cond with
+        | Some value -> Some (if value <> 0L then if_nonzero else if_zero)
+        | None -> None)
+    | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
+        let by_constants =
+          match semantic_operand_constant lhs, semantic_operand_constant rhs with
+          | Some a, Some b -> (
+              match fold_binop op a b with
+              | Some value -> Some (truth value)
+              | None -> None)
+          | _ -> None
+        in
+        let decision =
+          match by_constants with
+          | Some _ as decision -> decision
+          | None when semantic_operand_equal lhs rhs ->
+              semantic_compare_self_truth op
+          | None -> None
+        in
+        (match decision with
+         | Some take_true -> Some (if take_true then if_true else if_false)
+         | None -> None)
+    | Cfg.Jump _ | Cfg.Return _ -> None
+  in
+  let candidate_labels =
+    List.fold_left
+      (fun labels (block : Cfg.block) ->
+        match semantic_branch_target block.term with
+        | Some _ -> LabelSet.add block.label labels
+        | None -> labels)
+      LabelSet.empty f.blocks
+  in
+  let has_candidate_successor (block : Cfg.block) =
+    List.exists
+      (fun succ -> LabelSet.mem succ candidate_labels)
+      (Cfg.successors block.term)
+  in
+  let candidate_predecessors = Hashtbl.create 16 in
+  List.iter
+    (fun (block : Cfg.block) ->
+      if LabelSet.mem block.label candidate_labels then
+        List.iter
+          (fun succ ->
+            if LabelSet.mem succ candidate_labels then
+              Hashtbl.replace candidate_predecessors succ true)
+          (Cfg.successors block.term))
+    f.blocks;
+  let is_isolated_candidate (block : Cfg.block) =
+    LabelSet.mem block.label candidate_labels
+    && not (has_candidate_successor block)
+    && not (Hashtbl.mem candidate_predecessors block.label)
+  in
+  let rewrites = ref 0 in
+  let chain_skips = ref 0 in
+  let blocks =
+    List.map
+      (fun (block : Cfg.block) ->
+        match semantic_branch_target block.term with
+        | Some target when is_isolated_candidate block ->
+            incr rewrites;
+            let term = Cfg.Jump target in
+            { block with term; succs = [ target ] }
+        | Some _ ->
+            incr chain_skips;
+            block
+        | None -> block)
+      f.blocks
+  in
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" <> None
+     && (!rewrites > 0 || !chain_skips > 0)
   then
     Printf.eprintf
-      "item6-semantic-branch func=%s rewrites=%d\n%!"
-      f.name !semantic_branch_rewrites;
-  if
-    !rewrites = 0
-    && !semantic_branch_rewrites = 0
-  then f
+      "item6-semantic-branch-%s func=%s rewrites=%d chain-skips=%d\n%!"
+      debug_tag f.name !rewrites !chain_skips;
+  if !rewrites = 0 then f
   else Cfg.rebuild_edges { f with blocks }
 
 let general_linear_canonicalize_func (f : Cfg.func) =
@@ -29045,9 +29171,15 @@ let optimize_func global_init summaries globals return_globals removable_calls (
              ~removable_calls summaries globals return_globals
         |> copy_coalesce_func summaries globals
       in
+      let late_equiv_after_algebra =
+        algebra_canonicalize_func late_equiv_cleaned
+      in
+      let late_equiv_after_branch =
+        semantic_branch_fold_func
+          ~debug_tag:"late-equiv-isolated" late_equiv_after_algebra
+      in
       let late_equiv_recanon =
-        late_equiv_cleaned
-        |> algebra_canonicalize_func
+        late_equiv_after_branch
         |> general_linear_canonicalize_func
         |> factor_common_mul_func
         |> eliminate_dead_code_func
@@ -31006,10 +31138,12 @@ let rewrite_trivial_calls_func table (f : Cfg.func) =
 let cleanup_after_trivial_call_fold
     global_init summaries globals return_globals removable_calls
     (f : Cfg.func) =
+  let after_const =
+    const_propagate_func global_init summaries globals f
+  in
+  let after_algebra = algebra_canonicalize_func after_const in
   let candidate =
-    f
-    |> const_propagate_func global_init summaries globals
-    |> algebra_canonicalize_func
+    after_algebra
     |> eliminate_dead_code_func ~removable_calls summaries globals return_globals
     |> fold_branch_tails_func summaries globals
     |> thread_and_prune_func
