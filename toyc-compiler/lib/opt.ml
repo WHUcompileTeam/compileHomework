@@ -9368,6 +9368,73 @@ let proven_counted_control_of_recurrence_candidate
                     kind;
                   })
                 (build_kind control_iv.step)
+
+          (* v63: loop rotation turns the canonical pre-test
+
+                 while (i < bound) { body; i = i + step; }
+
+             into a guarded body whose latch tests the post-step value:
+
+                 body;
+                 i = i + step;
+                 if (i < bound) goto body;
+
+             In the unified recurrence domain this appears as
+
+                 Affine(phi=i, step=step, scale=1, bias=step).
+
+             The counted backend already represents this exactly as
+             [CountUpLt(bound, bias)] and computes
+
+                 ceil((bound - bias - i) / step).
+
+             Keep the semantic extension deliberately narrow:
+               - only compiler-generated split loops;
+               - the control block is distinct from the rotated header;
+               - zero logical start;
+               - unit scale;
+               - positive LT recurrence;
+               - bias is exactly one recurrence step.
+
+             This is the post-step rotation identity, not a general affine
+             relaxation.  All existing trip/live/phase proofs still run. *)
+          | Some 1L, Some bias
+            when
+              contains_substring header "_split_"
+              && candidate.recurrence_control_label <> header
+              && candidate.recurrence_control_op = Lt
+              && control_iv.step > 0L
+              && bias = control_iv.step
+              && loop_inv_expr_const_opt
+                   spec.symbolic_trip_start
+                 = Some 0L ->
+              if
+                Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS"
+                <> None
+              then
+                Printf.eprintf
+                  "counted-semantic-rotated-control-hit header=%s control=%s phi=t%d step=%Ld bias=%Ld\n%!"
+                  header
+                  candidate.recurrence_control_label
+                  control_iv.phi_temp
+                  control_iv.step
+                  bias;
+              Some
+                {
+                  control_iv;
+                  control_label =
+                    candidate.recurrence_control_label;
+                  inside_label =
+                    candidate.recurrence_control_inside_label;
+                  exit_label =
+                    candidate.recurrence_control_exit_label;
+                  kind =
+                    CountUpLt
+                      ( candidate
+                          .recurrence_control_bound_operand,
+                        bias );
+                }
+
           | Some scale, Some bias
             when
               candidate.recurrence_control_op = Lt
@@ -25973,8 +26040,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                  (List.length
                                     internal_preds);
                              Some addrec
-                         | [ _ ] ->
-                             None
+                         | [ _ ]
                          | []
                          | _ :: _ :: _ ->
                              None)
