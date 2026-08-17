@@ -27205,10 +27205,46 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                               doms def_blocks multi_defs
                               [ preheader_label ] step_expr
                           in
+                          let rotate_guard_bound_available =
+                            match bound_operand with
+                            | Tcg.Imm _ ->
+                                true
+                            | Tcg.Temp temp ->
+                                is_rotate_guard_label preheader_label
+                                && last_def_of_temp preheader temp = None
+                                && IntSet.mem
+                                     temp
+                                     (add_term_use_temps
+                                        IntSet.empty preheader.term)
+                                &&
+                                match
+                                  classify_loop_rotate_targets
+                                    loop preheader.term
+                                with
+                                | Some (inside_label, _outside_label) ->
+                                    inside_label = header
+                                | None ->
+                                    false
+                          in
                           let bound_available =
                             runtime_bound_available
                               def_blocks multi_defs preheader_label
                               bound_operand
+                            || rotate_guard_bound_available
+                          in
+                          let () =
+                            if
+                              debug
+                              && rotate_guard_bound_available
+                              && not
+                                   (runtime_bound_available
+                                      def_blocks multi_defs
+                                      preheader_label bound_operand)
+                            then
+                              Printf.eprintf
+                                "lve-runtime-rotate-guard-bound func=%s header=%s preheader=%s bound=%s result=available\n%!"
+                                f.name header preheader_label
+                                (string_of_lve_operand bound_operand)
                           in
                           let scale_available =
                             lve_expr_available_before_preds
