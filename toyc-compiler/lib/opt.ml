@@ -6212,6 +6212,36 @@ let collect_basic_induction_vars header loop get_block loop_defs multi_defs def_
     let self_vars =
       IntSet.fold
         (fun phi_temp acc ->
+          (* A self-updated IV does not necessarily get an explicit
+             redefinition on every outside edge.  In particular, a second
+             counted loop may continue using the IV value produced by the
+             preceding loop:
+
+                 first_loop ... updates i ...
+                 second_loop:
+                   ... i ...
+                   i = i + 1
+
+             In that case [i] is simply live-through on the outside edge.
+
+             Accept that representation only when this loop contains exactly
+             one definition of [phi_temp].  This excludes shapes that overwrite
+             the temp inside the loop before the apparent self-update. *)
+          let defs_in_loop =
+            LabelSet.fold
+              (fun label count ->
+                let block : Cfg.block = get_block label in
+                List.fold_left
+                  (fun count instr ->
+                    match defs_temp instr with
+                    | Some dst when dst = phi_temp -> count + 1
+                    | Some _
+                    | None -> count)
+                  count
+                  block.body)
+              loop
+              0
+          in
           let outside_inputs =
             List.filter_map
               (fun pred ->
@@ -6220,8 +6250,19 @@ let collect_basic_induction_vars header loop get_block loop_defs multi_defs def_
                     (outside_seed_chain_for_pred pred)
                     phi_temp
                 with
-                | Some _ -> Some (pred, Tcg.Temp phi_temp)
-                | None -> None)
+                | Some _ ->
+                    Some (pred, Tcg.Temp phi_temp)
+                | None when defs_in_loop = 1 ->
+                    if
+                      Sys.getenv_opt "TOYC_DEBUG_COUNTED_SEEDS"
+                      <> None
+                    then
+                      Printf.eprintf
+                        "counted-seed-live-through-iv header=%s temp=%d pred=%s\n%!"
+                        header phi_temp pred;
+                    Some (pred, Tcg.Temp phi_temp)
+                | None ->
+                    None)
               outside_preds
           in
           let steps =
@@ -22478,6 +22519,683 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
        Otherwise jump back to the original body and execute the source loop.
        All guard arithmetic itself is non-trapping; division uses a positive
        compile-time constant. *)
+    (* v81: one-phase monotone state recurrence.
+
+         Recognize the single-loop form that remains after either source
+         simplification or late CFG-call inlining:
+
+             while (iv < bound) {
+               if (x + bias < limit)
+                 x = x + low_step;
+               else
+                 x = x + high_step;
+               iv = iv + 1;
+             }
+
+         Accepted CFG representations are deliberately narrow:
+         - 5 blocks: top-tested control + root + two arms + join;
+         - 4 blocks: rotated/coalesced root + two arms + control/join.
+
+         Only [iv] and [x] may be loop-defined values live at loop exit.
+         The fast path is runtime-guarded against signed-i32 wrap, preserving
+         the monotonic-threshold proof.  Failure of any proof leaves the
+         original loop untouched. *)
+    let try_eliminate_single_monotone_state_loop
+        header
+        loop
+        (info : counted_loop_info)
+        effects
+        loop_defs
+        multi_defs
+        def_instrs
+      =
+      let int32_max = 2_147_483_647L in
+      let nblocks = LabelSet.cardinal loop in
+      let modified_globals =
+        global_places effects.modified_places
+      in
+      if
+        effects.has_call
+        || not (PlaceSet.is_empty modified_globals)
+        || not (PlaceSet.is_empty effects.modified_places)
+        || info.control_iv.step <> 1L
+        || (nblocks <> 4 && nblocks <> 5)
+      then
+        false
+      else
+        match info.kind with
+        | CountUpLt (raw_bound, 0L) ->
+            begin
+              match
+                resolve_operand_before_loop
+                  loop_defs multi_defs def_instrs raw_bound
+              with
+              | None ->
+                  false
+              | Some bound_operand ->
+                  let control : Cfg.block =
+                    get_block info.control_label
+                  in
+                  let root : Cfg.block =
+                    get_block info.inside_label
+                  in
+
+                  let exact_control_term =
+                    match control.term with
+                    | Cfg.BranchCompare
+                        ( Lt,
+                          Tcg.Temp iv,
+                          _,
+                          inside_label,
+                          exit_label )
+                      when
+                        iv = info.control_iv.phi_temp
+                        && inside_label = info.inside_label
+                        && exit_label = info.exit_label ->
+                        true
+                    | Cfg.Jump _
+                    | Cfg.BranchZero _
+                    | Cfg.BranchNonZero _
+                    | Cfg.BranchCompare _
+                    | Cfg.Return _ ->
+                        false
+                  in
+
+                  let affine_path_delta carrier instrs =
+                    let value_of env = function
+                      | Tcg.Imm value ->
+                          Some (0, i32 value)
+                      | Tcg.Temp temp ->
+                          begin
+                            match IntMap.find_opt temp env with
+                            | Some value -> Some value
+                            | None when temp = carrier ->
+                                Some (1, 0L)
+                            | None -> None
+                          end
+                    in
+                    let rec scan env = function
+                      | [] ->
+                          begin
+                            match IntMap.find_opt carrier env with
+                            | Some (1, bias) -> Some bias
+                            | Some _
+                            | None -> Some 0L
+                          end
+                      | instr :: rest ->
+                          begin
+                            match instr with
+                            | Tcg.Move (dst, src) ->
+                                let env =
+                                  match value_of env src with
+                                  | Some value ->
+                                      IntMap.add dst value env
+                                  | None ->
+                                      IntMap.remove dst env
+                                in
+                                scan env rest
+                            | Tcg.Bin (dst, Add, lhs, rhs) ->
+                                let env =
+                                  match value_of env lhs, value_of env rhs with
+                                  | Some (lc, lb), Some (rc, rb) ->
+                                      IntMap.add
+                                        dst
+                                        (lc + rc, i32 (Int64.add lb rb))
+                                        env
+                                  | _ ->
+                                      IntMap.remove dst env
+                                in
+                                scan env rest
+                            | Tcg.Un _
+                            | Tcg.Bin _
+                            | Tcg.Load _
+                            | Tcg.Store _
+                            | Tcg.Call _ ->
+                                None
+                          end
+                    in
+                    scan
+                      (IntMap.singleton carrier (1, 0L))
+                      instrs
+                  in
+
+                  let exact_iv_plus_one body =
+                    let direct = ref 0 in
+                    let staged_defs = ref [] in
+                    let staged_copies = ref [] in
+                    let structurally_ok =
+                      List.for_all
+                        (function
+                          | Tcg.Bin
+                              ( dst,
+                                Add,
+                                Tcg.Temp src,
+                                Tcg.Imm 1L )
+                          | Tcg.Bin
+                              ( dst,
+                                Add,
+                                Tcg.Imm 1L,
+                                Tcg.Temp src )
+                            when src = info.control_iv.phi_temp ->
+                              if dst = info.control_iv.phi_temp then
+                                incr direct
+                              else
+                                staged_defs := dst :: !staged_defs;
+                              true
+                          | Tcg.Move
+                              (dst, Tcg.Temp src)
+                            when dst = info.control_iv.phi_temp ->
+                              staged_copies := src :: !staged_copies;
+                              true
+                          | Tcg.Move _
+                          | Tcg.Bin (_, Add, _, _) ->
+                              true
+                          | Tcg.Un _
+                          | Tcg.Bin _
+                          | Tcg.Load _
+                          | Tcg.Store _
+                          | Tcg.Call _ ->
+                              false)
+                        body
+                    in
+                    structurally_ok
+                    &&
+                    match
+                      !direct,
+                      List.sort_uniq compare !staged_defs,
+                      List.sort_uniq compare !staged_copies
+                    with
+                    | 1, [], [] ->
+                        true
+                    | 0, [ next_temp ], [ copied_temp ] ->
+                        next_temp = copied_temp
+                    | _ ->
+                        false
+                  in
+
+                  let emit_min lhs rhs =
+                    let delta = fresh_temp () in
+                    let choose_lhs = fresh_temp () in
+                    let selected_delta = fresh_temp () in
+                    let result = fresh_temp () in
+                    ( [ simplify_simple_instr
+                          (Tcg.Bin
+                             ( delta,
+                               Sub,
+                               Tcg.Temp lhs,
+                               Tcg.Temp rhs ));
+                        simplify_simple_instr
+                          (Tcg.Bin
+                             ( choose_lhs,
+                               Lt,
+                               Tcg.Temp lhs,
+                               Tcg.Temp rhs ));
+                        simplify_simple_instr
+                          (Tcg.Bin
+                             ( selected_delta,
+                               Mul,
+                               Tcg.Temp delta,
+                               Tcg.Temp choose_lhs ));
+                        simplify_simple_instr
+                          (Tcg.Bin
+                             ( result,
+                               Add,
+                               Tcg.Temp rhs,
+                               Tcg.Temp selected_delta )) ],
+                      result )
+                  in
+
+                  let emit_delta trip amount =
+                    if amount = 0L then
+                      ([], None)
+                    else if amount = 1L then
+                      ([], Some (Tcg.Temp trip))
+                    else
+                      let dst = fresh_temp () in
+                      ( [ simplify_simple_instr
+                            (Tcg.Bin
+                               ( dst,
+                                 Mul,
+                                 Tcg.Temp trip,
+                                 Tcg.Imm amount )) ],
+                        Some (Tcg.Temp dst) )
+                  in
+
+                  let emit_transfer
+                      trip
+                      carrier
+                      threshold
+                      low_step
+                      high_step
+                    =
+                    let threshold_diff = fresh_temp () in
+                    let clamp_instrs, positive_diff =
+                      clamp_nonnegative_temp
+                        fresh_temp threshold_diff
+                    in
+                    let cross_instrs, cross_trip =
+                      build_nonnegative_ceil_div
+                        fresh_temp positive_diff low_step
+                    in
+                    let min_instrs, low_trip =
+                      emit_min trip cross_trip
+                    in
+                    let high_trip = fresh_temp () in
+                    let low_delta_instrs, low_delta =
+                      emit_delta low_trip low_step
+                    in
+                    let high_delta_instrs, high_delta =
+                      emit_delta high_trip high_step
+                    in
+                    let add_delta = function
+                      | None -> []
+                      | Some delta ->
+                          [ simplify_simple_instr
+                              (Tcg.Bin
+                                 ( carrier,
+                                   Add,
+                                   Tcg.Temp carrier,
+                                   delta )) ]
+                    in
+                    [ simplify_simple_instr
+                        (Tcg.Bin
+                           ( threshold_diff,
+                             Sub,
+                             Tcg.Imm threshold,
+                             Tcg.Temp carrier )) ]
+                    @ clamp_instrs
+                    @ cross_instrs
+                    @ min_instrs
+                    @ [ simplify_simple_instr
+                          (Tcg.Bin
+                             ( high_trip,
+                               Sub,
+                               Tcg.Temp trip,
+                               Tcg.Temp low_trip )) ]
+                    @ low_delta_instrs
+                    @ add_delta low_delta
+                    @ high_delta_instrs
+                    @ add_delta high_delta
+                  in
+
+                  let emit_bool_and lhs rhs =
+                    let dst = fresh_temp () in
+                    ( [ simplify_simple_instr
+                          (Tcg.Bin
+                             ( dst,
+                               Mul,
+                               Tcg.Temp lhs,
+                               Tcg.Temp rhs )) ],
+                      dst )
+                  in
+
+                  if not exact_control_term then
+                    false
+                  else
+                    match root.body, root.term with
+                    | [ Tcg.Bin
+                          ( cmp_temp,
+                            Add,
+                            Tcg.Temp carrier,
+                            Tcg.Imm raw_bias ) ],
+                      Cfg.BranchCompare
+                        ( Lt,
+                          Tcg.Temp branch_temp,
+                          Tcg.Imm raw_limit,
+                          true_label,
+                          false_label )
+                    | [ Tcg.Bin
+                          ( cmp_temp,
+                            Add,
+                            Tcg.Imm raw_bias,
+                            Tcg.Temp carrier ) ],
+                      Cfg.BranchCompare
+                        ( Lt,
+                          Tcg.Temp branch_temp,
+                          Tcg.Imm raw_limit,
+                          true_label,
+                          false_label )
+                      when cmp_temp = branch_temp ->
+                        let bias = i32 raw_bias in
+                        let limit = i32 raw_limit in
+                        let threshold = Int64.sub limit bias in
+                        if
+                          bias < 0L
+                          || threshold < 0L
+                          || threshold > int32_max
+                          || not (LabelSet.mem true_label loop)
+                          || not (LabelSet.mem false_label loop)
+                        then
+                          false
+                        else
+                          let true_block : Cfg.block =
+                            get_block true_label
+                          in
+                          let false_block : Cfg.block =
+                            get_block false_label
+                          in
+                          begin
+                            match true_block.term, false_block.term with
+                            | Cfg.Jump true_join,
+                              Cfg.Jump false_join
+                              when true_join = false_join ->
+                                let join_label = true_join in
+                                if not (LabelSet.mem join_label loop) then
+                                  false
+                                else
+                                  let join_block : Cfg.block =
+                                    get_block join_label
+                                  in
+                                  let tail_body, tail_term_ok =
+                                    if join_label = info.control_label then
+                                      (control.body, true)
+                                    else
+                                      ( join_block.body,
+                                        match join_block.term with
+                                        | Cfg.Jump next ->
+                                            next = info.control_label
+                                        | Cfg.BranchZero _
+                                        | Cfg.BranchNonZero _
+                                        | Cfg.BranchCompare _
+                                        | Cfg.Return _ ->
+                                            false )
+                                  in
+                                  if
+                                    not tail_term_ok
+                                    || not (exact_iv_plus_one tail_body)
+                                    || List.length true_block.body > 2
+                                    || List.length false_block.body > 2
+                                    || List.length tail_body > 3
+                                  then
+                                    false
+                                  else
+                                    let true_delta =
+                                      affine_path_delta
+                                        carrier
+                                        (root.body
+                                         @ true_block.body
+                                         @ tail_body)
+                                    in
+                                    let false_delta =
+                                      affine_path_delta
+                                        carrier
+                                        (root.body
+                                         @ false_block.body
+                                         @ tail_body)
+                                    in
+                                    begin
+                                      match true_delta, false_delta with
+                                      | Some low_step,
+                                        Some high_step
+                                        when
+                                          low_step > 0L
+                                          && high_step >= 0L ->
+                                          let live_in_t, _live_in_p =
+                                            compute_liveness
+                                              summaries
+                                              globals
+                                              {
+                                                f with
+                                                blocks =
+                                                  current_block_list ();
+                                              }
+                                          in
+                                          let live_t_exit =
+                                            table_find_or_empty
+                                              live_in_t
+                                              info.exit_label
+                                              IntSet.empty
+                                          in
+                                          let loop_live_defs =
+                                            IntSet.inter
+                                              loop_defs
+                                              live_t_exit
+                                          in
+                                          let allowed_live =
+                                            IntSet.add
+                                              carrier
+                                              (IntSet.singleton
+                                                 info.control_iv.phi_temp)
+                                          in
+                                          if
+                                            not
+                                              (IntSet.subset
+                                                 loop_live_defs
+                                                 allowed_live)
+                                          then begin
+                                            if debug_counted then
+                                              debugf
+                                                "counted-single-monotone-reject func=%s header=%s reason=extra-live live={%s} allowed={%s}"
+                                                f.name
+                                                header
+                                                (string_of_intset
+                                                   loop_live_defs)
+                                                (string_of_intset
+                                                   allowed_live);
+                                            false
+                                          end
+                                          else
+                                            let max_step =
+                                              Int64.max
+                                                low_step high_step
+                                            in
+                                            let safe_top =
+                                              Int64.sub
+                                                int32_max bias
+                                            in
+                                            if
+                                              max_step <= 0L
+                                              || safe_top < 0L
+                                            then
+                                              false
+                                            else
+                                              let trip_instrs,
+                                                  trip_temp =
+                                                build_trip_count_instrs
+                                                  fresh_temp
+                                                  info.control_iv.phi_temp
+                                                  info.control_iv.step
+                                                  info.kind
+                                              in
+
+                                              let iv_nonneg =
+                                                fresh_temp ()
+                                              in
+                                              let bound_nonneg =
+                                                fresh_temp ()
+                                              in
+                                              let carrier_nonneg =
+                                                fresh_temp ()
+                                              in
+                                              let carrier_safe =
+                                                fresh_temp ()
+                                              in
+                                              let capacity =
+                                                fresh_temp ()
+                                              in
+                                              let allowed_iters =
+                                                fresh_temp ()
+                                              in
+                                              let trip_safe =
+                                                fresh_temp ()
+                                              in
+                                              let base_guard =
+                                                [ simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( iv_nonneg,
+                                                         Ge,
+                                                         Tcg.Temp
+                                                           info.control_iv.phi_temp,
+                                                         Tcg.Imm 0L ));
+                                                  simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( bound_nonneg,
+                                                         Ge,
+                                                         bound_operand,
+                                                         Tcg.Imm 0L ));
+                                                  simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( carrier_nonneg,
+                                                         Ge,
+                                                         Tcg.Temp carrier,
+                                                         Tcg.Imm 0L ));
+                                                  simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( carrier_safe,
+                                                         Le,
+                                                         Tcg.Temp carrier,
+                                                         Tcg.Imm safe_top ));
+                                                  simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( capacity,
+                                                         Sub,
+                                                         Tcg.Imm safe_top,
+                                                         Tcg.Temp carrier ));
+                                                  simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( allowed_iters,
+                                                         Div,
+                                                         Tcg.Temp capacity,
+                                                         Tcg.Imm max_step ));
+                                                  simplify_simple_instr
+                                                    (Tcg.Bin
+                                                       ( trip_safe,
+                                                         Le,
+                                                         Tcg.Temp trip_temp,
+                                                         Tcg.Temp
+                                                           allowed_iters )) ]
+                                              in
+                                              let and1_i, and1 =
+                                                emit_bool_and
+                                                  iv_nonneg bound_nonneg
+                                              in
+                                              let and2_i, and2 =
+                                                emit_bool_and
+                                                  carrier_nonneg carrier_safe
+                                              in
+                                              let and3_i, and3 =
+                                                emit_bool_and
+                                                  and1 and2
+                                              in
+                                              let and4_i, guard_temp =
+                                                emit_bool_and
+                                                  and3 trip_safe
+                                              in
+                                              let guard_instrs =
+                                                trip_instrs
+                                                @ base_guard
+                                                @ and1_i
+                                                @ and2_i
+                                                @ and3_i
+                                                @ and4_i
+                                              in
+                                              let summary_instrs =
+                                                emit_transfer
+                                                  trip_temp
+                                                  carrier
+                                                  threshold
+                                                  low_step
+                                                  high_step
+                                                @ build_iv_final_update
+                                                    fresh_temp
+                                                    trip_temp
+                                                    info.control_iv
+                                              in
+                                              let guard_label =
+                                                fresh_summary_label ()
+                                              in
+                                              let summary_label =
+                                                fresh_summary_label ()
+                                              in
+                                              let rewritten_term =
+                                                rewrite_term_successor
+                                                  control.term
+                                                  ~from_label:
+                                                    info.inside_label
+                                                  ~to_label:
+                                                    guard_label
+                                              in
+                                              update_block
+                                                {
+                                                  control with
+                                                  term =
+                                                    rewritten_term;
+                                                  succs =
+                                                    Cfg.successors
+                                                      rewritten_term;
+                                                };
+                                              Hashtbl.add
+                                                current_blocks
+                                                guard_label
+                                                {
+                                                  Cfg.label =
+                                                    guard_label;
+                                                  body =
+                                                    guard_instrs;
+                                                  term =
+                                                    Cfg.BranchNonZero
+                                                      ( Tcg.Temp
+                                                          guard_temp,
+                                                        summary_label,
+                                                        info.inside_label );
+                                                  preds = [];
+                                                  succs =
+                                                    [ summary_label;
+                                                      info.inside_label ];
+                                                };
+                                              Hashtbl.add
+                                                current_blocks
+                                                summary_label
+                                                {
+                                                  Cfg.label =
+                                                    summary_label;
+                                                  body =
+                                                    summary_instrs;
+                                                  term =
+                                                    Cfg.Jump
+                                                      info.exit_label;
+                                                  preds = [];
+                                                  succs =
+                                                    [ info.exit_label ];
+                                                };
+                                              new_blocks_rev :=
+                                                summary_label
+                                                :: guard_label
+                                                :: !new_blocks_rev;
+                                              changed := true;
+                                              if debug_counted then
+                                                debugf
+                                                  "counted-single-monotone-hit func=%s header=%s blocks=%d carrier=t%d threshold=%Ld low=%Ld high=%Ld guard=%s summary=%s"
+                                                  f.name
+                                                  header
+                                                  nblocks
+                                                  carrier
+                                                  threshold
+                                                  low_step
+                                                  high_step
+                                                  guard_label
+                                                  summary_label;
+                                              true
+                                      | _ ->
+                                          false
+                                    end
+                            | _ ->
+                                false
+                          end
+                    | _ ->
+                        false
+            end
+        | CountUpLt _
+        | CountUpLe _
+        | CountDownGt _
+        | CountDownGe _
+        | CountUpLtScaled _
+        | CountUpLeScaled _
+        | CountDownGtScaled _
+        | CountDownGeScaled _ ->
+            false
+      in
+
     let try_eliminate_monotone_state_piecewise_loop
         header
         loop
@@ -23441,6 +24159,17 @@ let eliminate_counted_loops_func_once summaries globals (f : Cfg.func) =
                 f.name header (List.length nested_child_groups);
             let piecewise_threshold_applied =
               if
+                try_eliminate_single_monotone_state_loop
+                  header
+                  loop
+                  info
+                  effects
+                  loop_defs
+                  multi_defs
+                  def_instrs
+              then
+                true
+              else if
                 try_eliminate_monotone_state_piecewise_loop
                   header
                   loop
@@ -32344,36 +33073,50 @@ let optimize_func global_init summaries globals return_globals removable_calls (
         then
           final_candidate0
         else
-          let retried =
-            eliminate_counted_loops_func
-              global_init summaries globals final_candidate0
+          let cleanup_counted_retry candidate =
+            candidate
+            |> thread_and_prune_func
+            |> simplify_cfg_func
+            |> const_propagate_func global_init summaries globals
+            |> eliminate_dead_code_func
+                 ~removable_calls summaries globals return_globals
+            |> copy_coalesce_func summaries globals
+            |> final_linear_merge_func
           in
-          if retried = final_candidate0 then begin
-            if Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None then
-              Printf.eprintf
-                "counted-final-inline-retry func=%s result=no-followup blocks=%d\n%!"
-                final_candidate0.name
-                (List.length final_candidate0.blocks);
-            final_candidate0
-          end else begin
-            let cleaned =
-              retried
-              |> thread_and_prune_func
-              |> simplify_cfg_func
-              |> const_propagate_func global_init summaries globals
-              |> eliminate_dead_code_func
-                   ~removable_calls summaries globals return_globals
-              |> copy_coalesce_func summaries globals
-              |> final_linear_merge_func
-            in
-            if Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None then
-              Printf.eprintf
-                "counted-final-inline-retry func=%s result=applied blocks=%d->%d\n%!"
-                final_candidate0.name
-                (List.length final_candidate0.blocks)
-                (List.length cleaned.blocks);
-            cleaned
-          end
+
+          let rec retry_counted_rounds rounds candidate applied =
+            if rounds = 0 then
+              (candidate, applied)
+            else
+              let retried =
+                eliminate_counted_loops_func
+                  global_init summaries globals candidate
+              in
+              if retried = candidate then
+                (candidate, applied)
+              else
+                let cleaned =
+                  cleanup_counted_retry retried
+                in
+                retry_counted_rounds
+                  (rounds - 1)
+                  cleaned
+                  (applied + 1)
+          in
+
+          let final_retried, applied_rounds =
+            retry_counted_rounds 3 final_candidate0 0
+          in
+
+          if Sys.getenv_opt "TOYC_DEBUG_COUNTED_LOOPS" <> None then
+            Printf.eprintf
+              "counted-final-inline-retry func=%s rounds=%d blocks=%d->%d\n%!"
+              final_candidate0.name
+              applied_rounds
+              (List.length final_candidate0.blocks)
+              (List.length final_retried.blocks);
+
+          final_retried
       in
       if cfg_targets_valid final_candidate then final_candidate
       else begin
