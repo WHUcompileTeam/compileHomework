@@ -35495,6 +35495,241 @@ let item7_debug_callsite_global_snapshot
       !snapshot_failure
   end
 
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v29: final post-inline structural cleanup contract                    *)
+(*                                                                            *)
+(* Late item7 transforms intentionally do not re-enter [optimize_func].  v4    *)
+(* showed that a second full optimization of an already heavily transformed   *)
+(* CFG is not a safe/idempotent cleanup contract, and v27 showed that weaker  *)
+(* transforms must not run before stronger whole-call elimination.             *)
+(*                                                                            *)
+(* At the very end of the late pipeline we therefore allow STRUCTURAL cleanup *)
+(* only:                                                                       *)
+(*   1. local instruction/terminator simplification;                           *)
+(*   2. thread chains of empty jump blocks and prune unreachable blocks;       *)
+(*   3. merge linear CFG pairs;                                                *)
+(*   4. compact temp IDs after all late cloning/deletion is finished.          *)
+(*                                                                            *)
+(* Deliberately absent here: const propagation, algebra reassociation, GVN,    *)
+(* DCE, loop transforms, effect-based call deletion, and [optimize_func].       *)
+(* In particular, no liveness-driven deletion is allowed after the trapping    *)
+(* Div/Mod inline families: cloned operations that would execute at runtime     *)
+(* remain present unless they are in genuinely unreachable CFG.                *)
+(* -------------------------------------------------------------------------- *)
+
+let item7_final_structural_cleanup_func (f : Cfg.func) =
+  let before_blocks = List.length f.blocks in
+  let before_instrs =
+    List.fold_left
+      (fun acc (block : Cfg.block) -> acc + List.length block.body)
+      0 f.blocks
+  in
+  let before_temps = f.temp_count in
+  let rec iterate fuel current =
+    if fuel = 0 then current
+    else
+      let next =
+        current
+        |> simplify_cfg_func
+        |> thread_and_prune_func
+        |> final_linear_merge_func
+      in
+      if next.blocks = current.blocks then current
+      else iterate (fuel - 1) next
+  in
+  let structural = iterate 4 f in
+  let candidate =
+    compact_temp_ids_func
+      ~debug_tag:"item7-final-structural-cleanup"
+      structural
+  in
+  let result =
+    if cfg_targets_valid candidate then candidate
+    else begin
+      debug_cfg_validation "item7-final-structural-cleanup" candidate;
+      f
+    end
+  in
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_FINAL_STRUCTURAL_CLEANUP" <> None then begin
+    let after_blocks = List.length result.blocks in
+    let after_instrs =
+      List.fold_left
+        (fun acc (block : Cfg.block) -> acc + List.length block.body)
+        0 result.blocks
+    in
+    Printf.eprintf
+      "item7-final-structural-cleanup func=%s blocks=%d->%d instrs=%d->%d temps=%d->%d changed=%d\n%!"
+      f.name
+      before_blocks after_blocks
+      before_instrs after_instrs
+      before_temps result.temp_count
+      (if result.blocks <> f.blocks || result.temp_count <> f.temp_count then 1 else 0)
+  end;
+  result
+
+let item7_final_structural_cleanup_program (funcs : Cfg.func list) =
+  List.map item7_final_structural_cleanup_func funcs
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v30: final residual / seal audit                                      *)
+(*                                                                            *)
+(* Audit only.  v29 deliberately makes structural cleanup the last production *)
+(* transform, so before sealing item #7 verify that this cleanup did not       *)
+(* expose a stronger opportunity that the earlier late pipeline can no longer  *)
+(* consume.  In particular check two hazards:                                  *)
+(*   - a residual all-immediate call becomes fully interpretable only after     *)
+(*     cleanup;                                                                 *)
+(*   - a residual callee enters one of the already-existing inline candidate    *)
+(*     shape families only after cleanup.                                       *)
+(*                                                                            *)
+(* The audit also reports the final residual shape (effects, recursion,         *)
+(* Div/Mod/growth) so intentional leftovers can be distinguished from missed    *)
+(* opportunities.  It never rewrites CFG.                                      *)
+(* -------------------------------------------------------------------------- *)
+
+let item7_inline_candidate_families (f : Cfg.func) =
+  let families = ref [] in
+  let add name present =
+    if present then families := name :: !families
+  in
+  add "scalar" (late_scalar_inline_candidate_of_func f <> None);
+  add "branch" (late_branch_inline_candidate f <> None);
+  add "store-scalar" (late_store_scalar_inline_candidate_of_func f <> None);
+  add "store-cfg" (late_store_cfg_inline_candidate f <> None);
+  add "divmod-scalar" (late_divmod_scalar_inline_candidate_of_func f <> None);
+  add "divmod-cfg" (late_divmod_cfg_inline_candidate f <> None);
+  add "divmod-cycle" (late_divmod_singleblock_cycle_candidate f <> None);
+  add "divmod-sparse-cycle"
+    (late_divmod_sparse_oversize_cycle_candidate f <> None);
+  add "plain-cycle" (late_plain_singleblock_cycle_candidate f <> None);
+  List.rev !families
+
+let item7_string_of_family_list families =
+  match families with
+  | [] -> "-"
+  | _ -> String.concat "," families
+
+let item7_debug_final_seal_audit
+    global_init
+    globals
+    (before_cleanup : Cfg.func list)
+    (after_cleanup : Cfg.func list) =
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_FINAL_SEAL_AUDIT" <> None then begin
+    let before_by_label =
+      Hashtbl.create (max 8 (List.length before_cleanup))
+    in
+    List.iter
+      (fun (f : Cfg.func) -> Hashtbl.replace before_by_label f.label f)
+      before_cleanup;
+    let after_by_label =
+      Hashtbl.create (max 8 (List.length after_cleanup))
+    in
+    List.iter
+      (fun (f : Cfg.func) -> Hashtbl.replace after_by_label f.label f)
+      after_cleanup;
+    let readonly_globals =
+      item7_readonly_global_values global_init globals after_cleanup
+    in
+    let total = ref 0 in
+    let known = ref 0 in
+    let unknown = ref 0 in
+    let self_recursive = ref 0 in
+    let nested_callee = ref 0 in
+    let store_calls = ref 0 in
+    let divmod_calls = ref 0 in
+    let growth_heavy = ref 0 in
+    let all_const = ref 0 in
+    let const_evaluable_after_cleanup = ref 0 in
+    let candidate_shape_after = ref 0 in
+    let newly_candidate_shape_after_cleanup = ref 0 in
+    List.iter
+      (fun (caller : Cfg.func) ->
+        List.iter
+          (fun (block : Cfg.block) ->
+            List.iter
+              (function
+                | Tcg.Call (dst_opt, callee_label, args) ->
+                    incr total;
+                    begin
+                      match Hashtbl.find_opt after_by_label callee_label with
+                      | None ->
+                          incr unknown;
+                          Printf.eprintf
+                            "item7-final-seal-residual caller=%s callee=%s site=%s known=0 result=%d args=%d\n%!"
+                            caller.name callee_label block.label
+                            (match dst_opt with Some _ -> 1 | None -> 0)
+                            (List.length args)
+                      | Some callee ->
+                          incr known;
+                          let
+                            ( _blocks, _instrs, _branches, _joins, _returns,
+                              stores, divmods, nested_calls, _global_loads,
+                              _local_loads, _is_cyclic, _loop_count,
+                              _max_loop_blocks ) =
+                            item7_profitability_shape callee
+                          in
+                          let clone_units = item7_cfg_clone_units callee.blocks in
+                          if callee_label = caller.label then incr self_recursive;
+                          if nested_calls > 0 then incr nested_callee;
+                          if stores > 0 then incr store_calls;
+                          if divmods > 0 then incr divmod_calls;
+                          if clone_units > item7_inline_static_growth_instr_budget then
+                            incr growth_heavy;
+                          let concrete_args = item7_collect_immediate_args args in
+                          let all_const_here = concrete_args <> None in
+                          if all_const_here then incr all_const;
+                          let const_eval_after =
+                            match concrete_args with
+                            | None -> false
+                            | Some values ->
+                                item7_constant_eval_program_call
+                                  ~known_globals:readonly_globals
+                                  after_by_label callee_label values
+                                <> None
+                          in
+                          if const_eval_after then incr const_evaluable_after_cleanup;
+                          let after_families = item7_inline_candidate_families callee in
+                          let before_families =
+                            match Hashtbl.find_opt before_by_label callee_label with
+                            | Some before_callee ->
+                                item7_inline_candidate_families before_callee
+                            | None -> []
+                          in
+                          if after_families <> [] then incr candidate_shape_after;
+                          let newly_enabled =
+                            List.filter
+                              (fun family -> not (List.mem family before_families))
+                              after_families
+                          in
+                          if newly_enabled <> [] then
+                            incr newly_candidate_shape_after_cleanup;
+                          Printf.eprintf
+                            "item7-final-seal-residual caller=%s callee=%s site=%s known=1 result=%d args=%d all-const=%d const-eval-after=%d self=%d nested=%d stores=%d divmods=%d clone-units=%d growth-heavy=%d families-before=%s families-after=%s newly-enabled=%s\n%!"
+                            caller.name callee.name block.label
+                            (match dst_opt with Some _ -> 1 | None -> 0)
+                            (List.length args)
+                            (if all_const_here then 1 else 0)
+                            (if const_eval_after then 1 else 0)
+                            (if callee_label = caller.label then 1 else 0)
+                            nested_calls stores divmods clone_units
+                            (if clone_units > item7_inline_static_growth_instr_budget
+                             then 1 else 0)
+                            (item7_string_of_family_list before_families)
+                            (item7_string_of_family_list after_families)
+                            (item7_string_of_family_list newly_enabled)
+                    end
+                | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> ())
+              block.body)
+          caller.blocks)
+      after_cleanup;
+    Printf.eprintf
+      "item7-final-seal-summary calls=%d known=%d unknown=%d self=%d nested-callee=%d store=%d divmod=%d growth-heavy=%d all-const=%d const-evaluable-after-cleanup=%d candidate-shape-after=%d newly-candidate-shape-after-cleanup=%d\n%!"
+      !total !known !unknown !self_recursive !nested_callee !store_calls
+      !divmod_calls !growth_heavy !all_const !const_evaluable_after_cleanup
+      !candidate_shape_after !newly_candidate_shape_after_cleanup
+  end
+
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
   last_liveness_cache := None;
@@ -35574,9 +35809,6 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let optimized_funcs =
     refresh_final_effect_sets_dce_program summaries globals optimized_funcs
   in
-  let () =
-    item7_debug_profitability_feature_audit globals optimized_funcs
-  in
   let optimized_funcs =
     inline_late_store_scalar_calls_program globals optimized_funcs
   in
@@ -35595,13 +35827,9 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let optimized_funcs =
     inline_late_divmod_sparse_oversize_cycle_calls_program optimized_funcs
   in
-  let () =
-    item7_debug_instruction_heavy_benefit globals optimized_funcs
-  in
   let item7_readonly_globals =
     item7_readonly_global_values global_init globals optimized_funcs
   in
-  let () = item7_debug_readonly_global_values item7_readonly_globals in
   (* item7 v27 fix1: run the stronger whole-call constant evaluator before
      the weaker plain cyclic CFG inliner.  Otherwise an all-constant call
      that could collapse to [Move (dst, Imm k)] may be consumed by the
@@ -35614,14 +35842,17 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
       ~known_globals:item7_readonly_globals
       optimized_funcs
   in
-  let () =
-    item7_debug_callsite_global_snapshot
-      global_init globals item7_readonly_globals optimized_funcs
-  in
   let optimized_funcs =
     inline_late_plain_singleblock_cycle_calls_program optimized_funcs
   in
-  let () = item7_debug_post_const_residual globals optimized_funcs in
-  let () = item7_debug_const_eval_failure_reasons optimized_funcs in
-  item7_debug_inline_effect_capability summaries removable_calls globals optimized_funcs;
+  (* item7 v29: once all stronger whole-call transforms and late inline
+     families have had their chance, perform structural cleanup only. *)
+  (* item7 v31 sealed contract:
+     - stronger whole-call elimination has first refusal;
+     - late inline families run only before the final cleanup;
+     - the final cleanup is structural-only;
+     - no audit pass and no full optimize_func re-entry follows it. *)
+  let optimized_funcs =
+    item7_final_structural_cleanup_program optimized_funcs
+  in
   { Cfg.funcs = optimized_funcs }
