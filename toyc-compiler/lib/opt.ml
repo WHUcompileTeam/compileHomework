@@ -31643,9 +31643,12 @@ let item7_debug_readonly_global_values values =
       "item7-readonly-global-env globals=%d\n%!"
       (PlaceMap.cardinal values)
 
-let late_whole_program_constantization_enabled () =
-  Sys.getenv_opt "TOYC_ENABLE_LATE_CONST_WHOLE_PROGRAM" <> None
-
+(* item7 v26: production whole-program constantization is default-on.
+   The old environment gate has been retired.  Full constant-call evaluation
+   is provided by [fold_safe_late_constant_calls_program] later in the pipeline;
+   do not revive the older [fold_constant_calls_program] here because it performs
+   a full late [optimize_func] re-entry.  Constant-parameter specialization has
+   no equivalent safe replacement, so it is run unconditionally below. *)
 
 (* -------------------------------------------------------------------------- *)
 (* item7 v1: inline / effect capability audit                                 *)
@@ -34927,6 +34930,142 @@ let item7_debug_const_eval_failure_reasons (funcs : Cfg.func list) =
     Printf.eprintf "\n%!"
   end
 
+
+(* -------------------------------------------------------------------------- *)
+(* item7 v25: call-site global snapshot audit                                 *)
+(*                                                                            *)
+(* v24 proved that whole-program readonly globals unlock most constant calls. *)
+(* For the remaining all-immediate calls whose first evaluator blocker is a   *)
+(* Global Load, audit a strictly more contextual fact: the caller's existing  *)
+(* forward constant-propagation state immediately before the call.  If every  *)
+(* global actually needed by the concrete callee execution is known there,    *)
+(* [constant_eval_func] can evaluate the call using that snapshot even when    *)
+(* the global is mutable elsewhere in the program.                             *)
+(*                                                                            *)
+(* AUDIT ONLY: this function never rewrites the CFG.                           *)
+(* -------------------------------------------------------------------------- *)
+
+let item7_global_snapshot_of_cp_state readonly_values state =
+  PlaceMap.fold
+    (fun place fact acc ->
+      match place, fact with
+      | Tcg.Global _, CpConst value ->
+          PlaceMap.add place (i32 value) acc
+      | _ -> acc)
+    state.places readonly_values
+
+let item7_mutable_snapshot_count readonly_values snapshot =
+  PlaceMap.fold
+    (fun place _value count ->
+      if PlaceMap.mem place readonly_values then count else count + 1)
+    snapshot 0
+
+let item7_debug_callsite_global_snapshot
+    global_init
+    globals
+    readonly_values
+    (funcs : Cfg.func list) =
+  if Sys.getenv_opt "TOYC_DEBUG_ITEM7_CALLSITE_GLOBAL_SNAPSHOT" = None then ()
+  else begin
+    let fresh_summaries = compute_func_summaries globals funcs in
+    let func_by_label = Hashtbl.create (max 8 (List.length funcs)) in
+    List.iter
+      (fun (f : Cfg.func) -> Hashtbl.replace func_by_label f.label f)
+      funcs;
+
+    let total_all_const = ref 0 in
+    let global_load_residual = ref 0 in
+    let snapshot_has_mutable = ref 0 in
+    let snapshot_success = ref 0 in
+    let snapshot_failure = ref 0 in
+
+    List.iter
+      (fun (caller : Cfg.func) ->
+        let executable, in_states =
+          compute_const_states global_init fresh_summaries globals caller
+        in
+        List.iter
+          (fun (block : Cfg.block) ->
+            if LabelSet.mem block.label executable then begin
+              let entry_state =
+                match Hashtbl.find_opt in_states block.label with
+                | Some state -> state
+                | None when block.label = caller.entry ->
+                    initial_cp_state global_init caller
+                | None -> empty_cp_state
+              in
+              let rec walk state = function
+                | [] -> ()
+                | instr :: rest ->
+                    begin
+                      match instr with
+                      | Tcg.Call (_dst, callee_label, call_args) ->
+                          begin
+                            match item7_collect_immediate_args call_args,
+                                  Hashtbl.find_opt func_by_label callee_label with
+                            | Some args, Some callee ->
+                                incr total_all_const;
+                                begin
+                                  match item7_constant_eval_func_with_reason callee args with
+                                  | Error Item7_ce_global_load ->
+                                      incr global_load_residual;
+                                      let snapshot =
+                                        item7_global_snapshot_of_cp_state
+                                          readonly_values state
+                                      in
+                                      let mutable_known =
+                                        item7_mutable_snapshot_count
+                                          readonly_values snapshot
+                                      in
+                                      if mutable_known > 0 then
+                                        incr snapshot_has_mutable;
+                                      begin
+                                        match constant_eval_func
+                                                ~known_globals:snapshot
+                                                callee args with
+                                        | Some value ->
+                                            incr snapshot_success;
+                                            Printf.eprintf
+                                              "item7-callsite-global-snapshot caller=%s callee=%s site=%s argc=%d snapshot-globals=%d mutable-known=%d decision=success value=%Ld\n%!"
+                                              caller.name callee_label block.label
+                                              (List.length args)
+                                              (PlaceMap.cardinal snapshot)
+                                              mutable_known
+                                              (i32 value)
+                                        | None ->
+                                            incr snapshot_failure;
+                                            Printf.eprintf
+                                              "item7-callsite-global-snapshot caller=%s callee=%s site=%s argc=%d snapshot-globals=%d mutable-known=%d decision=fail\n%!"
+                                              caller.name callee_label block.label
+                                              (List.length args)
+                                              (PlaceMap.cardinal snapshot)
+                                              mutable_known
+                                      end
+                                  | Ok _ | Error _ -> ()
+                                end
+                            | _ -> ()
+                          end
+                      | _ -> ()
+                    end;
+                    let _rewritten, state =
+                      transfer_simple_instr fresh_summaries globals state instr
+                    in
+                    walk state rest
+              in
+              walk entry_state block.body
+            end)
+          caller.blocks)
+      funcs;
+
+    Printf.eprintf
+      "item7-callsite-global-snapshot-summary all-const=%d global-load-residual=%d mutable-snapshot=%d snapshot-success=%d snapshot-failure=%d\n%!"
+      !total_all_const
+      !global_load_residual
+      !snapshot_has_mutable
+      !snapshot_success
+      !snapshot_failure
+  end
+
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   incr analysis_cache_generation;
   last_liveness_cache := None;
@@ -34962,21 +35101,20 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
       [] cfg.funcs
   in
   let optimized_funcs = List.rev funcs_rev in
+  (* item7 v26: whole-program constantization is part of the default pipeline.
+     Full constant-call folding is intentionally NOT performed by the legacy
+     [fold_constant_calls_program] here: that implementation re-enters
+     [optimize_func] after rewriting a late CFG.  The default-on v21/v24 safe
+     constant evaluator later in this pipeline supersedes that route without
+     unsafe re-optimization.
+
+     Constant-parameter specialization is different: it exposes partially
+     constant call arguments inside a callee and is not subsumed by full-call
+     evaluation, so run it unconditionally. *)
   let optimized_funcs =
-    if late_whole_program_constantization_enabled () then
-      fold_constant_calls_program
-        global_init summaries globals return_global_demands removable_calls
-        optimized_funcs
-    else
-      optimized_funcs
-  in
-  let optimized_funcs =
-    if late_whole_program_constantization_enabled () then
-      specialize_constant_params_program
-        source_funcs
-        global_init summaries globals return_global_demands removable_calls
-        optimized_funcs
-    else
+    specialize_constant_params_program
+      source_funcs
+      global_init summaries globals return_global_demands removable_calls
       optimized_funcs
   in
   let optimized_funcs =
@@ -35039,6 +35177,10 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
     fold_safe_late_constant_calls_program
       ~known_globals:item7_readonly_globals
       optimized_funcs
+  in
+  let () =
+    item7_debug_callsite_global_snapshot
+      global_init globals item7_readonly_globals optimized_funcs
   in
   let () = item7_debug_post_const_residual globals optimized_funcs in
   let () = item7_debug_const_eval_failure_reasons optimized_funcs in
