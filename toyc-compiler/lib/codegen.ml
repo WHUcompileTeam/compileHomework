@@ -1381,7 +1381,10 @@ let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.fun
   in
   (homes, saved_regs)
 
-let compute_layout (f : Cfg.func) =
+let compute_layout
+    ?(reserve_ra = true)
+    ?(compact_frame = false)
+    (f : Cfg.func) =
   let local_homes = Hashtbl.create 64 in
   let param_seed_locals, param_seed_temps = find_param_seed_regs f in
   let global_base_regs = select_global_base_regs f in
@@ -1408,7 +1411,12 @@ let compute_layout (f : Cfg.func) =
     |> List.sort compare
   in
   let referenced_locals = referenced_local_ids f in
-  let save_area_size = 4 * (2 + List.length saved_regs) in
+  let save_area_size =
+    if compact_frame then
+      4 * ((if reserve_ra then 1 else 0) + List.length saved_regs)
+    else
+      4 * (2 + List.length saved_regs)
+  in
   let next = ref (save_area_size + 4) in
   let alloc_slot () =
     let off = - !next in
@@ -1487,6 +1495,44 @@ let item10_direct_global_mem_enabled () =
 
 let item10_branch_boundary_enabled () =
   Sys.getenv_opt "TOYC_DISABLE_ITEM10_BRANCH_BOUNDARY" = None
+
+let item10_leaf_ra_elision_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_LEAF_RA_ELISION" = None
+
+let item10_frame_compaction_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_FRAME_COMPACTION" = None
+
+let item10_const_branch_fold_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_CONST_BRANCH_FOLD" = None
+
+let item10_tail_sub_branch_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_TAIL_SUB_BRANCH" = None
+
+let item10_tail_compare_move_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_TAIL_COMPARE_MOVE" = None
+
+let item10_zero_operand_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_ZERO_OPERAND" = None
+
+let item10_is_compare_binop = function
+  | Eq | Ne | Lt | Gt | Le | Ge -> true
+  | Add | Sub | Mul | Div | Mod | LAnd | LOr -> false
+
+let item10_i32_compare op lhs rhs =
+  let lhs = Int64.to_int32 lhs in
+  let rhs = Int64.to_int32 rhs in
+  let c = Int32.compare lhs rhs in
+  match op with
+  | Eq -> Some (c = 0)
+  | Ne -> Some (c <> 0)
+  | Lt -> Some (c < 0)
+  | Gt -> Some (c > 0)
+  | Le -> Some (c <= 0)
+  | Ge -> Some (c >= 0)
+  | Add | Sub | Mul | Div | Mod | LAnd | LOr -> None
+
+let item10_i32_is_zero value =
+  Int32.equal (Int64.to_int32 value) 0l
 
 let load_place ctx dst = function
   | Tcg.Local id -> (
@@ -1841,10 +1887,15 @@ let emit_binop_operands ctx op dst lhs rhs =
 let emit_call_args ctx args =
   List.iteri
     (fun i arg ->
-      if i < 8 then load_operand ctx (Printf.sprintf "a%d" i) arg
-      else (
-        let arg_reg = operand_reg ctx "t0" arg in
-        emitf ctx "    sw %s, %d(sp)" arg_reg ((i - 8) * 4)))
+      if i < 8 then
+        load_operand ctx (Printf.sprintf "a%d" i) arg
+      else
+        match arg with
+        | Tcg.Imm 0L when item10_zero_operand_enabled () ->
+            emitf ctx "    sw x0, %d(sp)" ((i - 8) * 4)
+        | _ ->
+            let arg_reg = operand_reg ctx "t0" arg in
+            emitf ctx "    sw %s, %d(sp)" arg_reg ((i - 8) * 4))
     args
 
 let emit_call ctx callee args =
@@ -1859,6 +1910,13 @@ let replace_temp_operand dst replacement = function
   | operand -> operand
 
 let gen_simple_instr ctx = function
+  | Tcg.Move (dst, Tcg.Imm 0L)
+    when item10_zero_operand_enabled () ->
+      begin
+        match lookup_temp_home ctx.temp_homes dst with
+        | TempReg reg -> emitf ctx "    li %s, 0" reg
+        | TempStack off -> emit_sw_slot ctx "x0" off
+      end
   | Tcg.Move (dst, src) ->
       begin
         match lookup_temp_home ctx.temp_homes dst with
@@ -1900,6 +1958,9 @@ let gen_simple_instr ctx = function
             load_place ctx "t0" place;
             store_temp ctx dst "t0"
       end
+  | Tcg.Store (place, Tcg.Imm 0L)
+    when item10_zero_operand_enabled () ->
+      store_place ctx "x0" place
   | Tcg.Store (place, value) ->
       let value_reg = operand_reg ctx "t0" value in
       store_place ctx value_reg place
@@ -1934,6 +1995,16 @@ let emit_compare_branch ctx op lhs rhs if_true if_false next_label =
     else emit_branch_result ctx reg if_true if_false next_label
   in
   match (op, lhs, rhs) with
+  | ((Eq | Ne | Lt | Gt | Le | Ge) as cmp),
+    Tcg.Imm lhs_imm,
+    Tcg.Imm rhs_imm
+    when item10_const_branch_fold_enabled () ->
+      begin
+        match item10_i32_compare cmp lhs_imm rhs_imm with
+        | Some true -> emit_jump_if_needed ctx next_label if_true
+        | Some false -> emit_jump_if_needed ctx next_label if_false
+        | None -> assert false
+      end
   | Eq, lhs, rhs when lhs = rhs -> emit_jump_if_needed ctx next_label if_true
   | Ne, lhs, rhs when lhs = rhs -> emit_jump_if_needed ctx next_label if_false
   | Lt, lhs, rhs when lhs = rhs -> emit_jump_if_needed ctx next_label if_false
@@ -2105,9 +2176,17 @@ let emit_compare_branch ctx op lhs rhs if_true if_false next_label =
 
 let gen_terminator ctx next_label = function
   | Cfg.Jump label -> emit_jump_if_needed ctx next_label label
+  | Cfg.BranchZero (Tcg.Imm value, if_zero, if_nonzero)
+    when item10_const_branch_fold_enabled () ->
+      emit_jump_if_needed ctx next_label
+        (if item10_i32_is_zero value then if_zero else if_nonzero)
   | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
       let cond_reg = operand_reg ctx "t0" cond in
       emit_branch_result ctx cond_reg if_nonzero if_zero next_label
+  | Cfg.BranchNonZero (Tcg.Imm value, if_nonzero, if_zero)
+    when item10_const_branch_fold_enabled () ->
+      emit_jump_if_needed ctx next_label
+        (if item10_i32_is_zero value then if_zero else if_nonzero)
   | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
       let cond_reg = operand_reg ctx "t0" cond in
       emit_branch_result ctx cond_reg if_nonzero if_zero next_label
@@ -2164,6 +2243,10 @@ let gen_tail_return_instr ctx (instr : Tcg.simple_instr) =
 
 let gen_tail_branch_instr ctx next_label (instr : Tcg.simple_instr) if_nonzero if_zero =
   match instr with
+  | Tcg.Move (_, Tcg.Imm value)
+    when item10_const_branch_fold_enabled () ->
+      emit_jump_if_needed ctx next_label
+        (if item10_i32_is_zero value then if_zero else if_nonzero)
   | Tcg.Move (_, src) ->
       let reg = operand_reg ctx "t0" src in
       emit_branch_result ctx reg if_nonzero if_zero next_label
@@ -2176,6 +2259,9 @@ let gen_tail_branch_instr ctx next_label (instr : Tcg.simple_instr) if_nonzero i
       match op with
       | Eq | Ne | Lt | Gt | Le | Ge ->
           emit_compare_branch ctx op lhs rhs if_nonzero if_zero next_label
+      | Sub when item10_tail_sub_branch_enabled () ->
+          (* (lhs - rhs) != 0 iff lhs != rhs in RV32 modular arithmetic. *)
+          emit_compare_branch ctx Ne lhs rhs if_nonzero if_zero next_label
       | Add | Sub | Mul | Div | Mod ->
           emit_binop_operands ctx op "t2" lhs rhs;
           emit_branch_result ctx "t2" if_nonzero if_zero next_label
@@ -2192,6 +2278,30 @@ let gen_tail_branch_instr ctx next_label (instr : Tcg.simple_instr) if_nonzero i
 let gen_block ctx next_label (block : Cfg.block) =
   emitf ctx "%s:" block.label;
   match (List.rev block.body, block.term) with
+  | ( Tcg.Move (cond_dst, Tcg.Temp cmp_temp)
+      :: Tcg.Bin (cmp_dst, op, lhs, rhs)
+      :: rev_prefix ),
+    Cfg.BranchZero (Tcg.Temp cond, if_zero, if_nonzero)
+    when item10_tail_compare_move_enabled ()
+         && cond_dst = cond
+         && cmp_dst = cmp_temp
+         && item10_is_compare_binop op
+         && not (temp_live_out ctx block.label cond_dst)
+         && not (temp_live_out ctx block.label cmp_temp) ->
+      List.iter (gen_simple_instr ctx) (List.rev rev_prefix);
+      emit_compare_branch ctx op lhs rhs if_nonzero if_zero next_label
+  | ( Tcg.Move (cond_dst, Tcg.Temp cmp_temp)
+      :: Tcg.Bin (cmp_dst, op, lhs, rhs)
+      :: rev_prefix ),
+    Cfg.BranchNonZero (Tcg.Temp cond, if_nonzero, if_zero)
+    when item10_tail_compare_move_enabled ()
+         && cond_dst = cond
+         && cmp_dst = cmp_temp
+         && item10_is_compare_binop op
+         && not (temp_live_out ctx block.label cond_dst)
+         && not (temp_live_out ctx block.label cmp_temp) ->
+      List.iter (gen_simple_instr ctx) (List.rev rev_prefix);
+      emit_compare_branch ctx op lhs rhs if_nonzero if_zero next_label
   | (last_instr :: rev_prefix), Cfg.Return (Some (Tcg.Temp temp))
     when defs_temp last_instr = Some temp ->
       List.iter (gen_simple_instr ctx) (List.rev rev_prefix);
@@ -2388,7 +2498,14 @@ let item10_share_divrem_pairs (f : Cfg.func) =
 let gen_func buf (f : Cfg.func) =
   let f = item10_share_divrem_pairs f in
   let f = schedule_func_blocks_with_hot_traces f in
-  let layout = compute_layout f in
+  let leaf = not (func_has_call f) in
+  let save_ra =
+    (not (item10_leaf_ra_elision_enabled ())) || not leaf
+  in
+  let compact_frame = item10_frame_compaction_enabled () in
+  let layout =
+    compute_layout ~reserve_ra:save_ra ~compact_frame f
+  in
   let frameless_leaf = can_use_frameless_leaf f layout in
   (* Step5 uses sp-relative addressing for every stack home and incoming
      stack argument, so s0 is never materialized as a frame pointer. *)
@@ -2428,11 +2545,20 @@ let gen_func buf (f : Cfg.func) =
   emit ctx "    .align 2";
   if f.name = "main" then emit ctx "    .globl main";
   emitf ctx "%s:" f.label;
+  let saved_reg_offset i =
+    if compact_frame then
+      let fixed_before_saved = if save_ra then 1 else 0 in
+      layout.frame_size - (4 * (fixed_before_saved + i + 1))
+    else
+      layout.frame_size - (12 + (4 * i))
+  in
   if not frameless_leaf then begin
-    emitf ctx "    addi sp, sp, -%d" layout.frame_size;
-    emitf ctx "    sw ra, %d(sp)" (layout.frame_size - 4);
+    if layout.frame_size <> 0 then
+      emitf ctx "    addi sp, sp, -%d" layout.frame_size;
+    if save_ra then
+      emitf ctx "    sw ra, %d(sp)" (layout.frame_size - 4);
     List.iteri
-      (fun i reg -> emitf ctx "    sw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
+      (fun i reg -> emitf ctx "    sw %s, %d(sp)" reg (saved_reg_offset i))
       layout.saved_regs;
     Hashtbl.fold (fun label reg acc -> (reg, label) :: acc) layout.global_base_regs []
     |> List.sort (fun (a_reg, a_label) (b_reg, b_label) ->
@@ -2465,10 +2591,12 @@ let gen_func buf (f : Cfg.func) =
   emitf ctx "%s:" epilogue;
   if not frameless_leaf then begin
     List.iteri
-      (fun i reg -> emitf ctx "    lw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
+      (fun i reg -> emitf ctx "    lw %s, %d(sp)" reg (saved_reg_offset i))
       layout.saved_regs;
-    emitf ctx "    lw ra, %d(sp)" (layout.frame_size - 4);
-    emitf ctx "    addi sp, sp, %d" layout.frame_size
+    if save_ra then
+      emitf ctx "    lw ra, %d(sp)" (layout.frame_size - 4);
+    if layout.frame_size <> 0 then
+      emitf ctx "    addi sp, sp, %d" layout.frame_size
   end;
   emit ctx "    ret";
   emit ctx ""
