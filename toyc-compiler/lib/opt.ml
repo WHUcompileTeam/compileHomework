@@ -603,15 +603,10 @@ let stored_globals_in_func (f : Cfg.func) =
 type func_effect_summary = {
   read_globals : PlaceSet.t;
   written_globals : PlaceSet.t;
-  must_written_globals : PlaceSet.t;
 }
 
 let worst_case_effect_summary globals =
-  {
-    read_globals = globals;
-    written_globals = globals;
-    must_written_globals = PlaceSet.empty;
-  }
+  { read_globals = globals; written_globals = globals }
 
 let call_effect_summary summaries globals callee =
   match Hashtbl.find_opt summaries callee with
@@ -624,162 +619,14 @@ let call_read_globals summaries globals callee =
 let call_written_globals summaries globals callee =
   (call_effect_summary summaries globals callee).written_globals
 
-let call_must_written_globals summaries globals callee =
-  (call_effect_summary summaries globals callee).must_written_globals
-
 let call_touched_globals summaries globals callee =
   PlaceSet.union
     (call_read_globals summaries globals callee)
     (call_written_globals summaries globals callee)
 
-let advanced_mustwrite_flush_enabled () =
-  Sys.getenv_opt "TOYC_DISABLE_ADV_MUSTWRITE_FLUSH" = None
-
-let advanced_mustwrite_flush_debug_enabled () =
-  Sys.getenv_opt "TOYC_DEBUG_ADV_MUSTWRITE_FLUSH" <> None
-
-let call_required_flush_globals summaries globals callee =
-  if not (advanced_mustwrite_flush_enabled ()) then
-    call_touched_globals summaries globals callee
-  else
-    let reads = call_read_globals summaries globals callee in
-    let may_writes = call_written_globals summaries globals callee in
-    let must_writes = call_must_written_globals summaries globals callee in
-    PlaceSet.union
-      reads
-      (PlaceSet.diff may_writes must_writes)
-
 let equal_func_effect_summary a b =
   PlaceSet.equal a.read_globals b.read_globals
   && PlaceSet.equal a.written_globals b.written_globals
-  && PlaceSet.equal a.must_written_globals b.must_written_globals
-
-let summarize_must_written_globals summaries globals (f : Cfg.func) =
-  (* Definite-write analysis over normal-return paths.
-     Entry starts with no definite writes. Other reachable blocks start at TOP
-     ([globals]) and merge predecessors with intersection. Stores and calls to
-     functions with a proven must-write add facts. Unknown callees contribute
-     no must-write facts. The interprocedural fixed point starts from empty
-     must-write summaries, so recursive cycles remain conservative. *)
-  let block_map = Hashtbl.create (max 8 (List.length f.blocks)) in
-  List.iter
-    (fun (block : Cfg.block) ->
-      Hashtbl.replace block_map block.label block)
-    f.blocks;
-  let rec visit reachable label =
-    if LabelSet.mem label reachable then reachable
-    else
-      let reachable = LabelSet.add label reachable in
-      match Hashtbl.find_opt block_map label with
-      | None -> reachable
-      | Some (block : Cfg.block) ->
-          List.fold_left visit reachable (Cfg.successors block.term)
-  in
-  let reachable = visit LabelSet.empty f.entry in
-  let in_sets = Hashtbl.create (max 8 (List.length f.blocks)) in
-  let out_sets = Hashtbl.create (max 8 (List.length f.blocks)) in
-  List.iter
-    (fun (block : Cfg.block) ->
-      if LabelSet.mem block.label reachable then begin
-        Hashtbl.replace in_sets block.label
-          (if block.label = f.entry then PlaceSet.empty else globals);
-        Hashtbl.replace out_sets block.label
-          (if block.label = f.entry then PlaceSet.empty else globals)
-      end)
-    f.blocks;
-  let transfer defs (block : Cfg.block) =
-    List.fold_left
-      (fun defs instr ->
-        match instr with
-        | Tcg.Store ((Tcg.Global _ as place), _) ->
-            PlaceSet.add place defs
-        | Tcg.Call (_, callee, _) ->
-            PlaceSet.union
-              defs
-              (call_must_written_globals summaries globals callee)
-        | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _
-        | Tcg.Load _ | Tcg.Store _ ->
-            defs)
-      defs block.body
-  in
-  let changed = ref true in
-  while !changed do
-    changed := false;
-    List.iter
-      (fun (block : Cfg.block) ->
-        if LabelSet.mem block.label reachable then begin
-          let incoming =
-            if block.label = f.entry then
-              PlaceSet.empty
-            else
-              let reachable_preds =
-                List.filter
-                  (fun pred -> LabelSet.mem pred reachable)
-                  block.preds
-              in
-              match reachable_preds with
-              | [] -> PlaceSet.empty
-              | pred :: rest ->
-                  let first =
-                    Option.value
-                      ~default:PlaceSet.empty
-                      (Hashtbl.find_opt out_sets pred)
-                  in
-                  List.fold_left
-                    (fun acc pred ->
-                      let pred_out =
-                        Option.value
-                          ~default:PlaceSet.empty
-                          (Hashtbl.find_opt out_sets pred)
-                      in
-                      PlaceSet.inter acc pred_out)
-                    first rest
-          in
-          let outgoing = transfer incoming block in
-          let old_in =
-            Option.value
-              ~default:PlaceSet.empty
-              (Hashtbl.find_opt in_sets block.label)
-          in
-          let old_out =
-            Option.value
-              ~default:PlaceSet.empty
-              (Hashtbl.find_opt out_sets block.label)
-          in
-          if
-            not (PlaceSet.equal incoming old_in)
-            || not (PlaceSet.equal outgoing old_out)
-          then begin
-            Hashtbl.replace in_sets block.label incoming;
-            Hashtbl.replace out_sets block.label outgoing;
-            changed := true
-          end
-        end)
-      f.blocks
-  done;
-  let return_sets =
-    List.filter_map
-      (fun (block : Cfg.block) ->
-        if not (LabelSet.mem block.label reachable) then None
-        else
-          match block.term with
-          | Cfg.Return _ ->
-              Some
-                (Option.value
-                   ~default:PlaceSet.empty
-                   (Hashtbl.find_opt out_sets block.label))
-          | Cfg.Jump _
-          | Cfg.BranchZero _
-          | Cfg.BranchNonZero _
-          | Cfg.BranchCompare _ ->
-              None)
-      f.blocks
-  in
-  match return_sets with
-  | [] ->
-      PlaceSet.empty
-  | first :: rest ->
-      List.fold_left PlaceSet.inter first rest
 
 let summarize_func summaries globals (f : Cfg.func) =
   List.fold_left
@@ -794,22 +641,13 @@ let summarize_func summaries globals (f : Cfg.func) =
           | Tcg.Call (_, callee, _) ->
               let callee_summary = call_effect_summary summaries globals callee in
               {
-                summary with
-                read_globals =
-                  PlaceSet.union summary.read_globals callee_summary.read_globals;
+                read_globals = PlaceSet.union summary.read_globals callee_summary.read_globals;
                 written_globals =
-                  PlaceSet.union
-                    summary.written_globals
-                    callee_summary.written_globals;
+                  PlaceSet.union summary.written_globals callee_summary.written_globals;
               }
           | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> summary)
         summary block.body)
-    {
-      read_globals = PlaceSet.empty;
-      written_globals = PlaceSet.empty;
-      must_written_globals =
-        summarize_must_written_globals summaries globals f;
-    }
+    { read_globals = PlaceSet.empty; written_globals = PlaceSet.empty }
     f.blocks
 
 (* -------------------------------------------------------------------------- *)
@@ -1021,13 +859,7 @@ let item8_summary_cache_key globals funcs =
 
 let compute_func_summaries_uncached globals funcs =
   let summaries = Hashtbl.create (max 8 (List.length funcs)) in
-  let empty_summary =
-    {
-      read_globals = PlaceSet.empty;
-      written_globals = PlaceSet.empty;
-      must_written_globals = PlaceSet.empty;
-    }
-  in
+  let empty_summary = { read_globals = PlaceSet.empty; written_globals = PlaceSet.empty } in
   List.iter (fun (f : Cfg.func) -> Hashtbl.replace summaries f.label empty_summary) funcs;
   let changed = ref true in
   while !changed do
@@ -1378,26 +1210,6 @@ and canonical_scalar_atom_has_temp temp = function
       canonical_scalar_key_has_temp temp lhs
       || canonical_scalar_key_has_temp temp rhs
 
-let rec canonical_scalar_key_has_any_temp
-    temps (_const, terms) =
-  List.exists
-    (fun (atom, _) ->
-      canonical_scalar_atom_has_any_temp temps atom)
-    terms
-
-and canonical_scalar_atom_has_any_temp temps = function
-  | CanonicalOperandAtom (Tcg.Temp temp) ->
-      IntSet.mem temp temps
-  | CanonicalOperandAtom (Tcg.Imm _) ->
-      false
-  | CanonicalPlaceAtom _ ->
-      false
-  | CanonicalUnaryAtom (_, inner) ->
-      canonical_scalar_key_has_any_temp temps inner
-  | CanonicalBinaryAtom (_, lhs, rhs) ->
-      canonical_scalar_key_has_any_temp temps lhs
-      || canonical_scalar_key_has_any_temp temps rhs
-
 type linear_key = canonical_scalar_key
 
 type expr_key =
@@ -1447,12 +1259,6 @@ let linear_atom temp =
 let linear_key_of_form =
   canonical_scalar_key_of_form
 
-let advanced_exact_multidef_merge_enabled () =
-  Sys.getenv_opt "TOYC_DISABLE_ADV_EXACT_MULTIDEF_MERGE" = None
-
-let advanced_exact_multidef_merge_debug_enabled () =
-  Sys.getenv_opt "TOYC_DEBUG_ADV_EXACT_MULTIDEF_MERGE" <> None
-
 let make_linear_analyzer
     (f : Cfg.func) : linear_analyzer =
   (* The analyzer follows only unique definitions.  A multi-def temp is a
@@ -1463,18 +1269,8 @@ let make_linear_analyzer
   let def_instrs =
     Hashtbl.create (max 16 f.temp_count)
   in
-  let all_def_instrs =
-    Hashtbl.create (max 16 f.temp_count)
-  in
   let multi_defs = ref IntSet.empty in
   let record_def temp instr =
-    let old_defs =
-      Option.value
-        ~default:[]
-        (Hashtbl.find_opt all_def_instrs temp)
-    in
-    Hashtbl.replace
-      all_def_instrs temp (instr :: old_defs);
     if Hashtbl.mem def_instrs temp then
       multi_defs := IntSet.add temp !multi_defs
     else
@@ -1501,113 +1297,52 @@ let make_linear_analyzer
   let memo =
     Hashtbl.create (max 16 f.temp_count)
   in
-  let exact_merge_reported =
-    Hashtbl.create (max 8 (IntSet.cardinal multi_defs))
-  in
-  let report_exact_merge temp key =
-    if
-      advanced_exact_multidef_merge_debug_enabled ()
-      && not (Hashtbl.mem exact_merge_reported temp)
-    then begin
-      Hashtbl.add exact_merge_reported temp ();
-      Printf.eprintf
-        "adv-exact-multidef-merge func=%s temp=%d defs=%d key=%s\n%!"
-        f.name
-        temp
-        (match Hashtbl.find_opt all_def_instrs temp with
-         | Some defs -> List.length defs
-         | None -> 0)
-        (string_of_canonical_scalar_key key)
-    end
-  in
   let rec of_operand seen = function
     | Tcg.Imm value ->
         canonical_scalar_const value
     | Tcg.Temp temp ->
-        if IntSet.mem temp seen then
+        if
+          IntSet.mem temp multi_defs
+          || IntSet.mem temp seen
+        then
           linear_atom temp
         else
           match Hashtbl.find_opt memo temp with
           | Some form ->
               form
           | None ->
-              let seen = IntSet.add temp seen in
+              let seen =
+                IntSet.add temp seen
+              in
               let form =
-                if IntSet.mem temp multi_defs then
-                  match exact_multi_def_form seen temp with
-                  | Some merged ->
-                      merged
-                  | None ->
-                      linear_atom temp
-                else
-                  match Hashtbl.find_opt def_instrs temp with
-                  | Some instr ->
-                      form_of_def seen temp instr
-                  | None ->
-                      linear_atom temp
+                match Hashtbl.find_opt
+                        def_instrs temp
+                with
+                | Some (Tcg.Move (_, src))
+                | Some (Tcg.Un (_, UPlus, src)) ->
+                    of_operand seen src
+                | Some (Tcg.Un (_, UMinus, src)) ->
+                    canonical_scalar_un
+                      UMinus
+                      (of_operand seen src)
+                | Some
+                    (Tcg.Bin
+                       (_, ((Add | Sub | Mul) as op),
+                        lhs, rhs)) ->
+                    canonical_scalar_bin
+                      op
+                      (of_operand seen lhs)
+                      (of_operand seen rhs)
+                | Some (Tcg.Un _)
+                | Some (Tcg.Bin _)
+                | Some (Tcg.Load _)
+                | Some (Tcg.Store _)
+                | Some (Tcg.Call _)
+                | None ->
+                    linear_atom temp
               in
               Hashtbl.replace memo temp form;
               form
-
-  and form_of_def seen temp = function
-    | Tcg.Move (_, src)
-    | Tcg.Un (_, UPlus, src) ->
-        of_operand seen src
-    | Tcg.Un (_, UMinus, src) ->
-        canonical_scalar_un
-          UMinus
-          (of_operand seen src)
-    | Tcg.Bin
-        (_, ((Add | Sub | Mul) as op), lhs, rhs) ->
-        canonical_scalar_bin
-          op
-          (of_operand seen lhs)
-          (of_operand seen rhs)
-    | Tcg.Un _
-    | Tcg.Bin _
-    | Tcg.Load _
-    | Tcg.Store _
-    | Tcg.Call _ ->
-        linear_atom temp
-
-  and exact_multi_def_form seen temp =
-    if not (advanced_exact_multidef_merge_enabled ()) then
-      None
-    else
-      match Hashtbl.find_opt all_def_instrs temp with
-      | None | Some [] | Some [ _ ] ->
-          None
-      | Some defs ->
-          let forms =
-            List.map (form_of_def seen temp) defs
-          in
-          match forms with
-          | [] ->
-              None
-          | first :: rest ->
-              let key =
-                canonical_scalar_key_of_form first
-              in
-              (* A program-point-sensitive temp may not be smuggled back
-                 through the merged form, directly or through another
-                 multi-defined temp.  Only stable single-definition atoms are
-                 allowed underneath an exact multi-def merge. *)
-              if
-                canonical_scalar_key_has_any_temp
-                  multi_defs key
-              then
-                None
-              else if
-                List.for_all
-                  (fun form ->
-                    canonical_scalar_key_of_form form = key)
-                  rest
-              then begin
-                report_exact_merge temp key;
-                Some first
-              end
-              else
-                None
   in
   fun operand ->
     of_operand IntSet.empty operand
@@ -2087,46 +1822,10 @@ let fold_fact_bin op a b =
 let kill_place_facts places state =
   PlaceSet.fold (fun place acc -> set_place_fact acc place CpNac) places state
 
-(* Second-wave advanced optimization: whole-program readonly globals.
-   A global initializer is a valid function-entry constant outside [main] only
-   when no function in the current whole-program effect summary may write it.
-   Unknown callees are already represented conservatively by the effect
-   summaries, so this remains sound without external-link assumptions. *)
-let advanced_readonly_global_cp_enabled () =
-  Sys.getenv_opt "TOYC_DISABLE_ADV_READONLY_GLOBAL_CP" = None
-
-let advanced_readonly_global_cp_debug_enabled () =
-  Sys.getenv_opt "TOYC_DEBUG_ADV_READONLY_GLOBAL_CP" <> None
-
-let advanced_whole_program_written_globals summaries =
-  Hashtbl.fold
-    (fun _label (summary : func_effect_summary) acc ->
-      PlaceSet.union acc summary.written_globals)
-    summaries PlaceSet.empty
-
-let advanced_readonly_global_cp_facts global_init summaries =
-  if not (advanced_readonly_global_cp_enabled ()) then PlaceMap.empty
-  else
-    let written = advanced_whole_program_written_globals summaries in
-    PlaceMap.fold
-      (fun place fact acc ->
-        match place with
-        | Tcg.Global _ when not (PlaceSet.mem place written) ->
-            PlaceMap.add place fact acc
-        | Tcg.Global _ | Tcg.Local _ ->
-            acc)
-      global_init PlaceMap.empty
-
-let initial_cp_state global_init readonly_global_init (f : Cfg.func) =
+let initial_cp_state global_init (f : Cfg.func) =
   let global_init =
     if f.name = "main" then global_init
-    else
-      PlaceMap.mapi
-        (fun place _ ->
-          match PlaceMap.find_opt place readonly_global_init with
-          | Some fact -> fact
-          | None -> CpNac)
-        global_init
+    else PlaceMap.map (fun _ -> CpNac) global_init
   in
   let places =
     List.fold_left
@@ -2282,7 +1981,6 @@ type item8_const_cache_key =
   * string
   * Tcg.var list
   * cp_fact PlaceMap.t
-  * cp_fact PlaceMap.t
   * item8_const_callee_context list
 
 type item8_const_cache_value =
@@ -2308,34 +2006,21 @@ let item8_const_callee_context summaries globals (f : Cfg.func) =
   |> List.map (fun callee ->
          (callee, call_written_globals summaries globals callee))
 
-let item8_const_cache_key
-    global_init
-    readonly_global_init
-    summaries
-    globals
-    (f : Cfg.func) =
+let item8_const_cache_key global_init summaries globals (f : Cfg.func) =
   ( item8_func_shape_key f,
     f.name,
     f.params,
     global_init,
-    readonly_global_init,
     item8_const_callee_context summaries globals f )
 
-let compute_const_states_uncached
-    global_init
-    readonly_global_init
-    summaries
-    globals
-    (f : Cfg.func) =
+let compute_const_states_uncached global_init summaries globals (f : Cfg.func) =
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block) f.blocks;
   let in_states = Hashtbl.create (List.length f.blocks) in
   let out_states = Hashtbl.create (List.length f.blocks) in
   let executable = ref (LabelSet.singleton f.entry) in
   let executable_edges = Hashtbl.create (max 8 (2 * List.length f.blocks)) in
-  let entry_state =
-    initial_cp_state global_init readonly_global_init f
-  in
+  let entry_state = initial_cp_state global_init f in
   let meet_states = function
     | [] -> empty_cp_state
     | state :: rest -> List.fold_left meet_cp_state state rest
@@ -2395,13 +2080,7 @@ let compute_const_states global_init summaries globals (f : Cfg.func) =
     item8_note_seen item8_const_seen item8_const_repeats (item8_func_shape_key f)
   end;
   if !item8_manager_debug_active then incr item8_manager_const_requests;
-  let readonly_global_init =
-    advanced_readonly_global_cp_facts global_init summaries
-  in
-  let key =
-    item8_const_cache_key
-      global_init readonly_global_init summaries globals f
-  in
+  let key = item8_const_cache_key global_init summaries globals f in
   match item8_analysis_cache_find const_state_cache_table key with
   | Some cached ->
       if !item8_manager_debug_active then incr item8_manager_const_hits;
@@ -2409,43 +2088,13 @@ let compute_const_states global_init summaries globals (f : Cfg.func) =
   | None ->
       if !item8_manager_debug_active then incr item8_manager_const_computes;
       let result =
-        compute_const_states_uncached
-          global_init readonly_global_init summaries globals f
+        compute_const_states_uncached global_init summaries globals f
       in
       item8_analysis_cache_store const_state_cache_table key result;
       result
 
 let const_propagate_func global_init summaries globals (f : Cfg.func) =
-  let readonly_global_init =
-    advanced_readonly_global_cp_facts global_init summaries
-  in
-  let executable, in_states =
-    compute_const_states global_init summaries globals f
-  in
-  if advanced_readonly_global_cp_debug_enabled () then begin
-    let readonly_loads =
-      List.fold_left
-        (fun count (block : Cfg.block) ->
-          List.fold_left
-            (fun count instr ->
-              match instr with
-              | Tcg.Load (_, place)
-                when f.name <> "main"
-                     && PlaceMap.mem place readonly_global_init ->
-                  count + 1
-              | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _
-              | Tcg.Store _ | Tcg.Call _ ->
-                  count)
-            count block.body)
-        0 f.blocks
-    in
-    if readonly_loads <> 0 then
-      Printf.eprintf
-        "adv-readonly-cp func=%s readonly-globals=%d readonly-loads=%d\n%!"
-        f.name
-        (PlaceMap.cardinal readonly_global_init)
-        readonly_loads
-  end;
+  let executable, in_states = compute_const_states global_init summaries globals f in
   let blocks =
     List.filter_map
       (fun (block : Cfg.block) ->
@@ -2453,8 +2102,7 @@ let const_propagate_func global_init summaries globals (f : Cfg.func) =
           let state =
             match Hashtbl.find_opt in_states block.label with
             | Some state -> state
-            | None when block.label = f.entry ->
-                initial_cp_state global_init readonly_global_init f
+            | None when block.label = f.entry -> initial_cp_state global_init f
             | None -> empty_cp_state
           in
           Some (fst (run_transfer summaries globals state block))
@@ -4846,10 +4494,6 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
   attempt f all_candidates
 
 let promote_globals_func summaries globals (f : Cfg.func) =
-  let mustwrite_flush_calls = ref 0 in
-  let mustwrite_old_flushes = ref 0 in
-  let mustwrite_new_flushes = ref 0 in
-  let mustwrite_saved_actual = ref 0 in
   let stored_candidates = stored_globals_in_func f in
   let readonly_candidates = PlaceSet.diff (globals_in_func f) stored_candidates in
   let all_candidates = PlaceSet.union stored_candidates readonly_candidates in
@@ -4991,38 +4635,14 @@ let promote_globals_func summaries globals (f : Cfg.func) =
                 | Tcg.Store (place, value) when PlaceSet.mem place candidates ->
                     rewrite (PlaceMap.add place value env) acc rest
                 | Tcg.Call (_, callee, _) as instr ->
-                    let old_call_flushes =
+                    let call_flushes =
                       PlaceSet.inter
                         writeback_candidates
                         (call_touched_globals summaries globals callee)
                     in
-                    let call_flushes =
-                      PlaceSet.inter
-                        writeback_candidates
-                        (call_required_flush_globals summaries globals callee)
-                    in
                     let call_kills =
-                      PlaceSet.inter
-                        candidates
-                        (call_written_globals summaries globals callee)
+                      PlaceSet.inter candidates (call_written_globals summaries globals callee)
                     in
-                    if advanced_mustwrite_flush_debug_enabled () then begin
-                      incr mustwrite_flush_calls;
-                      mustwrite_old_flushes :=
-                        !mustwrite_old_flushes
-                        + PlaceSet.cardinal old_call_flushes;
-                      mustwrite_new_flushes :=
-                        !mustwrite_new_flushes
-                        + PlaceSet.cardinal call_flushes;
-                      let removed =
-                        PlaceSet.diff old_call_flushes call_flushes
-                      in
-                      PlaceSet.iter
-                        (fun place ->
-                          if PlaceMap.mem place env then
-                            incr mustwrite_saved_actual)
-                        removed
-                    end;
                     let flushed = flush_env_places call_flushes env in
                     let acc = List.rev_append (flushed @ [ instr ]) acc in
                     rewrite (kill_env_places call_kills env) acc rest
@@ -5082,20 +4702,7 @@ let promote_globals_func summaries globals (f : Cfg.func) =
         Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
     end
   in
-  let result = attempt all_candidates in
-  if
-    advanced_mustwrite_flush_debug_enabled ()
-    && (!mustwrite_flush_calls <> 0
-        || !mustwrite_saved_actual <> 0)
-  then
-    Printf.eprintf
-      "adv-mustwrite-flush func=%s calls=%d old-flush=%d new-flush=%d saved-actual=%d\n%!"
-      f.name
-      !mustwrite_flush_calls
-      !mustwrite_old_flushes
-      !mustwrite_new_flushes
-      !mustwrite_saved_actual;
-  result
+  attempt all_candidates
 
 let compute_dominators (f : Cfg.func) =
   if !item8_analysis_audit_active then begin
@@ -7201,42 +6808,6 @@ let loop_inv_expr_equal lhs rhs =
   canonical_scalar_key_equal
     (canonical_scalar_form_of_loop_inv_expr lhs)
     (canonical_scalar_form_of_loop_inv_expr rhs)
-
-let rec canonical_scalar_form_of_loop_inv_expr_with
-    (analyze : linear_analyzer)
-    expr =
-  match normalize_loop_inv_expr expr with
-  | LveConst value ->
-      canonical_scalar_const value
-  | LveOperand operand ->
-      analyze operand
-  | LveNeg inner ->
-      canonical_scalar_un
-        UMinus
-        (canonical_scalar_form_of_loop_inv_expr_with
-           analyze inner)
-  | LveAdd (lhs, rhs) ->
-      canonical_scalar_add
-        (canonical_scalar_form_of_loop_inv_expr_with
-           analyze lhs)
-        (canonical_scalar_form_of_loop_inv_expr_with
-           analyze rhs)
-  | LveMul (lhs, rhs) ->
-      canonical_scalar_mul
-        (canonical_scalar_form_of_loop_inv_expr_with
-           analyze lhs)
-        (canonical_scalar_form_of_loop_inv_expr_with
-           analyze rhs)
-
-let loop_inv_expr_semantically_equal_with
-    (analyze : linear_analyzer)
-    lhs
-    rhs =
-  canonical_scalar_key_equal
-    (canonical_scalar_form_of_loop_inv_expr_with
-       analyze lhs)
-    (canonical_scalar_form_of_loop_inv_expr_with
-       analyze rhs)
 
 let rec loop_inv_expr_temps expr =
   match normalize_loop_inv_expr expr with
@@ -26656,298 +26227,8 @@ let fold_late_equivalent_diamonds_func (f : Cfg.func) =
    The original loop is deliberately retained as a fallback.  This makes the
    transform profitable for ordinary positive runtime steps without changing
    zero/negative-step or overflow-sensitive behaviour. *)
-let advanced_symbolic_loop_residual_audit_enabled () =
-  Sys.getenv_opt "TOYC_DEBUG_ADV_SYMBOLIC_LOOP_RESIDUAL" <> None
-
-let advanced_runtime_control_recovery_enabled () =
-  Sys.getenv_opt "TOYC_DISABLE_ADV_RUNTIME_CONTROL_RECOVERY" = None
-
-let advanced_runtime_control_recovery_debug_enabled () =
-  Sys.getenv_opt "TOYC_DEBUG_ADV_RUNTIME_CONTROL_RECOVERY" <> None
-
-let advanced_string_has_prefix prefix s =
-  let lp = String.length prefix in
-  String.length s >= lp
-  && String.sub s 0 lp = prefix
-
-let advanced_symbolic_reject_category reason =
-  if advanced_string_has_prefix "body-chain-not-linear" reason then
-    "body-chain-not-linear"
-  else if advanced_string_has_prefix "body-chain-does-not-cover-loop" reason then
-    "body-chain-cover"
-  else if advanced_string_has_prefix "affine-body-shape" reason then
-    "affine-body-shape"
-  else if advanced_string_has_prefix "control-candidates" reason then
-    "control-shape"
-  else if advanced_string_has_prefix "effects" reason then
-    "effects"
-  else if advanced_string_has_prefix "self-add-count" reason then
-    "self-add-count"
-  else if reason = "no-symbolic-affine-lt-control-update" then
-    "no-symbolic-control"
-  else if reason = "initial-iv-scev-start-mismatch" then
-    "start-mismatch"
-  else if advanced_string_has_prefix "operand-unavailable" reason then
-    "operand-unavailable"
-  else if reason = "no-runtime-affine-reduction" then
-    "no-affine-reduction"
-  else if advanced_string_has_prefix "bad-liveout" reason then
-    "bad-liveout"
-  else if reason = "preheader-no-longer-reaches-loop" then
-    "preheader-disconnected"
-  else if reason = "outside-predecessor-count" then
-    "outside-pred-count"
-  else
-    "other"
-
-let advanced_lve_step_class expr =
-  match normalize_loop_inv_expr expr with
-  | LveConst _ ->
-      "const"
-  | LveOperand (Tcg.Imm _) ->
-      "const"
-  | LveOperand (Tcg.Temp _) ->
-      "symbolic-operand"
-  | LveNeg (LveOperand (Tcg.Temp _)) ->
-      "symbolic-neg-operand"
-  | LveNeg _
-  | LveAdd _
-  | LveMul _ ->
-      "symbolic-expr"
-
-let advanced_lve_expr_is_symbolic expr =
-  match advanced_lve_step_class expr with
-  | "const" -> false
-  | "symbolic-operand"
-  | "symbolic-neg-operand"
-  | "symbolic-expr" -> true
-  | _ -> true
-
-let advanced_symbolic_trip_spec_is_runtime (spec : symbolic_trip_spec) =
-  List.exists
-    advanced_lve_expr_is_symbolic
-    [ spec.symbolic_trip_start;
-      spec.symbolic_trip_step;
-      spec.symbolic_trip_scale;
-      spec.symbolic_trip_bias;
-      spec.symbolic_trip_bound ]
-
-let advanced_counter_inc table key =
-  let old =
-    Option.value ~default:0 (Hashtbl.find_opt table key)
-  in
-  Hashtbl.replace table key (old + 1)
-
-let advanced_term_kind = function
-  | Cfg.BranchCompare _ -> "branch-compare"
-  | Cfg.BranchZero _ -> "branch-zero"
-  | Cfg.BranchNonZero _ -> "branch-nonzero"
-  | Cfg.Jump _ -> "jump"
-  | Cfg.Return _ -> "return"
-
-let advanced_operand_uses_temp temp = function
-  | Tcg.Temp other -> temp = other
-  | Tcg.Imm _ -> false
-
-let advanced_instr_uses_temp temp = function
-  | Tcg.Move (_, src)
-  | Tcg.Un (_, _, src) ->
-      advanced_operand_uses_temp temp src
-  | Tcg.Bin (_, _, lhs, rhs) ->
-      advanced_operand_uses_temp temp lhs
-      || advanced_operand_uses_temp temp rhs
-  | Tcg.Load _ ->
-      false
-  | Tcg.Store (_, value) ->
-      advanced_operand_uses_temp temp value
-  | Tcg.Call (_, _, args) ->
-      List.exists (advanced_operand_uses_temp temp) args
-
-let advanced_term_uses_temp temp = function
-  | Cfg.BranchZero (cond, _, _)
-  | Cfg.BranchNonZero (cond, _, _) ->
-      advanced_operand_uses_temp temp cond
-  | Cfg.BranchCompare (_, lhs, rhs, _, _) ->
-      advanced_operand_uses_temp temp lhs
-      || advanced_operand_uses_temp temp rhs
-  | Cfg.Jump _
-  | Cfg.Return None ->
-      false
-  | Cfg.Return (Some value) ->
-      advanced_operand_uses_temp temp value
-
-let advanced_temp_def_in_block (block : Cfg.block) temp =
-  List.exists
-    (fun instr ->
-      match defs_temp instr with
-      | Some dst -> dst = temp
-      | None -> false)
-    block.body
-
-let advanced_temp_use_count_in_block (block : Cfg.block) temp =
-  let body_uses =
-    List.fold_left
-      (fun count instr ->
-        if advanced_instr_uses_temp temp instr then count + 1
-        else count)
-      0 block.body
-  in
-  body_uses
-  + if advanced_term_uses_temp temp block.term then 1 else 0
-
-let advanced_temp_use_count_in_blocks blocks temp =
-  List.fold_left
-    (fun count (block : Cfg.block) ->
-      count + advanced_temp_use_count_in_block block temp)
-    0 blocks
-
-let advanced_compare_chain_temps
-    all_blocks
-    (block : Cfg.block)
-    multi_defs
-    def_instrs =
-  let initial_operand =
-    match block.term with
-    | Cfg.BranchZero (cond, _, _)
-    | Cfg.BranchNonZero (cond, _, _) ->
-        Some cond
-    | Cfg.BranchCompare _
-    | Cfg.Jump _
-    | Cfg.Return _ ->
-        None
-  in
-  let rec walk seen temps = function
-    | Tcg.Imm _ ->
-        None
-    | Tcg.Temp temp ->
-        if IntSet.mem temp seen then None
-        else
-          match
-            def_instr_in_block_or_global
-              block multi_defs def_instrs temp
-          with
-          | Some (Tcg.Move (_, src))
-          | Some (Tcg.Un (_, UPlus, src))
-          | Some (Tcg.Un (_, UNot, src)) ->
-              walk
-                (IntSet.add temp seen)
-                (temp :: temps)
-                src
-          | Some (Tcg.Bin (_, op, _, _))
-            when is_compare_binop op ->
-              let temps = temp :: temps in
-              let all_local =
-                List.for_all
-                  (advanced_temp_def_in_block block)
-                  temps
-              in
-              let globally_single_use =
-                List.for_all
-                  (fun temp ->
-                    advanced_temp_use_count_in_blocks
-                      all_blocks temp = 1)
-                  temps
-              in
-              if all_local && globally_single_use then
-                Some
-                  (List.fold_left
-                     (fun set temp -> IntSet.add temp set)
-                     IntSet.empty temps)
-              else
-                None
-          | Some _
-          | None ->
-              None
-  in
-  match initial_operand with
-  | Some operand ->
-      walk IntSet.empty [] operand
-  | None ->
-      Some IntSet.empty
-
-let advanced_compare_chain_info
-    (block : Cfg.block)
-    multi_defs
-    def_instrs =
-  let initial_operand =
-    match block.term with
-    | Cfg.BranchZero (cond, _, _)
-    | Cfg.BranchNonZero (cond, _, _) ->
-        Some cond
-    | Cfg.BranchCompare _
-    | Cfg.Jump _
-    | Cfg.Return _ ->
-        None
-  in
-  let rec walk seen temps = function
-    | Tcg.Imm _ ->
-        None
-    | Tcg.Temp temp ->
-        if IntSet.mem temp seen then None
-        else
-          match
-            def_instr_in_block_or_global
-              block multi_defs def_instrs temp
-          with
-          | Some (Tcg.Move (_, src))
-          | Some (Tcg.Un (_, UPlus, src))
-          | Some (Tcg.Un (_, UNot, src)) ->
-              walk
-                (IntSet.add temp seen)
-                (temp :: temps)
-                src
-          | Some (Tcg.Bin (_, op, _, _))
-            when is_compare_binop op ->
-              let temps = temp :: temps in
-              let all_local =
-                List.for_all
-                  (advanced_temp_def_in_block block)
-                  temps
-              in
-              let single_use =
-                List.for_all
-                  (fun temp ->
-                    advanced_temp_use_count_in_block
-                      block temp = 1)
-                  temps
-              in
-              Some
-                ( List.length temps,
-                  all_local,
-                  single_use )
-          | Some _
-          | None ->
-              None
-  in
-  match initial_operand with
-  | Some operand ->
-      walk IntSet.empty [] operand
-  | None ->
-      None
-
 let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func) =
   let debug = Sys.getenv_opt "TOYC_DEBUG_LVE_SUMMARY" <> None in
-  let residual_audit =
-    advanced_symbolic_loop_residual_audit_enabled ()
-  in
-  let audit_addrec_headers = ref 0 in
-  let audit_symbolic_headers = ref 0 in
-  let audit_addrecs = ref 0 in
-  let audit_symbolic_addrecs = ref 0 in
-  let audit_control_candidates = ref 0 in
-  let audit_symbolic_control_candidates = ref 0 in
-  let audit_trip_specs = ref 0 in
-  let audit_runtime_trip_specs = ref 0 in
-  let audit_applied = ref 0 in
-  let audit_rejects = Hashtbl.create 16 in
-  let audit_symbolic_rejects = Hashtbl.create 16 in
-  let audit_symbolic_loop_info = Hashtbl.create 16 in
-  let audit_semantic_start_recoverable = ref 0 in
-  let audit_semantic_start_unrecoverable = ref 0 in
-  let residual_linear_analyze =
-    if residual_audit then Some (make_linear_analyzer f)
-    else None
-  in
   let _block_map, loops, headers = discover_natural_loops f in
   if headers = [] then f
   else
@@ -26959,110 +26240,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
     let update_block (block : Cfg.block) =
       Hashtbl.replace current_blocks block.label block
     in
-    if residual_audit then
-      List.iter
-        (fun header ->
-          let loop =
-            table_find_or_empty loops header LabelSet.empty
-          in
-          let loop_defs, _def_blocks, def_instrs, multi_defs =
-            analyze_temp_defs_of_blocks
-              ~loop f.temp_count f.blocks
-          in
-          let analysis =
-            build_loop_recurrence_analysis
-              header loop get_block
-              loop_defs multi_defs def_instrs
-          in
-          let addrecs =
-            analysis.loop_recurrence_addrecs
-          in
-          let symbolic_addrecs =
-            List.filter
-              (fun (addrec : loop_addrec) ->
-                advanced_lve_expr_is_symbolic
-                  addrec.addrec_step)
-              addrecs
-          in
-          if addrecs <> [] then
-            incr audit_addrec_headers;
-          if symbolic_addrecs <> [] then
-            incr audit_symbolic_headers;
-          audit_addrecs :=
-            !audit_addrecs + List.length addrecs;
-          audit_symbolic_addrecs :=
-            !audit_symbolic_addrecs
-            + List.length symbolic_addrecs;
-          let control =
-            find_recurrence_loop_control_candidate
-              analysis.loop_recurrence_facts
-              multi_defs def_instrs
-          in
-          let trip_spec =
-            Option.bind
-              control
-              (symbolic_trip_spec_of_candidate
-                 analysis.loop_recurrence_facts)
-          in
-          begin
-            match control with
-            | Some candidate ->
-                incr audit_control_candidates;
-                if
-                  advanced_lve_expr_is_symbolic
-                    candidate
-                      .recurrence_control_base
-                      .addrec_step
-                then
-                  incr audit_symbolic_control_candidates
-            | None -> ()
-          end;
-          let runtime_trip =
-            match trip_spec with
-            | Some spec ->
-                incr audit_trip_specs;
-                if advanced_symbolic_trip_spec_is_runtime spec then begin
-                  incr audit_runtime_trip_specs;
-                  true
-                end
-                else false
-            | None ->
-                false
-          in
-          let symbolic_control =
-            match control with
-            | Some candidate ->
-                advanced_lve_expr_is_symbolic
-                  candidate.recurrence_control_base.addrec_step
-            | None ->
-                false
-          in
-          Hashtbl.replace
-            audit_symbolic_loop_info
-            header
-            (List.length symbolic_addrecs, symbolic_control, runtime_trip);
-          Printf.eprintf
-            "adv-symbolic-loop-scan func=%s header=%s blocks=%d addrecs=%d symbolic-addrecs=%d control=%d trip-spec=%d runtime-trip=%d steps={%s}\n%!"
-            f.name
-            header
-            (LabelSet.cardinal loop)
-            (List.length addrecs)
-            (List.length symbolic_addrecs)
-            (if Option.is_some control then 1 else 0)
-            (if Option.is_some trip_spec then 1 else 0)
-            (if runtime_trip then 1 else 0)
-            (String.concat ","
-               (List.map
-                  (fun (addrec : loop_addrec) ->
-                    Printf.sprintf
-                      "t%d:%s:%s"
-                      addrec.addrec_phi_temp
-                      (advanced_lve_step_class
-                         addrec.addrec_step)
-                      (string_of_loop_inv_expr
-                         addrec.addrec_step))
-                  addrecs)))
-        headers;
     let doms = compute_dominators f in
     let live_in_t, _ = compute_liveness summaries globals f in
     let operand_available_at_preheader def_blocks multi_defs preheader_label operand =
@@ -27083,32 +26260,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
       Printf.sprintf ".L%s_lve_summary_%d_%s" f.label id suffix
     in
     let reject header reason =
-      if residual_audit then begin
-        let category =
-          advanced_symbolic_reject_category reason
-        in
-        advanced_counter_inc audit_rejects category;
-        let symbolic_addrecs, symbolic_control, runtime_trip =
-          Option.value
-            ~default:(0, false, false)
-            (Hashtbl.find_opt audit_symbolic_loop_info header)
-        in
-        let symbolic_relevant =
-          symbolic_addrecs > 0 || runtime_trip
-        in
-        if symbolic_relevant then
-          advanced_counter_inc audit_symbolic_rejects category;
-        Printf.eprintf
-          "adv-symbolic-loop-reject func=%s header=%s category=%s symbolic-relevant=%d symbolic-addrecs=%d symbolic-control=%d runtime-trip=%d reason=%s\n%!"
-          f.name
-          header
-          category
-          (if symbolic_relevant then 1 else 0)
-          symbolic_addrecs
-          (if symbolic_control then 1 else 0)
-          (if runtime_trip then 1 else 0)
-          reason
-      end;
       if debug then
         Printf.eprintf
           "lve-runtime-summary-reject func=%s header=%s reason=%s\n%!"
@@ -27200,93 +26351,38 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
           None
     in
 
-    let branch_continue_in_loop
-        all_blocks
-        loop
-        multi_defs
-        def_instrs
-        (block : Cfg.block) =
-      let direct_or_recovered =
-        match block.term with
-        | Cfg.BranchCompare (op, lhs, rhs, yes_label, no_label) ->
-            Some
-              ( op, lhs, rhs, yes_label, no_label,
-                IntSet.empty, false )
-        | (Cfg.BranchZero _ | Cfg.BranchNonZero _)
-          when advanced_runtime_control_recovery_enabled () ->
-            begin
-              match
-                ( branch_compare_shape_in_block
-                    block multi_defs def_instrs block.term,
-                  advanced_compare_chain_temps
-                    all_blocks block multi_defs def_instrs )
-              with
-              | Some (op, lhs, rhs, yes_label, no_label),
-                Some control_only_temps ->
-                  Some
-                    ( op, lhs, rhs, yes_label, no_label,
-                      control_only_temps, true )
-              | _ ->
-                  None
-            end
-        | Cfg.BranchZero _
-        | Cfg.BranchNonZero _
-        | Cfg.Jump _
-        | Cfg.Return _ ->
-            None
-      in
-      match direct_or_recovered with
-      | None ->
-          None
-      | Some
-          ( op, lhs, rhs, yes_label, no_label,
-            control_only_temps, recovered ) ->
+    let branch_continue_lt_in_loop loop term =
+      match term with
+      | Cfg.BranchCompare (op, lhs, rhs, yes_label, no_label) ->
           let yes_inside = LabelSet.mem yes_label loop in
           let no_inside = LabelSet.mem no_label loop in
-          if yes_inside = no_inside then
-            None
+          if yes_inside = no_inside then None
           else if yes_inside then
-            Some
-              ( op, lhs, rhs, yes_label, no_label,
-                control_only_temps, recovered )
+            Some (op, lhs, rhs, yes_label, no_label)
           else
-            Some
-              ( invert_compare op, lhs, rhs,
-                no_label, yes_label,
-                control_only_temps, recovered )
+            Some (invert_compare op, lhs, rhs, no_label, yes_label)
+      | Cfg.BranchZero _
+      | Cfg.BranchNonZero _
+      | Cfg.Jump _
+      | Cfg.Return _ ->
+          None
     in
 
     let find_runtime_summary_shape loop =
       let loop_blocks =
         LabelSet.elements loop |> List.map get_block
       in
-      let current_blocks_snapshot =
-        Hashtbl.fold
-          (fun _ (block : Cfg.block) acc ->
-            block :: acc)
-          current_blocks
-          []
-      in
-      let _loop_defs, _def_blocks, def_instrs, multi_defs =
-        analyze_temp_defs_of_blocks
-          ~loop f.temp_count current_blocks_snapshot
-      in
       let control_candidates =
         List.filter_map
           (fun (candidate : Cfg.block) ->
             Option.map
               (fun branch -> (candidate, branch))
-              (branch_continue_in_loop
-                 current_blocks_snapshot
-                 loop multi_defs def_instrs candidate))
+              (branch_continue_lt_in_loop loop candidate.term))
           loop_blocks
       in
       match control_candidates with
       | [ (control_block,
-           ( branch_op, lhs, rhs,
-             continue_label, exit_label,
-             control_only_temps,
-             recovered_control )) ] ->
+           (branch_op, lhs, rhs, continue_label, exit_label)) ] ->
           let rec trace_body_chain visited labels_rev instrs current_label =
             if current_label = control_block.label then
               Some (visited, List.rev labels_rev, instrs)
@@ -27367,18 +26463,9 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                    | Tcg.Call _ ->
                        false
                  in
-                  let control_only_instr instr =
-                    match defs_temp instr with
-                    | Some dst ->
-                        IntSet.mem dst control_only_temps
-                    | None ->
-                        false
-                  in
                   let extra_instrs =
                     List.filter
-                      (fun instr ->
-                        Option.is_none (self_add instr)
-                        && not (control_only_instr instr))
+                      (fun instr -> Option.is_none (self_add instr))
                       body_instrs
                   in
                   let extra_instr_budget = 6 in
@@ -27412,18 +26499,7 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                          (List.length extra_instrs)
                          extra_instr_budget
                          (List.length nonpure_extra))
-                 else begin
-                   if
-                     recovered_control
-                     && advanced_runtime_control_recovery_debug_enabled ()
-                   then
-                     Printf.eprintf
-                       "adv-runtime-control-recovery func=%s control=%s chain-temps=%d body-instrs=%d extras=%d\n%!"
-                       f.name
-                       control_block.label
-                       (IntSet.cardinal control_only_temps)
-                       (List.length body_instrs)
-                       (List.length extra_instrs);
+                 else
                    Ok
                      ( body_instrs,
                        body_labels,
@@ -27431,80 +26507,13 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                        branch_op,
                        lhs,
                        rhs,
-                       exit_label )
-                 end)
+                       exit_label ))
       | _ ->
           Error
             (Printf.sprintf
                "control-candidates blocks=%d control=%d"
                (List.length loop_blocks)
                (List.length control_candidates))
-    in
-
-    let audit_control_shape_recovery discovered_header loop =
-      if residual_audit then begin
-        let current_blocks_snapshot =
-          Hashtbl.fold
-            (fun _ (block : Cfg.block) acc ->
-              block :: acc)
-            current_blocks
-            []
-        in
-        let _loop_defs, _def_blocks, def_instrs, multi_defs =
-          analyze_temp_defs_of_blocks
-            ~loop f.temp_count current_blocks_snapshot
-        in
-        let recovered =
-          LabelSet.elements loop
-          |> List.filter_map
-               (fun label ->
-                 let block : Cfg.block = get_block label in
-                 match
-                   branch_compare_shape_in_block
-                     block multi_defs def_instrs block.term
-                 with
-                 | Some (op, lhs, rhs, yes_label, no_label)
-                   when
-                     LabelSet.mem yes_label loop
-                     <> LabelSet.mem no_label loop ->
-                     Some
-                       ( block,
-                         op,
-                         lhs,
-                         rhs,
-                         advanced_compare_chain_info
-                           block multi_defs def_instrs )
-                 | Some _
-                 | None ->
-                     None)
-        in
-        let semantic_count = List.length recovered in
-        begin
-          match recovered with
-          | [ (block, _op, _lhs, _rhs, chain_info) ] ->
-              let chain_len, all_local, single_use =
-                match chain_info with
-                | Some (len, local, one_use) ->
-                    (len, local, one_use)
-                | None ->
-                    (0, false, false)
-              in
-              Printf.eprintf
-                "adv-symbolic-control-recovery func=%s header=%s semantic-controls=1 term=%s chain-len=%d chain-all-local=%d chain-single-use=%d\n%!"
-                f.name
-                discovered_header
-                (advanced_term_kind block.term)
-                chain_len
-                (if all_local then 1 else 0)
-                (if single_use then 1 else 0)
-          | _ ->
-              Printf.eprintf
-                "adv-symbolic-control-recovery func=%s header=%s semantic-controls=%d term=multiple-or-none chain-len=0 chain-all-local=0 chain-single-use=0\n%!"
-                f.name
-                discovered_header
-                semantic_count
-        end
-      end
     in
 
     List.iter
@@ -27515,13 +26524,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
         in
         match find_runtime_summary_shape loop with
         | Error reason ->
-            if
-              residual_audit
-              && advanced_symbolic_reject_category reason
-                 = "control-shape"
-            then
-              audit_control_shape_recovery
-                discovered_header loop;
             reject discovered_header reason
         | Ok
             ( body_instrs,
@@ -28647,53 +27649,9 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                           | None, _ ->
                               initial_zero
                         in
-                        if not semantic_start_agrees then begin
-                          if residual_audit then begin
-                            let semantic_recoverable =
-                              match
-                                ( residual_linear_analyze,
-                                  symbolic_trip_spec,
-                                  initial_iv_expr )
-                              with
-                              | Some analyze, Some spec, Some init_expr ->
-                                  loop_inv_expr_semantically_equal_with
-                                    analyze
-                                    spec.symbolic_trip_start
-                                    init_expr
-                              | Some analyze, None, Some init_expr ->
-                                  loop_inv_expr_semantically_equal_with
-                                    analyze
-                                    scalar_inv_zero
-                                    init_expr
-                              | Some _, Some _, None
-                              | Some _, None, None
-                              | None, _, _ ->
-                                  false
-                            in
-                            if semantic_recoverable then
-                              incr audit_semantic_start_recoverable
-                            else
-                              incr audit_semantic_start_unrecoverable;
-                            Printf.eprintf
-                              "adv-symbolic-start-mismatch func=%s header=%s recoverable=%d trip-start=%s init=%s\n%!"
-                              f.name
-                              header
-                              (if semantic_recoverable then 1 else 0)
-                              (match symbolic_trip_spec with
-                               | Some spec ->
-                                   string_of_loop_inv_expr
-                                     spec.symbolic_trip_start
-                               | None ->
-                                   "0")
-                              (match initial_iv_expr with
-                               | Some expr ->
-                                   string_of_loop_inv_expr expr
-                               | None ->
-                                   "<unknown>")
-                          end;
+                        if not semantic_start_agrees then
                           reject header
                             "initial-iv-scev-start-mismatch"
-                        end
                         else
                           let proof_control_start_expr =
                             match symbolic_trip_spec with
@@ -29968,30 +28926,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                   apply_block ];
 
                                               changed := true;
-                                              if residual_audit then begin
-                                                incr audit_applied;
-                                                Printf.eprintf
-                                                  "adv-symbolic-loop-apply func=%s header=%s iv=t%d step-class=%s step=%s bound=%s trip-mode=%s\n%!"
-                                                  f.name
-                                                  header
-                                                  iv_temp
-                                                  (advanced_lve_step_class
-                                                     step_expr)
-                                                  (string_of_loop_inv_expr
-                                                     step_expr)
-                                                  (string_of_lve_operand
-                                                     bound_operand)
-                                                  (match symbolic_trip_spec with
-                                                   | Some spec
-                                                     when
-                                                       advanced_symbolic_trip_spec_is_runtime
-                                                         spec ->
-                                                       "runtime"
-                                                   | Some _ ->
-                                                       "static"
-                                                   | None ->
-                                                       "legacy")
-                                              end;
                                               if debug then
                                                 Printf.eprintf
                                                   "lve-runtime-invariant-affine-summary func=%s header=%s iv=t%d scale=%s bias=%s control-start=%s acc=t%d reduction=%s step=%s bound=%s fallback=%s\n%!"
@@ -30176,20 +29110,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                   apply_block ];
 
                                               changed := true;
-                                              if residual_audit then begin
-                                                incr audit_applied;
-                                                Printf.eprintf
-                                                  "adv-symbolic-loop-apply func=%s header=%s iv=t%d step-class=%s step=%s bound=%s trip-mode=legacy-runtime\n%!"
-                                                  f.name
-                                                  header
-                                                  iv_temp
-                                                  (advanced_lve_step_class
-                                                     step_expr)
-                                                  (string_of_loop_inv_expr
-                                                     step_expr)
-                                                  (string_of_lve_operand
-                                                     bound_operand)
-                                              end;
                                               if debug then
                                                 Printf.eprintf
                                                   "lve-runtime-summary func=%s header=%s blocks=%d iv=t%d acc=t%d reduction=%s step=%s bound=%s fallback=%s\n%!"
@@ -30220,45 +29140,6 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                              end)
       | _ -> reject header "outside-predecessor-count")
       headers;
-
-    if residual_audit then begin
-      let reject_total =
-        Hashtbl.fold
-          (fun _ count total -> total + count)
-          audit_rejects 0
-      in
-      Printf.eprintf
-        "adv-symbolic-loop-summary func=%s loops=%d addrec-headers=%d symbolic-headers=%d addrecs=%d symbolic-addrecs=%d controls=%d symbolic-controls=%d trip-specs=%d runtime-trip-specs=%d applied=%d rejected=%d symbolic-rejected=%d start-recoverable=%d start-unrecoverable=%d\n%!"
-        f.name
-        (List.length headers)
-        !audit_addrec_headers
-        !audit_symbolic_headers
-        !audit_addrecs
-        !audit_symbolic_addrecs
-        !audit_control_candidates
-        !audit_symbolic_control_candidates
-        !audit_trip_specs
-        !audit_runtime_trip_specs
-        !audit_applied
-        reject_total
-        (Hashtbl.fold
-           (fun _ count total -> total + count)
-           audit_symbolic_rejects 0)
-        !audit_semantic_start_recoverable
-        !audit_semantic_start_unrecoverable;
-      Hashtbl.iter
-        (fun category count ->
-          Printf.eprintf
-            "adv-symbolic-loop-reject-summary func=%s category=%s count=%d\n%!"
-            f.name category count)
-        audit_rejects;
-      Hashtbl.iter
-        (fun category count ->
-          Printf.eprintf
-            "adv-symbolic-focused-reject-summary func=%s category=%s count=%d\n%!"
-            f.name category count)
-        audit_symbolic_rejects
-    end;
 
     if !changed then
       let original_labels =
@@ -37011,9 +35892,6 @@ let item7_debug_callsite_global_snapshot
 
     List.iter
       (fun (caller : Cfg.func) ->
-        let readonly_global_init =
-          advanced_readonly_global_cp_facts global_init fresh_summaries
-        in
         let executable, in_states =
           compute_const_states global_init fresh_summaries globals caller
         in
@@ -37024,8 +35902,7 @@ let item7_debug_callsite_global_snapshot
                 match Hashtbl.find_opt in_states block.label with
                 | Some state -> state
                 | None when block.label = caller.entry ->
-                    initial_cp_state
-                      global_init readonly_global_init caller
+                    initial_cp_state global_init caller
                 | None -> empty_cp_state
               in
               let rec walk state = function

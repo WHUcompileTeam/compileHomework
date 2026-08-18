@@ -110,12 +110,6 @@ let first_and_rest = function
   | [] -> (None, [])
   | head :: rest -> (Some head, rest)
 
-let is_int64_literal s =
-  try
-    ignore (Int64.of_string s);
-    true
-  with _ -> false
-
 let uses_defs line =
   let s = trim line in
   if s = "" || is_label line || starts_with s "." then (RegSet.empty, RegSet.empty)
@@ -137,21 +131,10 @@ let uses_defs line =
               | dst :: _ when is_register dst -> (RegSet.empty, RegSet.singleton dst)
               | _ -> (operand_regs, RegSet.empty))
           | "lw" | "addi" | "add" | "sub" | "mul" | "div" | "rem"
-          | "slt" | "sltu" | "slti" | "sltiu"
-          | "slli" | "srli" | "srai"
-          | "andi" | "xor" | "xori" | "neg" ->
+          | "slt" | "sltu" | "sltiu" | "xori" | "neg" ->
               def_first ()
-          | "sw" -> (
-              match operands with
-              | [ src; symbol; scratch ]
-                when is_register src
-                     && is_register scratch
-                     && not (is_int64_literal symbol) ->
-                  (* GNU pseudo: sw rs, symbol, scratch.
-                     rs is read; scratch is clobbered by the AUIPC expansion. *)
-                  (RegSet.singleton src, RegSet.singleton scratch)
-              | _ ->
-                  (operand_regs, RegSet.empty))
+          | "sw" ->
+              (operand_regs, RegSet.empty)
           | "beq" | "bne" | "blt" | "bge" | "bltu" | "bgeu"
           | "beqz" | "bnez" ->
               (operand_regs, RegSet.empty)
@@ -353,451 +336,333 @@ let peephole_pass asm =
   in
   String.concat "\n" (loop 0 []) ^ "\n"
 
-(* -------------------------------------------------------------------------- *)
-(* #10 final generic post-RA machine cleanup.                                 *)
-(*                                                                            *)
-(* These rules are workload-independent and only fire when they strictly      *)
-(* remove machine instructions or redirect control flow without changing      *)
-(* semantics.  They run after the older peephole pass and participate in the  *)
-(* same fixed point.                                                          *)
-(* -------------------------------------------------------------------------- *)
+let item10_machine_mix_audit_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ITEM10_MACHINE_MIX" <> None
+  && Array.exists (fun arg -> arg = "-opt") Sys.argv
 
-let item10_final_asm_cleanup_enabled () =
-  Sys.getenv_opt "TOYC_DISABLE_ITEM10_FINAL_ASM_CLEANUP" = None
-
-let item10_parse_li line =
-  match split_asm_words line with
-  | [ "li"; dst; imm ] when is_register dst -> (
-      match parse_int64 imm with
-      | Some value -> Some (dst, value)
-      | None -> None)
-  | _ -> None
-
-let item10_positive_pow2_shift value =
-  if Int64.compare value 0L <= 0 then None
-  else
-    let rec loop v shift =
-      if v = 1L then Some shift
-      else if Int64.logand v 1L <> 0L then None
-      else if shift >= 31 then None
-      else loop (Int64.shift_right_logical v 1) (shift + 1)
-    in
-    loop value 0
-
-type item10_branch =
-  | Item10BranchZero of string * string * string
-  | Item10BranchBinary of string * string * string * string
-
-let item10_parse_branch line =
-  match split_asm_words line with
-  | [ (("beqz" | "bnez") as opcode); reg; target ] ->
-      Some (Item10BranchZero (opcode, reg, target))
-  | [ (("beq" | "bne" | "blt" | "bge" | "bltu" | "bgeu") as opcode);
-      lhs; rhs; target ] ->
-      Some (Item10BranchBinary (opcode, lhs, rhs, target))
-  | _ -> None
-
-let item10_branch_line = function
-  | Item10BranchZero (opcode, reg, target) ->
-      Printf.sprintf "    %s %s, %s" opcode reg target
-  | Item10BranchBinary (opcode, lhs, rhs, target) ->
-      Printf.sprintf "    %s %s, %s, %s" opcode lhs rhs target
-
-let item10_replace_branch_reg branch old_reg new_reg =
-  match branch with
-  | Item10BranchZero (opcode, reg, target) ->
-      Item10BranchZero
-        (opcode, (if reg = old_reg then new_reg else reg), target)
-  | Item10BranchBinary (opcode, lhs, rhs, target) ->
-      Item10BranchBinary
-        ( opcode,
-          (if lhs = old_reg then new_reg else lhs),
-          (if rhs = old_reg then new_reg else rhs),
-          target )
-
-let item10_replace_branch_target branch new_target =
-  match branch with
-  | Item10BranchZero (opcode, reg, _) ->
-      Item10BranchZero (opcode, reg, new_target)
-  | Item10BranchBinary (opcode, lhs, rhs, _) ->
-      Item10BranchBinary (opcode, lhs, rhs, new_target)
-
-let item10_branch_target = function
-  | Item10BranchZero (_, _, target)
-  | Item10BranchBinary (_, _, _, target) ->
-      target
-
-let item10_is_ignorable_line line =
+let item10_is_exec_line line =
   let s = trim line in
-  s = "" || starts_with s "."
+  s <> "" && not (is_label line) && not (starts_with s ".")
 
-let item10_build_label_pos lines =
-  let table = Hashtbl.create 64 in
-  Array.iteri
-    (fun i line ->
-      if is_label line then
-        Hashtbl.replace table (label_name line) i)
-    lines;
-  table
-
-let rec item10_first_exec_after lines i =
-  if i >= Array.length lines then None
-  else if is_label lines.(i) || item10_is_ignorable_line lines.(i) then
-    item10_first_exec_after lines (i + 1)
-  else
-    Some i
-
-type item10_target_resolution =
-  | Item10TargetRet
-  | Item10TargetLabel of string
-
-let item10_resolve_target lines label_pos original =
-  let rec loop visited label =
-    if List.mem label visited then Item10TargetLabel original
-    else
-      match Hashtbl.find_opt label_pos label with
-      | None -> Item10TargetLabel label
-      | Some pos -> (
-          match item10_first_exec_after lines (pos + 1) with
-          | Some instr_pos -> (
-              match split_asm_words lines.(instr_pos) with
-              | [ "ret" ] -> Item10TargetRet
-              | [ "j"; next ] ->
-                  loop (label :: visited) next
-              | _ -> Item10TargetLabel label)
-          | None -> Item10TargetLabel label)
+let item10_next_exec_line lines start =
+  let n = Array.length lines in
+  let rec loop i =
+    if i >= n then None
+    else if item10_is_exec_line lines.(i) then Some (i, lines.(i))
+    else if is_label lines.(i) then None
+    else loop (i + 1)
   in
-  loop [] original
+  loop start
 
-let item10_branch_target_is_next lines label_pos i target =
-  match Hashtbl.find_opt label_pos target with
-  | Some target_pos when target_pos > i ->
-      let rec only_ignorable j =
-        if j >= target_pos then true
-        else if is_label lines.(j) || item10_is_ignorable_line lines.(j) then
-          only_ignorable (j + 1)
-        else
-          false
-      in
-      only_ignorable (i + 1)
-  | Some _ | None -> false
+let item10_mem_base operands =
+  match operands with
+  | _reg :: _off :: base :: _ -> Some base
+  | _ -> None
 
-let item10_constant_branch branch =
-  match branch with
-  | Item10BranchZero ("beqz", "x0", target) ->
-      Some (Some (Printf.sprintf "    j %s" target))
-  | Item10BranchZero ("bnez", "x0", _) ->
-      Some None
-  | Item10BranchZero _ ->
-      None
-  | Item10BranchBinary (opcode, lhs, rhs, target)
-    when lhs = rhs ->
-      begin
-        match opcode with
-        | "beq" | "bge" | "bgeu" ->
-            Some (Some (Printf.sprintf "    j %s" target))
-        | "bne" | "blt" | "bltu" ->
-            Some None
-        | _ ->
-            None
-      end
-  | Item10BranchBinary _ ->
-      None
+let item10_reg_used_by_line reg line =
+  let words = split_asm_words line in
+  List.exists (fun w -> w = reg) words
 
-let item10_can_drop_value_after live_out index reg consumer_line =
-  let _, defs = uses_defs consumer_line in
-  RegSet.mem reg defs || not (RegSet.mem reg live_out.(index))
-
-let item10_rewrite_zero_consumer reg line =
-  match split_asm_words line with
-  | [ (("add" | "sub" | "mul" | "div" | "rem" | "slt" | "sltu" | "xor") as op);
-      dst; lhs; rhs ] ->
-      let lhs' = if lhs = reg then "x0" else lhs in
-      let rhs' = if rhs = reg then "x0" else rhs in
-      if lhs' = lhs && rhs' = rhs then None
-      else Some (Printf.sprintf "    %s %s, %s, %s" op dst lhs' rhs')
-  | [ (("addi" | "slti" | "sltiu" | "slli" | "srli" | "srai"
-        | "andi" | "xori") as op);
-      dst; src; imm ] ->
-      if src = reg then
-        Some (Printf.sprintf "    %s %s, x0, %s" op dst imm)
-      else None
-  | [ "neg"; dst; src ] ->
-      if src = reg then Some (Printf.sprintf "    neg %s, x0" dst) else None
-  | [ "lw"; dst; off; base ] ->
-      if base = reg then
-        Some (Printf.sprintf "    lw %s, %s(x0)" dst off)
-      else None
-  | [ "sw"; src; middle; base ] ->
-      let src' = if src = reg then "x0" else src in
-      let base' =
-        if is_int64_literal middle && base = reg then "x0" else base
-      in
-      if src' = src && base' = base then None
-      else if is_int64_literal middle then
-        Some (Printf.sprintf "    sw %s, %s(%s)" src' middle base')
-      else
-        (* GNU symbol-form store: third register is a scratch/clobber, not use. *)
-        Some (Printf.sprintf "    sw %s, %s, %s" src' middle base)
-  | [ (("beqz" | "bnez") as op); src; target ] ->
-      if src = reg then
-        Some (Printf.sprintf "    %s x0, %s" op target)
-      else None
-  | [ (("beq" | "bne" | "blt" | "bge" | "bltu" | "bgeu") as op);
-      lhs; rhs; target ] ->
-      let lhs' = if lhs = reg then "x0" else lhs in
-      let rhs' = if rhs = reg then "x0" else rhs in
-      if lhs' = lhs && rhs' = rhs then None
-      else Some (Printf.sprintf "    %s %s, %s, %s" op lhs' rhs' target)
-  | _ ->
-      None
-
-let item10_li_consumer_fold live_out second_index li_reg imm consumer =
-  let can_drop =
-    item10_can_drop_value_after live_out second_index li_reg consumer
-  in
-  if not can_drop then None
-  else
-    match split_asm_words consumer with
-    | [ "add"; dst; lhs; rhs ]
-      when fits_simm12 imm && lhs = li_reg && rhs <> li_reg ->
-        Some (addi_line dst rhs imm)
-    | [ "add"; dst; lhs; rhs ]
-      when fits_simm12 imm && rhs = li_reg && lhs <> li_reg ->
-        Some (addi_line dst lhs imm)
-    | [ "sub"; dst; lhs; rhs ]
-      when rhs = li_reg
-           && lhs <> li_reg
-           && fits_simm12 (Int64.neg imm) ->
-        Some (addi_line dst lhs (Int64.neg imm))
-    | [ "slt"; dst; lhs; rhs ]
-      when rhs = li_reg
-           && lhs <> li_reg
-           && fits_simm12 imm ->
-        Some (Printf.sprintf "    slti %s, %s, %Ld" dst lhs imm)
-    | [ "mul"; dst; lhs; rhs ]
-      when lhs = li_reg && rhs <> li_reg ->
-        begin
-          match item10_positive_pow2_shift imm with
-          | Some shift when shift >= 1 && shift <= 31 ->
-              Some (Printf.sprintf "    slli %s, %s, %d" dst rhs shift)
-          | Some _ | None -> None
-        end
-    | [ "mul"; dst; lhs; rhs ]
-      when rhs = li_reg && lhs <> li_reg ->
-        begin
-          match item10_positive_pow2_shift imm with
-          | Some shift when shift >= 1 && shift <= 31 ->
-              Some (Printf.sprintf "    slli %s, %s, %d" dst lhs shift)
-          | Some _ | None -> None
-        end
-    | _ when imm = 0L ->
-        item10_rewrite_zero_consumer li_reg consumer
-    | _ ->
-        None
-
-let item10_pair_compare_branch live_out second_index first second =
-  match split_asm_words first, item10_parse_branch second with
-  | [ "sub"; dst; lhs; rhs ],
-    Some (Item10BranchZero (branch_op, cond, target))
-    when dst = cond && not (RegSet.mem dst live_out.(second_index)) ->
-      let op = if branch_op = "bnez" then "bne" else "beq" in
-      Some (Printf.sprintf "    %s %s, %s, %s" op lhs rhs target)
-  | [ "sltu"; dst; "x0"; src ],
-    Some (Item10BranchZero (branch_op, cond, target))
-    when dst = cond && not (RegSet.mem dst live_out.(second_index)) ->
-      let op = if branch_op = "bnez" then "bnez" else "beqz" in
-      Some (Printf.sprintf "    %s %s, %s" op src target)
-  | [ (("slt" | "sltu") as cmp); dst; lhs; rhs ],
-    Some (Item10BranchZero (branch_op, cond, target))
-    when dst = cond && not (RegSet.mem dst live_out.(second_index)) ->
-      let op =
-        match cmp, branch_op with
-        | "slt", "bnez" -> "blt"
-        | "slt", "beqz" -> "bge"
-        | "sltu", "bnez" -> "bltu"
-        | "sltu", "beqz" -> "bgeu"
-        | _ -> assert false
-      in
-      Some (Printf.sprintf "    %s %s, %s, %s" op lhs rhs target)
-  | [ "sltiu"; dst; src; "1" ],
-    Some (Item10BranchZero (branch_op, cond, target))
-    when dst = cond && not (RegSet.mem dst live_out.(second_index)) ->
-      let op = if branch_op = "bnez" then "beqz" else "bnez" in
-      Some (Printf.sprintf "    %s %s, %s" op src target)
-  | _ ->
-      None
-
-let item10_triple_compare_branch live_out third_index first second third =
-  match split_asm_words first,
-        split_asm_words second,
-        item10_parse_branch third with
-  | [ "slt"; mid; lhs; rhs ],
-    [ "xori"; dst; src; "1" ],
-    Some (Item10BranchZero (branch_op, cond, target))
-    when src = mid
-         && dst = cond
-         && not (RegSet.mem mid live_out.(third_index))
-         && not (RegSet.mem dst live_out.(third_index)) ->
-      let op = if branch_op = "bnez" then "bge" else "blt" in
-      Some (Printf.sprintf "    %s %s, %s, %s" op lhs rhs target)
-  | [ "sltu"; mid; lhs; rhs ],
-    [ "xori"; dst; src; "1" ],
-    Some (Item10BranchZero (branch_op, cond, target))
-    when src = mid
-         && dst = cond
-         && not (RegSet.mem mid live_out.(third_index))
-         && not (RegSet.mem dst live_out.(third_index)) ->
-      let op = if branch_op = "bnez" then "bgeu" else "bltu" in
-      Some (Printf.sprintf "    %s %s, %s, %s" op lhs rhs target)
-  | [ "sub"; mid; lhs; rhs ],
-    [ "sltiu"; dst; src; "1" ],
-    Some (Item10BranchZero (branch_op, cond, target))
-    when src = mid
-         && dst = cond
-         && not (RegSet.mem mid live_out.(third_index))
-         && not (RegSet.mem dst live_out.(third_index)) ->
-      let op = if branch_op = "bnez" then "beq" else "bne" in
-      Some (Printf.sprintf "    %s %s, %s, %s" op lhs rhs target)
-  | [ "sub"; mid; lhs; rhs ],
-    [ "sltu"; dst; "x0"; src ],
-    Some (Item10BranchZero (branch_op, cond, target))
-    when src = mid
-         && dst = cond
-         && not (RegSet.mem mid live_out.(third_index))
-         && not (RegSet.mem dst live_out.(third_index)) ->
-      let op = if branch_op = "bnez" then "bne" else "beq" in
-      Some (Printf.sprintf "    %s %s, %s, %s" op lhs rhs target)
-  | _ ->
-      None
-
-let item10_final_asm_cleanup_pass asm =
-  if not (item10_final_asm_cleanup_enabled ()) then asm
-  else
+let item10_machine_mix_audit asm =
+  if item10_machine_mix_audit_enabled () then begin
     let lines = asm |> split_lines |> Array.of_list in
-    let n = Array.length lines in
-    let live_out = compute_live_out lines in
-    let label_pos = item10_build_label_pos lines in
-    let rec loop i acc =
-      if i >= n then List.rev acc
-      else if i + 2 < n then
-        begin
-          match item10_triple_compare_branch
-                  live_out (i + 2)
-                  lines.(i) lines.(i + 1) lines.(i + 2) with
-          | Some replacement ->
-              loop (i + 3) (replacement :: acc)
-          | None ->
-              loop_pair i acc
-        end
-      else
-        loop_pair i acc
 
-    and loop_pair i acc =
-      if i + 1 < n then
-        begin
-          match item10_pair_compare_branch
-                  live_out (i + 1) lines.(i) lines.(i + 1) with
-          | Some replacement ->
-              loop (i + 2) (replacement :: acc)
-          | None ->
-              begin
-                match parse_move lines.(i), item10_parse_branch lines.(i + 1) with
-                | Some (dst, src), Some branch
-                  when dst <> src
-                       && not (RegSet.mem dst live_out.(i + 1)) ->
-                    let branch' = item10_replace_branch_reg branch dst src in
-                    if branch' <> branch then begin
-                      loop (i + 2) (item10_branch_line branch' :: acc)
-                    end
-                    else
-                      loop_li_pair i acc
-                | _ ->
-                    loop_li_pair i acc
-              end
-        end
-      else
-        loop_single i acc
+    let instrs = ref 0 in
+    let moves = ref 0 in
+    let li = ref 0 in
+    let la = ref 0 in
+    let lw = ref 0 in
+    let sw = ref 0 in
+    let stack_lw = ref 0 in
+    let stack_sw = ref 0 in
+    let nonstack_lw = ref 0 in
+    let nonstack_sw = ref 0 in
 
-    and loop_li_pair i acc =
-      if i + 1 < n then
-        begin
-          match item10_parse_li lines.(i) with
-          | Some (reg, imm) ->
-              begin
-                match item10_li_consumer_fold
-                        live_out (i + 1) reg imm lines.(i + 1) with
-                | Some replacement ->
-                    loop (i + 2) (replacement :: acc)
-                | None ->
-                    loop_single i acc
-              end
-          | None ->
-              loop_single i acc
-        end
-      else
-        loop_single i acc
+    let la_mem_load = ref 0 in
+    let la_mem_store = ref 0 in
+    let la_other = ref 0 in
 
-    and loop_single i acc =
-      let line = lines.(i) in
-      match item10_parse_branch line with
-      | Some branch ->
+    let li_next_arith = ref 0 in
+    let li_next_branch = ref 0 in
+    let li_next_other = ref 0 in
+
+    let addi = ref 0 in
+    let add = ref 0 in
+    let sub = ref 0 in
+    let mul = ref 0 in
+    let div = ref 0 in
+    let rem = ref 0 in
+
+    let compare_materialize = ref 0 in
+    let cond_branch = ref 0 in
+    let jump = ref 0 in
+    let call = ref 0 in
+    let ret = ref 0 in
+    let other = ref 0 in
+
+    let note_la i dst =
+      match item10_next_exec_line lines (i + 1) with
+      | Some (_, next_line) ->
           begin
-            match item10_constant_branch branch with
-            | Some None ->
-                loop (i + 1) acc
-            | Some (Some replacement) ->
-                loop (i + 1) (replacement :: acc)
-            | None ->
-                let target = item10_branch_target branch in
-                if item10_branch_target_is_next lines label_pos i target then begin
-                  loop (i + 1) acc
-                end
-                else
-                  begin
-                    match item10_resolve_target lines label_pos target with
-                    | Item10TargetLabel final_target
-                      when final_target <> target ->
-                        let branch' =
-                          item10_replace_branch_target branch final_target
-                        in
-                        loop (i + 1) (item10_branch_line branch' :: acc)
-                    | Item10TargetRet
-                    | Item10TargetLabel _ ->
-                        loop (i + 1) (line :: acc)
-                  end
-          end
-      | None ->
-          begin
-            match split_asm_words line with
-            | [ "j"; target ] ->
+            match split_asm_words next_line with
+            | "lw" :: operands ->
                 begin
-                  match item10_resolve_target lines label_pos target with
-                  | Item10TargetRet ->
-                      loop (i + 1) ("    ret" :: acc)
-                  | Item10TargetLabel final_target
-                    when final_target <> target ->
-                      loop
-                        (i + 1)
-                        (Printf.sprintf "    j %s" final_target :: acc)
-                  | Item10TargetLabel _ ->
-                      loop (i + 1) (line :: acc)
+                  match item10_mem_base operands with
+                  | Some base when base = dst -> incr la_mem_load
+                  | Some _ | None -> incr la_other
                 end
-            | _ ->
-                loop (i + 1) (line :: acc)
+            | "sw" :: operands ->
+                begin
+                  match item10_mem_base operands with
+                  | Some base when base = dst -> incr la_mem_store
+                  | Some _ | None -> incr la_other
+                end
+            | _ -> incr la_other
           end
+      | None -> incr la_other
     in
 
-    let result = String.concat "\n" (loop 0 []) ^ "\n" in
-    result
+    let note_li i dst =
+      match item10_next_exec_line lines (i + 1) with
+      | Some (_, next_line) when item10_reg_used_by_line dst next_line ->
+          begin
+            match split_asm_words next_line with
+            | ("add" | "sub" | "mul" | "div" | "rem"
+              | "slt" | "sltu" | "sltiu" | "xori" | "addi") :: _ ->
+                incr li_next_arith
+            | ("beq" | "bne" | "blt" | "bge" | "bltu" | "bgeu"
+              | "beqz" | "bnez") :: _ ->
+                incr li_next_branch
+            | _ -> incr li_next_other
+          end
+      | Some _ | None ->
+          incr li_next_other
+    in
+
+    Array.iteri
+      (fun i line ->
+        if item10_is_exec_line line then begin
+          incr instrs;
+          match split_asm_words line with
+          | [] -> ()
+          | opcode :: operands ->
+              begin
+                match opcode with
+                | "addi" ->
+                    begin
+                      match operands with
+                      | [ dst; src; "0" ] when dst <> src ->
+                          incr moves
+                      | _ ->
+                          incr addi
+                    end
+                | "add" -> incr add
+                | "sub" -> incr sub
+                | "mul" -> incr mul
+                | "div" -> incr div
+                | "rem" -> incr rem
+                | "slt" | "sltu" | "sltiu" | "xori" ->
+                    incr compare_materialize
+                | "lw" ->
+                    incr lw;
+                    begin
+                      match item10_mem_base operands with
+                      | Some "sp" -> incr stack_lw
+                      | Some _ | None -> incr nonstack_lw
+                    end
+                | "sw" ->
+                    incr sw;
+                    begin
+                      match item10_mem_base operands with
+                      | Some "sp" -> incr stack_sw
+                      | Some _ | None -> incr nonstack_sw
+                    end
+                | "la" ->
+                    incr la;
+                    begin
+                      match operands with
+                      | dst :: _ -> note_la i dst
+                      | [] -> incr la_other
+                    end
+                | "li" ->
+                    incr li;
+                    begin
+                      match operands with
+                      | dst :: _ -> note_li i dst
+                      | [] -> incr li_next_other
+                    end
+                | "beq" | "bne" | "blt" | "bge" | "bltu" | "bgeu"
+                | "beqz" | "bnez" ->
+                    incr cond_branch
+                | "j" -> incr jump
+                | "call" -> incr call
+                | "ret" -> incr ret
+                | _ -> incr other
+              end
+        end)
+      lines;
+
+    Printf.eprintf
+      "item10-machine-mix instrs=%d moves=%d li=%d la=%d lw=%d sw=%d stack-lw=%d stack-sw=%d nonstack-lw=%d nonstack-sw=%d la-mem-load=%d la-mem-store=%d la-other=%d li-next-arith=%d li-next-branch=%d li-next-other=%d addi=%d add=%d sub=%d mul=%d div=%d rem=%d compare-materialize=%d cond-branch=%d jump=%d call=%d ret=%d other=%d asm-bytes=%d\n%!"
+      !instrs !moves !li !la !lw !sw !stack_lw !stack_sw
+      !nonstack_lw !nonstack_sw !la_mem_load !la_mem_store !la_other
+      !li_next_arith !li_next_branch !li_next_other !addi !add !sub
+      !mul !div !rem !compare_materialize !cond_branch !jump !call !ret
+      !other (String.length asm)
+  end
+
+let item10_immediate_audit_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ITEM10_IMMEDIATE_AUDIT" <> None
+  && Array.exists (fun arg -> arg = "-opt") Sys.argv
+
+let item10_parse_i64 s =
+  try Some (Int64.of_string s) with _ -> None
+
+let item10_fits_simm12_i64 n =
+  Int64.compare n (-2048L) >= 0 && Int64.compare n 2047L <= 0
+
+let item10_is_positive_pow2 n =
+  Int64.compare n 0L > 0
+  && Int64.logand n (Int64.sub n 1L) = 0L
+
+let item10_immediate_audit asm =
+  if item10_immediate_audit_enabled () then begin
+    let lines = asm |> split_lines |> Array.of_list in
+
+    let total = ref 0 in
+    let parseable = ref 0 in
+    let zero = ref 0 in
+    let one = ref 0 in
+    let minus_one = ref 0 in
+    let simm12 = ref 0 in
+    let neg_fits_simm12 = ref 0 in
+    let pos_pow2 = ref 0 in
+
+    let to_add = ref 0 in
+    let to_sub = ref 0 in
+    let to_mul = ref 0 in
+    let to_div = ref 0 in
+    let to_rem = ref 0 in
+    let to_slt = ref 0 in
+    let to_sltu = ref 0 in
+    let to_sltiu = ref 0 in
+    let to_xori = ref 0 in
+    let to_addi = ref 0 in
+    let to_branch = ref 0 in
+    let to_lw = ref 0 in
+    let to_sw = ref 0 in
+    let to_call = ref 0 in
+    let to_move = ref 0 in
+    let to_other = ref 0 in
+    let no_direct_use = ref 0 in
+
+    let mul_pow2 = ref 0 in
+    let mul_simm12 = ref 0 in
+    let div_pow2 = ref 0 in
+    let rem_pow2 = ref 0 in
+    let branch_simm12 = ref 0 in
+    let compare_simm12 = ref 0 in
+
+    Array.iteri
+      (fun i line ->
+        match split_asm_words line with
+        | [ "li"; dst; imm_text ] ->
+            incr total;
+            let imm = item10_parse_i64 imm_text in
+            begin
+              match imm with
+              | Some n ->
+                  incr parseable;
+                  if n = 0L then incr zero;
+                  if n = 1L then incr one;
+                  if n = -1L then incr minus_one;
+                  if item10_fits_simm12_i64 n then incr simm12;
+                  if item10_fits_simm12_i64 (Int64.neg n) then incr neg_fits_simm12;
+                  if item10_is_positive_pow2 n then incr pos_pow2
+              | None -> ()
+            end;
+
+            begin
+              match item10_next_exec_line lines (i + 1) with
+              | Some (_, next_line) when item10_reg_used_by_line dst next_line ->
+                  begin
+                    match split_asm_words next_line with
+                    | "add" :: _ -> incr to_add
+                    | "sub" :: _ -> incr to_sub
+                    | "mul" :: _ ->
+                        incr to_mul;
+                        begin match imm with
+                        | Some n when item10_is_positive_pow2 n -> incr mul_pow2
+                        | _ -> ()
+                        end;
+                        begin match imm with
+                        | Some n when item10_fits_simm12_i64 n -> incr mul_simm12
+                        | _ -> ()
+                        end
+                    | "div" :: _ ->
+                        incr to_div;
+                        begin match imm with
+                        | Some n when item10_is_positive_pow2 n -> incr div_pow2
+                        | _ -> ()
+                        end
+                    | "rem" :: _ ->
+                        incr to_rem;
+                        begin match imm with
+                        | Some n when item10_is_positive_pow2 n -> incr rem_pow2
+                        | _ -> ()
+                        end
+                    | "slt" :: _ ->
+                        incr to_slt;
+                        begin match imm with
+                        | Some n when item10_fits_simm12_i64 n -> incr compare_simm12
+                        | _ -> ()
+                        end
+                    | "sltu" :: _ ->
+                        incr to_sltu;
+                        begin match imm with
+                        | Some n when item10_fits_simm12_i64 n -> incr compare_simm12
+                        | _ -> ()
+                        end
+                    | "sltiu" :: _ -> incr to_sltiu
+                    | "xori" :: _ -> incr to_xori
+                    | "addi" :: _ ->
+                        begin
+                          match parse_move next_line with
+                          | Some _ -> incr to_move
+                          | None -> incr to_addi
+                        end
+                    | ("beq" | "bne" | "blt" | "bge" | "bltu" | "bgeu"
+                      | "beqz" | "bnez") :: _ ->
+                        incr to_branch;
+                        begin match imm with
+                        | Some n when item10_fits_simm12_i64 n -> incr branch_simm12
+                        | _ -> ()
+                        end
+                    | "lw" :: _ -> incr to_lw
+                    | "sw" :: _ -> incr to_sw
+                    | "call" :: _ -> incr to_call
+                    | _ -> incr to_other
+                  end
+              | Some _ | None -> incr no_direct_use
+            end
+        | _ -> ())
+      lines;
+
+    Printf.eprintf
+      "item10-immediate-audit total=%d parseable=%d zero=%d one=%d minus-one=%d simm12=%d neg-fits-simm12=%d pos-pow2=%d to-add=%d to-sub=%d to-mul=%d to-div=%d to-rem=%d to-slt=%d to-sltu=%d to-sltiu=%d to-xori=%d to-addi=%d to-branch=%d to-lw=%d to-sw=%d to-call=%d to-move=%d to-other=%d no-direct-use=%d mul-pow2=%d mul-simm12=%d div-pow2=%d rem-pow2=%d branch-simm12=%d compare-simm12=%d\n%!"
+      !total !parseable !zero !one !minus_one !simm12 !neg_fits_simm12
+      !pos_pow2 !to_add !to_sub !to_mul !to_div !to_rem !to_slt !to_sltu
+      !to_sltiu !to_xori !to_addi !to_branch !to_lw !to_sw !to_call
+      !to_move !to_other !no_direct_use !mul_pow2 !mul_simm12 !div_pow2
+      !rem_pow2 !branch_simm12 !compare_simm12
+  end
 
 let peephole asm =
   let rec fix current =
-    let next =
-      current
-      |> peephole_pass
-      |> item10_final_asm_cleanup_pass
-    in
+    let next = peephole_pass current in
     if next = current then current else fix next
   in
-  fix asm
+  let result = fix asm in
+  item10_machine_mix_audit result;
+  item10_immediate_audit result;
+  result
