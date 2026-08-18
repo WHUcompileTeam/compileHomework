@@ -1035,17 +1035,45 @@ let item9_add_live_pairs pairs live =
 let item9_exact_interference_pairs (f : Cfg.func) =
   let _live_in, live_out = compute_temp_live_sets f in
   let pairs = ref IntPairSet.empty in
-  let note live = pairs := item9_add_live_pairs !pairs live in
+  let add_edge a b =
+    if a <> b then
+      let x, y = if a < b then (a, b) else (b, a) in
+      pairs := IntPairSet.add (x, y) !pairs
+  in
+  let add_def_edges dst ?move_src live =
+    IntSet.iter
+      (fun other ->
+        if other <> dst
+           && (match move_src with Some src -> other <> src | None -> true)
+        then add_edge dst other)
+      live
+  in
   List.iter
     (fun (block : Cfg.block) ->
+      (* Build the ordinary interference graph backwards from exact CFG
+         liveness.  Crucially, a copy [dst <- src] does NOT add the
+         dst/src edge merely because src is also live-out of the move.
+         Coalescing those equal values is safe; if either value is later
+         redefined while the other is live, that later definition will add
+         the real interference edge.  The previous all-pairs-live scheme was
+         too conservative and defeated copy coalescing for precisely the
+         "two live copies" case. *)
       let live = ref (table_find_or_empty live_out block.label IntSet.empty) in
-      note !live;
       live := scan_term_live_in block.term !live;
-      note !live;
       List.iter
         (fun instr ->
-          live := scan_simple_live_in instr !live;
-          note !live)
+          begin
+            match instr with
+            | Tcg.Move (dst, Tcg.Temp src) ->
+                add_def_edges dst ~move_src:src !live
+            | _ ->
+                begin
+                  match defs_temp instr with
+                  | Some dst -> add_def_edges dst !live
+                  | None -> ()
+                end
+          end;
+          live := scan_simple_live_in instr !live)
         (List.rev block.body))
     f.blocks;
   !pairs

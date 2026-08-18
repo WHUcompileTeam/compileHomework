@@ -2463,6 +2463,694 @@ let const_propagate_func global_init summaries globals (f : Cfg.func) =
   in
   Cfg.rebuild_edges { f with blocks }
 
+
+(* -------------------------------------------------------------------------- *)
+(* General range propagation v1.3                                             *)
+(*                                                                            *)
+(* Keep this analysis deliberately separate from [cp_fact].  Constant         *)
+(* propagation is already a mature SCCP-style pass with its own cache and      *)
+(* whole-program dependencies; range propagation adds path-sensitive signed    *)
+(* i32 interval facts without perturbing that lattice.                         *)
+(*                                                                            *)
+(* v1.3 is intentionally conservative under ToyC's wrapping i32 semantics:       *)
+(*   - exact singleton arithmetic may still fold through [fold_binop];          *)
+(*   - non-singleton Add/Sub/Mul/Div/Mod/UMinus ranges are NOT inferred;        *)
+(*   - comparisons, logical truth, Move/UPlus, Load/Store, and branch-edge      *)
+(*     constraints are propagated;                                              *)
+(*   - equality/non-equality only use interval information that a single        *)
+(*     convex interval can represent soundly.                                   *)
+(* -------------------------------------------------------------------------- *)
+
+type range_fact = {
+  range_lower : int64 option;
+  range_upper : int64 option;
+}
+
+type range_state = {
+  range_temps : range_fact IntMap.t;
+  range_places : range_fact PlaceMap.t;
+}
+
+let range_i32_min = -2147483648L
+let range_i32_max = 2147483647L
+
+let range_top = { range_lower = None; range_upper = None }
+let range_bool = { range_lower = Some 0L; range_upper = Some 1L }
+
+let range_singleton value =
+  let value = i32 value in
+  { range_lower = Some value; range_upper = Some value }
+
+let range_is_top range =
+  range.range_lower = None && range.range_upper = None
+
+let range_singleton_value range =
+  match (range.range_lower, range.range_upper) with
+  | Some lower, Some upper when lower = upper -> Some lower
+  | _ -> None
+
+let range_equal a b =
+  a.range_lower = b.range_lower && a.range_upper = b.range_upper
+
+let empty_range_state = {
+  range_temps = IntMap.empty;
+  range_places = PlaceMap.empty;
+}
+
+let equal_range_state a b =
+  IntMap.equal range_equal a.range_temps b.range_temps
+  && PlaceMap.equal range_equal a.range_places b.range_places
+
+(* CFG joins need the convex union of incoming path ranges.  A missing map      *)
+(* entry denotes TOP, so TOP joined with anything is TOP and is omitted.        *)
+let join_range_fact a b =
+  let lower =
+    match (a.range_lower, b.range_lower) with
+    | Some x, Some y -> Some (if x <= y then x else y)
+    | None, _ | _, None -> None
+  in
+  let upper =
+    match (a.range_upper, b.range_upper) with
+    | Some x, Some y -> Some (if x >= y then x else y)
+    | None, _ | _, None -> None
+  in
+  { range_lower = lower; range_upper = upper }
+
+let join_range_int_map a b =
+  IntMap.merge
+    (fun _ va vb ->
+      match (va, vb) with
+      | Some ra, Some rb ->
+          let joined = join_range_fact ra rb in
+          if range_is_top joined then None else Some joined
+      | Some _, None | None, Some _ | None, None -> None)
+    a b
+
+let join_range_place_map a b =
+  PlaceMap.merge
+    (fun _ va vb ->
+      match (va, vb) with
+      | Some ra, Some rb ->
+          let joined = join_range_fact ra rb in
+          if range_is_top joined then None else Some joined
+      | Some _, None | None, Some _ | None, None -> None)
+    a b
+
+let join_range_state a b =
+  {
+    range_temps = join_range_int_map a.range_temps b.range_temps;
+    range_places = join_range_place_map a.range_places b.range_places;
+  }
+
+let join_range_states = function
+  | [] -> empty_range_state
+  | state :: rest -> List.fold_left join_range_state state rest
+
+let set_temp_range state temp range =
+  {
+    state with
+    range_temps =
+      if range_is_top range then IntMap.remove temp state.range_temps
+      else IntMap.add temp range state.range_temps;
+  }
+
+let set_place_range state place range =
+  {
+    state with
+    range_places =
+      if range_is_top range then PlaceMap.remove place state.range_places
+      else PlaceMap.add place range state.range_places;
+  }
+
+let get_temp_range state temp =
+  Option.value ~default:range_top (IntMap.find_opt temp state.range_temps)
+
+let get_place_range state place =
+  Option.value ~default:range_top (PlaceMap.find_opt place state.range_places)
+
+let range_of_operand state = function
+  | Tcg.Imm value -> range_singleton value
+  | Tcg.Temp temp -> get_temp_range state temp
+
+let range_is_definitely_zero range =
+  match range_singleton_value range with
+  | Some value -> value = 0L
+  | None -> false
+
+let range_is_definitely_nonzero range =
+  match range.range_lower, range.range_upper with
+  | Some lower, _ when lower > 0L -> true
+  | _, Some upper when upper < 0L -> true
+  | Some lower, Some upper when lower = upper -> lower <> 0L
+  | _ -> false
+
+let range_disjoint a b =
+  match a.range_upper, b.range_lower, b.range_upper, a.range_lower with
+  | Some au, Some bl, _, _ when au < bl -> true
+  | _, _, Some bu, Some al when bu < al -> true
+  | _ -> false
+
+let rec prove_compare_ranges op lhs rhs =
+  match op with
+  | Lt -> (
+      match lhs.range_upper, rhs.range_lower, lhs.range_lower, rhs.range_upper with
+      | Some lu, Some rl, _, _ when lu < rl -> Some true
+      | _, _, Some ll, Some ru when ll >= ru -> Some false
+      | _ -> None)
+  | Le -> (
+      match lhs.range_upper, rhs.range_lower, lhs.range_lower, rhs.range_upper with
+      | Some lu, Some rl, _, _ when lu <= rl -> Some true
+      | _, _, Some ll, Some ru when ll > ru -> Some false
+      | _ -> None)
+  | Gt -> prove_compare_ranges Lt rhs lhs
+  | Ge -> prove_compare_ranges Le rhs lhs
+  | Eq -> (
+      match range_singleton_value lhs, range_singleton_value rhs with
+      | Some a, Some b -> Some (a = b)
+      | _ when range_disjoint lhs rhs -> Some false
+      | _ -> None)
+  | Ne -> Option.map not (prove_compare_ranges Eq lhs rhs)
+  | Add | Sub | Mul | Div | Mod | LAnd | LOr -> None
+
+let eval_range_un op src =
+  match range_singleton_value src with
+  | Some value -> (
+      match fold_unop op value with
+      | Some folded -> range_singleton folded
+      | None -> range_top)
+  | None -> (
+      match op with
+      | UPlus -> src
+      | UNot ->
+          if range_is_definitely_zero src then range_singleton 1L
+          else if range_is_definitely_nonzero src then range_singleton 0L
+          else range_bool
+      | UMinus -> range_top)
+
+let eval_range_bin op lhs rhs =
+  match range_singleton_value lhs, range_singleton_value rhs with
+  | Some a, Some b -> (
+      match fold_binop op a b with
+      | Some folded -> range_singleton folded
+      | None -> range_top)
+  | _ -> (
+      match op with
+      | Lt | Gt | Le | Ge | Eq | Ne -> (
+          match prove_compare_ranges op lhs rhs with
+          | Some value -> range_singleton (bool_int value)
+          | None -> range_bool)
+      | LAnd ->
+          if range_is_definitely_zero lhs || range_is_definitely_zero rhs then
+            range_singleton 0L
+          else if range_is_definitely_nonzero lhs && range_is_definitely_nonzero rhs then
+            range_singleton 1L
+          else
+            range_bool
+      | LOr ->
+          if range_is_definitely_nonzero lhs || range_is_definitely_nonzero rhs then
+            range_singleton 1L
+          else if range_is_definitely_zero lhs && range_is_definitely_zero rhs then
+            range_singleton 0L
+          else
+            range_bool
+      | Add | Sub | Mul | Div | Mod ->
+          (* Deliberately no interval arithmetic here: without a no-wrap proof,
+             ordinary endpoint arithmetic is unsound for signed wrapping i32. *)
+          range_top)
+
+let range_of_simple_instr state = function
+  | Tcg.Move (_, src) -> range_of_operand state src
+  | Tcg.Un (_, op, src) -> eval_range_un op (range_of_operand state src)
+  | Tcg.Bin (_, op, lhs, rhs) ->
+      eval_range_bin op (range_of_operand state lhs) (range_of_operand state rhs)
+  | Tcg.Load (_, place) -> get_place_range state place
+  | Tcg.Store _ | Tcg.Call _ -> range_top
+
+let kill_range_place_facts places state =
+  PlaceSet.fold
+    (fun place acc -> set_place_range acc place range_top)
+    places state
+
+let rewrite_operand_range ?rewrite_count state operand =
+  match operand with
+  | Tcg.Imm _ -> operand
+  | Tcg.Temp temp -> (
+      match range_singleton_value (get_temp_range state temp) with
+      | Some value ->
+          (match rewrite_count with Some count -> incr count | None -> ());
+          Tcg.Imm value
+      | None -> operand)
+
+let transfer_range_instr summaries globals ?rewrite_count:_ state instr =
+  (* v1.3 deliberately keeps the transfer function purely abstract.  Earlier
+     versions rewrote singleton operands and re-ran [simplify_simple_instr]
+     while solving the range fixed point.  Even when the rewrite was discarded
+     from the emitted body, that made the analysis depend on a second hidden
+     optimizer inside its transfer function.  Range propagation should derive
+     facts from the actual CFG instruction only; ordinary constant folding is
+     already handled by the existing CP pass. *)
+  match instr with
+  | Tcg.Move (dst, src) ->
+      let range = range_of_operand state src in
+      (instr, set_temp_range state dst range)
+  | Tcg.Un (dst, op, src) ->
+      let range = eval_range_un op (range_of_operand state src) in
+      (instr, set_temp_range state dst range)
+  | Tcg.Bin (dst, op, lhs, rhs) ->
+      let range =
+        eval_range_bin op
+          (range_of_operand state lhs)
+          (range_of_operand state rhs)
+      in
+      (instr, set_temp_range state dst range)
+  | Tcg.Load (dst, place) ->
+      let range = get_place_range state place in
+      (instr, set_temp_range state dst range)
+  | Tcg.Store (place, value) ->
+      let range = range_of_operand state value in
+      (instr, set_place_range state place range)
+  | Tcg.Call (dst, callee, _args) ->
+      let state =
+        kill_range_place_facts
+          (call_written_globals summaries globals callee)
+          state
+      in
+      let state =
+        match dst with
+        | Some temp -> set_temp_range state temp range_top
+        | None -> state
+      in
+      (instr, state)
+
+let run_range_body summaries globals ?rewrite_count state body =
+  List.fold_left
+    (fun (acc, state) instr ->
+      let instr, state =
+        transfer_range_instr summaries globals ?rewrite_count state instr
+      in
+      (instr :: acc, state))
+    ([], state) body
+  |> fun (body_rev, state) -> (List.rev body_rev, state)
+
+let intersect_range_fact current constraint_range =
+  let lower =
+    match current.range_lower, constraint_range.range_lower with
+    | Some a, Some b -> Some (if a >= b then a else b)
+    | Some a, None -> Some a
+    | None, Some b -> Some b
+    | None, None -> None
+  in
+  let upper =
+    match current.range_upper, constraint_range.range_upper with
+    | Some a, Some b -> Some (if a <= b then a else b)
+    | Some a, None -> Some a
+    | None, Some b -> Some b
+    | None, None -> None
+  in
+  match lower, upper with
+  | Some lower, Some upper when lower > upper -> None
+  | _ -> Some { range_lower = lower; range_upper = upper }
+
+let range_negate_compare = function
+  | Lt -> Ge
+  | Le -> Gt
+  | Gt -> Le
+  | Ge -> Lt
+  | Eq -> Ne
+  | Ne -> Eq
+  | Add | Sub | Mul | Div | Mod | LAnd | LOr -> invalid_arg "range_negate_compare"
+
+let range_swap_compare = function
+  | Lt -> Gt
+  | Le -> Ge
+  | Gt -> Lt
+  | Ge -> Le
+  | Eq -> Eq
+  | Ne -> Ne
+  | Add | Sub | Mul | Div | Mod | LAnd | LOr -> invalid_arg "range_swap_compare"
+
+let refine_range_fact_compare current op constant =
+  let constant = i32 constant in
+  match op with
+  | Lt ->
+      if constant = range_i32_min then None
+      else
+        intersect_range_fact current
+          { range_lower = None; range_upper = Some Int64.(sub constant 1L) }
+  | Le ->
+      intersect_range_fact current
+        { range_lower = None; range_upper = Some constant }
+  | Gt ->
+      if constant = range_i32_max then None
+      else
+        intersect_range_fact current
+          { range_lower = Some Int64.(add constant 1L); range_upper = None }
+  | Ge ->
+      intersect_range_fact current
+        { range_lower = Some constant; range_upper = None }
+  | Eq -> intersect_range_fact current (range_singleton constant)
+  | Ne -> (
+      match range_singleton_value current with
+      | Some value when value = constant -> None
+      | _ ->
+          let lower, upper = current.range_lower, current.range_upper in
+          if lower = Some constant && constant < range_i32_max then
+            Some { current with range_lower = Some Int64.(add constant 1L) }
+          else if upper = Some constant && constant > range_i32_min then
+            Some { current with range_upper = Some Int64.(sub constant 1L) }
+          else
+            Some current)
+  | Add | Sub | Mul | Div | Mod | LAnd | LOr -> Some current
+
+let refine_operand_compare state operand op constant =
+  match operand with
+  | Tcg.Imm value -> (
+      match fold_binop op value constant with
+      | Some result when truth result -> Some state
+      | Some _ | None -> None)
+  | Tcg.Temp temp -> (
+      match refine_range_fact_compare (get_temp_range state temp) op constant with
+      | None -> None
+      | Some range -> Some (set_temp_range state temp range))
+
+let refine_compare_edge state op lhs rhs take_true =
+  if not (is_compare_binop op) then Some state
+  else
+    let op = if take_true then op else range_negate_compare op in
+    match prove_compare_ranges op (range_of_operand state lhs) (range_of_operand state rhs) with
+    | Some false -> None
+    | Some true -> Some state
+    | None -> (
+        match range_singleton_value (range_of_operand state rhs) with
+        | Some constant -> refine_operand_compare state lhs op constant
+        | None -> (
+            match range_singleton_value (range_of_operand state lhs) with
+            | Some constant ->
+                refine_operand_compare state rhs (range_swap_compare op) constant
+            | None -> Some state))
+
+let refine_zero_edge state operand want_zero =
+  refine_operand_compare state operand (if want_zero then Eq else Ne) 0L
+
+let range_edge_state state term succ =
+  match term with
+  | Cfg.Jump label -> if label = succ then Some state else None
+  | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
+      if if_zero = if_nonzero then
+        if succ = if_zero then Some state else None
+      else if succ = if_zero then
+        refine_zero_edge state cond true
+      else if succ = if_nonzero then
+        refine_zero_edge state cond false
+      else
+        None
+  | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
+      if if_zero = if_nonzero then
+        if succ = if_zero then Some state else None
+      else if succ = if_nonzero then
+        refine_zero_edge state cond false
+      else if succ = if_zero then
+        refine_zero_edge state cond true
+      else
+        None
+  | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
+      if if_true = if_false then
+        if succ = if_true then Some state else None
+      else if succ = if_true then
+        refine_compare_edge state op lhs rhs true
+      else if succ = if_false then
+        refine_compare_edge state op lhs rhs false
+      else
+        None
+  | Cfg.Return _ -> None
+
+let range_possible_successors state term =
+  Cfg.successors term
+  |> List.filter (fun succ -> Option.is_some (range_edge_state state term succ))
+  |> List.sort_uniq String.compare
+
+let compute_range_states summaries globals (f : Cfg.func) =
+  (* Range v1.3 uses an explicit whole-state BOTTOM represented by absence
+     from [in_states]/[out_states].  A present [range_state] is a reachable
+     abstract state; within such a state, a missing temp/place fact still means
+     TOP for that value.
+
+     This distinction is essential for path-sensitive interval propagation.
+     Starting non-entry blocks at BOTTOM makes the forward iteration monotone:
+     reachable states can only appear and then widen as more predecessor
+     contributions become available.  Therefore an edge may be temporarily
+     absent only because its predecessor is genuinely BOTTOM or because the
+     current reachable predecessor state soundly proves the edge impossible;
+     if that predecessor later widens, the edge is reconsidered and can become
+     reachable.  This avoids the self-justifying narrow fixed point from v1/v1.1. *)
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter
+    (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block)
+    f.blocks;
+  let in_states = Hashtbl.create (List.length f.blocks) in
+  let out_states = Hashtbl.create (List.length f.blocks) in
+
+  let join_optional_state acc contribution =
+    match acc, contribution with
+    | None, None -> None
+    | Some state, None | None, Some state -> Some state
+    | Some a, Some b -> Some (join_range_state a b)
+  in
+
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter
+      (fun (block : Cfg.block) ->
+        let incoming =
+          if block.label = f.entry then
+            (* External function entry is TOP.  Joining anything with TOP is
+               TOP, so entry predecessors (normally none) cannot refine it. *)
+            Some empty_range_state
+          else
+            List.fold_left
+              (fun acc pred ->
+                let contribution =
+                  match Hashtbl.find_opt out_states pred,
+                        Hashtbl.find_opt block_map pred with
+                  | Some pred_state, Some pred_block ->
+                      range_edge_state pred_state pred_block.term block.label
+                  | _ ->
+                      (* Predecessor is still BOTTOM / unavailable. *)
+                      None
+                in
+                join_optional_state acc contribution)
+              None block.preds
+        in
+        match incoming with
+        | None ->
+            (* This block is still BOTTOM.  Do not manufacture TOP here: doing
+               so was the v1.1 bug that blurred unreachable and unknown. *)
+            ()
+        | Some in_state ->
+            begin
+              match Hashtbl.find_opt in_states block.label with
+              | None ->
+                  Hashtbl.replace in_states block.label in_state;
+                  changed := true
+              | Some prev_in when not (equal_range_state in_state prev_in) ->
+                  Hashtbl.replace in_states block.label in_state;
+                  changed := true
+              | Some _ -> ()
+            end;
+            let _, out_state =
+              run_range_body summaries globals in_state block.body
+            in
+            begin
+              match Hashtbl.find_opt out_states block.label with
+              | None ->
+                  Hashtbl.replace out_states block.label out_state;
+                  changed := true
+              | Some prev_out when not (equal_range_state out_state prev_out) ->
+                  Hashtbl.replace out_states block.label out_state;
+                  changed := true
+              | Some _ -> ()
+            end)
+      f.blocks
+  done;
+  let reachable =
+    Hashtbl.fold
+      (fun label _ labels -> LabelSet.add label labels)
+      in_states LabelSet.empty
+  in
+  (reachable, in_states)
+
+let range_propagation_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_RANGE_PROP" = None
+
+let range_propagation_debug_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_RANGE_PROP" <> None
+
+let range_propagation_proof_debug_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_RANGE_PROOFS" <> None
+
+let range_allow_cyclic_cfg () =
+  Sys.getenv_opt "TOYC_RANGE_ALLOW_CYCLIC_CFG" <> None
+
+let range_func_has_cycle (f : Cfg.func) =
+  (* Range v1 is intentionally acyclic-only.  A loop needs a separately
+     specified loop-header abstract semantics (and, once arithmetic intervals
+     are added, widening/narrowing).  More importantly for this optimizer,
+     changing a loop-internal branch shape can feed different CFGs into the
+     mature counted-loop/nested-summary machinery.  Keep cyclic CFGs out of the
+     first landed version; [TOYC_RANGE_ALLOW_CYCLIC_CFG=1] exists only for
+     diagnostics while developing the loop-aware version. *)
+  let block_map = Hashtbl.create (List.length f.blocks) in
+  List.iter
+    (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block)
+    f.blocks;
+  let color = Hashtbl.create (List.length f.blocks) in
+  let rec dfs label =
+    match Hashtbl.find_opt color label with
+    | Some 1 -> true
+    | Some 2 -> false
+    | _ ->
+        Hashtbl.replace color label 1;
+        let found =
+          match Hashtbl.find_opt block_map label with
+          | None -> false
+          | Some (block : Cfg.block) ->
+              List.exists
+                (fun succ -> Hashtbl.mem block_map succ && dfs succ)
+                block.succs
+        in
+        Hashtbl.replace color label 2;
+        found
+  in
+  dfs f.entry
+
+let string_of_range_fact range =
+  let bound = function None -> "?" | Some value -> Int64.to_string value in
+  Printf.sprintf "[%s,%s]" (bound range.range_lower) (bound range.range_upper)
+
+let string_of_range_operand = function
+  | Tcg.Imm value -> Printf.sprintf "imm(%Ld)" (i32 value)
+  | Tcg.Temp temp -> Printf.sprintf "t%d" temp
+
+let string_of_range_compare = function
+  | Lt -> "<"
+  | Le -> "<="
+  | Gt -> ">"
+  | Ge -> ">="
+  | Eq -> "=="
+  | Ne -> "!="
+  | Add -> "+"
+  | Sub -> "-"
+  | Mul -> "*"
+  | Div -> "/"
+  | Mod -> "%"
+  | LAnd -> "&&"
+  | LOr -> "||"
+
+let rewrite_range_terminator ?rewrite_count:_ state term =
+  (* v1.1 safety rule: range propagation may prove control-flow, but it does
+     not materialize singleton interval facts back into ordinary operands yet.
+     That keeps the first landed version branch-only; the existing constant
+     propagation pass remains the sole pass that rewrites computed values. *)
+  match term with
+  | Cfg.Jump _ as term -> (term, false)
+  | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
+      if if_zero = if_nonzero then (Cfg.Jump if_zero, true)
+      else begin
+        let range = range_of_operand state cond in
+        if range_is_definitely_zero range then (Cfg.Jump if_zero, true)
+        else if range_is_definitely_nonzero range then (Cfg.Jump if_nonzero, true)
+        else (Cfg.BranchZero (cond, if_zero, if_nonzero), false)
+      end
+  | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
+      if if_zero = if_nonzero then (Cfg.Jump if_zero, true)
+      else begin
+        let range = range_of_operand state cond in
+        if range_is_definitely_nonzero range then (Cfg.Jump if_nonzero, true)
+        else if range_is_definitely_zero range then (Cfg.Jump if_zero, true)
+        else (Cfg.BranchNonZero (cond, if_nonzero, if_zero), false)
+      end
+  | Cfg.BranchCompare (op, lhs, rhs, if_true, if_false) ->
+      if if_true = if_false then (Cfg.Jump if_true, true)
+      else begin
+        match prove_compare_ranges op
+                (range_of_operand state lhs)
+                (range_of_operand state rhs) with
+        | Some value -> (Cfg.Jump (if value then if_true else if_false), true)
+        | None -> (Cfg.BranchCompare (op, lhs, rhs, if_true, if_false), false)
+      end
+  | Cfg.Return _ as term -> (term, false)
+
+let range_propagate_func summaries globals (f : Cfg.func) =
+  if not (range_propagation_enabled ()) then f
+  else if range_func_has_cycle f && not (range_allow_cyclic_cfg ()) then begin
+    if range_propagation_debug_enabled () then
+      Printf.eprintf
+        "range-prop func=%s skipped=cyclic-cfg\n%!"
+        f.name;
+    f
+  end else
+    let executable, in_states = compute_range_states summaries globals f in
+    let folded_branches = ref 0 in
+    let before_blocks = List.length f.blocks in
+    let blocks =
+      List.map
+        (fun (block : Cfg.block) ->
+          let state =
+            Option.value ~default:empty_range_state
+              (Hashtbl.find_opt in_states block.label)
+          in
+          (* Re-run only to obtain the state at the terminator.  The rewritten
+             body returned by the transfer is intentionally discarded in
+             v1.1, so range analysis cannot change ordinary computations. *)
+          let _, state =
+            run_range_body summaries globals state block.body
+          in
+          let term, folded =
+            rewrite_range_terminator state block.term
+          in
+          if folded then begin
+            incr folded_branches;
+            if range_propagation_proof_debug_enabled () then
+              match block.term, term with
+              | Cfg.BranchCompare (op, lhs, rhs, _, _), Cfg.Jump target ->
+                  Printf.eprintf
+                    "range-proof func=%s block=%s kind=compare lhs=%s:%s op=%s rhs=%s:%s -> %s\n%!"
+                    f.name block.label
+                    (string_of_range_operand lhs)
+                    (string_of_range_fact (range_of_operand state lhs))
+                    (string_of_range_compare op)
+                    (string_of_range_operand rhs)
+                    (string_of_range_fact (range_of_operand state rhs))
+                    target
+              | Cfg.BranchZero (cond, _, _), Cfg.Jump target ->
+                  Printf.eprintf
+                    "range-proof func=%s block=%s kind=zero cond=%s:%s -> %s\n%!"
+                    f.name block.label
+                    (string_of_range_operand cond)
+                    (string_of_range_fact (range_of_operand state cond))
+                    target
+              | Cfg.BranchNonZero (cond, _, _), Cfg.Jump target ->
+                  Printf.eprintf
+                    "range-proof func=%s block=%s kind=nonzero cond=%s:%s -> %s\n%!"
+                    f.name block.label
+                    (string_of_range_operand cond)
+                    (string_of_range_fact (range_of_operand state cond))
+                    target
+              | _ -> ()
+          end;
+          { block with body = block.body; term; succs = Cfg.successors term })
+        f.blocks
+    in
+    let result = Cfg.rebuild_edges { f with blocks } in
+    if range_propagation_debug_enabled () then
+      Printf.eprintf
+        "range-prop func=%s blocks=%d->%d folded=%d singleton-rewrites=0\n%!"
+        f.name before_blocks (List.length result.blocks)
+        !folded_branches;
+    ignore executable;
+    result
+
 let run_gvn_transfer ?linear summaries globals state (block : Cfg.block) =
   let body_rev, state =
     List.fold_left
@@ -31103,8 +31791,30 @@ let optimize_func
       let with_hoisted_loop_bounds =
         hoist_unrolled_loop_branch_immediates_func summaries globals late_runtime_cleaned
       in
+      (* Range v1.3 is deliberately final-only.  It is kept out of the iterative
+         optimizer so a newly folded branch cannot feed a changed loop/diamond
+         shape back into runtime-summary, unswitch, counted-loop, unroll, or
+         nested-summary transforms.  Cyclic CFGs are skipped by default inside
+         [range_propagate_func]; the first landed version is acyclic-only. *)
+      let final_range =
+        range_propagate_func summaries globals with_hoisted_loop_bounds
+      in
+      let final_range_cleaned =
+        if final_range = with_hoisted_loop_bounds then
+          (* Preserve the exact 085134 pipeline whenever Range is disabled, skips
+             a cyclic CFG, or proves no branch.  In particular, do not sneak in
+             an extra CP/DCE/thread round for functions Range did not change. *)
+          with_hoisted_loop_bounds
+        else
+          final_range
+          |> simplify_cfg_func
+          |> const_propagate_func global_init summaries globals
+          |> eliminate_dead_code_func
+               ~removable_calls summaries globals return_globals
+          |> thread_and_prune_func
+      in
       let final_candidate =
-        final_linear_merge_func with_hoisted_loop_bounds
+        final_linear_merge_func final_range_cleaned
       in
       if cfg_targets_valid final_candidate then final_candidate
       else begin
@@ -31115,7 +31825,8 @@ let optimize_func
            retained whenever possible. *)
         let fallbacks =
           [
-            ("pre-final-merge", with_hoisted_loop_bounds);
+            ("final-range-cleaned", final_range_cleaned);
+            ("pre-final-range", with_hoisted_loop_bounds);
             ("late-runtime-cleaned", late_runtime_cleaned);
             ("late-equiv-recanon", late_equiv_recanon);
             ("late-equiv-cleaned", late_equiv_cleaned);

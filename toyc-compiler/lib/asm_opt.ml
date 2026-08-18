@@ -671,6 +671,130 @@ let item10_triple_compare_branch live_out third_index first second third =
   | _ ->
       None
 
+
+(* -------------------------------------------------------------------------- *)
+(* Post-RA copy-back folding.                                                 *)
+(*                                                                            *)
+(* Recognize a pure value update that is first computed into a temporary and  *)
+(* only copied back to the original register later in the same straight-line  *)
+(* region:                                                                    *)
+(*                                                                            *)
+(*     addi tmp, base, K                                                      *)
+(*       ... may read base, but must not write base or touch tmp ...          *)
+(*     addi base, tmp, 0                                                      *)
+(*                                                                            *)
+(* and sink the computation to the copy-back site:                            *)
+(*                                                                            *)
+(*       ...                                                                  *)
+(*     addi base, base, K                                                      *)
+(*                                                                            *)
+(* This preserves all intervening reads of the old [base] value and removes   *)
+(* one physical-register copy.  We deliberately stop at every CFG/call        *)
+(* boundary and only accept instructions whose register effects are known.    *)
+(* -------------------------------------------------------------------------- *)
+
+let item10_copy_back_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_COPY_BACK" = None
+
+let item10_copy_back_debug_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ASM_COPY_BACK" <> None
+
+let item10_copy_back_middle_opcode_safe = function
+  | "li" | "la" | "lw" | "sw"
+  | "addi" | "add" | "sub" | "mul" | "div" | "rem"
+  | "slt" | "sltu" | "slti" | "sltiu"
+  | "slli" | "srli" | "srai"
+  | "andi" | "xor" | "xori" | "neg" ->
+      true
+  | _ ->
+      false
+
+let item10_copy_back_barrier line =
+  let s = trim line in
+  if s = "" then false
+  else if is_label line || starts_with s "." then true
+  else
+    match split_asm_words line with
+    | [] -> false
+    | opcode :: _ -> not (item10_copy_back_middle_opcode_safe opcode)
+
+let item10_copy_back_fold_pass asm =
+  if not (item10_copy_back_enabled ()) then asm
+  else
+    let lines = asm |> split_lines |> Array.of_list in
+    let n = Array.length lines in
+    let live_out = compute_live_out lines in
+    let removed = Array.make n false in
+    let replacements : string option array = Array.make n None in
+    let folds = ref 0 in
+
+    let effective_line i =
+      match replacements.(i) with
+      | Some line -> line
+      | None -> lines.(i)
+    in
+
+    let rec find_copy_back tmp base imm j =
+      if j >= n then None
+      else if removed.(j) then find_copy_back tmp base imm (j + 1)
+      else
+        let line = effective_line j in
+        if item10_copy_back_barrier line then None
+        else
+          match parse_move line with
+          | Some (dst, src)
+            when dst = base
+                 && src = tmp
+                 && not (RegSet.mem tmp live_out.(j)) ->
+              Some j
+          | Some (dst, src) when dst = base && src = tmp ->
+              (* [tmp] remains live after the copy-back, so deleting the
+                 producer would destroy a later use of its value. *)
+              None
+          | _ ->
+              let uses, defs = uses_defs line in
+              (* [tmp] must remain a private carrier until the copy-back. *)
+              if RegSet.mem tmp uses || RegSet.mem tmp defs then None
+              (* The old [base] value may be read, but must not be overwritten
+                 before the delayed update is installed. *)
+              else if RegSet.mem base defs then None
+              else find_copy_back tmp base imm (j + 1)
+    in
+
+    for i = 0 to n - 1 do
+      if not removed.(i) && replacements.(i) = None then
+        match parse_addi lines.(i) with
+        | Some (tmp, base, imm)
+          when tmp <> base
+               && imm <> 0L
+               && value_register tmp
+               && value_register base ->
+            begin
+              match find_copy_back tmp base imm (i + 1) with
+              | Some j ->
+                  removed.(i) <- true;
+                  replacements.(j) <- Some (addi_line base base imm);
+                  incr folds;
+                  if item10_copy_back_debug_enabled () then
+                    Printf.eprintf
+                      "asm-copy-back producer=%d copy=%d tmp=%s base=%s imm=%Ld\n%!"
+                      (i + 1) (j + 1) tmp base imm
+              | None ->
+                  ()
+            end
+        | Some _ | None ->
+            ()
+    done;
+
+    if !folds = 0 then asm
+    else
+      let out = ref [] in
+      for i = n - 1 downto 0 do
+        if not removed.(i) then
+          out := effective_line i :: !out
+      done;
+      String.concat "\n" !out ^ "\n"
+
 let item10_final_asm_cleanup_pass asm =
   if not (item10_final_asm_cleanup_enabled ()) then asm
   else
@@ -796,6 +920,7 @@ let peephole asm =
     let next =
       current
       |> peephole_pass
+      |> item10_copy_back_fold_pass
       |> item10_final_asm_cleanup_pass
     in
     if next = current then current else fix next
