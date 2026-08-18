@@ -2213,14 +2213,46 @@ let item8_gvn_audit_key summaries globals (f : Cfg.func) =
   in
   (item8_func_shape_key f, context)
 
+(* -------------------------------------------------------------------------- *)
+(* item8 v8: context-keyed GVN state cache                                    *)
+(*                                                                            *)
+(* GVN's fixed-point input is the exact CFG plus the write-effects of direct  *)
+(* callees, because calls kill value numbers for globals they may write.       *)
+(* The linear analyzer used by GVN is itself derived solely from the exact CFG *)
+(* shape already present in the key.  Cache only the analysis in-states; the   *)
+(* transformation/rewrite still executes normally on every GVN invocation.    *)
+(* -------------------------------------------------------------------------- *)
+
+type item8_gvn_cache_key = item8_gvn_audit_key
+type item8_gvn_cache_value = (string, gvn_state) Hashtbl.t
+
+let gvn_state_cache_table :
+    (item8_gvn_cache_key, item8_gvn_cache_value) Hashtbl.t =
+  Hashtbl.create 128
+
+let item8_manager_gvn_requests = ref 0
+let item8_manager_gvn_hits = ref 0
+let item8_manager_gvn_computes = ref 0
+
 let gvn_func summaries globals (f : Cfg.func) =
+  let key = item8_gvn_audit_key summaries globals f in
   if !item8_final_work_audit_active then begin
     incr item8_final_gvn_requests;
-    item8_final_note_seen item8_final_gvn_seen item8_final_gvn_repeats
-      (item8_gvn_audit_key summaries globals f)
+    item8_final_note_seen item8_final_gvn_seen item8_final_gvn_repeats key
   end;
+  if !item8_manager_debug_active then incr item8_manager_gvn_requests;
   let linear = make_linear_analyzer f in
-  let in_states = compute_gvn_states ~linear summaries globals f in
+  let in_states =
+    match item8_analysis_cache_find gvn_state_cache_table key with
+    | Some cached ->
+        if !item8_manager_debug_active then incr item8_manager_gvn_hits;
+        cached
+    | None ->
+        if !item8_manager_debug_active then incr item8_manager_gvn_computes;
+        let result = compute_gvn_states ~linear summaries globals f in
+        item8_analysis_cache_store gvn_state_cache_table key result;
+        result
+  in
   let blocks =
     List.map
       (fun (block : Cfg.block) ->
@@ -2592,6 +2624,9 @@ let item8_begin_manager_debug () =
   item8_manager_const_requests := 0;
   item8_manager_const_hits := 0;
   item8_manager_const_computes := 0;
+  item8_manager_gvn_requests := 0;
+  item8_manager_gvn_hits := 0;
+  item8_manager_gvn_computes := 0;
   item8_manager_dom_requests := 0;
   item8_manager_dom_hits := 0;
   item8_manager_dom_computes := 0;
@@ -2608,11 +2643,13 @@ let item8_begin_manager_debug () =
 let item8_print_manager_debug () =
   if !item8_manager_debug_active then
     Printf.eprintf
-      "item8-manager-summary summary-requests=%d summary-hits=%d summary-computes=%d const-requests=%d const-hits=%d const-computes=%d dom-requests=%d dom-hits=%d dom-computes=%d loop-requests=%d loop-hits=%d loop-computes=%d liveness-requests=%d liveness-hits=%d liveness-computes=%d context-liveness-requests=%d context-liveness-hits=%d context-liveness-computes=%d\n%!"
+      "item8-manager-summary summary-requests=%d summary-hits=%d summary-computes=%d const-requests=%d const-hits=%d const-computes=%d gvn-requests=%d gvn-hits=%d gvn-computes=%d dom-requests=%d dom-hits=%d dom-computes=%d loop-requests=%d loop-hits=%d loop-computes=%d liveness-requests=%d liveness-hits=%d liveness-computes=%d context-liveness-requests=%d context-liveness-hits=%d context-liveness-computes=%d\n%!"
       !item8_manager_summary_requests !item8_manager_summary_hits
       !item8_manager_summary_computes
       !item8_manager_const_requests !item8_manager_const_hits
       !item8_manager_const_computes
+      !item8_manager_gvn_requests !item8_manager_gvn_hits
+      !item8_manager_gvn_computes
       !item8_manager_dom_requests !item8_manager_dom_hits
       !item8_manager_dom_computes !item8_manager_loop_requests
       !item8_manager_loop_hits !item8_manager_loop_computes
@@ -4820,6 +4857,7 @@ let item8_begin_analysis_generation () =
      old entries enables safe A/B/A reuse across rewrite waves. *)
   Hashtbl.reset effect_summary_cache_table;
   Hashtbl.reset const_state_cache_table;
+  Hashtbl.reset gvn_state_cache_table;
   Hashtbl.reset liveness_cache_table;
   Hashtbl.reset dominator_cache_table;
   Hashtbl.reset natural_loop_cache_table
@@ -36175,9 +36213,12 @@ let item7_debug_final_seal_audit
   end
 
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
-  item8_begin_analysis_audit ();
+  (* item8 sealed contract:
+     - begin one generation-scoped analysis-manager lifetime per optimize_cfg;
+     - production analyses use exact semantic keys and reuse within the generation;
+     - only optional manager accounting remains behind a DEBUG-only flag;
+     - recomputation/final-work/seal audits are not on the production path. *)
   item8_begin_manager_debug ();
-  item8_begin_final_work_audit ();
   item8_begin_analysis_generation ();
   let cfg = { Cfg.funcs = List.map tailrec_elim_func cfg.funcs } in
   let source_funcs = cfg.funcs in
@@ -36300,7 +36341,5 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let optimized_funcs =
     item7_final_structural_cleanup_program optimized_funcs
   in
-  let () = item8_print_analysis_audit () in
   let () = item8_print_manager_debug () in
-  let () = item8_print_final_work_audit () in
   { Cfg.funcs = optimized_funcs }

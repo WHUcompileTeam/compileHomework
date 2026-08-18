@@ -5,6 +5,10 @@ exception Error of string
 module StringMap = Map.Make (String)
 module IntSet = Set.Make (Int)
 module LabelSet = Set.Make (String)
+module IntPairSet = Set.Make (struct
+  type t = int * int
+  let compare = Stdlib.compare
+end)
 
 type layout = {
   local_homes : (int, local_home) Hashtbl.t;
@@ -986,6 +990,82 @@ let find_param_seed_regs (f : Cfg.func) =
     load_info;
   (by_local, by_temp)
 
+let item9_exact_coalesce_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM9_EXACT_COALESCE" = None
+
+let item9_exact_coalesce_debug_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ITEM9_EXACT_COALESCE" <> None
+  && Array.exists (fun arg -> arg = "-opt") Sys.argv
+
+let item9_add_live_pairs_for_coalesce pairs live =
+  let temps = IntSet.elements live in
+  let rec outer pairs = function
+    | [] -> pairs
+    | a :: rest ->
+        let pairs =
+          List.fold_left
+            (fun acc b ->
+              let x, y = if a < b then (a, b) else (b, a) in
+              IntPairSet.add (x, y) acc)
+            pairs rest
+        in
+        outer pairs rest
+  in
+  outer pairs temps
+
+let item9_exact_interference_pairs (f : Cfg.func) =
+  let _live_in, live_out = compute_temp_live_sets f in
+  let pairs = ref IntPairSet.empty in
+  let note live =
+    pairs := item9_add_live_pairs_for_coalesce !pairs live
+  in
+  List.iter
+    (fun (block : Cfg.block) ->
+      let live = ref (table_find_or_empty live_out block.label IntSet.empty) in
+      note !live;
+      live := scan_term_live_in block.term !live;
+      note !live;
+      List.iter
+        (fun instr ->
+          live := scan_simple_live_in instr !live;
+          note !live)
+        (List.rev block.body))
+    f.blocks;
+  !pairs
+
+let item9_interferes pairs a b =
+  if a = b then false
+  else
+    let x, y = if a < b then (a, b) else (b, a) in
+    IntPairSet.mem (x, y) pairs
+
+let item9_move_affinities (f : Cfg.func) =
+  let loop_depths = compute_loop_depths f in
+  let table = Hashtbl.create 32 in
+  List.iter
+    (fun (block : Cfg.block) ->
+      let depth = Option.value ~default:0 (Hashtbl.find_opt loop_depths block.label) in
+      let weight = 1 + (16 * depth) in
+      List.iter
+        (function
+          | Tcg.Move (dst, Tcg.Temp src) when dst <> src ->
+              let key = (dst, src) in
+              let old = Option.value ~default:0 (Hashtbl.find_opt table key) in
+              Hashtbl.replace table key (old + weight)
+          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ | Tcg.Call _ -> ())
+        block.body)
+    f.blocks;
+  Hashtbl.fold
+    (fun (dst, src) score acc -> (score, dst, src) :: acc)
+    table []
+  |> List.sort (fun (score_a, dst_a, src_a) (score_b, dst_b, src_b) ->
+         match compare score_b score_a with
+         | 0 -> (
+             match compare dst_a dst_b with
+             | 0 -> compare src_a src_b
+             | c -> c)
+         | c -> c)
+
 let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.func) =
   let entry_reg_hints = Option.value ~default:(Hashtbl.create 0) entry_reg_hints in
   let intervals =
@@ -1172,6 +1252,116 @@ let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.fun
               insert_active interval spill_entry.reg
             end)
     intervals;
+
+  (* #9 exact-interference move coalescing.
+     The linear scan above intentionally remains the primary allocator.  This
+     post-pass only recolors an already register-resident temp onto the register
+     of a move-related temp when exact instruction-level liveness proves that
+     the recoloring introduces no interference.  It therefore attacks copy
+     quality without changing the spill model. *)
+  if item9_exact_coalesce_enabled () then begin
+    let exact_pairs = item9_exact_interference_pairs f in
+    let interval_by_temp = Hashtbl.create (max 8 f.temp_count) in
+    List.iter
+      (fun (interval : interval) ->
+        Hashtbl.replace interval_by_temp interval.temp interval)
+      intervals;
+
+    let attempted = ref 0 in
+    let coalesced = ref 0 in
+    let dst_to_src = ref 0 in
+    let src_to_dst = ref 0 in
+    let blocked_interference = ref 0 in
+    let blocked_class = ref 0 in
+    let blocked_entry_hint = ref 0 in
+
+    let entry_hint_ok temp reg =
+      match Hashtbl.find_opt entry_reg_hints temp with
+      | None -> true
+      | Some required -> required = reg
+    in
+
+    let interval_allows temp reg =
+      match Hashtbl.find_opt interval_by_temp temp with
+      | None -> false
+      | Some interval -> List.mem reg (allowed_regs interval)
+    in
+
+    let reg_conflict_free temp reg =
+      Hashtbl.fold
+        (fun other home ok ->
+          if not ok || other = temp then ok
+          else
+            match home with
+            | TempReg other_reg when other_reg = reg ->
+                not (item9_interferes exact_pairs temp other)
+            | TempReg _ | TempStack _ -> true)
+        homes true
+    in
+
+    let try_recolor temp reg =
+      if not (entry_hint_ok temp reg) then begin
+        incr blocked_entry_hint;
+        false
+      end
+      else if not (interval_allows temp reg) then begin
+        incr blocked_class;
+        false
+      end
+      else if not (reg_conflict_free temp reg) then begin
+        incr blocked_interference;
+        false
+      end
+      else begin
+        Hashtbl.replace homes temp (TempReg reg);
+        true
+      end
+    in
+
+    List.iter
+      (fun (_score, dst, src) ->
+        match Hashtbl.find_opt homes dst, Hashtbl.find_opt homes src with
+        | Some (TempReg dst_reg), Some (TempReg src_reg) when dst_reg <> src_reg ->
+            incr attempted;
+            if not (item9_interferes exact_pairs dst src) then begin
+              (* Natural direction first: keep the source's established home and
+                 let the value flow through the move in the same register. *)
+              if try_recolor dst src_reg then begin
+                incr coalesced;
+                incr dst_to_src
+              end
+              else
+                (* Reverse recoloring is deliberately more conservative because
+                   moving a call result, call argument, or entry-seeded value
+                   away from its ABI-friendly register can merely move the copy
+                   somewhere else. *)
+                match Hashtbl.find_opt interval_by_temp src with
+                | Some src_interval
+                  when (not src_interval.defined_by_call)
+                       && not src_interval.used_in_call_args
+                       && not (Hashtbl.mem entry_reg_hints src) ->
+                    if try_recolor src dst_reg then begin
+                      incr coalesced;
+                      incr src_to_dst
+                    end
+                | Some _ | None -> ()
+            end
+            else incr blocked_interference
+        | Some (TempReg _), Some (TempReg _)
+        | Some (TempStack _), _
+        | _, Some (TempStack _)
+        | None, _
+        | _, None ->
+            ())
+      (item9_move_affinities f);
+
+    if item9_exact_coalesce_debug_enabled () then
+      Printf.eprintf
+        "item9-exact-coalesce func=%s attempted=%d coalesced=%d dst-to-src=%d src-to-dst=%d blocked-interference=%d blocked-class=%d blocked-entry-hint=%d\n%!"
+        f.name !attempted !coalesced !dst_to_src !src_to_dst
+        !blocked_interference !blocked_class !blocked_entry_hint
+  end;
+
   let saved_regs =
     Hashtbl.fold
       (fun _ home acc ->
@@ -1184,6 +1374,212 @@ let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.fun
     |> List.sort compare
   in
   (homes, saved_regs)
+
+
+let item9_regalloc_audit_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ITEM9_REGALLOC_AUDIT" <> None
+  && Array.exists (fun arg -> arg = "-opt") Sys.argv
+
+let item9_add_live_pairs pairs live =
+  let temps = IntSet.elements live in
+  let rec outer pairs = function
+    | [] -> pairs
+    | a :: rest ->
+        let pairs =
+          List.fold_left
+            (fun acc b ->
+              let x, y = if a < b then (a, b) else (b, a) in
+              IntPairSet.add (x, y) acc)
+            pairs rest
+        in
+        outer pairs rest
+  in
+  outer pairs temps
+
+let item9_live_shape_stats (f : Cfg.func) =
+  let _live_in, live_out = compute_temp_live_sets f in
+  let max_live = ref 0 in
+  let pairs = ref IntPairSet.empty in
+  let call_sites = ref 0 in
+  let max_call_cross_live = ref 0 in
+  let note live =
+    max_live := max !max_live (IntSet.cardinal live);
+    pairs := item9_add_live_pairs !pairs live
+  in
+  List.iter
+    (fun (block : Cfg.block) ->
+      let live = ref (table_find_or_empty live_out block.label IntSet.empty) in
+      note !live;
+      live := scan_term_live_in block.term !live;
+      note !live;
+      List.iter
+        (fun instr ->
+          begin
+            match instr with
+            | Tcg.Call (dst, _, _) ->
+                incr call_sites;
+                let across =
+                  match dst with
+                  | Some temp -> IntSet.remove temp !live
+                  | None -> !live
+                in
+                max_call_cross_live :=
+                  max !max_call_cross_live (IntSet.cardinal across)
+            | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> ()
+          end;
+          live := scan_simple_live_in instr !live;
+          note !live)
+        (List.rev block.body))
+    f.blocks;
+  (!max_live, !pairs, !call_sites, !max_call_cross_live)
+
+let item9_interval_shape_stats intervals =
+  let max_pressure =
+    List.fold_left
+      (fun best (probe : interval) ->
+        let pressure =
+          List.fold_left
+            (fun count (other : interval) ->
+              if other.start_pos <= probe.start_pos && probe.start_pos <= other.end_pos
+              then count + 1
+              else count)
+            0 intervals
+        in
+        max best pressure)
+      0 intervals
+  in
+  let rec pair_count acc = function
+    | [] -> acc
+    | (a : interval) :: rest ->
+        let acc =
+          List.fold_left
+            (fun count (b : interval) ->
+              if a.start_pos <= b.end_pos && b.start_pos <= a.end_pos
+              then count + 1
+              else count)
+            acc rest
+        in
+        pair_count acc rest
+  in
+  (max_pressure, pair_count 0 intervals)
+
+let item9_temp_stack_traffic (f : Cfg.func) temp_homes =
+  let loop_depths = compute_loop_depths f in
+  let loads = ref 0 in
+  let stores = ref 0 in
+  let hot_score = ref 0 in
+  let note_use depth = function
+    | Tcg.Imm _ -> ()
+    | Tcg.Temp temp -> (
+        match Hashtbl.find_opt temp_homes temp with
+        | Some (TempStack _) ->
+            incr loads;
+            hot_score := !hot_score + 1 + (6 * depth)
+        | Some (TempReg _) | None -> ())
+  in
+  let note_def depth temp =
+    match Hashtbl.find_opt temp_homes temp with
+    | Some (TempStack _) ->
+        incr stores;
+        hot_score := !hot_score + 1 + (6 * depth)
+    | Some (TempReg _) | None -> ()
+  in
+  let note_instr depth = function
+    | Tcg.Move (dst, src)
+    | Tcg.Un (dst, _, src) ->
+        note_use depth src;
+        note_def depth dst
+    | Tcg.Bin (dst, _, lhs, rhs) ->
+        note_use depth lhs;
+        note_use depth rhs;
+        note_def depth dst
+    | Tcg.Load (dst, _) -> note_def depth dst
+    | Tcg.Store (_, value) -> note_use depth value
+    | Tcg.Call (dst, _, args) ->
+        List.iter (note_use depth) args;
+        Option.iter (note_def depth) dst
+  in
+  let note_term depth = function
+    | Cfg.Jump _ | Cfg.Return None -> ()
+    | Cfg.BranchZero (op, _, _)
+    | Cfg.BranchNonZero (op, _, _)
+    | Cfg.Return (Some op) ->
+        note_use depth op
+    | Cfg.BranchCompare (_, lhs, rhs, _, _) ->
+        note_use depth lhs;
+        note_use depth rhs
+  in
+  List.iter
+    (fun (block : Cfg.block) ->
+      let depth = Option.value ~default:0 (Hashtbl.find_opt loop_depths block.label) in
+      List.iter (note_instr depth) block.body;
+      note_term depth block.term)
+    f.blocks;
+  (!loads, !stores, !hot_score)
+
+let item9_print_regalloc_audit (f : Cfg.func) (layout : layout) =
+  if item9_regalloc_audit_enabled () then begin
+    let intervals = compute_temp_intervals f in
+    let max_live, exact_pairs, call_sites, max_call_cross_live =
+      item9_live_shape_stats f
+    in
+    let max_interval_pressure, interval_pairs =
+      item9_interval_shape_stats intervals
+    in
+    let false_overlap_pairs =
+      max 0 (interval_pairs - IntPairSet.cardinal exact_pairs)
+    in
+    let temp_regs = ref 0 in
+    let temp_stack = ref 0 in
+    let caller_reg_temps = ref 0 in
+    let saved_reg_temps = ref 0 in
+    Hashtbl.iter
+      (fun _ home ->
+        match home with
+        | TempStack _ -> incr temp_stack
+        | TempReg reg ->
+            incr temp_regs;
+            if List.mem reg allocatable_saved_regs then incr saved_reg_temps
+            else incr caller_reg_temps)
+      layout.temp_homes;
+    let local_regs = ref 0 in
+    let local_stack = ref 0 in
+    Hashtbl.iter
+      (fun _ home ->
+        match home with
+        | LocalReg _ -> incr local_regs
+        | LocalStack _ -> incr local_stack)
+      layout.local_homes;
+    let call_crossing = ref 0 in
+    let call_crossing_spilled = ref 0 in
+    let noncall_spilled = ref 0 in
+    List.iter
+      (fun (interval : interval) ->
+        if interval.call_crossings > 0 then begin
+          incr call_crossing;
+          match Hashtbl.find_opt layout.temp_homes interval.temp with
+          | Some (TempStack _) -> incr call_crossing_spilled
+          | Some (TempReg _) | None -> ()
+        end else
+          match Hashtbl.find_opt layout.temp_homes interval.temp with
+          | Some (TempStack _) -> incr noncall_spilled
+          | Some (TempReg _) | None -> ())
+      intervals;
+    let spill_loads, spill_stores, spill_hot_score =
+      item9_temp_stack_traffic f layout.temp_homes
+    in
+    Printf.eprintf
+      "item9-regalloc-audit func=%s blocks=%d instrs=%d temps=%d intervals=%d temp-reg=%d temp-stack=%d caller-reg-temp=%d saved-reg-temp=%d call-cross=%d call-cross-spill=%d noncall-spill=%d call-sites=%d max-call-cross-live=%d max-live=%d max-interval=%d pressure-gap=%d exact-pairs=%d interval-pairs=%d false-overlap=%d spill-loads=%d spill-stores=%d spill-hot=%d local-reg=%d local-stack=%d global-base=%d saved=%d frame=%d outgoing=%d\n%!"
+      f.name (List.length f.blocks) (block_instr_count f.blocks) f.temp_count
+      (List.length intervals) !temp_regs !temp_stack !caller_reg_temps
+      !saved_reg_temps !call_crossing !call_crossing_spilled !noncall_spilled
+      call_sites max_call_cross_live max_live max_interval_pressure
+      (max 0 (max_interval_pressure - max_live))
+      (IntPairSet.cardinal exact_pairs) interval_pairs false_overlap_pairs
+      spill_loads spill_stores spill_hot_score !local_regs !local_stack
+      (Hashtbl.length layout.global_base_regs) (List.length layout.saved_regs)
+      layout.frame_size layout.outgoing_area
+  end
 
 let compute_layout (f : Cfg.func) =
   let local_homes = Hashtbl.create 64 in
@@ -1248,14 +1644,18 @@ let compute_layout (f : Cfg.func) =
   let extra_args = max 0 (max_call_args f - 8) in
   let outgoing_area = align16 (extra_args * 4) in
   let frame_bytes = outgoing_area + (!next - 4) in
-  {
-    local_homes;
-    temp_homes;
-    global_base_regs;
-    frame_size = align16 frame_bytes;
-    outgoing_area;
-    saved_regs;
-  }
+  let layout =
+    {
+      local_homes;
+      temp_homes;
+      global_base_regs;
+      frame_size = align16 frame_bytes;
+      outgoing_area;
+      saved_regs;
+    }
+  in
+  item9_print_regalloc_audit f layout;
+  layout
 
 let emit_reg_copy ctx dst src =
   if dst <> src then emitf ctx "    addi %s, %s, 0" dst src
