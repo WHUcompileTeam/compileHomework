@@ -336,9 +336,333 @@ let peephole_pass asm =
   in
   String.concat "\n" (loop 0 []) ^ "\n"
 
+let item10_machine_mix_audit_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ITEM10_MACHINE_MIX" <> None
+  && Array.exists (fun arg -> arg = "-opt") Sys.argv
+
+let item10_is_exec_line line =
+  let s = trim line in
+  s <> "" && not (is_label line) && not (starts_with s ".")
+
+let item10_next_exec_line lines start =
+  let n = Array.length lines in
+  let rec loop i =
+    if i >= n then None
+    else if item10_is_exec_line lines.(i) then Some (i, lines.(i))
+    else if is_label lines.(i) then None
+    else loop (i + 1)
+  in
+  loop start
+
+let item10_mem_base operands =
+  match operands with
+  | _reg :: _off :: base :: _ -> Some base
+  | _ -> None
+
+let item10_reg_used_by_line reg line =
+  let words = split_asm_words line in
+  List.exists (fun w -> w = reg) words
+
+let item10_machine_mix_audit asm =
+  if item10_machine_mix_audit_enabled () then begin
+    let lines = asm |> split_lines |> Array.of_list in
+
+    let instrs = ref 0 in
+    let moves = ref 0 in
+    let li = ref 0 in
+    let la = ref 0 in
+    let lw = ref 0 in
+    let sw = ref 0 in
+    let stack_lw = ref 0 in
+    let stack_sw = ref 0 in
+    let nonstack_lw = ref 0 in
+    let nonstack_sw = ref 0 in
+
+    let la_mem_load = ref 0 in
+    let la_mem_store = ref 0 in
+    let la_other = ref 0 in
+
+    let li_next_arith = ref 0 in
+    let li_next_branch = ref 0 in
+    let li_next_other = ref 0 in
+
+    let addi = ref 0 in
+    let add = ref 0 in
+    let sub = ref 0 in
+    let mul = ref 0 in
+    let div = ref 0 in
+    let rem = ref 0 in
+
+    let compare_materialize = ref 0 in
+    let cond_branch = ref 0 in
+    let jump = ref 0 in
+    let call = ref 0 in
+    let ret = ref 0 in
+    let other = ref 0 in
+
+    let note_la i dst =
+      match item10_next_exec_line lines (i + 1) with
+      | Some (_, next_line) ->
+          begin
+            match split_asm_words next_line with
+            | "lw" :: operands ->
+                begin
+                  match item10_mem_base operands with
+                  | Some base when base = dst -> incr la_mem_load
+                  | Some _ | None -> incr la_other
+                end
+            | "sw" :: operands ->
+                begin
+                  match item10_mem_base operands with
+                  | Some base when base = dst -> incr la_mem_store
+                  | Some _ | None -> incr la_other
+                end
+            | _ -> incr la_other
+          end
+      | None -> incr la_other
+    in
+
+    let note_li i dst =
+      match item10_next_exec_line lines (i + 1) with
+      | Some (_, next_line) when item10_reg_used_by_line dst next_line ->
+          begin
+            match split_asm_words next_line with
+            | ("add" | "sub" | "mul" | "div" | "rem"
+              | "slt" | "sltu" | "sltiu" | "xori" | "addi") :: _ ->
+                incr li_next_arith
+            | ("beq" | "bne" | "blt" | "bge" | "bltu" | "bgeu"
+              | "beqz" | "bnez") :: _ ->
+                incr li_next_branch
+            | _ -> incr li_next_other
+          end
+      | Some _ | None ->
+          incr li_next_other
+    in
+
+    Array.iteri
+      (fun i line ->
+        if item10_is_exec_line line then begin
+          incr instrs;
+          match split_asm_words line with
+          | [] -> ()
+          | opcode :: operands ->
+              begin
+                match opcode with
+                | "addi" ->
+                    begin
+                      match operands with
+                      | [ dst; src; "0" ] when dst <> src ->
+                          incr moves
+                      | _ ->
+                          incr addi
+                    end
+                | "add" -> incr add
+                | "sub" -> incr sub
+                | "mul" -> incr mul
+                | "div" -> incr div
+                | "rem" -> incr rem
+                | "slt" | "sltu" | "sltiu" | "xori" ->
+                    incr compare_materialize
+                | "lw" ->
+                    incr lw;
+                    begin
+                      match item10_mem_base operands with
+                      | Some "sp" -> incr stack_lw
+                      | Some _ | None -> incr nonstack_lw
+                    end
+                | "sw" ->
+                    incr sw;
+                    begin
+                      match item10_mem_base operands with
+                      | Some "sp" -> incr stack_sw
+                      | Some _ | None -> incr nonstack_sw
+                    end
+                | "la" ->
+                    incr la;
+                    begin
+                      match operands with
+                      | dst :: _ -> note_la i dst
+                      | [] -> incr la_other
+                    end
+                | "li" ->
+                    incr li;
+                    begin
+                      match operands with
+                      | dst :: _ -> note_li i dst
+                      | [] -> incr li_next_other
+                    end
+                | "beq" | "bne" | "blt" | "bge" | "bltu" | "bgeu"
+                | "beqz" | "bnez" ->
+                    incr cond_branch
+                | "j" -> incr jump
+                | "call" -> incr call
+                | "ret" -> incr ret
+                | _ -> incr other
+              end
+        end)
+      lines;
+
+    Printf.eprintf
+      "item10-machine-mix instrs=%d moves=%d li=%d la=%d lw=%d sw=%d stack-lw=%d stack-sw=%d nonstack-lw=%d nonstack-sw=%d la-mem-load=%d la-mem-store=%d la-other=%d li-next-arith=%d li-next-branch=%d li-next-other=%d addi=%d add=%d sub=%d mul=%d div=%d rem=%d compare-materialize=%d cond-branch=%d jump=%d call=%d ret=%d other=%d asm-bytes=%d\n%!"
+      !instrs !moves !li !la !lw !sw !stack_lw !stack_sw
+      !nonstack_lw !nonstack_sw !la_mem_load !la_mem_store !la_other
+      !li_next_arith !li_next_branch !li_next_other !addi !add !sub
+      !mul !div !rem !compare_materialize !cond_branch !jump !call !ret
+      !other (String.length asm)
+  end
+
+let item10_immediate_audit_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ITEM10_IMMEDIATE_AUDIT" <> None
+  && Array.exists (fun arg -> arg = "-opt") Sys.argv
+
+let item10_parse_i64 s =
+  try Some (Int64.of_string s) with _ -> None
+
+let item10_fits_simm12_i64 n =
+  Int64.compare n (-2048L) >= 0 && Int64.compare n 2047L <= 0
+
+let item10_is_positive_pow2 n =
+  Int64.compare n 0L > 0
+  && Int64.logand n (Int64.sub n 1L) = 0L
+
+let item10_immediate_audit asm =
+  if item10_immediate_audit_enabled () then begin
+    let lines = asm |> split_lines |> Array.of_list in
+
+    let total = ref 0 in
+    let parseable = ref 0 in
+    let zero = ref 0 in
+    let one = ref 0 in
+    let minus_one = ref 0 in
+    let simm12 = ref 0 in
+    let neg_fits_simm12 = ref 0 in
+    let pos_pow2 = ref 0 in
+
+    let to_add = ref 0 in
+    let to_sub = ref 0 in
+    let to_mul = ref 0 in
+    let to_div = ref 0 in
+    let to_rem = ref 0 in
+    let to_slt = ref 0 in
+    let to_sltu = ref 0 in
+    let to_sltiu = ref 0 in
+    let to_xori = ref 0 in
+    let to_addi = ref 0 in
+    let to_branch = ref 0 in
+    let to_lw = ref 0 in
+    let to_sw = ref 0 in
+    let to_call = ref 0 in
+    let to_move = ref 0 in
+    let to_other = ref 0 in
+    let no_direct_use = ref 0 in
+
+    let mul_pow2 = ref 0 in
+    let mul_simm12 = ref 0 in
+    let div_pow2 = ref 0 in
+    let rem_pow2 = ref 0 in
+    let branch_simm12 = ref 0 in
+    let compare_simm12 = ref 0 in
+
+    Array.iteri
+      (fun i line ->
+        match split_asm_words line with
+        | [ "li"; dst; imm_text ] ->
+            incr total;
+            let imm = item10_parse_i64 imm_text in
+            begin
+              match imm with
+              | Some n ->
+                  incr parseable;
+                  if n = 0L then incr zero;
+                  if n = 1L then incr one;
+                  if n = -1L then incr minus_one;
+                  if item10_fits_simm12_i64 n then incr simm12;
+                  if item10_fits_simm12_i64 (Int64.neg n) then incr neg_fits_simm12;
+                  if item10_is_positive_pow2 n then incr pos_pow2
+              | None -> ()
+            end;
+
+            begin
+              match item10_next_exec_line lines (i + 1) with
+              | Some (_, next_line) when item10_reg_used_by_line dst next_line ->
+                  begin
+                    match split_asm_words next_line with
+                    | "add" :: _ -> incr to_add
+                    | "sub" :: _ -> incr to_sub
+                    | "mul" :: _ ->
+                        incr to_mul;
+                        begin match imm with
+                        | Some n when item10_is_positive_pow2 n -> incr mul_pow2
+                        | _ -> ()
+                        end;
+                        begin match imm with
+                        | Some n when item10_fits_simm12_i64 n -> incr mul_simm12
+                        | _ -> ()
+                        end
+                    | "div" :: _ ->
+                        incr to_div;
+                        begin match imm with
+                        | Some n when item10_is_positive_pow2 n -> incr div_pow2
+                        | _ -> ()
+                        end
+                    | "rem" :: _ ->
+                        incr to_rem;
+                        begin match imm with
+                        | Some n when item10_is_positive_pow2 n -> incr rem_pow2
+                        | _ -> ()
+                        end
+                    | "slt" :: _ ->
+                        incr to_slt;
+                        begin match imm with
+                        | Some n when item10_fits_simm12_i64 n -> incr compare_simm12
+                        | _ -> ()
+                        end
+                    | "sltu" :: _ ->
+                        incr to_sltu;
+                        begin match imm with
+                        | Some n when item10_fits_simm12_i64 n -> incr compare_simm12
+                        | _ -> ()
+                        end
+                    | "sltiu" :: _ -> incr to_sltiu
+                    | "xori" :: _ -> incr to_xori
+                    | "addi" :: _ ->
+                        begin
+                          match parse_move next_line with
+                          | Some _ -> incr to_move
+                          | None -> incr to_addi
+                        end
+                    | ("beq" | "bne" | "blt" | "bge" | "bltu" | "bgeu"
+                      | "beqz" | "bnez") :: _ ->
+                        incr to_branch;
+                        begin match imm with
+                        | Some n when item10_fits_simm12_i64 n -> incr branch_simm12
+                        | _ -> ()
+                        end
+                    | "lw" :: _ -> incr to_lw
+                    | "sw" :: _ -> incr to_sw
+                    | "call" :: _ -> incr to_call
+                    | _ -> incr to_other
+                  end
+              | Some _ | None -> incr no_direct_use
+            end
+        | _ -> ())
+      lines;
+
+    Printf.eprintf
+      "item10-immediate-audit total=%d parseable=%d zero=%d one=%d minus-one=%d simm12=%d neg-fits-simm12=%d pos-pow2=%d to-add=%d to-sub=%d to-mul=%d to-div=%d to-rem=%d to-slt=%d to-sltu=%d to-sltiu=%d to-xori=%d to-addi=%d to-branch=%d to-lw=%d to-sw=%d to-call=%d to-move=%d to-other=%d no-direct-use=%d mul-pow2=%d mul-simm12=%d div-pow2=%d rem-pow2=%d branch-simm12=%d compare-simm12=%d\n%!"
+      !total !parseable !zero !one !minus_one !simm12 !neg_fits_simm12
+      !pos_pow2 !to_add !to_sub !to_mul !to_div !to_rem !to_slt !to_sltu
+      !to_sltiu !to_xori !to_addi !to_branch !to_lw !to_sw !to_call
+      !to_move !to_other !no_direct_use !mul_pow2 !mul_simm12 !div_pow2
+      !rem_pow2 !branch_simm12 !compare_simm12
+  end
+
 let peephole asm =
   let rec fix current =
     let next = peephole_pass current in
     if next = current then current else fix next
   in
-  fix asm
+  let result = fix asm in
+  item10_machine_mix_audit result;
+  item10_immediate_audit result;
+  result

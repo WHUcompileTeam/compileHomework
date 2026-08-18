@@ -1562,6 +1562,92 @@ let emit_compare_zero ctx op dst reg zero_on_left =
   | LOr, _ ->
       raise (Error "non-compare op in compare-zero lowering")
 
+let item10_immediate_lowering_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_IMMEDIATE_LOWERING" = None
+
+let item10_positive_pow2_shift imm =
+  if Int64.compare imm 0L <= 0 then None
+  else
+    let rec loop value shift =
+      if value = 1L then Some shift
+      else if Int64.logand value 1L <> 0L then None
+      else if shift >= 30 then None
+      else loop (Int64.shift_right_logical value 1) (shift + 1)
+    in
+    loop imm 0
+
+let item10_emit_compare_imm_rhs ctx op dst lhs imm =
+  if not (fits_simm12 imm) then false
+  else
+    match op with
+    | Eq ->
+        let lhs_reg = operand_reg ctx "t0" lhs in
+        emitf ctx "    xori %s, %s, %Ld" dst lhs_reg imm;
+        emitf ctx "    sltiu %s, %s, 1" dst dst;
+        true
+    | Ne ->
+        let lhs_reg = operand_reg ctx "t0" lhs in
+        emitf ctx "    xori %s, %s, %Ld" dst lhs_reg imm;
+        emitf ctx "    sltu %s, x0, %s" dst dst;
+        true
+    | Lt ->
+        let lhs_reg = operand_reg ctx "t0" lhs in
+        emitf ctx "    slti %s, %s, %Ld" dst lhs_reg imm;
+        true
+    | Le ->
+        let next = Int64.add imm 1L in
+        if fits_simm12 next then begin
+          let lhs_reg = operand_reg ctx "t0" lhs in
+          emitf ctx "    slti %s, %s, %Ld" dst lhs_reg next;
+          true
+        end
+        else false
+    | Ge ->
+        let lhs_reg = operand_reg ctx "t0" lhs in
+        emitf ctx "    slti %s, %s, %Ld" dst lhs_reg imm;
+        emitf ctx "    xori %s, %s, 1" dst dst;
+        true
+    | Gt ->
+        false
+    | Add | Sub | Mul | Div | Mod | LAnd | LOr ->
+        false
+
+let item10_emit_compare_imm_lhs ctx op dst imm rhs =
+  if not (fits_simm12 imm) then false
+  else
+    match op with
+    | Eq ->
+        let rhs_reg = operand_reg ctx "t0" rhs in
+        emitf ctx "    xori %s, %s, %Ld" dst rhs_reg imm;
+        emitf ctx "    sltiu %s, %s, 1" dst dst;
+        true
+    | Ne ->
+        let rhs_reg = operand_reg ctx "t0" rhs in
+        emitf ctx "    xori %s, %s, %Ld" dst rhs_reg imm;
+        emitf ctx "    sltu %s, x0, %s" dst dst;
+        true
+    | Gt ->
+        let rhs_reg = operand_reg ctx "t0" rhs in
+        emitf ctx "    slti %s, %s, %Ld" dst rhs_reg imm;
+        true
+    | Le ->
+        let rhs_reg = operand_reg ctx "t0" rhs in
+        emitf ctx "    slti %s, %s, %Ld" dst rhs_reg imm;
+        emitf ctx "    xori %s, %s, 1" dst dst;
+        true
+    | Ge ->
+        let next = Int64.add imm 1L in
+        if fits_simm12 next then begin
+          let rhs_reg = operand_reg ctx "t0" rhs in
+          emitf ctx "    slti %s, %s, %Ld" dst rhs_reg next;
+          true
+        end
+        else false
+    | Lt ->
+        false
+    | Add | Sub | Mul | Div | Mod | LAnd | LOr ->
+        false
+
 let emit_binop_operands ctx op dst lhs rhs =
   match (op, lhs, rhs) with
   | Add, Tcg.Imm imm, rhs when fits_simm12 imm ->
@@ -1573,6 +1659,59 @@ let emit_binop_operands ctx op dst lhs rhs =
   | Sub, lhs, Tcg.Imm imm when fits_simm12 Int64.(neg imm) ->
       let lhs_reg = operand_reg ctx "t0" lhs in
       emitf ctx "    addi %s, %s, %Ld" dst lhs_reg Int64.(neg imm)
+
+  | Mul, Tcg.Imm 0L, _
+  | Mul, _, Tcg.Imm 0L
+    when item10_immediate_lowering_enabled () ->
+      emitf ctx "    li %s, 0" dst
+  | Mul, Tcg.Imm 1L, rhs
+  | Mul, rhs, Tcg.Imm 1L
+    when item10_immediate_lowering_enabled () ->
+      let rhs_reg = operand_reg ctx "t0" rhs in
+      emit_reg_copy ctx dst rhs_reg
+  | Mul, Tcg.Imm (-1L), rhs
+  | Mul, rhs, Tcg.Imm (-1L)
+    when item10_immediate_lowering_enabled () ->
+      let rhs_reg = operand_reg ctx "t0" rhs in
+      emitf ctx "    neg %s, %s" dst rhs_reg
+  | Mul, Tcg.Imm imm, rhs
+    when item10_immediate_lowering_enabled () ->
+      begin
+        match item10_positive_pow2_shift imm with
+        | Some shift ->
+            let rhs_reg = operand_reg ctx "t0" rhs in
+            emitf ctx "    slli %s, %s, %d" dst rhs_reg shift
+        | None ->
+            let lhs_reg = operand_reg ctx "t0" lhs in
+            let rhs_reg = operand_reg ctx "t1" rhs in
+            emit_binop ctx op dst lhs_reg rhs_reg
+      end
+  | Mul, lhs, Tcg.Imm imm
+    when item10_immediate_lowering_enabled () ->
+      begin
+        match item10_positive_pow2_shift imm with
+        | Some shift ->
+            let lhs_reg = operand_reg ctx "t0" lhs in
+            emitf ctx "    slli %s, %s, %d" dst lhs_reg shift
+        | None ->
+            let lhs_reg = operand_reg ctx "t0" lhs in
+            let rhs_reg = operand_reg ctx "t1" rhs in
+            emit_binop ctx op dst lhs_reg rhs_reg
+      end
+
+  | Div, lhs, Tcg.Imm 1L
+    when item10_immediate_lowering_enabled () ->
+      let lhs_reg = operand_reg ctx "t0" lhs in
+      emit_reg_copy ctx dst lhs_reg
+  | Div, lhs, Tcg.Imm (-1L)
+    when item10_immediate_lowering_enabled () ->
+      let lhs_reg = operand_reg ctx "t0" lhs in
+      emitf ctx "    neg %s, %s" dst lhs_reg
+  | Mod, _, Tcg.Imm 1L
+  | Mod, _, Tcg.Imm (-1L)
+    when item10_immediate_lowering_enabled () ->
+      emitf ctx "    li %s, 0" dst
+
   | Eq, Tcg.Imm 0L, rhs
   | Ne, Tcg.Imm 0L, rhs
   | Lt, Tcg.Imm 0L, rhs
@@ -1589,10 +1728,20 @@ let emit_binop_operands ctx op dst lhs rhs =
   | Ge, lhs, Tcg.Imm 0L ->
       let lhs_reg = operand_reg ctx "t0" lhs in
       emit_compare_zero ctx op dst lhs_reg false
+
+  | (Eq | Ne | Lt | Gt | Le | Ge), lhs, Tcg.Imm imm
+    when item10_immediate_lowering_enabled ()
+         && item10_emit_compare_imm_rhs ctx op dst lhs imm ->
+      ()
+  | (Eq | Ne | Lt | Gt | Le | Ge), Tcg.Imm imm, rhs
+    when item10_immediate_lowering_enabled ()
+         && item10_emit_compare_imm_lhs ctx op dst imm rhs ->
+      ()
+
   | _ ->
-       let lhs_reg = operand_reg ctx "t0" lhs in
-       let rhs_reg = operand_reg ctx "t1" rhs in
-       emit_binop ctx op dst lhs_reg rhs_reg
+      let lhs_reg = operand_reg ctx "t0" lhs in
+      let rhs_reg = operand_reg ctx "t1" rhs in
+      emit_binop ctx op dst lhs_reg rhs_reg
 
 let emit_call_args ctx args =
   List.iteri
@@ -2035,9 +2184,112 @@ let emit_global buf g =
   Buffer.add_string buf (g.Semant.label ^ ":\n");
   Buffer.add_string buf (Printf.sprintf "    .word %Ld\n\n" g.Semant.init)
 
+let item10_reachable_emission_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_REACHABLE_EMISSION" = None
+
+let item10_reachable_emission_debug_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ITEM10_REACHABLE_EMISSION" <> None
+  && Array.exists (fun arg -> arg = "-opt") Sys.argv
+
+let item10_direct_callee_labels (f : Cfg.func) =
+  List.fold_left
+    (fun acc (block : Cfg.block) ->
+      List.fold_left
+        (fun acc instr ->
+          match instr with
+          | Tcg.Call (_, callee, _) -> LabelSet.add callee acc
+          | Tcg.Move _
+          | Tcg.Un _
+          | Tcg.Bin _
+          | Tcg.Load _
+          | Tcg.Store _ ->
+              acc)
+        acc block.body)
+    LabelSet.empty f.blocks
+
+let item10_reachable_func_labels (cfg : Cfg.program) =
+  let by_label = Hashtbl.create (max 8 (List.length cfg.funcs)) in
+  List.iter
+    (fun (f : Cfg.func) -> Hashtbl.replace by_label f.label f)
+    cfg.funcs;
+  let roots =
+    List.fold_left
+      (fun acc (f : Cfg.func) ->
+        if f.name = "main" then f.label :: acc else acc)
+      [] cfg.funcs
+  in
+  match roots with
+  | [] ->
+      (* Be conservative for non-executable/library-like inputs. *)
+      List.fold_left
+        (fun acc (f : Cfg.func) -> LabelSet.add f.label acc)
+        LabelSet.empty cfg.funcs
+  | _ ->
+      let rec visit work seen =
+        match work with
+        | [] -> seen
+        | label :: rest ->
+            if LabelSet.mem label seen then
+              visit rest seen
+            else
+              let seen = LabelSet.add label seen in
+              match Hashtbl.find_opt by_label label with
+              | None ->
+                  (* External/direct runtime callee: there is no local body
+                     to emit, but retaining the edge is harmless. *)
+                  visit rest seen
+              | Some f ->
+                  let callees =
+                    item10_direct_callee_labels f
+                    |> LabelSet.elements
+                  in
+                  visit (List.rev_append callees rest) seen
+      in
+      visit roots LabelSet.empty
+
+let item10_cfg_instr_count (f : Cfg.func) =
+  List.fold_left
+    (fun total (block : Cfg.block) ->
+      total + List.length block.body + 1)
+    0 f.blocks
+
 let generate (analysis : Semant.analysis) (cfg : Cfg.program) =
+  let reachable =
+    if item10_reachable_emission_enabled () then
+      item10_reachable_func_labels cfg
+    else
+      List.fold_left
+        (fun acc (f : Cfg.func) -> LabelSet.add f.label acc)
+        LabelSet.empty cfg.funcs
+  in
+  let emitted_funcs =
+    List.filter
+      (fun (f : Cfg.func) -> LabelSet.mem f.label reachable)
+      cfg.funcs
+  in
   let buf = Buffer.create 16384 in
   Buffer.add_string buf "    .option nopic\n\n";
   List.iter (emit_global buf) analysis.globals;
-  List.iter (gen_func buf) cfg.funcs;
+  List.iter (gen_func buf) emitted_funcs;
+  if item10_reachable_emission_debug_enabled () then begin
+    let total_cfg_instrs =
+      List.fold_left
+        (fun total f -> total + item10_cfg_instr_count f)
+        0 cfg.funcs
+    in
+    let emitted_cfg_instrs =
+      List.fold_left
+        (fun total f -> total + item10_cfg_instr_count f)
+        0 emitted_funcs
+    in
+    Printf.eprintf
+      "item10-reachable-emission funcs-total=%d funcs-emitted=%d funcs-pruned=%d cfg-instr-total=%d cfg-instr-emitted=%d cfg-instr-pruned=%d asm-bytes=%d\n%!"
+      (List.length cfg.funcs)
+      (List.length emitted_funcs)
+      (List.length cfg.funcs - List.length emitted_funcs)
+      total_cfg_instrs
+      emitted_cfg_instrs
+      (total_cfg_instrs - emitted_cfg_instrs)
+      (Buffer.length buf)
+  end;
   Buffer.contents buf
