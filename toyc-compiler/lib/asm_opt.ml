@@ -795,6 +795,179 @@ let item10_copy_back_fold_pass asm =
       done;
       String.concat "\n" !out ^ "\n"
 
+
+(* -------------------------------------------------------------------------- *)
+(* Post-RA loop snapshot reconstruction.                                      *)
+(*                                                                            *)
+(* After copy-back folding, a loop may still maintain a point-in-time          *)
+(* snapshot on every iteration:                                               *)
+(*                                                                            *)
+(*   loop:                                                                    *)
+(*       ...                                                                  *)
+(*       addi snapshot, value, 0                                              *)
+(*       ...                                                                  *)
+(*       addi value, value, K                                                 *)
+(*       ...                                                                  *)
+(*       b?? ..., loop                                                        *)
+(*                                                                            *)
+(* If the loop body is straight-line, [snapshot] is not read in the body, and  *)
+(* [value] has exactly that one self-update, the last snapshot on loop exit is *)
+(* exactly [value - K].  Remove the per-iteration copy and reconstruct it once *)
+(* on the fallthrough edge:                                                   *)
+(*                                                                            *)
+(*       b?? ..., loop                                                        *)
+(*       addi snapshot, value, -K                                             *)
+(*                                                                            *)
+(* Placing the reconstruction before the following label is edge-specific:     *)
+(* other predecessors that jump directly to that label correctly bypass it.    *)
+(* -------------------------------------------------------------------------- *)
+
+let item10_loop_snapshot_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_LOOP_SNAPSHOT" = None
+
+let item10_loop_snapshot_debug_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ASM_LOOP_SNAPSHOT" <> None
+
+let item10_is_control_opcode = function
+  | "j" | "call" | "ret"
+  | "beq" | "bne" | "blt" | "bge" | "bltu" | "bgeu"
+  | "beqz" | "bnez" ->
+      true
+  | _ ->
+      false
+
+let item10_loop_snapshot_pass asm =
+  if not (item10_loop_snapshot_enabled ()) then asm
+  else
+    let lines = asm |> split_lines |> Array.of_list in
+    let n = Array.length lines in
+    let live_out = compute_live_out lines in
+    let label_pos = item10_build_label_pos lines in
+    let removed = Array.make n false in
+    let insert_after : string list array = Array.make n [] in
+    let rewrites = ref 0 in
+
+    let body_is_straight_line header_pos latch_pos =
+      let ok = ref true in
+      let i = ref (header_pos + 1) in
+      while !ok && !i < latch_pos do
+        let line = lines.(!i) in
+        let s = trim line in
+        if is_label line then ok := false
+        else if s = "" || starts_with s "." then ()
+        else begin
+          match split_asm_words line with
+          | opcode :: _ when item10_is_control_opcode opcode -> ok := false
+          | _ -> ()
+        end;
+        incr i
+      done;
+      !ok
+    in
+
+    let analyze_loop header_pos latch_pos =
+      let snapshots = ref [] in
+      let self_updates = ref [] in
+      for i = header_pos + 1 to latch_pos - 1 do
+        begin
+          match parse_move lines.(i) with
+          | Some (dst, src) when dst <> src && value_register dst && value_register src ->
+              snapshots := (i, dst, src) :: !snapshots
+          | Some _ | None -> ()
+        end;
+        begin
+          match parse_addi lines.(i) with
+          | Some (dst, src, imm)
+            when dst = src
+                 && imm <> 0L
+                 && value_register dst
+                 && fits_simm12 (Int64.neg imm) ->
+              self_updates := (i, dst, imm) :: !self_updates
+          | Some _ | None -> ()
+        end
+      done;
+
+      let try_snapshot (move_i, snapshot, value) =
+        let updates =
+          List.filter (fun (_, reg, _) -> reg = value) !self_updates
+        in
+        match updates with
+        | [ (update_i, _, step) ] when move_i < update_i ->
+            let valid = ref true in
+            for i = header_pos + 1 to latch_pos - 1 do
+              if !valid then begin
+                let uses, defs = uses_defs lines.(i) in
+                if i = move_i then begin
+                  (* This must be the sole definition of [snapshot] in-body. *)
+                  if not (RegSet.mem snapshot defs) then valid := false
+                end
+                else begin
+                  if RegSet.mem snapshot uses || RegSet.mem snapshot defs then
+                    valid := false
+                end;
+
+                if i = update_i then begin
+                  if not (RegSet.mem value defs) then valid := false
+                end
+                else if RegSet.mem value defs then
+                  valid := false
+              end
+            done;
+            let latch_uses, _ = uses_defs lines.(latch_pos) in
+            if RegSet.mem snapshot latch_uses then valid := false;
+            if not (RegSet.mem snapshot live_out.(latch_pos)) then valid := false;
+            if !valid then Some (move_i, snapshot, value, step) else None
+        | [ _ ] | [] | _ :: _ :: _ ->
+            None
+      in
+
+      let candidates =
+        List.filter_map try_snapshot !snapshots
+      in
+      (* Keep the transformation deliberately unambiguous.  Multiple independent
+         snapshots in one tiny loop can be supported later, but processing one
+         per fixed-point iteration avoids interactions between inserted edge
+         reconstructions and keeps the proof local. *)
+      match candidates with
+      | (move_i, snapshot, value, step) :: _ ->
+          removed.(move_i) <- true;
+          let rebuild = addi_line snapshot value (Int64.neg step) in
+          insert_after.(latch_pos) <- insert_after.(latch_pos) @ [ rebuild ];
+          incr rewrites;
+          if item10_loop_snapshot_debug_enabled () then
+            Printf.eprintf
+              "asm-loop-snapshot header=%d move=%d latch=%d snapshot=%s value=%s step=%Ld rebuild=%Ld\n%!"
+              (header_pos + 1) (move_i + 1) (latch_pos + 1)
+              snapshot value step (Int64.neg step)
+      | [] ->
+          ()
+    in
+
+    for latch_pos = 0 to n - 1 do
+      match branch_target lines.(latch_pos) with
+      | Some target when is_conditional_branch lines.(latch_pos) ->
+          begin
+            match Hashtbl.find_opt label_pos target with
+            | Some header_pos
+              when header_pos < latch_pos
+                   && body_is_straight_line header_pos latch_pos ->
+                analyze_loop header_pos latch_pos
+            | Some _ | None ->
+                ()
+          end
+      | Some _ | None ->
+          ()
+    done;
+
+    if !rewrites = 0 then asm
+    else
+      let out = ref [] in
+      for i = 0 to n - 1 do
+        if not removed.(i) then out := lines.(i) :: !out;
+        List.iter (fun line -> out := line :: !out) insert_after.(i)
+      done;
+      String.concat "\n" (List.rev !out) ^ "\n"
+
 let item10_final_asm_cleanup_pass asm =
   if not (item10_final_asm_cleanup_enabled ()) then asm
   else
@@ -921,6 +1094,7 @@ let peephole asm =
       current
       |> peephole_pass
       |> item10_copy_back_fold_pass
+      |> item10_loop_snapshot_pass
       |> item10_final_asm_cleanup_pass
     in
     if next = current then current else fix next
