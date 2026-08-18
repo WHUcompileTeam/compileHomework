@@ -1565,6 +1565,14 @@ let emit_compare_zero ctx op dst reg zero_on_left =
 let item10_immediate_lowering_enabled () =
   Sys.getenv_opt "TOYC_DISABLE_ITEM10_IMMEDIATE_LOWERING" = None
 
+let item10_div2_lowering_enabled () =
+  item10_immediate_lowering_enabled ()
+  && Sys.getenv_opt "TOYC_DISABLE_ITEM10_DIV2_LOWERING" = None
+
+let item10_rem2_lowering_enabled () =
+  item10_immediate_lowering_enabled ()
+  && Sys.getenv_opt "TOYC_DISABLE_ITEM10_REM2_LOWERING" = None
+
 let item10_positive_pow2_shift imm =
   if Int64.compare imm 0L <= 0 then None
   else
@@ -1707,10 +1715,38 @@ let emit_binop_operands ctx op dst lhs rhs =
     when item10_immediate_lowering_enabled () ->
       let lhs_reg = operand_reg ctx "t0" lhs in
       emitf ctx "    neg %s, %s" dst lhs_reg
+
+  (* Signed division by 2 must truncate toward zero, exactly like C/RISC-V
+     DIV.  Arithmetic right shift alone is wrong for negative odd values:
+       -3 / 2 = -1, but -3 >> 1 = -2.
+     For d = 2:
+       bias = unsigned(x) >> 31          (0 or 1)
+       q    = (x + bias) >> 1
+     The addition is 32-bit wrapping, which is safe for all int32 values. *)
+  | Div, lhs, Tcg.Imm 2L
+    when item10_div2_lowering_enabled () ->
+      let lhs_reg = operand_reg ctx "t0" lhs in
+      emitf ctx "    srli t1, %s, 31" lhs_reg;
+      emitf ctx "    add t1, %s, t1" lhs_reg;
+      emitf ctx "    srai %s, t1, 1" dst
+
   | Mod, _, Tcg.Imm 1L
   | Mod, _, Tcg.Imm (-1L)
     when item10_immediate_lowering_enabled () ->
       emitf ctx "    li %s, 0" dst
+
+  (* Signed remainder by 2 has the sign of the dividend.
+       p = x & 1
+       s = x >> 31                      (0 or -1)
+       r = (p xor s) - s
+     For x >= 0 this is p; for x < 0 this is -p. *)
+  | Mod, lhs, Tcg.Imm 2L
+    when item10_rem2_lowering_enabled () ->
+      let lhs_reg = operand_reg ctx "t0" lhs in
+      emitf ctx "    andi t1, %s, 1" lhs_reg;
+      emitf ctx "    srai t2, %s, 31" lhs_reg;
+      emitf ctx "    xor t1, t1, t2";
+      emitf ctx "    sub %s, t1, t2" dst
 
   | Eq, Tcg.Imm 0L, rhs
   | Ne, Tcg.Imm 0L, rhs
