@@ -799,7 +799,44 @@ let compute_temp_intervals (f : Cfg.func) =
   let hint_tables = Hashtbl.create (max 8 f.temp_count) in
   let block_ranges = Hashtbl.create (List.length f.blocks) in
   let loop_depths = compute_loop_depths f in
-  let call_sites_rev = ref [] in
+
+  (* Count only values whose OLD value is genuinely live after a call.
+     The linear-scan interval is intentionally widened to block boundaries,
+     so using interval start/end to infer call crossing incorrectly classifies
+     an argument whose last use is the call itself as live-across-call. *)
+  let exact_call_crossings = Hashtbl.create (max 8 f.temp_count) in
+  let note_call_crossing temp =
+    let old =
+      Option.value ~default:0 (Hashtbl.find_opt exact_call_crossings temp)
+    in
+    Hashtbl.replace exact_call_crossings temp (old + 1)
+  in
+  List.iter
+    (fun (block : Cfg.block) ->
+      let live =
+        ref (table_find_or_empty live_out block.label IntSet.empty)
+      in
+      live := scan_term_live_in block.term !live;
+      List.iter
+        (fun instr ->
+          begin
+            match instr with
+            | Tcg.Call (dst, _, _) ->
+                (* [live] is the instruction live-out set.  A call result is
+                   born by this call, so it is not an old value crossing it. *)
+                let across =
+                  match dst with
+                  | Some temp -> IntSet.remove temp !live
+                  | None -> !live
+                in
+                IntSet.iter note_call_crossing across
+            | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _
+            | Tcg.Load _ | Tcg.Store _ ->
+                ()
+          end;
+          live := scan_simple_live_in instr !live)
+        (List.rev block.body))
+    f.blocks;
   let note_operand pos loop_depth = function
     | Tcg.Temp temp -> note_temp_use stats_table temp pos loop_depth
     | Tcg.Imm _ -> ()
@@ -834,7 +871,6 @@ let compute_temp_intervals (f : Cfg.func) =
     | Tcg.Call (dst, _, args) ->
         let use_pos = 2 * pos in
         let def_pos = use_pos + 1 in
-        call_sites_rev := def_pos :: !call_sites_rev;
         Option.iter
           (fun temp ->
             note_temp_def stats_table temp def_pos loop_depth;
@@ -933,10 +969,7 @@ let compute_temp_intervals (f : Cfg.func) =
         | None -> []
       in
       let call_crossings =
-        List.fold_left
-          (fun acc call_pos ->
-            if stats.start_pos < call_pos && call_pos < stats.end_pos then acc + 1 else acc)
-          0 !call_sites_rev
+        Option.value ~default:0 (Hashtbl.find_opt exact_call_crossings temp)
       in
       {
         temp;
@@ -1110,6 +1143,66 @@ let item9_move_affinities (f : Cfg.func) =
              | 0 -> compare src_a src_b
              | c -> c)
          | c -> c)
+
+
+(* Post-allocation call-argument affinity.
+   The linear-scan allocator already *prefers* aN for a temp used as call
+   argument N, but that preference only applies when aN happens to be free at
+   first allocation time.  Long-lived argument values can therefore fall into
+   callee-saved s-registers, causing both:
+     - prologue/epilogue save+restore traffic, and
+     - an addi aN, sX, 0 immediately before the call.
+
+   Revisit those choices after allocation using exact interference.  This is
+   safe because [try_recolor] below also checks the interval's register class:
+   temps genuinely live across a call still cannot move into caller-saved aN. *)
+let item9_call_arg_affinities (f : Cfg.func) =
+  let loop_depths = compute_loop_depths f in
+  let table = Hashtbl.create 32 in
+  List.iter
+    (fun (block : Cfg.block) ->
+      let depth =
+        Option.value ~default:0 (Hashtbl.find_opt loop_depths block.label)
+      in
+      let weight = 1 + (16 * depth) in
+      List.iter
+        (function
+          | Tcg.Call (_, _, args) ->
+              List.iteri
+                (fun index arg ->
+                  if index < 8 then
+                    match arg with
+                    | Tcg.Temp temp ->
+                        let reg = Printf.sprintf "a%d" index in
+                        let key = (temp, reg) in
+                        let old =
+                          Option.value ~default:0
+                            (Hashtbl.find_opt table key)
+                        in
+                        Hashtbl.replace table key (old + weight)
+                    | Tcg.Imm _ -> ())
+                args
+          | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _
+          | Tcg.Load _ | Tcg.Store _ -> ())
+        block.body)
+    f.blocks;
+  Hashtbl.fold
+    (fun (temp, reg) score acc -> (score, temp, reg) :: acc)
+    table []
+  |> List.sort
+       (fun (score_a, temp_a, reg_a) (score_b, temp_b, reg_b) ->
+         match compare score_b score_a with
+         | 0 -> (
+             match compare temp_a temp_b with
+             | 0 -> compare reg_a reg_b
+             | c -> c)
+         | c -> c)
+
+let item9_call_arg_affinity_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM9_CALL_ARG_AFFINITY" = None
+
+let item9_call_arg_affinity_debug_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ITEM9_CALL_ARG_AFFINITY" <> None
 
 (* Only ordinary returns that still reach [gen_terminator] matter here.
    Tail-defined return values are already emitted directly into a0. *)
@@ -1374,6 +1467,22 @@ let allocate_temp_regs
         homes true
     in
 
+    let reg_conflict_blockers temp reg =
+      Hashtbl.fold
+        (fun other home acc ->
+          if other = temp then acc
+          else
+            match home with
+            | TempReg other_reg
+              when other_reg = reg
+                   && item9_interferes exact_pairs temp other ->
+                other :: acc
+            | TempReg _ | TempStack _ ->
+                acc)
+        homes []
+      |> List.sort compare
+    in
+
     let try_recolor temp reg =
       entry_hint_ok temp reg
       && interval_allows temp reg
@@ -1406,6 +1515,56 @@ let allocate_temp_regs
         | _, None ->
             ())
       (item9_move_affinities f);
+
+    (* Repair call-argument placement after linear scan.  Exact interference
+       allows us to move an argument-only/live-to-call temp directly into its
+       ABI argument register even when that register was unavailable when the
+       interval was first allocated.  This often removes both the final
+       register copy and an otherwise unnecessary callee-saved register. *)
+    if item9_call_arg_affinity_enabled () then begin
+      List.iter
+        (fun (score, temp, reg) ->
+          match Hashtbl.find_opt homes temp with
+          | Some (TempReg old_reg) when old_reg <> reg ->
+              let entry_ok = entry_hint_ok temp reg in
+              let allowed_ok = interval_allows temp reg in
+              let blockers =
+                if entry_ok && allowed_ok then reg_conflict_blockers temp reg
+                else []
+              in
+              let changed = try_recolor temp reg in
+              if item9_call_arg_affinity_debug_enabled () then begin
+                if changed then
+                  Printf.eprintf
+                    "item9-call-arg-affinity func=%s temp=%d %s->%s score=%d\n%!"
+                    f.name temp old_reg reg score
+                else
+                  let interval_info =
+                    match Hashtbl.find_opt interval_by_temp temp with
+                    | Some (interval : interval) ->
+                        Printf.sprintf
+                          "cross=%d maxarg=%s uses=%d defs=%d"
+                          interval.call_crossings
+                          (match interval.max_call_arg_index with
+                           | Some i -> string_of_int i
+                           | None -> "none")
+                          interval.use_count interval.def_count
+                    | None ->
+                        "no-interval"
+                  in
+                  Printf.eprintf
+                    "item9-call-arg-affinity-reject func=%s temp=%d home=%s target=%s score=%d entry=%b allowed=%b blockers=%s %s\n%!"
+                    f.name temp old_reg reg score entry_ok allowed_ok
+                    (if blockers = [] then "-"
+                     else String.concat "," (List.map string_of_int blockers))
+                    interval_info
+              end
+          | Some (TempReg _)
+          | Some (TempStack _)
+          | None ->
+              ())
+        (item9_call_arg_affinities f)
+    end;
 
     (* A return-only temp can safely prefer a0 when exact liveness proves that
        the register is available throughout its live range. *)
