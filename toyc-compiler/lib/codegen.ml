@@ -2495,6 +2495,72 @@ let item10_share_divrem_pairs (f : Cfg.func) =
 
     { f with blocks; temp_count = !next_temp }
 
+let item10_final_codegen_audit_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ITEM10_FINAL_CODEGEN_AUDIT" <> None
+  && Array.exists (fun arg -> arg = "-opt") Sys.argv
+
+let item10_final_codegen_audit
+    (f : Cfg.func)
+    (layout : layout)
+    leaf
+    frameless_leaf =
+  if item10_final_codegen_audit_enabled () then begin
+    let is_saved_reg reg =
+      List.mem reg layout.saved_regs
+    in
+    let global_base_saved =
+      Hashtbl.fold
+        (fun _ reg count ->
+          if is_saved_reg reg then count + 1 else count)
+        layout.global_base_regs
+        0
+    in
+    let local_saved_homes =
+      Hashtbl.fold
+        (fun _ home count ->
+          match home with
+          | LocalReg reg when is_saved_reg reg -> count + 1
+          | LocalReg _ | LocalStack _ -> count)
+        layout.local_homes
+        0
+    in
+    let temp_saved_homes =
+      Hashtbl.fold
+        (fun _ home count ->
+          match home with
+          | TempReg reg when is_saved_reg reg -> count + 1
+          | TempReg _ | TempStack _ -> count)
+        layout.temp_homes
+        0
+    in
+    let local_stack =
+      Hashtbl.fold
+        (fun _ home count ->
+          match home with LocalStack _ -> count + 1 | LocalReg _ -> count)
+        layout.local_homes 0
+    in
+    let temp_stack =
+      Hashtbl.fold
+        (fun _ home count ->
+          match home with TempStack _ -> count + 1 | TempReg _ -> count)
+        layout.temp_homes 0
+    in
+    Printf.eprintf
+      "item10-final-codegen-audit func=%s leaf=%d frameless=%d frame=%d saved=%d global-base-saved=%d local-saved-homes=%d temp-saved-homes=%d local-stack=%d temp-stack=%d blocks=%d temps=%d\n%!"
+      f.name
+      (if leaf then 1 else 0)
+      (if frameless_leaf then 1 else 0)
+      layout.frame_size
+      (List.length layout.saved_regs)
+      global_base_saved
+      local_saved_homes
+      temp_saved_homes
+      local_stack
+      temp_stack
+      (List.length f.blocks)
+      f.temp_count
+  end
+
 let gen_func buf (f : Cfg.func) =
   let f = item10_share_divrem_pairs f in
   let f = schedule_func_blocks_with_hot_traces f in
@@ -2507,6 +2573,7 @@ let gen_func buf (f : Cfg.func) =
     compute_layout ~reserve_ra:save_ra ~compact_frame f
   in
   let frameless_leaf = can_use_frameless_leaf f layout in
+  item10_final_codegen_audit f layout leaf frameless_leaf;
   (* Step5 uses sp-relative addressing for every stack home and incoming
      stack argument, so s0 is never materialized as a frame pointer. *)
   let use_frame_pointer = false in
