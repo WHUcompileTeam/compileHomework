@@ -1565,12 +1565,14 @@ let emit_compare_zero ctx op dst reg zero_on_left =
 let item10_immediate_lowering_enabled () =
   Sys.getenv_opt "TOYC_DISABLE_ITEM10_IMMEDIATE_LOWERING" = None
 
-let item10_div2_lowering_enabled () =
+let item10_pow2_div_lowering_enabled () =
   item10_immediate_lowering_enabled ()
+  && Sys.getenv_opt "TOYC_DISABLE_ITEM10_POW2_DIV_LOWERING" = None
   && Sys.getenv_opt "TOYC_DISABLE_ITEM10_DIV2_LOWERING" = None
 
-let item10_rem2_lowering_enabled () =
+let item10_pow2_rem_lowering_enabled () =
   item10_immediate_lowering_enabled ()
+  && Sys.getenv_opt "TOYC_DISABLE_ITEM10_POW2_REM_LOWERING" = None
   && Sys.getenv_opt "TOYC_DISABLE_ITEM10_REM2_LOWERING" = None
 
 let item10_positive_pow2_shift imm =
@@ -1583,6 +1585,50 @@ let item10_positive_pow2_shift imm =
       else loop (Int64.shift_right_logical value 1) (shift + 1)
     in
     loop imm 0
+
+let item10_emit_signed_div_pow2 ctx dst lhs shift =
+  let lhs_reg = operand_reg ctx "t0" lhs in
+  if shift = 1 then begin
+    (* C/RISC-V signed division truncates toward zero:
+         q = (x + (unsigned(x) >> 31)) >> 1 *)
+    emitf ctx "    srli t1, %s, 31" lhs_reg;
+    emitf ctx "    add t1, %s, t1" lhs_reg;
+    emitf ctx "    srai %s, t1, 1" dst
+  end
+  else begin
+    (* For d = 2^k:
+         signmask = x >> 31                 (0 or -1)
+         bias     = signmask >>> (32-k)     (0 or d-1)
+         q        = (x + bias) >> k
+       This is exact for every int32 x and implements truncation toward zero. *)
+    emitf ctx "    srai t1, %s, 31" lhs_reg;
+    emitf ctx "    srli t1, t1, %d" (32 - shift);
+    emitf ctx "    add t1, %s, t1" lhs_reg;
+    emitf ctx "    srai %s, t1, %d" dst shift
+  end
+
+let item10_emit_signed_rem_pow2 ctx dst lhs shift =
+  let lhs_reg = operand_reg ctx "t0" lhs in
+  if shift = 1 then begin
+    (* Fast signed x % 2, preserving the sign of the dividend. *)
+    emitf ctx "    andi t1, %s, 1" lhs_reg;
+    emitf ctx "    srai t2, %s, 31" lhs_reg;
+    emitf ctx "    xor t1, t1, t2";
+    emitf ctx "    sub %s, t1, t2" dst
+  end
+  else begin
+    (* Standalone signed remainder:
+         q = trunc(x / 2^k)
+         r = x - (q << k)
+       Paired div/rem is handled earlier by quotient sharing, so this path is
+       only for a remainder whose quotient is not already available. *)
+    emitf ctx "    srai t1, %s, 31" lhs_reg;
+    emitf ctx "    srli t1, t1, %d" (32 - shift);
+    emitf ctx "    add t1, %s, t1" lhs_reg;
+    emitf ctx "    srai t1, t1, %d" shift;
+    emitf ctx "    slli t1, t1, %d" shift;
+    emitf ctx "    sub %s, %s, t1" dst lhs_reg
+  end
 
 let item10_emit_compare_imm_rhs ctx op dst lhs imm =
   if not (fits_simm12 imm) then false
@@ -1716,37 +1762,34 @@ let emit_binop_operands ctx op dst lhs rhs =
       let lhs_reg = operand_reg ctx "t0" lhs in
       emitf ctx "    neg %s, %s" dst lhs_reg
 
-  (* Signed division by 2 must truncate toward zero, exactly like C/RISC-V
-     DIV.  Arithmetic right shift alone is wrong for negative odd values:
-       -3 / 2 = -1, but -3 >> 1 = -2.
-     For d = 2:
-       bias = unsigned(x) >> 31          (0 or 1)
-       q    = (x + bias) >> 1
-     The addition is 32-bit wrapping, which is safe for all int32 values. *)
-  | Div, lhs, Tcg.Imm 2L
-    when item10_div2_lowering_enabled () ->
-      let lhs_reg = operand_reg ctx "t0" lhs in
-      emitf ctx "    srli t1, %s, 31" lhs_reg;
-      emitf ctx "    add t1, %s, t1" lhs_reg;
-      emitf ctx "    srai %s, t1, 1" dst
+  | Div, lhs, Tcg.Imm imm
+    when item10_pow2_div_lowering_enabled () ->
+      begin
+        match item10_positive_pow2_shift imm with
+        | Some shift when shift >= 1 ->
+            item10_emit_signed_div_pow2 ctx dst lhs shift
+        | Some _ | None ->
+            let lhs_reg = operand_reg ctx "t0" lhs in
+            let rhs_reg = operand_reg ctx "t1" rhs in
+            emit_binop ctx op dst lhs_reg rhs_reg
+      end
 
   | Mod, _, Tcg.Imm 1L
   | Mod, _, Tcg.Imm (-1L)
     when item10_immediate_lowering_enabled () ->
       emitf ctx "    li %s, 0" dst
 
-  (* Signed remainder by 2 has the sign of the dividend.
-       p = x & 1
-       s = x >> 31                      (0 or -1)
-       r = (p xor s) - s
-     For x >= 0 this is p; for x < 0 this is -p. *)
-  | Mod, lhs, Tcg.Imm 2L
-    when item10_rem2_lowering_enabled () ->
-      let lhs_reg = operand_reg ctx "t0" lhs in
-      emitf ctx "    andi t1, %s, 1" lhs_reg;
-      emitf ctx "    srai t2, %s, 31" lhs_reg;
-      emitf ctx "    xor t1, t1, t2";
-      emitf ctx "    sub %s, t1, t2" dst
+  | Mod, lhs, Tcg.Imm imm
+    when item10_pow2_rem_lowering_enabled () ->
+      begin
+        match item10_positive_pow2_shift imm with
+        | Some shift when shift >= 1 ->
+            item10_emit_signed_rem_pow2 ctx dst lhs shift
+        | Some _ | None ->
+            let lhs_reg = operand_reg ctx "t0" lhs in
+            let rhs_reg = operand_reg ctx "t1" rhs in
+            emit_binop ctx op dst lhs_reg rhs_reg
+      end
 
   | Eq, Tcg.Imm 0L, rhs
   | Ne, Tcg.Imm 0L, rhs
@@ -2147,58 +2190,84 @@ let item10_share_divrem_pairs (f : Cfg.func) =
     in
 
     let rewrite_block (block : Cfg.block) =
-      (* Map source temp -> quotient temp for an earlier
-         q = source / 2 in this same basic block. *)
-      let div2_by_source = Hashtbl.create 8 in
+      (* Keyed by (source temp, positive power-of-two divisor). *)
+      let div_by_source_and_divisor = Hashtbl.create 8 in
       let rev_body = ref [] in
 
       let append instr =
         rev_body := instr :: !rev_body
       in
 
+      let invalidate_temp defined =
+        let doomed = ref [] in
+        Hashtbl.iter
+          (fun ((source, _) as key) quotient ->
+            if source = defined || quotient = defined then
+              doomed := key :: !doomed)
+          div_by_source_and_divisor;
+        List.iter
+          (Hashtbl.remove div_by_source_and_divisor)
+          !doomed
+      in
+
       List.iter
         (fun instr ->
-          (* Be conservative if a virtual temp is ever redefined.  Normal
-             TCG is SSA-like, but this keeps the rewrite correct without
-             relying on that stronger invariant. *)
           begin
             match defs_temp instr with
-            | Some defined ->
-                Hashtbl.remove div2_by_source defined
+            | Some defined -> invalidate_temp defined
             | None -> ()
           end;
 
           match instr with
-          | Tcg.Bin (quotient, Div, Tcg.Temp source, Tcg.Imm 2L)
+          | Tcg.Bin (quotient, Div, Tcg.Temp source, Tcg.Imm divisor)
             when quotient <> source ->
-              append instr;
-              Hashtbl.replace div2_by_source source quotient
-
-          | Tcg.Bin (remainder, Mod, Tcg.Temp source, Tcg.Imm 2L) ->
               begin
-                match Hashtbl.find_opt div2_by_source source with
-                | Some quotient ->
-                    (* C signed division/remainder identity:
-                         x = (x / 2) * 2 + (x % 2)
-                       where / truncates toward zero.
-                       Therefore once q = x / 2 already exists:
-                         r = x - 2*q
-                       This is valid for every int32 value, including
-                       negative odd numbers and INT_MIN.
+                match item10_positive_pow2_shift divisor with
+                | Some shift when shift >= 1 ->
+                    append instr;
+                    Hashtbl.replace
+                      div_by_source_and_divisor
+                      (source, divisor)
+                      quotient
+                | Some _ | None ->
+                    append instr
+              end
 
-                       Materialize the hidden quotient dependency in TCG
-                       before register allocation so liveness and homes stay
-                       exact.  The existing immediate lowering turns
-                       q * 2 into one SLLI. *)
-                    let twice_q = fresh_temp () in
-                    append
-                      (Tcg.Bin
-                         (twice_q, Mul, Tcg.Temp quotient, Tcg.Imm 2L));
-                    append
-                      (Tcg.Bin
-                         (remainder, Sub, Tcg.Temp source, Tcg.Temp twice_q));
-                    incr shared_pairs
-                | None ->
+          | Tcg.Bin
+              (remainder, Mod, Tcg.Temp source, Tcg.Imm divisor) ->
+              begin
+                match item10_positive_pow2_shift divisor with
+                | Some shift when shift >= 1 ->
+                    begin
+                      match
+                        Hashtbl.find_opt
+                          div_by_source_and_divisor
+                          (source, divisor)
+                      with
+                      | Some quotient ->
+                          (* General C identity:
+                               x = (x / d) * d + (x % d)
+                             for d = 2^k > 0 and truncating signed division.
+                             The existing constant-multiply lowering maps
+                             q * d to SLLI q,k. *)
+                          let scaled_q = fresh_temp () in
+                          append
+                            (Tcg.Bin
+                               ( scaled_q,
+                                 Mul,
+                                 Tcg.Temp quotient,
+                                 Tcg.Imm divisor ));
+                          append
+                            (Tcg.Bin
+                               ( remainder,
+                                 Sub,
+                                 Tcg.Temp source,
+                                 Tcg.Temp scaled_q ));
+                          incr shared_pairs
+                      | None ->
+                          append instr
+                    end
+                | Some _ | None ->
                     append instr
               end
 
