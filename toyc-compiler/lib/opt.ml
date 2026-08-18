@@ -31855,6 +31855,7 @@ let specialize_constant_params_program_once
                 f.name mode;
             let cleaned =
               optimize_func
+                ~allow_addrec_liveout_summary:false
                 global_init summaries globals return_globals removable_calls
                 specialized
             in
@@ -32349,6 +32350,7 @@ let inline_small_hot_calls_program
           let expanded = metrics_of_func inlined in
           let cleaned =
             optimize_func
+              ~allow_addrec_liveout_summary:false
               global_init summaries globals return_globals removable_calls
               inlined
           in
@@ -32584,6 +32586,7 @@ let inline_late_branch_calls_program
                 let expanded = metrics_of_func inlined in
                 let cleaned =
                   optimize_func
+                    ~allow_addrec_liveout_summary:false
                     global_init summaries globals return_globals removable_calls
                     inlined
                 in
@@ -32813,6 +32816,7 @@ let inline_late_scalar_calls_program
                 in
                 let cleaned =
                   optimize_func
+                    ~allow_addrec_liveout_summary:false
                     global_init summaries globals return_globals removable_calls
                     rewritten
                 in
@@ -33301,6 +33305,7 @@ let fold_constant_calls_program
               in
               let cleaned =
                 optimize_func
+                  ~allow_addrec_liveout_summary:false
                   global_init summaries globals
                   return_globals removable_calls rewritten
               in
