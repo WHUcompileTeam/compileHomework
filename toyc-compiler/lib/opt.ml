@@ -30981,12 +30981,47 @@ let optimize_func
       let late_algebra = algebra_canonicalize_func late_promoted in
       let late_linear = general_linear_canonicalize_func late_algebra in
       let late_factor = factor_common_mul_func late_linear in
+      (* Late mem2reg introduces fresh Move chains (including values replacing
+         promoted Local loads).  The early single-def propagation pass has
+         already run long before this point, so run the same conservative,
+         correctness-preserving cleanup again here before DCE/coalescing.
+
+         Keep propagation before coalescing: propagation relies on the
+         single-definition shape, while coalescing may deliberately merge
+         several definitions onto the same temp. *)
+      let late_move_propagated =
+        propagate_singledef_moves_func late_factor
+      in
       let late_pre_summary_input =
-        late_factor
+        late_move_propagated
         |> eliminate_dead_code_func
              ~removable_calls summaries globals return_globals
         |> copy_coalesce_func summaries globals
       in
+      if Sys.getenv_opt "TOYC_DEBUG_LATE_COPY_CLEANUP" <> None then begin
+        let count_moves (func : Cfg.func) =
+          List.fold_left
+            (fun count (block : Cfg.block) ->
+              List.fold_left
+                (fun count instr ->
+                  match instr with
+                  | Tcg.Move _ -> count + 1
+                  | _ -> count)
+                count block.body)
+            0 func.blocks
+        in
+        let before = metrics_of_func late_factor in
+        let after_prop = metrics_of_func late_move_propagated in
+        let after_cleanup = metrics_of_func late_pre_summary_input in
+        Printf.eprintf
+          "late-copy-cleanup func=%s moves=%d->%d->%d instrs=%d->%d->%d temps=%d->%d->%d\n%!"
+          late_factor.name
+          (count_moves late_factor)
+          (count_moves late_move_propagated)
+          (count_moves late_pre_summary_input)
+          before.instr_count after_prop.instr_count after_cleanup.instr_count
+          before.temp_count after_prop.temp_count after_cleanup.temp_count
+      end;
       let () =
         debug_lcssa_stage
           "pre-runtime-summary"
