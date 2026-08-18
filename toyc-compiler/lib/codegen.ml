@@ -1482,6 +1482,9 @@ let store_temp ctx temp src =
 
 let cached_global_base_reg ctx label = Hashtbl.find_opt ctx.global_base_regs label
 
+let item10_direct_global_mem_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_DIRECT_GLOBAL_MEM" = None
+
 let load_place ctx dst = function
   | Tcg.Local id -> (
       match lookup_local_home ctx.local_homes id with
@@ -1489,7 +1492,12 @@ let load_place ctx dst = function
       | LocalReg reg -> emit_reg_copy ctx dst reg)
   | Tcg.Global label -> (
       match cached_global_base_reg ctx label with
-      | Some base_reg -> emitf ctx "    lw %s, 0(%s)" dst base_reg
+      | Some base_reg ->
+          emitf ctx "    lw %s, 0(%s)" dst base_reg
+      | None when item10_direct_global_mem_enabled () ->
+          (* GNU RISC-V symbol-form LW is a standard assembler macro.
+             It expands to AUIPC + LW, avoiding the extra ADDI from LA. *)
+          emitf ctx "    lw %s, %s" dst label
       | None ->
           emitf ctx "    la %s, %s" global_addr_reg label;
           emitf ctx "    lw %s, 0(%s)" dst global_addr_reg)
@@ -1501,7 +1509,12 @@ let store_place ctx src = function
       | LocalReg reg -> emit_reg_copy ctx reg src)
   | Tcg.Global label -> (
       match cached_global_base_reg ctx label with
-      | Some base_reg -> emitf ctx "    sw %s, 0(%s)" src base_reg
+      | Some base_reg ->
+          emitf ctx "    sw %s, 0(%s)" src base_reg
+      | None when item10_direct_global_mem_enabled () ->
+          (* Store-to-symbol macro needs a scratch base register.  t3 is
+             permanently reserved by this backend for global addressing. *)
+          emitf ctx "    sw %s, %s, %s" src label global_addr_reg
       | None ->
           emitf ctx "    la %s, %s" global_addr_reg label;
           emitf ctx "    sw %s, 0(%s)" src global_addr_reg)
@@ -2454,6 +2467,38 @@ let item10_cfg_instr_count (f : Cfg.func) =
       total + List.length block.body + 1)
     0 f.blocks
 
+let item10_dead_global_emission_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_DEAD_GLOBAL_EMISSION" = None
+
+let item10_dead_global_emission_debug_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ITEM10_DEAD_GLOBAL_EMISSION" <> None
+  && Array.exists (fun arg -> arg = "-opt") Sys.argv
+
+let item10_has_main (cfg : Cfg.program) =
+  List.exists (fun (f : Cfg.func) -> f.name = "main") cfg.funcs
+
+let item10_referenced_globals (funcs : Cfg.func list) =
+  List.fold_left
+    (fun globals (f : Cfg.func) ->
+      List.fold_left
+        (fun globals (block : Cfg.block) ->
+          List.fold_left
+            (fun globals instr ->
+              match instr with
+              | Tcg.Load (_, Tcg.Global label)
+              | Tcg.Store (Tcg.Global label, _) ->
+                  LabelSet.add label globals
+              | Tcg.Move _
+              | Tcg.Un _
+              | Tcg.Bin _
+              | Tcg.Load (_, Tcg.Local _)
+              | Tcg.Store (Tcg.Local _, _)
+              | Tcg.Call _ ->
+                  globals)
+            globals block.body)
+        globals f.blocks)
+    LabelSet.empty funcs
+
 let generate (analysis : Semant.analysis) (cfg : Cfg.program) =
   let reachable =
     if item10_reachable_emission_enabled () then
@@ -2468,9 +2513,23 @@ let generate (analysis : Semant.analysis) (cfg : Cfg.program) =
       (fun (f : Cfg.func) -> LabelSet.mem f.label reachable)
       cfg.funcs
   in
+  let emitted_globals =
+    if item10_dead_global_emission_enabled ()
+       && item10_reachable_emission_enabled ()
+       && item10_has_main cfg
+    then
+      let referenced = item10_referenced_globals emitted_funcs in
+      List.filter
+        (fun g -> LabelSet.mem g.Semant.label referenced)
+        analysis.globals
+    else
+      (* Conservative fallback for library-like/no-main inputs or explicit
+         rollback: retain every declared global. *)
+      analysis.globals
+  in
   let buf = Buffer.create 16384 in
   Buffer.add_string buf "    .option nopic\n\n";
-  List.iter (emit_global buf) analysis.globals;
+  List.iter (emit_global buf) emitted_globals;
   List.iter (gen_func buf) emitted_funcs;
   if item10_reachable_emission_debug_enabled () then begin
     let total_cfg_instrs =
@@ -2493,4 +2552,10 @@ let generate (analysis : Semant.analysis) (cfg : Cfg.program) =
       (total_cfg_instrs - emitted_cfg_instrs)
       (Buffer.length buf)
   end;
+  if item10_dead_global_emission_debug_enabled () then
+    Printf.eprintf
+      "item10-dead-global-emission globals-total=%d globals-emitted=%d globals-pruned=%d\n%!"
+      (List.length analysis.globals)
+      (List.length emitted_globals)
+      (List.length analysis.globals - List.length emitted_globals);
   Buffer.contents buf
