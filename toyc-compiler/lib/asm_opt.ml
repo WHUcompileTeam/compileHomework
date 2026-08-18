@@ -693,6 +693,101 @@ let item10_triple_compare_branch live_out third_index first second third =
 (* boundary and only accept instructions whose register effects are known.    *)
 (* -------------------------------------------------------------------------- *)
 
+(* -------------------------------------------------------------------------- *)
+(* #10 post-RA producer retargeting.                                          *)
+(*                                                                            *)
+(* Fold an adjacent single-result producer followed by a pure register copy:  *)
+(*                                                                            *)
+(*     add  tmp, x, y                                                         *)
+(*     addi dst, tmp, 0                                                       *)
+(*                                                                            *)
+(* into:                                                                      *)
+(*                                                                            *)
+(*     add  dst, x, y                                                         *)
+(*                                                                            *)
+(* This is safe when [tmp] is dead after the copy.  RISC-V integer ALU         *)
+(* instructions permit the destination to overlap either source, so patterns   *)
+(* such as [add tmp, dst, x; mv dst,tmp] safely become [add dst,dst,x].        *)
+(* We deliberately require adjacency and whitelist only instructions with one  *)
+(* ordinary register destination.                                              *)
+(* -------------------------------------------------------------------------- *)
+
+let item10_producer_retarget_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_PRODUCER_RETARGET" = None
+
+let item10_producer_retarget_debug_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ASM_PRODUCER_RETARGET" <> None
+
+let item10_retarget_producer line old_dst new_dst =
+  match split_asm_words line with
+  | [ (("add" | "sub" | "mul" | "div" | "rem"
+        | "slt" | "sltu" | "xor") as op);
+      dst; lhs; rhs ]
+    when dst = old_dst ->
+      Some (Printf.sprintf "    %s %s, %s, %s" op new_dst lhs rhs)
+  | [ (("addi" | "slti" | "sltiu"
+        | "slli" | "srli" | "srai"
+        | "andi" | "xori") as op);
+      dst; src; imm ]
+    when dst = old_dst ->
+      Some (Printf.sprintf "    %s %s, %s, %s" op new_dst src imm)
+  | [ "neg"; dst; src ] when dst = old_dst ->
+      Some (Printf.sprintf "    neg %s, %s" new_dst src)
+  | [ "li"; dst; imm ] when dst = old_dst ->
+      Some (Printf.sprintf "    li %s, %s" new_dst imm)
+  | _ ->
+      None
+
+let item10_producer_retarget_pass asm =
+  if not (item10_producer_retarget_enabled ()) then asm
+  else
+    let lines = asm |> split_lines |> Array.of_list in
+    let n = Array.length lines in
+    let live_out = compute_live_out lines in
+    let removed = Array.make n false in
+    let replacements : string option array = Array.make n None in
+    let rewrites = ref 0 in
+
+    for i = 0 to n - 2 do
+      if not removed.(i) && not removed.(i + 1) then
+        match parse_move lines.(i + 1) with
+        | Some (dst, src)
+          when dst <> src
+               && value_register dst
+               && value_register src
+               && not (RegSet.mem src live_out.(i + 1)) ->
+            begin
+              match item10_retarget_producer lines.(i) src dst with
+              | Some producer' ->
+                  replacements.(i) <- Some producer';
+                  removed.(i + 1) <- true;
+                  incr rewrites;
+                  if item10_producer_retarget_debug_enabled () then
+                    Printf.eprintf
+                      "asm-producer-retarget producer=%d copy=%d src=%s dst=%s\n%!"
+                      (i + 1) (i + 2) src dst
+              | None ->
+                  ()
+            end
+        | Some _ | None ->
+            ()
+    done;
+
+    if !rewrites = 0 then asm
+    else
+      let out = ref [] in
+      for i = n - 1 downto 0 do
+        if not removed.(i) then
+          let line =
+            match replacements.(i) with
+            | Some replacement -> replacement
+            | None -> lines.(i)
+          in
+          out := line :: !out
+      done;
+      String.concat "\n" !out ^ "\n"
+
+
 let item10_copy_back_enabled () =
   Sys.getenv_opt "TOYC_DISABLE_ITEM10_COPY_BACK" = None
 
@@ -1093,6 +1188,7 @@ let peephole asm =
     let next =
       current
       |> peephole_pass
+      |> item10_producer_retarget_pass
       |> item10_copy_back_fold_pass
       |> item10_loop_snapshot_pass
       |> item10_final_asm_cleanup_pass
