@@ -1326,7 +1326,7 @@ let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.fun
       (fun (_score, dst, src) ->
         match Hashtbl.find_opt homes dst, Hashtbl.find_opt homes src with
         | Some (TempReg dst_reg), Some (TempReg src_reg) when dst_reg <> src_reg ->
-            if not (item9_interferes exact_pairs dst src) then
+            if not (item9_interferes exact_pairs dst src) then begin
               if not (try_recolor dst src_reg) then
                 match Hashtbl.find_opt interval_by_temp src with
                 | Some src_interval
@@ -1335,6 +1335,7 @@ let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.fun
                        && not (Hashtbl.mem entry_reg_hints src) ->
                     ignore (try_recolor src dst_reg)
                 | Some _ | None -> ()
+            end
         | Some (TempReg _), Some (TempReg _)
         | Some (TempStack _), _
         | _, Some (TempStack _)
