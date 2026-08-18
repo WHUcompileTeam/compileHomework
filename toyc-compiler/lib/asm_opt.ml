@@ -365,9 +365,6 @@ let peephole_pass asm =
 let item10_final_asm_cleanup_enabled () =
   Sys.getenv_opt "TOYC_DISABLE_ITEM10_FINAL_ASM_CLEANUP" = None
 
-let item10_debug_final_asm_cleanup =
-  Sys.getenv_opt "TOYC_DEBUG_ITEM10_FINAL_ASM_CLEANUP" <> None
-
 let item10_parse_li line =
   match split_asm_words line with
   | [ "li"; dst; imm ] when is_register dst -> (
@@ -681,10 +678,6 @@ let item10_final_asm_cleanup_pass asm =
     let n = Array.length lines in
     let live_out = compute_live_out lines in
     let label_pos = item10_build_label_pos lines in
-    let rewrites = ref 0 in
-
-    let note () = incr rewrites in
-
     let rec loop i acc =
       if i >= n then List.rev acc
       else if i + 2 < n then
@@ -693,7 +686,6 @@ let item10_final_asm_cleanup_pass asm =
                   live_out (i + 2)
                   lines.(i) lines.(i + 1) lines.(i + 2) with
           | Some replacement ->
-              note ();
               loop (i + 3) (replacement :: acc)
           | None ->
               loop_pair i acc
@@ -707,7 +699,6 @@ let item10_final_asm_cleanup_pass asm =
           match item10_pair_compare_branch
                   live_out (i + 1) lines.(i) lines.(i + 1) with
           | Some replacement ->
-              note ();
               loop (i + 2) (replacement :: acc)
           | None ->
               begin
@@ -717,7 +708,6 @@ let item10_final_asm_cleanup_pass asm =
                        && not (RegSet.mem dst live_out.(i + 1)) ->
                     let branch' = item10_replace_branch_reg branch dst src in
                     if branch' <> branch then begin
-                      note ();
                       loop (i + 2) (item10_branch_line branch' :: acc)
                     end
                     else
@@ -738,7 +728,6 @@ let item10_final_asm_cleanup_pass asm =
                 match item10_li_consumer_fold
                         live_out (i + 1) reg imm lines.(i + 1) with
                 | Some replacement ->
-                    note ();
                     loop (i + 2) (replacement :: acc)
                 | None ->
                     loop_single i acc
@@ -756,15 +745,12 @@ let item10_final_asm_cleanup_pass asm =
           begin
             match item10_constant_branch branch with
             | Some None ->
-                note ();
                 loop (i + 1) acc
             | Some (Some replacement) ->
-                note ();
                 loop (i + 1) (replacement :: acc)
             | None ->
                 let target = item10_branch_target branch in
                 if item10_branch_target_is_next lines label_pos i target then begin
-                  note ();
                   loop (i + 1) acc
                 end
                 else
@@ -772,7 +758,6 @@ let item10_final_asm_cleanup_pass asm =
                     match item10_resolve_target lines label_pos target with
                     | Item10TargetLabel final_target
                       when final_target <> target ->
-                        note ();
                         let branch' =
                           item10_replace_branch_target branch final_target
                         in
@@ -789,11 +774,9 @@ let item10_final_asm_cleanup_pass asm =
                 begin
                   match item10_resolve_target lines label_pos target with
                   | Item10TargetRet ->
-                      note ();
                       loop (i + 1) ("    ret" :: acc)
                   | Item10TargetLabel final_target
                     when final_target <> target ->
-                      note ();
                       loop
                         (i + 1)
                         (Printf.sprintf "    j %s" final_target :: acc)
@@ -806,10 +789,6 @@ let item10_final_asm_cleanup_pass asm =
     in
 
     let result = String.concat "\n" (loop 0 []) ^ "\n" in
-    if item10_debug_final_asm_cleanup && !rewrites <> 0 then
-      Printf.eprintf
-        "item10-final-asm-cleanup rewrites=%d\n%!"
-        !rewrites;
     result
 
 let peephole asm =

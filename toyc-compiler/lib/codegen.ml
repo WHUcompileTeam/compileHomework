@@ -687,15 +687,17 @@ let compute_local_access_stats (f : Cfg.func) =
     f.blocks;
   stats
 
-let select_global_base_regs (f : Cfg.func) =
+let select_global_base_regs
+    ?(available_regs = reserved_global_base_regs)
+    (f : Cfg.func) =
   let stats = compute_global_access_stats f in
   let reserved_budget =
     if f.temp_count >= 192 || block_instr_count f.blocks >= 384 then 0
     else if f.temp_count >= 96 || block_instr_count f.blocks >= 192 then 1
-    else List.length reserved_global_base_regs
+    else List.length available_regs
   in
   let available_reserved_regs =
-    reserved_global_base_regs
+    available_regs
     |> List.fold_left
          (fun (acc, slots_left) reg ->
            if slots_left <= 0 then (acc, 0) else (reg :: acc, slots_left - 1))
@@ -726,6 +728,24 @@ let select_global_base_regs (f : Cfg.func) =
   in
   assign available_reserved_regs candidates;
   mapping
+
+let item10_func_has_global_memory (f : Cfg.func) =
+  List.exists
+    (fun (block : Cfg.block) ->
+      List.exists
+        (function
+          | Tcg.Load (_, Tcg.Global _)
+          | Tcg.Store (Tcg.Global _, _) ->
+              true
+          | Tcg.Move _
+          | Tcg.Un _
+          | Tcg.Bin _
+          | Tcg.Load (_, Tcg.Local _)
+          | Tcg.Store (Tcg.Local _, _)
+          | Tcg.Call _ ->
+              false)
+        block.body)
+    f.blocks
 
 let select_hot_local_regs reserved_saved_regs (f : Cfg.func) =
   if not hot_local_regs_enabled then Hashtbl.create 0
@@ -1090,7 +1110,12 @@ let item9_normal_return_temp_counts (f : Cfg.func) =
     f.blocks;
   counts
 
-let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.func) =
+let allocate_temp_regs
+    ?(reserved_saved_regs = [])
+    ?(reserved_caller_regs = [])
+    ?(extra_caller_regs = [])
+    ?entry_reg_hints
+    (f : Cfg.func) =
   let entry_reg_hints = Option.value ~default:(Hashtbl.create 0) entry_reg_hints in
   let intervals =
     compute_temp_intervals f
@@ -1107,7 +1132,17 @@ let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.fun
   let temp_saved_regs =
     List.filter (fun reg -> not (List.mem reg reserved_saved_regs)) allocatable_saved_regs
   in
-  let free_regs = ref (allocatable_caller_regs @ temp_saved_regs) in
+  let available_temp_regs =
+    (allocatable_temp_regs @ extra_caller_regs)
+    |> List.filter (fun reg -> not (List.mem reg reserved_caller_regs))
+  in
+  let available_arg_regs =
+    allocatable_arg_regs
+    |> List.filter (fun reg -> not (List.mem reg reserved_caller_regs))
+  in
+  let free_regs =
+    ref (available_temp_regs @ available_arg_regs @ temp_saved_regs)
+  in
   let remove_reg reg regs =
     let rec loop acc = function
       | [] -> List.rev acc
@@ -1157,11 +1192,11 @@ let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.fun
           match arg_reg_index reg with
           | Some index -> index >= min_safe_index
           | None -> false)
-        allocatable_arg_regs
+        available_arg_regs
   in
   let allowed_regs (interval : interval) =
     if interval.call_crossings = 0 then
-      allocatable_temp_regs @ allowed_arg_regs interval @ temp_saved_regs
+      available_temp_regs @ allowed_arg_regs interval @ temp_saved_regs
     else temp_saved_regs
   in
   let allowed_free_regs interval =
@@ -1384,14 +1419,30 @@ let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.fun
 let compute_layout
     ?(reserve_ra = true)
     ?(compact_frame = false)
+    ?(leaf_caller_regs = false)
     (f : Cfg.func) =
   let local_homes = Hashtbl.create 64 in
   let param_seed_locals, param_seed_temps = find_param_seed_regs f in
-  let global_base_regs = select_global_base_regs f in
-  let reserved_saved_regs =
+  let global_base_physical_regs =
+    if leaf_caller_regs then [ "t6"; "t5" ]
+    else reserved_global_base_regs
+  in
+  let global_base_regs =
+    select_global_base_regs ~available_regs:global_base_physical_regs f
+  in
+  let global_base_reg_values =
     Hashtbl.fold
       (fun _ reg acc -> if List.mem reg acc then acc else reg :: acc)
       global_base_regs []
+  in
+  let reserved_saved_regs =
+    global_base_reg_values
+    |> List.filter (fun reg -> List.mem reg allocatable_saved_regs)
+    |> List.sort compare
+  in
+  let reserved_caller_regs =
+    global_base_reg_values
+    |> List.filter (fun reg -> List.mem reg allocatable_caller_regs)
     |> List.sort compare
   in
   let hot_local_regs = select_hot_local_regs reserved_saved_regs f in
@@ -1401,8 +1452,18 @@ let compute_layout
       hot_local_regs reserved_saved_regs
     |> List.sort compare
   in
+  let extra_caller_regs =
+    if leaf_caller_regs && not (item10_func_has_global_memory f)
+    then [ global_addr_reg ]
+    else []
+  in
   let temp_homes, temp_saved_regs =
-    allocate_temp_regs ~reserved_saved_regs ~entry_reg_hints:param_seed_temps f
+    allocate_temp_regs
+      ~reserved_saved_regs
+      ~reserved_caller_regs
+      ~extra_caller_regs
+      ~entry_reg_hints:param_seed_temps
+      f
   in
   let saved_regs =
     List.fold_left
@@ -1461,6 +1522,40 @@ let compute_layout
     saved_regs;
   }
 
+let item10_layout_stack_home_count (layout : layout) =
+  let local_stack =
+    Hashtbl.fold
+      (fun _ home count ->
+        match home with
+        | LocalStack _ -> count + 1
+        | LocalReg _ -> count)
+      layout.local_homes
+      0
+  in
+  let temp_stack =
+    Hashtbl.fold
+      (fun _ home count ->
+        match home with
+        | TempStack _ -> count + 1
+        | TempReg _ -> count)
+      layout.temp_homes
+      0
+  in
+  local_stack + temp_stack
+
+let item10_leaf_layout_strictly_better candidate baseline =
+  let candidate_stack = item10_layout_stack_home_count candidate in
+  let baseline_stack = item10_layout_stack_home_count baseline in
+  if candidate_stack <> baseline_stack then
+    candidate_stack < baseline_stack
+  else
+    let candidate_saved = List.length candidate.saved_regs in
+    let baseline_saved = List.length baseline.saved_regs in
+    if candidate_saved <> baseline_saved then
+      candidate_saved < baseline_saved
+    else
+      candidate.frame_size < baseline.frame_size
+
 let emit_reg_copy ctx dst src =
   if dst <> src then emitf ctx "    addi %s, %s, 0" dst src
 
@@ -1513,6 +1608,9 @@ let item10_tail_compare_move_enabled () =
 
 let item10_zero_operand_enabled () =
   Sys.getenv_opt "TOYC_DISABLE_ITEM10_ZERO_OPERAND" = None
+
+let item10_leaf_caller_regs_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_LEAF_CALLER_REGS" = None
 
 let item10_is_compare_binop = function
   | Eq | Ne | Lt | Gt | Le | Ge -> true
@@ -2495,72 +2593,6 @@ let item10_share_divrem_pairs (f : Cfg.func) =
 
     { f with blocks; temp_count = !next_temp }
 
-let item10_final_codegen_audit_enabled () =
-  Sys.getenv_opt "TOYC_DEBUG_ITEM10_FINAL_CODEGEN_AUDIT" <> None
-  && Array.exists (fun arg -> arg = "-opt") Sys.argv
-
-let item10_final_codegen_audit
-    (f : Cfg.func)
-    (layout : layout)
-    leaf
-    frameless_leaf =
-  if item10_final_codegen_audit_enabled () then begin
-    let is_saved_reg reg =
-      List.mem reg layout.saved_regs
-    in
-    let global_base_saved =
-      Hashtbl.fold
-        (fun _ reg count ->
-          if is_saved_reg reg then count + 1 else count)
-        layout.global_base_regs
-        0
-    in
-    let local_saved_homes =
-      Hashtbl.fold
-        (fun _ home count ->
-          match home with
-          | LocalReg reg when is_saved_reg reg -> count + 1
-          | LocalReg _ | LocalStack _ -> count)
-        layout.local_homes
-        0
-    in
-    let temp_saved_homes =
-      Hashtbl.fold
-        (fun _ home count ->
-          match home with
-          | TempReg reg when is_saved_reg reg -> count + 1
-          | TempReg _ | TempStack _ -> count)
-        layout.temp_homes
-        0
-    in
-    let local_stack =
-      Hashtbl.fold
-        (fun _ home count ->
-          match home with LocalStack _ -> count + 1 | LocalReg _ -> count)
-        layout.local_homes 0
-    in
-    let temp_stack =
-      Hashtbl.fold
-        (fun _ home count ->
-          match home with TempStack _ -> count + 1 | TempReg _ -> count)
-        layout.temp_homes 0
-    in
-    Printf.eprintf
-      "item10-final-codegen-audit func=%s leaf=%d frameless=%d frame=%d saved=%d global-base-saved=%d local-saved-homes=%d temp-saved-homes=%d local-stack=%d temp-stack=%d blocks=%d temps=%d\n%!"
-      f.name
-      (if leaf then 1 else 0)
-      (if frameless_leaf then 1 else 0)
-      layout.frame_size
-      (List.length layout.saved_regs)
-      global_base_saved
-      local_saved_homes
-      temp_saved_homes
-      local_stack
-      temp_stack
-      (List.length f.blocks)
-      f.temp_count
-  end
-
 let gen_func buf (f : Cfg.func) =
   let f = item10_share_divrem_pairs f in
   let f = schedule_func_blocks_with_hot_traces f in
@@ -2569,11 +2601,26 @@ let gen_func buf (f : Cfg.func) =
     (not (item10_leaf_ra_elision_enabled ())) || not leaf
   in
   let compact_frame = item10_frame_compaction_enabled () in
-  let layout =
+  let baseline_layout =
     compute_layout ~reserve_ra:save_ra ~compact_frame f
   in
+  let layout =
+    if leaf && item10_leaf_caller_regs_enabled () then
+      let candidate =
+        compute_layout
+          ~reserve_ra:save_ra
+          ~compact_frame
+          ~leaf_caller_regs:true
+          f
+      in
+      let adopted =
+        item10_leaf_layout_strictly_better candidate baseline_layout
+      in
+      if adopted then candidate else baseline_layout
+    else
+      baseline_layout
+  in
   let frameless_leaf = can_use_frameless_leaf f layout in
-  item10_final_codegen_audit f layout leaf frameless_leaf;
   (* Step5 uses sp-relative addressing for every stack home and incoming
      stack argument, so s0 is never materialized as a frame pointer. *)
   let use_frame_pointer = false in
@@ -2627,12 +2674,6 @@ let gen_func buf (f : Cfg.func) =
     List.iteri
       (fun i reg -> emitf ctx "    sw %s, %d(sp)" reg (saved_reg_offset i))
       layout.saved_regs;
-    Hashtbl.fold (fun label reg acc -> (reg, label) :: acc) layout.global_base_regs []
-    |> List.sort (fun (a_reg, a_label) (b_reg, b_label) ->
-           match compare a_reg b_reg with
-           | 0 -> compare a_label b_label
-           | c -> c)
-    |> List.iter (fun (reg, label) -> emitf ctx "    la %s, %s" reg label);
     List.iteri
       (fun i (param : Tcg.var) ->
         match Hashtbl.find_opt layout.local_homes param.id with
@@ -2647,6 +2688,12 @@ let gen_func buf (f : Cfg.func) =
             else emitf ctx "    lw %s, %d(sp)" reg (layout.frame_size + ((i - 8) * 4)))
       f.params
   end;
+  Hashtbl.fold (fun label reg acc -> (reg, label) :: acc) layout.global_base_regs []
+  |> List.sort (fun (a_reg, a_label) (b_reg, b_label) ->
+         match compare a_reg b_reg with
+         | 0 -> compare a_label b_label
+         | c -> c)
+  |> List.iter (fun (reg, label) -> emitf ctx "    la %s, %s" reg label);
   let rec emit_blocks = function
     | [] -> ()
     | [ block ] -> gen_block ctx None block
