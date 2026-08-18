@@ -1210,6 +1210,26 @@ and canonical_scalar_atom_has_temp temp = function
       canonical_scalar_key_has_temp temp lhs
       || canonical_scalar_key_has_temp temp rhs
 
+let rec canonical_scalar_key_has_any_temp
+    temps (_const, terms) =
+  List.exists
+    (fun (atom, _) ->
+      canonical_scalar_atom_has_any_temp temps atom)
+    terms
+
+and canonical_scalar_atom_has_any_temp temps = function
+  | CanonicalOperandAtom (Tcg.Temp temp) ->
+      IntSet.mem temp temps
+  | CanonicalOperandAtom (Tcg.Imm _) ->
+      false
+  | CanonicalPlaceAtom _ ->
+      false
+  | CanonicalUnaryAtom (_, inner) ->
+      canonical_scalar_key_has_any_temp temps inner
+  | CanonicalBinaryAtom (_, lhs, rhs) ->
+      canonical_scalar_key_has_any_temp temps lhs
+      || canonical_scalar_key_has_any_temp temps rhs
+
 type linear_key = canonical_scalar_key
 
 type expr_key =
@@ -1259,7 +1279,14 @@ let linear_atom temp =
 let linear_key_of_form =
   canonical_scalar_key_of_form
 
+let advanced_exact_multidef_merge_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ADV_EXACT_MULTIDEF_MERGE" = None
+
+let advanced_exact_multidef_merge_debug_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ADV_EXACT_MULTIDEF_MERGE" <> None
+
 let make_linear_analyzer
+    ?(consumer = "unknown")
     (f : Cfg.func) : linear_analyzer =
   (* The analyzer follows only unique definitions.  A multi-def temp is a
      program-point-sensitive value, so it remains an opaque scalar atom.
@@ -1269,8 +1296,18 @@ let make_linear_analyzer
   let def_instrs =
     Hashtbl.create (max 16 f.temp_count)
   in
+  let all_def_instrs =
+    Hashtbl.create (max 16 f.temp_count)
+  in
   let multi_defs = ref IntSet.empty in
   let record_def temp instr =
+    let old_defs =
+      Option.value
+        ~default:[]
+        (Hashtbl.find_opt all_def_instrs temp)
+    in
+    Hashtbl.replace
+      all_def_instrs temp (instr :: old_defs);
     if Hashtbl.mem def_instrs temp then
       multi_defs := IntSet.add temp !multi_defs
     else
@@ -1297,52 +1334,114 @@ let make_linear_analyzer
   let memo =
     Hashtbl.create (max 16 f.temp_count)
   in
+  let exact_merge_reported =
+    Hashtbl.create (max 8 (IntSet.cardinal multi_defs))
+  in
+  let report_exact_merge temp key =
+    if
+      advanced_exact_multidef_merge_debug_enabled ()
+      && not (Hashtbl.mem exact_merge_reported temp)
+    then begin
+      Hashtbl.add exact_merge_reported temp ();
+      Printf.eprintf
+        "adv-exact-multidef-merge consumer=%s func=%s temp=%d defs=%d key=%s\n%!"
+        consumer
+        f.name
+        temp
+        (match Hashtbl.find_opt all_def_instrs temp with
+         | Some defs -> List.length defs
+         | None -> 0)
+        (string_of_canonical_scalar_key key)
+    end
+  in
   let rec of_operand seen = function
     | Tcg.Imm value ->
         canonical_scalar_const value
     | Tcg.Temp temp ->
-        if
-          IntSet.mem temp multi_defs
-          || IntSet.mem temp seen
-        then
+        if IntSet.mem temp seen then
           linear_atom temp
         else
           match Hashtbl.find_opt memo temp with
           | Some form ->
               form
           | None ->
-              let seen =
-                IntSet.add temp seen
-              in
+              let seen = IntSet.add temp seen in
               let form =
-                match Hashtbl.find_opt
-                        def_instrs temp
-                with
-                | Some (Tcg.Move (_, src))
-                | Some (Tcg.Un (_, UPlus, src)) ->
-                    of_operand seen src
-                | Some (Tcg.Un (_, UMinus, src)) ->
-                    canonical_scalar_un
-                      UMinus
-                      (of_operand seen src)
-                | Some
-                    (Tcg.Bin
-                       (_, ((Add | Sub | Mul) as op),
-                        lhs, rhs)) ->
-                    canonical_scalar_bin
-                      op
-                      (of_operand seen lhs)
-                      (of_operand seen rhs)
-                | Some (Tcg.Un _)
-                | Some (Tcg.Bin _)
-                | Some (Tcg.Load _)
-                | Some (Tcg.Store _)
-                | Some (Tcg.Call _)
-                | None ->
-                    linear_atom temp
+                if IntSet.mem temp multi_defs then
+                  match exact_multi_def_form seen temp with
+                  | Some merged ->
+                      merged
+                  | None ->
+                      linear_atom temp
+                else
+                  match Hashtbl.find_opt def_instrs temp with
+                  | Some instr ->
+                      form_of_def seen temp instr
+                  | None ->
+                      linear_atom temp
               in
               Hashtbl.replace memo temp form;
               form
+
+  and form_of_def seen temp = function
+    | Tcg.Move (_, src)
+    | Tcg.Un (_, UPlus, src) ->
+        of_operand seen src
+    | Tcg.Un (_, UMinus, src) ->
+        canonical_scalar_un
+          UMinus
+          (of_operand seen src)
+    | Tcg.Bin
+        (_, ((Add | Sub | Mul) as op), lhs, rhs) ->
+        canonical_scalar_bin
+          op
+          (of_operand seen lhs)
+          (of_operand seen rhs)
+    | Tcg.Un _
+    | Tcg.Bin _
+    | Tcg.Load _
+    | Tcg.Store _
+    | Tcg.Call _ ->
+        linear_atom temp
+
+  and exact_multi_def_form seen temp =
+    if not (advanced_exact_multidef_merge_enabled ()) then
+      None
+    else
+      match Hashtbl.find_opt all_def_instrs temp with
+      | None | Some [] | Some [ _ ] ->
+          None
+      | Some defs ->
+          let forms =
+            List.map (form_of_def seen temp) defs
+          in
+          match forms with
+          | [] ->
+              None
+          | first :: rest ->
+              let key =
+                canonical_scalar_key_of_form first
+              in
+              (* A program-point-sensitive temp may not be smuggled back
+                 through the merged form, directly or through another
+                 multi-defined temp.  Only stable single-definition atoms are
+                 allowed underneath an exact multi-def merge. *)
+              if
+                canonical_scalar_key_has_any_temp
+                  multi_defs key
+              then
+                None
+              else if
+                List.for_all
+                  (fun form ->
+                    canonical_scalar_key_of_form form = key)
+                  rest
+              then begin
+                report_exact_merge temp key;
+                Some first
+              end
+              else
+                None
   in
   fun operand ->
     of_operand IntSet.empty operand
@@ -1822,10 +1921,46 @@ let fold_fact_bin op a b =
 let kill_place_facts places state =
   PlaceSet.fold (fun place acc -> set_place_fact acc place CpNac) places state
 
-let initial_cp_state global_init (f : Cfg.func) =
+(* Second-wave advanced optimization: whole-program readonly globals.
+   A global initializer is a valid function-entry constant outside [main] only
+   when no function in the current whole-program effect summary may write it.
+   Unknown callees are already represented conservatively by the effect
+   summaries, so this remains sound without external-link assumptions. *)
+let advanced_readonly_global_cp_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ADV_READONLY_GLOBAL_CP" = None
+
+let advanced_readonly_global_cp_debug_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ADV_READONLY_GLOBAL_CP" <> None
+
+let advanced_whole_program_written_globals summaries =
+  Hashtbl.fold
+    (fun _label (summary : func_effect_summary) acc ->
+      PlaceSet.union acc summary.written_globals)
+    summaries PlaceSet.empty
+
+let advanced_readonly_global_cp_facts global_init summaries =
+  if not (advanced_readonly_global_cp_enabled ()) then PlaceMap.empty
+  else
+    let written = advanced_whole_program_written_globals summaries in
+    PlaceMap.fold
+      (fun place fact acc ->
+        match place with
+        | Tcg.Global _ when not (PlaceSet.mem place written) ->
+            PlaceMap.add place fact acc
+        | Tcg.Global _ | Tcg.Local _ ->
+            acc)
+      global_init PlaceMap.empty
+
+let initial_cp_state global_init readonly_global_init (f : Cfg.func) =
   let global_init =
     if f.name = "main" then global_init
-    else PlaceMap.map (fun _ -> CpNac) global_init
+    else
+      PlaceMap.mapi
+        (fun place _ ->
+          match PlaceMap.find_opt place readonly_global_init with
+          | Some fact -> fact
+          | None -> CpNac)
+        global_init
   in
   let places =
     List.fold_left
@@ -1981,6 +2116,7 @@ type item8_const_cache_key =
   * string
   * Tcg.var list
   * cp_fact PlaceMap.t
+  * cp_fact PlaceMap.t
   * item8_const_callee_context list
 
 type item8_const_cache_value =
@@ -2006,21 +2142,34 @@ let item8_const_callee_context summaries globals (f : Cfg.func) =
   |> List.map (fun callee ->
          (callee, call_written_globals summaries globals callee))
 
-let item8_const_cache_key global_init summaries globals (f : Cfg.func) =
+let item8_const_cache_key
+    global_init
+    readonly_global_init
+    summaries
+    globals
+    (f : Cfg.func) =
   ( item8_func_shape_key f,
     f.name,
     f.params,
     global_init,
+    readonly_global_init,
     item8_const_callee_context summaries globals f )
 
-let compute_const_states_uncached global_init summaries globals (f : Cfg.func) =
+let compute_const_states_uncached
+    global_init
+    readonly_global_init
+    summaries
+    globals
+    (f : Cfg.func) =
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block) f.blocks;
   let in_states = Hashtbl.create (List.length f.blocks) in
   let out_states = Hashtbl.create (List.length f.blocks) in
   let executable = ref (LabelSet.singleton f.entry) in
   let executable_edges = Hashtbl.create (max 8 (2 * List.length f.blocks)) in
-  let entry_state = initial_cp_state global_init f in
+  let entry_state =
+    initial_cp_state global_init readonly_global_init f
+  in
   let meet_states = function
     | [] -> empty_cp_state
     | state :: rest -> List.fold_left meet_cp_state state rest
@@ -2080,7 +2229,13 @@ let compute_const_states global_init summaries globals (f : Cfg.func) =
     item8_note_seen item8_const_seen item8_const_repeats (item8_func_shape_key f)
   end;
   if !item8_manager_debug_active then incr item8_manager_const_requests;
-  let key = item8_const_cache_key global_init summaries globals f in
+  let readonly_global_init =
+    advanced_readonly_global_cp_facts global_init summaries
+  in
+  let key =
+    item8_const_cache_key
+      global_init readonly_global_init summaries globals f
+  in
   match item8_analysis_cache_find const_state_cache_table key with
   | Some cached ->
       if !item8_manager_debug_active then incr item8_manager_const_hits;
@@ -2088,13 +2243,43 @@ let compute_const_states global_init summaries globals (f : Cfg.func) =
   | None ->
       if !item8_manager_debug_active then incr item8_manager_const_computes;
       let result =
-        compute_const_states_uncached global_init summaries globals f
+        compute_const_states_uncached
+          global_init readonly_global_init summaries globals f
       in
       item8_analysis_cache_store const_state_cache_table key result;
       result
 
 let const_propagate_func global_init summaries globals (f : Cfg.func) =
-  let executable, in_states = compute_const_states global_init summaries globals f in
+  let readonly_global_init =
+    advanced_readonly_global_cp_facts global_init summaries
+  in
+  let executable, in_states =
+    compute_const_states global_init summaries globals f
+  in
+  if advanced_readonly_global_cp_debug_enabled () then begin
+    let readonly_loads =
+      List.fold_left
+        (fun count (block : Cfg.block) ->
+          List.fold_left
+            (fun count instr ->
+              match instr with
+              | Tcg.Load (_, place)
+                when f.name <> "main"
+                     && PlaceMap.mem place readonly_global_init ->
+                  count + 1
+              | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _
+              | Tcg.Store _ | Tcg.Call _ ->
+                  count)
+            count block.body)
+        0 f.blocks
+    in
+    if readonly_loads <> 0 then
+      Printf.eprintf
+        "adv-readonly-cp func=%s readonly-globals=%d readonly-loads=%d\n%!"
+        f.name
+        (PlaceMap.cardinal readonly_global_init)
+        readonly_loads
+  end;
   let blocks =
     List.filter_map
       (fun (block : Cfg.block) ->
@@ -2102,7 +2287,8 @@ let const_propagate_func global_init summaries globals (f : Cfg.func) =
           let state =
             match Hashtbl.find_opt in_states block.label with
             | Some state -> state
-            | None when block.label = f.entry -> initial_cp_state global_init f
+            | None when block.label = f.entry ->
+                initial_cp_state global_init readonly_global_init f
             | None -> empty_cp_state
           in
           Some (fst (run_transfer summaries globals state block))
@@ -2241,7 +2427,7 @@ let gvn_func summaries globals (f : Cfg.func) =
     item8_final_note_seen item8_final_gvn_seen item8_final_gvn_repeats key
   end;
   if !item8_manager_debug_active then incr item8_manager_gvn_requests;
-  let linear = make_linear_analyzer f in
+  let linear = make_linear_analyzer ~consumer:"gvn" f in
   let in_states =
     match item8_analysis_cache_find gvn_state_cache_table key with
     | Some cached ->
@@ -23909,7 +24095,7 @@ let temp_use_counts blocks =
 let item6_canonical_adoption_audit (f : Cfg.func) =
   if Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" = None then ()
   else
-    let analyze = make_linear_analyzer f in
+    let analyze = make_linear_analyzer ~consumer:"item6-adoption-audit" f in
     let _, _, def_instrs, multi_defs =
       analyze_temp_defs_of_blocks f.temp_count f.blocks
     in
@@ -24048,7 +24234,7 @@ let algebra_canonicalize_func (f : Cfg.func) =
      isolated late-equiv pass below, preserving connected proof-guard chains.
      No pass rebuilds/reassociates expression trees merely to enforce canonical
      physical syntax. *)
-  let semantic_analyze = make_linear_analyzer f in
+  let semantic_analyze = make_linear_analyzer ~consumer:"algebra" f in
   let _, _, def_instrs, multi_defs =
     analyze_temp_defs_of_blocks f.temp_count f.blocks
   in
@@ -24471,7 +24657,7 @@ let algebra_canonicalize_func (f : Cfg.func) =
    no candidate predecessor and no candidate successor (singleton components).
    This preserves proof chains without depending on generated label names. *)
 let semantic_branch_fold_func ?(debug_tag = "late-equiv-isolated") (f : Cfg.func) =
-  let semantic_analyze = make_linear_analyzer f in
+  let semantic_analyze = make_linear_analyzer ~consumer:"semantic-branch" f in
   let _, _, _, multi_defs =
     analyze_temp_defs_of_blocks f.temp_count f.blocks
   in
@@ -24597,7 +24783,7 @@ let semantic_branch_fold_func ?(debug_tag = "late-equiv-isolated") (f : Cfg.func
   else Cfg.rebuild_edges { f with blocks }
 
 let general_linear_canonicalize_func (f : Cfg.func) =
-  let analyze = make_linear_analyzer f in
+  let analyze = make_linear_analyzer ~consumer:"general-linear" f in
   let rewrites = ref 0 in
   let rewrite_instr instr =
     let initial = simplify_simple_instr instr in
@@ -24664,7 +24850,7 @@ let general_linear_canonicalize_func (f : Cfg.func) =
    DCE removes the now-dead earlier multiplication immediately afterwards in
    the normal pipeline. *)
 let factor_common_mul_func (f : Cfg.func) =
-  let canonical_scalar = make_linear_analyzer f in
+  let canonical_scalar = make_linear_analyzer ~consumer:"factor-common-mul" f in
   let canonical_operand_equal lhs rhs =
     canonical_scalar_key_equal
       (canonical_scalar lhs)
@@ -24904,7 +25090,7 @@ let reassociate_loop_adds_func (f : Cfg.func) =
     let get_block = get_block_exn current_blocks in
     let changed = ref false in
     let adoption_reassoc_mid_gap = ref 0 in
-    let adoption_analyze = make_linear_analyzer f in
+    let adoption_analyze = make_linear_analyzer ~consumer:"loop-reassoc" f in
     let adoption_semantic_equal lhs rhs =
       canonical_scalar_key_equal
         (adoption_analyze lhs)
@@ -35892,6 +36078,9 @@ let item7_debug_callsite_global_snapshot
 
     List.iter
       (fun (caller : Cfg.func) ->
+        let readonly_global_init =
+          advanced_readonly_global_cp_facts global_init fresh_summaries
+        in
         let executable, in_states =
           compute_const_states global_init fresh_summaries globals caller
         in
@@ -35902,7 +36091,8 @@ let item7_debug_callsite_global_snapshot
                 match Hashtbl.find_opt in_states block.label with
                 | Some state -> state
                 | None when block.label = caller.entry ->
-                    initial_cp_state global_init caller
+                    initial_cp_state
+                      global_init readonly_global_init caller
                 | None -> empty_cp_state
               in
               let rec walk state = function
