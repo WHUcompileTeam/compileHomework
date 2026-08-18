@@ -650,7 +650,88 @@ let summarize_func summaries globals (f : Cfg.func) =
     { read_globals = PlaceSet.empty; written_globals = PlaceSet.empty }
     f.blocks
 
+(* -------------------------------------------------------------------------- *)
+(* item8 v1: analysis recomputation/caching capability audit                  *)
+(*                                                                            *)
+(* Audit-only.  Track exact repeated requests for the same immutable CFG       *)
+(* shape, and compare them with the two primitive one-entry caches already     *)
+(* present for liveness and dominators.                                        *)
+(* -------------------------------------------------------------------------- *)
+
+type item8_func_shape_key = string * string * int * Cfg.block list
+
+let item8_func_shape_key (f : Cfg.func) : item8_func_shape_key =
+  (f.label, f.entry, f.temp_count, f.blocks)
+
+let item8_analysis_audit_active = ref false
+
+let item8_summary_requests = ref 0
+let item8_summary_repeats = ref 0
+let item8_const_requests = ref 0
+let item8_const_repeats = ref 0
+let item8_liveness_requests = ref 0
+let item8_liveness_hits = ref 0
+let item8_liveness_repeats = ref 0
+let item8_dominator_requests = ref 0
+let item8_dominator_hits = ref 0
+let item8_dominator_repeats = ref 0
+let item8_loop_requests = ref 0
+let item8_loop_repeats = ref 0
+
+let item8_summary_seen : (item8_func_shape_key list, unit) Hashtbl.t =
+  Hashtbl.create 32
+let item8_const_seen : (item8_func_shape_key, unit) Hashtbl.t =
+  Hashtbl.create 64
+let item8_liveness_seen : (item8_func_shape_key, unit) Hashtbl.t =
+  Hashtbl.create 64
+let item8_dominator_seen : (item8_func_shape_key, unit) Hashtbl.t =
+  Hashtbl.create 64
+let item8_loop_seen : (item8_func_shape_key, unit) Hashtbl.t =
+  Hashtbl.create 64
+
+let item8_note_seen seen repeats key =
+  if Hashtbl.mem seen key then incr repeats
+  else Hashtbl.add seen key ()
+
+let item8_begin_analysis_audit () =
+  item8_analysis_audit_active :=
+    Sys.getenv_opt "TOYC_DEBUG_ITEM8_ANALYSIS_RECOMPUTE" <> None;
+  item8_summary_requests := 0;
+  item8_summary_repeats := 0;
+  item8_const_requests := 0;
+  item8_const_repeats := 0;
+  item8_liveness_requests := 0;
+  item8_liveness_hits := 0;
+  item8_liveness_repeats := 0;
+  item8_dominator_requests := 0;
+  item8_dominator_hits := 0;
+  item8_dominator_repeats := 0;
+  item8_loop_requests := 0;
+  item8_loop_repeats := 0;
+  Hashtbl.reset item8_summary_seen;
+  Hashtbl.reset item8_const_seen;
+  Hashtbl.reset item8_liveness_seen;
+  Hashtbl.reset item8_dominator_seen;
+  Hashtbl.reset item8_loop_seen
+
+let item8_print_analysis_audit () =
+  if !item8_analysis_audit_active then
+    Printf.eprintf
+      "item8-analysis-summary summaries=%d summary-repeat=%d const=%d const-repeat=%d liveness=%d liveness-hit=%d liveness-repeat=%d liveness-missed-reuse=%d dominators=%d dominator-hit=%d dominator-repeat=%d dominator-missed-reuse=%d loops=%d loop-repeat=%d\n%!"
+      !item8_summary_requests !item8_summary_repeats
+      !item8_const_requests !item8_const_repeats
+      !item8_liveness_requests !item8_liveness_hits !item8_liveness_repeats
+      (max 0 (!item8_liveness_repeats - !item8_liveness_hits))
+      !item8_dominator_requests !item8_dominator_hits !item8_dominator_repeats
+      (max 0 (!item8_dominator_repeats - !item8_dominator_hits))
+      !item8_loop_requests !item8_loop_repeats
+
 let compute_func_summaries globals funcs =
+  if !item8_analysis_audit_active then begin
+    incr item8_summary_requests;
+    item8_note_seen item8_summary_seen item8_summary_repeats
+      (List.map item8_func_shape_key funcs)
+  end;
   let summaries = Hashtbl.create (max 8 (List.length funcs)) in
   let empty_summary = { read_globals = PlaceSet.empty; written_globals = PlaceSet.empty } in
   List.iter (fun (f : Cfg.func) -> Hashtbl.replace summaries f.label empty_summary) funcs;
@@ -1736,7 +1817,61 @@ let executable_successors state (term : Cfg.terminator) =
         end
   | Cfg.Return _ -> []
 
-let compute_const_states global_init summaries globals (f : Cfg.func) =
+(* -------------------------------------------------------------------------- *)
+(* item8 v4: context-keyed multi-entry constant-state cache                    *)
+(*                                                                            *)
+(* Constant propagation depends on more than CFG shape: [initial_cp_state]     *)
+(* observes the global initializer map (and the function's parameter places),  *)
+(* while calls kill exactly the globals in the current callee write summary.   *)
+(* Cache those semantic dependencies explicitly.                               *)
+(* -------------------------------------------------------------------------- *)
+
+let analysis_cache_generation = ref 0
+let item8_manager_debug_active = ref false
+let item8_manager_const_requests = ref 0
+let item8_manager_const_hits = ref 0
+let item8_manager_const_computes = ref 0
+
+type item8_const_callee_context = string * PlaceSet.t
+
+type item8_const_cache_key =
+  item8_func_shape_key
+  * string
+  * Tcg.var list
+  * cp_fact PlaceMap.t
+  * item8_const_callee_context list
+
+type item8_const_cache_value =
+  LabelSet.t * (string, cp_state) Hashtbl.t
+
+let const_state_cache_table :
+    (item8_const_cache_key, item8_const_cache_value) Hashtbl.t =
+  Hashtbl.create 128
+
+let item8_const_callee_context summaries globals (f : Cfg.func) =
+  let callees =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        List.fold_left
+          (fun acc instr ->
+            match instr with
+            | Tcg.Call (_, callee, _) -> LabelSet.add callee acc
+            | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> acc)
+          acc block.body)
+      LabelSet.empty f.blocks
+  in
+  LabelSet.elements callees
+  |> List.map (fun callee ->
+         (callee, call_written_globals summaries globals callee))
+
+let item8_const_cache_key global_init summaries globals (f : Cfg.func) =
+  ( item8_func_shape_key f,
+    f.name,
+    f.params,
+    global_init,
+    item8_const_callee_context summaries globals f )
+
+let compute_const_states_uncached global_init summaries globals (f : Cfg.func) =
   let block_map = Hashtbl.create (List.length f.blocks) in
   List.iter (fun (block : Cfg.block) -> Hashtbl.replace block_map block.label block) f.blocks;
   let in_states = Hashtbl.create (List.length f.blocks) in
@@ -1796,6 +1931,29 @@ let compute_const_states global_init summaries globals (f : Cfg.func) =
       f.blocks
   done;
   (!executable, in_states)
+
+let compute_const_states global_init summaries globals (f : Cfg.func) =
+  if !item8_analysis_audit_active then begin
+    incr item8_const_requests;
+    item8_note_seen item8_const_seen item8_const_repeats (item8_func_shape_key f)
+  end;
+  if !item8_manager_debug_active then incr item8_manager_const_requests;
+  let key = item8_const_cache_key global_init summaries globals f in
+  match
+    if !analysis_cache_generation = 0 then None
+    else Hashtbl.find_opt const_state_cache_table key
+  with
+  | Some cached ->
+      if !item8_manager_debug_active then incr item8_manager_const_hits;
+      cached
+  | None ->
+      if !item8_manager_debug_active then incr item8_manager_const_computes;
+      let result =
+        compute_const_states_uncached global_init summaries globals f
+      in
+      if !analysis_cache_generation <> 0 then
+        Hashtbl.replace const_state_cache_table key result;
+      result
 
 let const_propagate_func global_init summaries globals (f : Cfg.func) =
   let executable, in_states = compute_const_states global_init summaries globals f in
@@ -2217,90 +2375,116 @@ let table_find_or_empty table key empty =
   | Some value -> value
   | None -> empty
 
-type liveness_cache = {
-  generation : int;
-  entry_label : string;
-  temp_count : int;
-  blocks_key : Cfg.block list;
-  live_in_t_cache : (string, IntSet.t) Hashtbl.t;
-  live_in_p_cache : (string, PlaceSet.t) Hashtbl.t;
-}
+(* -------------------------------------------------------------------------- *)
+(* item8 v3: context-keyed multi-entry liveness cache                         *)
+(*                                                                            *)
+(* Liveness is not a function of CFG shape alone.  Calls use the current      *)
+(* interprocedural read/write summaries, returns may expose only a subset of   *)
+(* globals, and DCE may additionally know that some dead-result calls are      *)
+(* removable.  Snapshot exactly the pieces of that context that this function  *)
+(* can observe and include them in the cache key.  This makes A/B/A reuse safe  *)
+(* without relying on mutable summary-table identity.                          *)
+(* -------------------------------------------------------------------------- *)
 
-type dominator_cache = {
-  generation : int;
-  entry_label : string;
-  temp_count : int;
-  blocks_key : Cfg.block list;
-  doms_cache : (string, LabelSet.t) Hashtbl.t;
-}
+type item8_liveness_callee_context =
+  string * PlaceSet.t * PlaceSet.t * bool
 
-let analysis_cache_generation = ref 0
-let last_liveness_cache : liveness_cache option ref = ref None
-let last_dominator_cache : dominator_cache option ref = ref None
+type item8_liveness_context_key =
+  PlaceSet.t * item8_liveness_callee_context list
 
-let compute_liveness summaries globals (f : Cfg.func) =
-  match !last_liveness_cache with
-  | Some cache
-    when !analysis_cache_generation <> 0
-         && cache.generation = !analysis_cache_generation
-         && cache.entry_label = f.entry
-         && cache.temp_count = f.temp_count
-         && cache.blocks_key = f.blocks ->
-      (cache.live_in_t_cache, cache.live_in_p_cache)
-  | Some _ | None ->
-      let live_in_t = Hashtbl.create (List.length f.blocks) in
-      let live_in_p = Hashtbl.create (List.length f.blocks) in
-      let blocks = List.rev f.blocks in
-      let changed = ref true in
-      while !changed do
-        changed := false;
-        List.iter
-          (fun (block : Cfg.block) ->
-            let live_t_out =
-              List.fold_left
-                (fun acc succ ->
-                  IntSet.union acc (table_find_or_empty live_in_t succ IntSet.empty))
-                IntSet.empty block.succs
-            in
-            let live_p_out =
-              List.fold_left
-                (fun acc succ ->
-                  PlaceSet.union acc (table_find_or_empty live_in_p succ PlaceSet.empty))
-                PlaceSet.empty block.succs
-            in
-            let _, live_t_in, live_p_in = scan_block summaries globals block live_t_out live_p_out in
-            if
-              not (IntSet.equal live_t_in (table_find_or_empty live_in_t block.label IntSet.empty))
-            then (
-              Hashtbl.replace live_in_t block.label live_t_in;
-              changed := true);
-            if
-              not
-                (PlaceSet.equal live_p_in
-                   (table_find_or_empty live_in_p block.label PlaceSet.empty))
-            then (
-              Hashtbl.replace live_in_p block.label live_p_in;
-              changed := true))
-          blocks
-      done;
-      if !analysis_cache_generation <> 0 then
-        last_liveness_cache :=
-          Some
-            {
-              generation = !analysis_cache_generation;
-              entry_label = f.entry;
-              temp_count = f.temp_count;
-              blocks_key = f.blocks;
-              live_in_t_cache = live_in_t;
-              live_in_p_cache = live_in_p;
-            };
-      (live_in_t, live_in_p)
+type item8_liveness_cache_key =
+  item8_func_shape_key * item8_liveness_context_key
 
-(* DCE sometimes knows that only a subset of globals must be observable when a
-   function returns.  Keep the normal cached liveness above conservative for
-   every other optimization, and use this uncached variant only for the
-   context-sensitive dead-store analysis. *)
-let compute_liveness_with_return_globals ?removable_calls summaries globals return_globals (f : Cfg.func) =
+type item8_liveness_cache_value =
+  (string, IntSet.t) Hashtbl.t * (string, PlaceSet.t) Hashtbl.t
+
+(* item8 v2/v3: generation-scoped multi-entry analysis stores. *)
+type dominator_cache_value = (string, LabelSet.t) Hashtbl.t
+
+let liveness_cache_table :
+    (item8_liveness_cache_key, item8_liveness_cache_value) Hashtbl.t =
+  Hashtbl.create 128
+let dominator_cache_table :
+    (item8_func_shape_key, dominator_cache_value) Hashtbl.t =
+  Hashtbl.create 128
+
+let item8_manager_dom_requests = ref 0
+let item8_manager_dom_hits = ref 0
+let item8_manager_dom_computes = ref 0
+let item8_manager_loop_requests = ref 0
+let item8_manager_loop_hits = ref 0
+let item8_manager_loop_computes = ref 0
+let item8_manager_liveness_requests = ref 0
+let item8_manager_liveness_hits = ref 0
+let item8_manager_liveness_computes = ref 0
+let item8_manager_context_liveness_requests = ref 0
+let item8_manager_context_liveness_hits = ref 0
+let item8_manager_context_liveness_computes = ref 0
+
+let item8_begin_manager_debug () =
+  item8_manager_debug_active :=
+    Sys.getenv_opt "TOYC_DEBUG_ITEM8_ANALYSIS_MANAGER" <> None;
+  item8_manager_const_requests := 0;
+  item8_manager_const_hits := 0;
+  item8_manager_const_computes := 0;
+  item8_manager_dom_requests := 0;
+  item8_manager_dom_hits := 0;
+  item8_manager_dom_computes := 0;
+  item8_manager_loop_requests := 0;
+  item8_manager_loop_hits := 0;
+  item8_manager_loop_computes := 0;
+  item8_manager_liveness_requests := 0;
+  item8_manager_liveness_hits := 0;
+  item8_manager_liveness_computes := 0;
+  item8_manager_context_liveness_requests := 0;
+  item8_manager_context_liveness_hits := 0;
+  item8_manager_context_liveness_computes := 0
+
+let item8_print_manager_debug () =
+  if !item8_manager_debug_active then
+    Printf.eprintf
+      "item8-manager-summary const-requests=%d const-hits=%d const-computes=%d dom-requests=%d dom-hits=%d dom-computes=%d loop-requests=%d loop-hits=%d loop-computes=%d liveness-requests=%d liveness-hits=%d liveness-computes=%d context-liveness-requests=%d context-liveness-hits=%d context-liveness-computes=%d\n%!"
+      !item8_manager_const_requests !item8_manager_const_hits
+      !item8_manager_const_computes
+      !item8_manager_dom_requests !item8_manager_dom_hits
+      !item8_manager_dom_computes !item8_manager_loop_requests
+      !item8_manager_loop_hits !item8_manager_loop_computes
+      !item8_manager_liveness_requests !item8_manager_liveness_hits
+      !item8_manager_liveness_computes !item8_manager_context_liveness_requests
+      !item8_manager_context_liveness_hits !item8_manager_context_liveness_computes
+
+let item8_liveness_context_key
+    ?removable_calls summaries globals return_globals (f : Cfg.func) =
+  let callees =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        List.fold_left
+          (fun acc instr ->
+            match instr with
+            | Tcg.Call (_, callee, _) -> LabelSet.add callee acc
+            | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> acc)
+          acc block.body)
+      LabelSet.empty f.blocks
+  in
+  let callee_context =
+    LabelSet.elements callees
+    |> List.map (fun callee ->
+           let read_globals = call_read_globals summaries globals callee in
+           let written_globals = call_written_globals summaries globals callee in
+           let removable =
+             match removable_calls with
+             | None -> false
+             | Some table -> (
+                 match Hashtbl.find_opt table callee with
+                 | Some true -> true
+                 | Some false | None -> false)
+           in
+           (callee, read_globals, written_globals, removable))
+  in
+  (return_globals, callee_context)
+
+let compute_liveness_uncached
+    ?removable_calls summaries globals return_globals (f : Cfg.func) =
   let live_in_t = Hashtbl.create (List.length f.blocks) in
   let live_in_p = Hashtbl.create (List.length f.blocks) in
   let blocks = List.rev f.blocks in
@@ -2322,25 +2506,80 @@ let compute_liveness_with_return_globals ?removable_calls summaries globals retu
             PlaceSet.empty block.succs
         in
         let _, live_t_in, live_p_in =
-          scan_block ~return_globals ?removable_calls summaries globals block live_t_out live_p_out
+          scan_block ~return_globals ?removable_calls summaries globals block
+            live_t_out live_p_out
         in
         if
           not
             (IntSet.equal live_t_in
                (table_find_or_empty live_in_t block.label IntSet.empty))
-        then (
+        then begin
           Hashtbl.replace live_in_t block.label live_t_in;
-          changed := true);
+          changed := true
+        end;
         if
           not
             (PlaceSet.equal live_p_in
                (table_find_or_empty live_in_p block.label PlaceSet.empty))
-        then (
+        then begin
           Hashtbl.replace live_in_p block.label live_p_in;
-          changed := true))
+          changed := true
+        end)
       blocks
   done;
   (live_in_t, live_in_p)
+
+let item8_get_liveness
+    ?removable_calls ~contextual summaries globals return_globals (f : Cfg.func) =
+  if contextual then begin
+    if !item8_manager_debug_active then
+      incr item8_manager_context_liveness_requests
+  end else begin
+    if !item8_manager_debug_active then incr item8_manager_liveness_requests
+  end;
+  let key =
+    ( item8_func_shape_key f,
+      item8_liveness_context_key ?removable_calls summaries globals
+        return_globals f )
+  in
+  match
+    if !analysis_cache_generation = 0 then None
+    else Hashtbl.find_opt liveness_cache_table key
+  with
+  | Some cached ->
+      if contextual then begin
+        if !item8_manager_debug_active then incr item8_manager_context_liveness_hits
+      end else begin
+        if !item8_manager_debug_active then incr item8_manager_liveness_hits;
+        if !item8_analysis_audit_active then incr item8_liveness_hits
+      end;
+      cached
+  | None ->
+      if contextual then begin
+        if !item8_manager_debug_active then
+          incr item8_manager_context_liveness_computes
+      end else begin
+        if !item8_manager_debug_active then incr item8_manager_liveness_computes
+      end;
+      let result =
+        compute_liveness_uncached ?removable_calls summaries globals return_globals f
+      in
+      if !analysis_cache_generation <> 0 then
+        Hashtbl.replace liveness_cache_table key result;
+      result
+
+let compute_liveness summaries globals (f : Cfg.func) =
+  if !item8_analysis_audit_active then begin
+    incr item8_liveness_requests;
+    item8_note_seen item8_liveness_seen item8_liveness_repeats
+      (item8_func_shape_key f)
+  end;
+  item8_get_liveness ~contextual:false summaries globals globals f
+
+let compute_liveness_with_return_globals
+    ?removable_calls summaries globals return_globals (f : Cfg.func) =
+  item8_get_liveness ?removable_calls ~contextual:true summaries globals
+    return_globals f
 
 let direct_callees_of_func (f : Cfg.func) =
   List.fold_left
@@ -4260,15 +4499,23 @@ let promote_globals_func summaries globals (f : Cfg.func) =
   attempt all_candidates
 
 let compute_dominators (f : Cfg.func) =
-  match !last_dominator_cache with
-  | Some cache
-    when !analysis_cache_generation <> 0
-         && cache.generation = !analysis_cache_generation
-         && cache.entry_label = f.entry
-         && cache.temp_count = f.temp_count
-         && cache.blocks_key = f.blocks ->
-      cache.doms_cache
-  | Some _ | None ->
+  if !item8_analysis_audit_active then begin
+    incr item8_dominator_requests;
+    item8_note_seen item8_dominator_seen item8_dominator_repeats
+      (item8_func_shape_key f)
+  end;
+  if !item8_manager_debug_active then incr item8_manager_dom_requests;
+  let key = item8_func_shape_key f in
+  match
+    if !analysis_cache_generation = 0 then None
+    else Hashtbl.find_opt dominator_cache_table key
+  with
+  | Some doms ->
+      if !item8_analysis_audit_active then incr item8_dominator_hits;
+      if !item8_manager_debug_active then incr item8_manager_dom_hits;
+      doms
+  | None ->
+      if !item8_manager_debug_active then incr item8_manager_dom_computes;
       let reachable = reachable_labels f.entry f.blocks in
       let reachable_blocks =
         List.filter (fun (block : Cfg.block) -> LabelSet.mem block.label reachable) f.blocks
@@ -4308,15 +4555,7 @@ let compute_dominators (f : Cfg.func) =
           reachable_blocks
       done;
       if !analysis_cache_generation <> 0 then
-        last_dominator_cache :=
-          Some
-            {
-              generation = !analysis_cache_generation;
-              entry_label = f.entry;
-              temp_count = f.temp_count;
-              blocks_key = f.blocks;
-              doms_cache = doms;
-            };
+        Hashtbl.replace dominator_cache_table key doms;
       doms
 
 type licm_candidate =
@@ -4399,44 +4638,71 @@ let natural_loop block_map header pred =
           | None -> visit rest seen
   in
   visit [ pred ] (LabelSet.singleton header)
+
+type natural_loop_cache_value =
+  (Tcg.label, Cfg.block) Hashtbl.t
+  * (Tcg.label, LabelSet.t) Hashtbl.t
+  * Tcg.label list
+
+let natural_loop_cache_table :
+    (item8_func_shape_key, natural_loop_cache_value) Hashtbl.t =
+  Hashtbl.create 128
 let discover_natural_loops (f : Cfg.func) =
-  let block_map = Hashtbl.create (List.length f.blocks) in
-  List.iter
-    (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block)
-    f.blocks;
-  let doms = compute_dominators f in
-  let backedges =
-    List.fold_left
-      (fun acc (block : Cfg.block) ->
+  if !item8_analysis_audit_active then begin
+    incr item8_loop_requests;
+    item8_note_seen item8_loop_seen item8_loop_repeats (item8_func_shape_key f)
+  end;
+  if !item8_manager_debug_active then incr item8_manager_loop_requests;
+  let key = item8_func_shape_key f in
+  match
+    if !analysis_cache_generation = 0 then None
+    else Hashtbl.find_opt natural_loop_cache_table key
+  with
+  | Some cached ->
+      if !item8_manager_debug_active then incr item8_manager_loop_hits;
+      cached
+  | None ->
+      if !item8_manager_debug_active then incr item8_manager_loop_computes;
+      let block_map = Hashtbl.create (List.length f.blocks) in
+      List.iter
+        (fun (block : Cfg.block) -> Hashtbl.add block_map block.label block)
+        f.blocks;
+      let doms = compute_dominators f in
+      let backedges =
         List.fold_left
-          (fun acc succ ->
-            if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
-              (block.label, succ) :: acc
-            else acc)
-          acc block.succs)
-      [] f.blocks
-  in
-  let loops = Hashtbl.create 8 in
-  List.iter
-    (fun (pred, header) ->
-      let loop = natural_loop block_map header pred in
-      let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
-      Hashtbl.replace loops header merged)
-    backedges;
-  let headers =
-    Hashtbl.fold
-      (fun header loop acc ->
-        (header, LabelSet.cardinal loop) :: acc)
-      loops
-      []
-    |> List.sort
-         (fun (header_a, size_a) (header_b, size_b) ->
-           let by_size = compare size_a size_b in
-           if by_size <> 0 then by_size
-           else String.compare header_a header_b)
-    |> List.map fst
-  in
-  (block_map, loops, headers)
+          (fun acc (block : Cfg.block) ->
+            List.fold_left
+              (fun acc succ ->
+                if LabelSet.mem succ (table_find_or_empty doms block.label LabelSet.empty) then
+                  (block.label, succ) :: acc
+                else acc)
+              acc block.succs)
+          [] f.blocks
+      in
+      let loops = Hashtbl.create 8 in
+      List.iter
+        (fun (pred, header) ->
+          let loop = natural_loop block_map header pred in
+          let merged = LabelSet.union loop (table_find_or_empty loops header LabelSet.empty) in
+          Hashtbl.replace loops header merged)
+        backedges;
+      let headers =
+        Hashtbl.fold
+          (fun header loop acc ->
+            (header, LabelSet.cardinal loop) :: acc)
+          loops
+          []
+        |> List.sort
+             (fun (header_a, size_a) (header_b, size_b) ->
+               let by_size = compare size_a size_b in
+               if by_size <> 0 then by_size
+               else String.compare header_a header_b)
+        |> List.map fst
+      in
+      let result = (block_map, loops, headers) in
+      if !analysis_cache_generation <> 0 then
+        Hashtbl.replace natural_loop_cache_table key result;
+      result
 
 (* -------------------------------------------------------------------------- *)
 (* item2.1: LoopForest / canonical loop metadata                              *)
@@ -35731,9 +35997,13 @@ let item7_debug_final_seal_audit
   end
 
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
+  item8_begin_analysis_audit ();
+  item8_begin_manager_debug ();
   incr analysis_cache_generation;
-  last_liveness_cache := None;
-  last_dominator_cache := None;
+  Hashtbl.reset const_state_cache_table;
+  Hashtbl.reset liveness_cache_table;
+  Hashtbl.reset dominator_cache_table;
+  Hashtbl.reset natural_loop_cache_table;
   let cfg = { Cfg.funcs = List.map tailrec_elim_func cfg.funcs } in
   let source_funcs = cfg.funcs in
   let global_init, globals =
@@ -35855,4 +36125,6 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   let optimized_funcs =
     item7_final_structural_cleanup_program optimized_funcs
   in
+  let () = item8_print_analysis_audit () in
+  let () = item8_print_manager_debug () in
   { Cfg.funcs = optimized_funcs }
