@@ -726,12 +726,138 @@ let item8_print_analysis_audit () =
       (max 0 (!item8_dominator_repeats - !item8_dominator_hits))
       !item8_loop_requests !item8_loop_repeats
 
-let compute_func_summaries globals funcs =
-  if !item8_analysis_audit_active then begin
-    incr item8_summary_requests;
-    item8_note_seen item8_summary_seen item8_summary_repeats
-      (List.map item8_func_shape_key funcs)
-  end;
+(* -------------------------------------------------------------------------- *)
+(* item8 v5: whole-program effect-summary cache                               *)
+(*                                                                            *)
+(* Function effect summaries form an interprocedural fixed point.  Their      *)
+(* semantic inputs are the exact current function CFG set plus the global      *)
+(* universe used for unknown-callee worst-case effects.  Cache that complete   *)
+(* input within one optimize_cfg generation.                                   *)
+(* -------------------------------------------------------------------------- *)
+
+(* -------------------------------------------------------------------------- *)
+(* item8 v6: unified analysis-manager lifetime / invalidation contract         *)
+(*                                                                            *)
+(* Cache lifetime has two levels:                                             *)
+(*   1. program boundary: begin a new generation and drop every cached result; *)
+(*   2. inside one program: do NOT eagerly invalidate on CFG rewrites.          *)
+(*                                                                            *)
+(* Every store below is content-addressed by the exact semantic inputs of its  *)
+(* analysis.  A CFG mutation therefore creates a different function-shape key; *)
+(* effect/return/global context changes create a different contextual key.      *)
+(* If a transformation later recreates an identical semantic input (A/B/A),    *)
+(* reusing the old result is valid and desirable.                              *)
+(*                                                                            *)
+(* This is the manager's invalidation contract:                                *)
+(*   - cross-program state: invalidate all;                                    *)
+(*   - structural mutation: key-version miss, no destructive global flush;     *)
+(*   - semantic-context mutation: dependency-key miss;                          *)
+(*   - identical semantic input: preserve/reuse analysis.                      *)
+(* -------------------------------------------------------------------------- *)
+
+let analysis_cache_generation = ref 0
+
+let item8_analysis_cache_active () =
+  !analysis_cache_generation <> 0
+
+let item8_analysis_cache_find table key =
+  if item8_analysis_cache_active () then Hashtbl.find_opt table key else None
+
+let item8_analysis_cache_store table key value =
+  if item8_analysis_cache_active () then Hashtbl.replace table key value
+
+let item8_manager_debug_active = ref false
+
+(* -------------------------------------------------------------------------- *)
+(* item8 v7: final residual analysis-work audit                               *)
+(*                                                                            *)
+(* This is AUDIT ONLY.  The managed analyses above already cache exact semantic *)
+(* inputs.  Before sealing item8, count the remaining expensive analyses that  *)
+(* still run outside the manager and ask whether identical semantic requests   *)
+(* recur often enough to justify another production cache.                     *)
+(* -------------------------------------------------------------------------- *)
+
+let item8_final_work_audit_active = ref false
+
+let item8_final_gvn_requests = ref 0
+let item8_final_gvn_repeats = ref 0
+let item8_final_return_demand_requests = ref 0
+let item8_final_return_demand_repeats = ref 0
+let item8_final_removable_requests = ref 0
+let item8_final_removable_repeats = ref 0
+
+(* GVN depends on the exact CFG and on the write-effects of direct callees. *)
+type item8_gvn_audit_key =
+  item8_func_shape_key * (string * PlaceSet.t) list
+
+(* Whole-program demand/removability analyses depend on the program CFG set,
+   globals, and the current fixed-point effect summaries. *)
+type item8_program_semantic_audit_key =
+  PlaceSet.t
+  * item8_func_shape_key list
+  * (string * PlaceSet.t * PlaceSet.t) list
+
+let item8_final_gvn_seen : (item8_gvn_audit_key, unit) Hashtbl.t =
+  Hashtbl.create 256
+
+let item8_final_return_demand_seen :
+    (item8_program_semantic_audit_key, unit) Hashtbl.t =
+  Hashtbl.create 64
+
+let item8_final_removable_seen :
+    (item8_program_semantic_audit_key, unit) Hashtbl.t =
+  Hashtbl.create 64
+
+let item8_final_note_seen seen repeats key =
+  if Hashtbl.mem seen key then incr repeats
+  else Hashtbl.add seen key ()
+
+let item8_program_semantic_audit_key summaries globals funcs =
+  let funcs_shape = List.map item8_func_shape_key funcs in
+  let effects =
+    funcs
+    |> List.map (fun (f : Cfg.func) ->
+           let eff = call_effect_summary summaries globals f.label in
+           (f.label, eff.read_globals, eff.written_globals))
+    |> List.sort compare
+  in
+  (globals, funcs_shape, effects)
+
+let item8_begin_final_work_audit () =
+  item8_final_work_audit_active :=
+    Sys.getenv_opt "TOYC_DEBUG_ITEM8_FINAL_WORK_AUDIT" <> None;
+  item8_final_gvn_requests := 0;
+  item8_final_gvn_repeats := 0;
+  item8_final_return_demand_requests := 0;
+  item8_final_return_demand_repeats := 0;
+  item8_final_removable_requests := 0;
+  item8_final_removable_repeats := 0;
+  Hashtbl.reset item8_final_gvn_seen;
+  Hashtbl.reset item8_final_return_demand_seen;
+  Hashtbl.reset item8_final_removable_seen
+
+let item8_print_final_work_audit () =
+  if !item8_final_work_audit_active then
+    Printf.eprintf
+      "item8-final-work-summary gvn-requests=%d gvn-repeat=%d return-demand-requests=%d return-demand-repeat=%d removable-requests=%d removable-repeat=%d\n%!"
+      !item8_final_gvn_requests !item8_final_gvn_repeats
+      !item8_final_return_demand_requests !item8_final_return_demand_repeats
+      !item8_final_removable_requests !item8_final_removable_repeats
+let item8_manager_summary_requests = ref 0
+let item8_manager_summary_hits = ref 0
+let item8_manager_summary_computes = ref 0
+
+type item8_summary_cache_key = PlaceSet.t * item8_func_shape_key list
+type item8_summary_cache_value = (string, func_effect_summary) Hashtbl.t
+
+let effect_summary_cache_table :
+    (item8_summary_cache_key, item8_summary_cache_value) Hashtbl.t =
+  Hashtbl.create 64
+
+let item8_summary_cache_key globals funcs =
+  (globals, List.map item8_func_shape_key funcs)
+
+let compute_func_summaries_uncached globals funcs =
   let summaries = Hashtbl.create (max 8 (List.length funcs)) in
   let empty_summary = { read_globals = PlaceSet.empty; written_globals = PlaceSet.empty } in
   List.iter (fun (f : Cfg.func) -> Hashtbl.replace summaries f.label empty_summary) funcs;
@@ -752,6 +878,24 @@ let compute_func_summaries globals funcs =
       funcs
   done;
   summaries
+
+let compute_func_summaries globals funcs =
+  if !item8_analysis_audit_active then begin
+    incr item8_summary_requests;
+    item8_note_seen item8_summary_seen item8_summary_repeats
+      (List.map item8_func_shape_key funcs)
+  end;
+  if !item8_manager_debug_active then incr item8_manager_summary_requests;
+  let key = item8_summary_cache_key globals funcs in
+  match item8_analysis_cache_find effect_summary_cache_table key with
+  | Some cached ->
+      if !item8_manager_debug_active then incr item8_manager_summary_hits;
+      cached
+  | None ->
+      if !item8_manager_debug_active then incr item8_manager_summary_computes;
+      let result = compute_func_summaries_uncached globals funcs in
+      item8_analysis_cache_store effect_summary_cache_table key result;
+      result
 
 let operand_is_zero = function
   | Tcg.Imm 0L -> true
@@ -1826,8 +1970,6 @@ let executable_successors state (term : Cfg.terminator) =
 (* Cache those semantic dependencies explicitly.                               *)
 (* -------------------------------------------------------------------------- *)
 
-let analysis_cache_generation = ref 0
-let item8_manager_debug_active = ref false
 let item8_manager_const_requests = ref 0
 let item8_manager_const_hits = ref 0
 let item8_manager_const_computes = ref 0
@@ -1939,10 +2081,7 @@ let compute_const_states global_init summaries globals (f : Cfg.func) =
   end;
   if !item8_manager_debug_active then incr item8_manager_const_requests;
   let key = item8_const_cache_key global_init summaries globals f in
-  match
-    if !analysis_cache_generation = 0 then None
-    else Hashtbl.find_opt const_state_cache_table key
-  with
+  match item8_analysis_cache_find const_state_cache_table key with
   | Some cached ->
       if !item8_manager_debug_active then incr item8_manager_const_hits;
       cached
@@ -1951,8 +2090,7 @@ let compute_const_states global_init summaries globals (f : Cfg.func) =
       let result =
         compute_const_states_uncached global_init summaries globals f
       in
-      if !analysis_cache_generation <> 0 then
-        Hashtbl.replace const_state_cache_table key result;
+      item8_analysis_cache_store const_state_cache_table key result;
       result
 
 let const_propagate_func global_init summaries globals (f : Cfg.func) =
@@ -2056,7 +2194,31 @@ let compute_gvn_states ?linear summaries globals (f : Cfg.func) =
   done;
   in_states
 
+let item8_gvn_audit_key summaries globals (f : Cfg.func) =
+  let callees =
+    List.fold_left
+      (fun acc (block : Cfg.block) ->
+        List.fold_left
+          (fun acc instr ->
+            match instr with
+            | Tcg.Call (_, callee, _) -> LabelSet.add callee acc
+            | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> acc)
+          acc block.body)
+      LabelSet.empty f.blocks
+  in
+  let context =
+    LabelSet.elements callees
+    |> List.map (fun callee ->
+           (callee, call_written_globals summaries globals callee))
+  in
+  (item8_func_shape_key f, context)
+
 let gvn_func summaries globals (f : Cfg.func) =
+  if !item8_final_work_audit_active then begin
+    incr item8_final_gvn_requests;
+    item8_final_note_seen item8_final_gvn_seen item8_final_gvn_repeats
+      (item8_gvn_audit_key summaries globals f)
+  end;
   let linear = make_linear_analyzer f in
   let in_states = compute_gvn_states ~linear summaries globals f in
   let blocks =
@@ -2424,6 +2586,9 @@ let item8_manager_context_liveness_computes = ref 0
 let item8_begin_manager_debug () =
   item8_manager_debug_active :=
     Sys.getenv_opt "TOYC_DEBUG_ITEM8_ANALYSIS_MANAGER" <> None;
+  item8_manager_summary_requests := 0;
+  item8_manager_summary_hits := 0;
+  item8_manager_summary_computes := 0;
   item8_manager_const_requests := 0;
   item8_manager_const_hits := 0;
   item8_manager_const_computes := 0;
@@ -2443,7 +2608,9 @@ let item8_begin_manager_debug () =
 let item8_print_manager_debug () =
   if !item8_manager_debug_active then
     Printf.eprintf
-      "item8-manager-summary const-requests=%d const-hits=%d const-computes=%d dom-requests=%d dom-hits=%d dom-computes=%d loop-requests=%d loop-hits=%d loop-computes=%d liveness-requests=%d liveness-hits=%d liveness-computes=%d context-liveness-requests=%d context-liveness-hits=%d context-liveness-computes=%d\n%!"
+      "item8-manager-summary summary-requests=%d summary-hits=%d summary-computes=%d const-requests=%d const-hits=%d const-computes=%d dom-requests=%d dom-hits=%d dom-computes=%d loop-requests=%d loop-hits=%d loop-computes=%d liveness-requests=%d liveness-hits=%d liveness-computes=%d context-liveness-requests=%d context-liveness-hits=%d context-liveness-computes=%d\n%!"
+      !item8_manager_summary_requests !item8_manager_summary_hits
+      !item8_manager_summary_computes
       !item8_manager_const_requests !item8_manager_const_hits
       !item8_manager_const_computes
       !item8_manager_dom_requests !item8_manager_dom_hits
@@ -2542,10 +2709,7 @@ let item8_get_liveness
       item8_liveness_context_key ?removable_calls summaries globals
         return_globals f )
   in
-  match
-    if !analysis_cache_generation = 0 then None
-    else Hashtbl.find_opt liveness_cache_table key
-  with
+  match item8_analysis_cache_find liveness_cache_table key with
   | Some cached ->
       if contextual then begin
         if !item8_manager_debug_active then incr item8_manager_context_liveness_hits
@@ -2564,8 +2728,7 @@ let item8_get_liveness
       let result =
         compute_liveness_uncached ?removable_calls summaries globals return_globals f
       in
-      if !analysis_cache_generation <> 0 then
-        Hashtbl.replace liveness_cache_table key result;
+      item8_analysis_cache_store liveness_cache_table key result;
       result
 
 let compute_liveness summaries globals (f : Cfg.func) =
@@ -2678,6 +2841,12 @@ let collect_call_global_demands summaries globals return_globals (f : Cfg.func) 
   demands
 
 let compute_return_global_demands summaries globals (funcs : Cfg.func list) =
+  if !item8_final_work_audit_active then begin
+    incr item8_final_return_demand_requests;
+    item8_final_note_seen item8_final_return_demand_seen
+      item8_final_return_demand_repeats
+      (item8_program_semantic_audit_key summaries globals funcs)
+  end;
   let reachable = reachable_func_labels funcs in
   let demands = Hashtbl.create (max 8 (List.length funcs)) in
   List.iter
@@ -4506,10 +4675,7 @@ let compute_dominators (f : Cfg.func) =
   end;
   if !item8_manager_debug_active then incr item8_manager_dom_requests;
   let key = item8_func_shape_key f in
-  match
-    if !analysis_cache_generation = 0 then None
-    else Hashtbl.find_opt dominator_cache_table key
-  with
+  match item8_analysis_cache_find dominator_cache_table key with
   | Some doms ->
       if !item8_analysis_audit_active then incr item8_dominator_hits;
       if !item8_manager_debug_active then incr item8_manager_dom_hits;
@@ -4554,8 +4720,7 @@ let compute_dominators (f : Cfg.func) =
                 changed := true))
           reachable_blocks
       done;
-      if !analysis_cache_generation <> 0 then
-        Hashtbl.replace dominator_cache_table key doms;
+      item8_analysis_cache_store dominator_cache_table key doms;
       doms
 
 type licm_candidate =
@@ -4647,6 +4812,18 @@ type natural_loop_cache_value =
 let natural_loop_cache_table :
     (item8_func_shape_key, natural_loop_cache_value) Hashtbl.t =
   Hashtbl.create 128
+
+let item8_begin_analysis_generation () =
+  incr analysis_cache_generation;
+  (* Program boundary is the only eager invalidation point.  Inside a program,
+     exact structural/context keys serve as semantic versions, so preserving
+     old entries enables safe A/B/A reuse across rewrite waves. *)
+  Hashtbl.reset effect_summary_cache_table;
+  Hashtbl.reset const_state_cache_table;
+  Hashtbl.reset liveness_cache_table;
+  Hashtbl.reset dominator_cache_table;
+  Hashtbl.reset natural_loop_cache_table
+
 let discover_natural_loops (f : Cfg.func) =
   if !item8_analysis_audit_active then begin
     incr item8_loop_requests;
@@ -4654,10 +4831,7 @@ let discover_natural_loops (f : Cfg.func) =
   end;
   if !item8_manager_debug_active then incr item8_manager_loop_requests;
   let key = item8_func_shape_key f in
-  match
-    if !analysis_cache_generation = 0 then None
-    else Hashtbl.find_opt natural_loop_cache_table key
-  with
+  match item8_analysis_cache_find natural_loop_cache_table key with
   | Some cached ->
       if !item8_manager_debug_active then incr item8_manager_loop_hits;
       cached
@@ -4700,8 +4874,7 @@ let discover_natural_loops (f : Cfg.func) =
         |> List.map fst
       in
       let result = (block_map, loops, headers) in
-      if !analysis_cache_generation <> 0 then
-        Hashtbl.replace natural_loop_cache_table key result;
+      item8_analysis_cache_store natural_loop_cache_table key result;
       result
 
 (* -------------------------------------------------------------------------- *)
@@ -29685,6 +29858,11 @@ let compute_provably_terminating_funcs summaries globals funcs =
   terminating
 
 let compute_dead_call_removable_funcs summaries globals funcs =
+  if !item8_final_work_audit_active then begin
+    incr item8_final_removable_requests;
+    item8_final_note_seen item8_final_removable_seen item8_final_removable_repeats
+      (item8_program_semantic_audit_key summaries globals funcs)
+  end;
   let terminating = compute_provably_terminating_funcs summaries globals funcs in
   let removable = Hashtbl.create (max 8 (List.length funcs)) in
   List.iter
@@ -35999,11 +36177,8 @@ let item7_debug_final_seal_audit
 let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   item8_begin_analysis_audit ();
   item8_begin_manager_debug ();
-  incr analysis_cache_generation;
-  Hashtbl.reset const_state_cache_table;
-  Hashtbl.reset liveness_cache_table;
-  Hashtbl.reset dominator_cache_table;
-  Hashtbl.reset natural_loop_cache_table;
+  item8_begin_final_work_audit ();
+  item8_begin_analysis_generation ();
   let cfg = { Cfg.funcs = List.map tailrec_elim_func cfg.funcs } in
   let source_funcs = cfg.funcs in
   let global_init, globals =
@@ -36127,4 +36302,5 @@ let optimize_cfg (analysis : Semant.analysis) (cfg : Cfg.program) =
   in
   let () = item8_print_analysis_audit () in
   let () = item8_print_manager_debug () in
+  let () = item8_print_final_work_audit () in
   { Cfg.funcs = optimized_funcs }
