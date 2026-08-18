@@ -1485,6 +1485,9 @@ let cached_global_base_reg ctx label = Hashtbl.find_opt ctx.global_base_regs lab
 let item10_direct_global_mem_enabled () =
   Sys.getenv_opt "TOYC_DISABLE_ITEM10_DIRECT_GLOBAL_MEM" = None
 
+let item10_branch_boundary_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_BRANCH_BOUNDARY" = None
+
 let load_place ctx dst = function
   | Tcg.Local id -> (
       match lookup_local_home ctx.local_homes id with
@@ -1949,6 +1952,84 @@ let emit_compare_branch ctx op lhs rhs if_true if_false next_label =
   | Ne, rhs, Tcg.Imm 0L ->
       let reg = operand_reg ctx "t0" rhs in
       direct_zero_branch reg false
+
+  (* Signed boundary canonicalization around zero.
+       x <  1  <=> x <= 0
+       x >= 1  <=> x >  0
+       x <= -1 <=> x <  0
+       x > -1  <=> x >= 0
+     These turn LI +/-1 + branch into one branch against x0. *)
+  | Lt, lhs, Tcg.Imm 1L
+    when item10_branch_boundary_enabled () ->
+      let reg = operand_reg ctx "t0" lhs in
+      emit_binary_branch ctx "bge" "blt" "x0" reg
+        if_true if_false next_label
+  | Ge, lhs, Tcg.Imm 1L
+    when item10_branch_boundary_enabled () ->
+      let reg = operand_reg ctx "t0" lhs in
+      emit_binary_branch ctx "blt" "bge" "x0" reg
+        if_true if_false next_label
+  | Le, lhs, Tcg.Imm (-1L)
+    when item10_branch_boundary_enabled () ->
+      let reg = operand_reg ctx "t0" lhs in
+      emit_binary_branch ctx "blt" "bge" reg "x0"
+        if_true if_false next_label
+  | Gt, lhs, Tcg.Imm (-1L)
+    when item10_branch_boundary_enabled () ->
+      let reg = operand_reg ctx "t0" lhs in
+      emit_binary_branch ctx "bge" "blt" reg "x0"
+        if_true if_false next_label
+
+  (* Mirrored immediate-on-the-left forms. *)
+  | Gt, Tcg.Imm 1L, rhs
+    when item10_branch_boundary_enabled () ->
+      let reg = operand_reg ctx "t0" rhs in
+      emit_binary_branch ctx "bge" "blt" "x0" reg
+        if_true if_false next_label
+  | Le, Tcg.Imm 1L, rhs
+    when item10_branch_boundary_enabled () ->
+      let reg = operand_reg ctx "t0" rhs in
+      emit_binary_branch ctx "blt" "bge" "x0" reg
+        if_true if_false next_label
+  | Ge, Tcg.Imm (-1L), rhs
+    when item10_branch_boundary_enabled () ->
+      let reg = operand_reg ctx "t0" rhs in
+      emit_binary_branch ctx "blt" "bge" reg "x0"
+        if_true if_false next_label
+  | Lt, Tcg.Imm (-1L), rhs
+    when item10_branch_boundary_enabled () ->
+      let reg = operand_reg ctx "t0" rhs in
+      emit_binary_branch ctx "bge" "blt" reg "x0"
+        if_true if_false next_label
+
+  (* Extremal signed-int comparisons that are tautologically true/false.
+     ToyC integers are signed 32-bit and the input is defined-behavior C-like
+     integer code, so these identities are exact. *)
+  | Lt, _, Tcg.Imm (-2147483648L)
+    when item10_branch_boundary_enabled () ->
+      emit_jump_if_needed ctx next_label if_false
+  | Ge, _, Tcg.Imm (-2147483648L)
+    when item10_branch_boundary_enabled () ->
+      emit_jump_if_needed ctx next_label if_true
+  | Gt, _, Tcg.Imm 2147483647L
+    when item10_branch_boundary_enabled () ->
+      emit_jump_if_needed ctx next_label if_false
+  | Le, _, Tcg.Imm 2147483647L
+    when item10_branch_boundary_enabled () ->
+      emit_jump_if_needed ctx next_label if_true
+
+  | Lt, Tcg.Imm 2147483647L, _
+    when item10_branch_boundary_enabled () ->
+      emit_jump_if_needed ctx next_label if_false
+  | Ge, Tcg.Imm 2147483647L, _
+    when item10_branch_boundary_enabled () ->
+      emit_jump_if_needed ctx next_label if_true
+  | Gt, Tcg.Imm (-2147483648L), _
+    when item10_branch_boundary_enabled () ->
+      emit_jump_if_needed ctx next_label if_false
+  | Le, Tcg.Imm (-2147483648L), _
+    when item10_branch_boundary_enabled () ->
+      emit_jump_if_needed ctx next_label if_true
   | Eq, Tcg.Imm imm, rhs when fits_simm12 Int64.(neg imm) ->
       let reg = operand_reg ctx "t0" rhs in
       emitf ctx "    addi t2, %s, %Ld" reg Int64.(neg imm);
