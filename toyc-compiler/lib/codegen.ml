@@ -687,15 +687,17 @@ let compute_local_access_stats (f : Cfg.func) =
     f.blocks;
   stats
 
-let select_global_base_regs (f : Cfg.func) =
+let select_global_base_regs
+    ?(available_regs = reserved_global_base_regs)
+    (f : Cfg.func) =
   let stats = compute_global_access_stats f in
   let reserved_budget =
     if f.temp_count >= 192 || block_instr_count f.blocks >= 384 then 0
     else if f.temp_count >= 96 || block_instr_count f.blocks >= 192 then 1
-    else List.length reserved_global_base_regs
+    else List.length available_regs
   in
   let available_reserved_regs =
-    reserved_global_base_regs
+    available_regs
     |> List.fold_left
          (fun (acc, slots_left) reg ->
            if slots_left <= 0 then (acc, 0) else (reg :: acc, slots_left - 1))
@@ -726,6 +728,24 @@ let select_global_base_regs (f : Cfg.func) =
   in
   assign available_reserved_regs candidates;
   mapping
+
+let item10_func_has_global_memory (f : Cfg.func) =
+  List.exists
+    (fun (block : Cfg.block) ->
+      List.exists
+        (function
+          | Tcg.Load (_, Tcg.Global _)
+          | Tcg.Store (Tcg.Global _, _) ->
+              true
+          | Tcg.Move _
+          | Tcg.Un _
+          | Tcg.Bin _
+          | Tcg.Load (_, Tcg.Local _)
+          | Tcg.Store (Tcg.Local _, _)
+          | Tcg.Call _ ->
+              false)
+        block.body)
+    f.blocks
 
 let select_hot_local_regs reserved_saved_regs (f : Cfg.func) =
   if not hot_local_regs_enabled then Hashtbl.create 0
@@ -1090,7 +1110,12 @@ let item9_normal_return_temp_counts (f : Cfg.func) =
     f.blocks;
   counts
 
-let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.func) =
+let allocate_temp_regs
+    ?(reserved_saved_regs = [])
+    ?(reserved_caller_regs = [])
+    ?(extra_caller_regs = [])
+    ?entry_reg_hints
+    (f : Cfg.func) =
   let entry_reg_hints = Option.value ~default:(Hashtbl.create 0) entry_reg_hints in
   let intervals =
     compute_temp_intervals f
@@ -1107,7 +1132,17 @@ let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.fun
   let temp_saved_regs =
     List.filter (fun reg -> not (List.mem reg reserved_saved_regs)) allocatable_saved_regs
   in
-  let free_regs = ref (allocatable_caller_regs @ temp_saved_regs) in
+  let available_temp_regs =
+    (allocatable_temp_regs @ extra_caller_regs)
+    |> List.filter (fun reg -> not (List.mem reg reserved_caller_regs))
+  in
+  let available_arg_regs =
+    allocatable_arg_regs
+    |> List.filter (fun reg -> not (List.mem reg reserved_caller_regs))
+  in
+  let free_regs =
+    ref (available_temp_regs @ available_arg_regs @ temp_saved_regs)
+  in
   let remove_reg reg regs =
     let rec loop acc = function
       | [] -> List.rev acc
@@ -1157,11 +1192,11 @@ let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.fun
           match arg_reg_index reg with
           | Some index -> index >= min_safe_index
           | None -> false)
-        allocatable_arg_regs
+        available_arg_regs
   in
   let allowed_regs (interval : interval) =
     if interval.call_crossings = 0 then
-      allocatable_temp_regs @ allowed_arg_regs interval @ temp_saved_regs
+      available_temp_regs @ allowed_arg_regs interval @ temp_saved_regs
     else temp_saved_regs
   in
   let allowed_free_regs interval =
@@ -1381,14 +1416,33 @@ let allocate_temp_regs ?(reserved_saved_regs = []) ?entry_reg_hints (f : Cfg.fun
   in
   (homes, saved_regs)
 
-let compute_layout (f : Cfg.func) =
+let compute_layout
+    ?(reserve_ra = true)
+    ?(compact_frame = false)
+    ?(leaf_caller_regs = false)
+    (f : Cfg.func) =
   let local_homes = Hashtbl.create 64 in
   let param_seed_locals, param_seed_temps = find_param_seed_regs f in
-  let global_base_regs = select_global_base_regs f in
-  let reserved_saved_regs =
+  let global_base_physical_regs =
+    if leaf_caller_regs then [ "t6"; "t5" ]
+    else reserved_global_base_regs
+  in
+  let global_base_regs =
+    select_global_base_regs ~available_regs:global_base_physical_regs f
+  in
+  let global_base_reg_values =
     Hashtbl.fold
       (fun _ reg acc -> if List.mem reg acc then acc else reg :: acc)
       global_base_regs []
+  in
+  let reserved_saved_regs =
+    global_base_reg_values
+    |> List.filter (fun reg -> List.mem reg allocatable_saved_regs)
+    |> List.sort compare
+  in
+  let reserved_caller_regs =
+    global_base_reg_values
+    |> List.filter (fun reg -> List.mem reg allocatable_caller_regs)
     |> List.sort compare
   in
   let hot_local_regs = select_hot_local_regs reserved_saved_regs f in
@@ -1398,8 +1452,18 @@ let compute_layout (f : Cfg.func) =
       hot_local_regs reserved_saved_regs
     |> List.sort compare
   in
+  let extra_caller_regs =
+    if leaf_caller_regs && not (item10_func_has_global_memory f)
+    then [ global_addr_reg ]
+    else []
+  in
   let temp_homes, temp_saved_regs =
-    allocate_temp_regs ~reserved_saved_regs ~entry_reg_hints:param_seed_temps f
+    allocate_temp_regs
+      ~reserved_saved_regs
+      ~reserved_caller_regs
+      ~extra_caller_regs
+      ~entry_reg_hints:param_seed_temps
+      f
   in
   let saved_regs =
     List.fold_left
@@ -1408,7 +1472,12 @@ let compute_layout (f : Cfg.func) =
     |> List.sort compare
   in
   let referenced_locals = referenced_local_ids f in
-  let save_area_size = 4 * (2 + List.length saved_regs) in
+  let save_area_size =
+    if compact_frame then
+      4 * ((if reserve_ra then 1 else 0) + List.length saved_regs)
+    else
+      4 * (2 + List.length saved_regs)
+  in
   let next = ref (save_area_size + 4) in
   let alloc_slot () =
     let off = - !next in
@@ -1453,6 +1522,40 @@ let compute_layout (f : Cfg.func) =
     saved_regs;
   }
 
+let item10_layout_stack_home_count (layout : layout) =
+  let local_stack =
+    Hashtbl.fold
+      (fun _ home count ->
+        match home with
+        | LocalStack _ -> count + 1
+        | LocalReg _ -> count)
+      layout.local_homes
+      0
+  in
+  let temp_stack =
+    Hashtbl.fold
+      (fun _ home count ->
+        match home with
+        | TempStack _ -> count + 1
+        | TempReg _ -> count)
+      layout.temp_homes
+      0
+  in
+  local_stack + temp_stack
+
+let item10_leaf_layout_strictly_better candidate baseline =
+  let candidate_stack = item10_layout_stack_home_count candidate in
+  let baseline_stack = item10_layout_stack_home_count baseline in
+  if candidate_stack <> baseline_stack then
+    candidate_stack < baseline_stack
+  else
+    let candidate_saved = List.length candidate.saved_regs in
+    let baseline_saved = List.length baseline.saved_regs in
+    if candidate_saved <> baseline_saved then
+      candidate_saved < baseline_saved
+    else
+      candidate.frame_size < baseline.frame_size
+
 let emit_reg_copy ctx dst src =
   if dst <> src then emitf ctx "    addi %s, %s, 0" dst src
 
@@ -1482,6 +1585,53 @@ let store_temp ctx temp src =
 
 let cached_global_base_reg ctx label = Hashtbl.find_opt ctx.global_base_regs label
 
+let item10_direct_global_mem_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_DIRECT_GLOBAL_MEM" = None
+
+let item10_branch_boundary_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_BRANCH_BOUNDARY" = None
+
+let item10_leaf_ra_elision_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_LEAF_RA_ELISION" = None
+
+let item10_frame_compaction_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_FRAME_COMPACTION" = None
+
+let item10_const_branch_fold_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_CONST_BRANCH_FOLD" = None
+
+let item10_tail_sub_branch_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_TAIL_SUB_BRANCH" = None
+
+let item10_tail_compare_move_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_TAIL_COMPARE_MOVE" = None
+
+let item10_zero_operand_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_ZERO_OPERAND" = None
+
+let item10_leaf_caller_regs_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_LEAF_CALLER_REGS" = None
+
+let item10_is_compare_binop = function
+  | Eq | Ne | Lt | Gt | Le | Ge -> true
+  | Add | Sub | Mul | Div | Mod | LAnd | LOr -> false
+
+let item10_i32_compare op lhs rhs =
+  let lhs = Int64.to_int32 lhs in
+  let rhs = Int64.to_int32 rhs in
+  let c = Int32.compare lhs rhs in
+  match op with
+  | Eq -> Some (c = 0)
+  | Ne -> Some (c <> 0)
+  | Lt -> Some (c < 0)
+  | Gt -> Some (c > 0)
+  | Le -> Some (c <= 0)
+  | Ge -> Some (c >= 0)
+  | Add | Sub | Mul | Div | Mod | LAnd | LOr -> None
+
+let item10_i32_is_zero value =
+  Int32.equal (Int64.to_int32 value) 0l
+
 let load_place ctx dst = function
   | Tcg.Local id -> (
       match lookup_local_home ctx.local_homes id with
@@ -1489,7 +1639,12 @@ let load_place ctx dst = function
       | LocalReg reg -> emit_reg_copy ctx dst reg)
   | Tcg.Global label -> (
       match cached_global_base_reg ctx label with
-      | Some base_reg -> emitf ctx "    lw %s, 0(%s)" dst base_reg
+      | Some base_reg ->
+          emitf ctx "    lw %s, 0(%s)" dst base_reg
+      | None when item10_direct_global_mem_enabled () ->
+          (* GNU RISC-V symbol-form LW is a standard assembler macro.
+             It expands to AUIPC + LW, avoiding the extra ADDI from LA. *)
+          emitf ctx "    lw %s, %s" dst label
       | None ->
           emitf ctx "    la %s, %s" global_addr_reg label;
           emitf ctx "    lw %s, 0(%s)" dst global_addr_reg)
@@ -1501,7 +1656,12 @@ let store_place ctx src = function
       | LocalReg reg -> emit_reg_copy ctx reg src)
   | Tcg.Global label -> (
       match cached_global_base_reg ctx label with
-      | Some base_reg -> emitf ctx "    sw %s, 0(%s)" src base_reg
+      | Some base_reg ->
+          emitf ctx "    sw %s, 0(%s)" src base_reg
+      | None when item10_direct_global_mem_enabled () ->
+          (* Store-to-symbol macro needs a scratch base register.  t3 is
+             permanently reserved by this backend for global addressing. *)
+          emitf ctx "    sw %s, %s, %s" src label global_addr_reg
       | None ->
           emitf ctx "    la %s, %s" global_addr_reg label;
           emitf ctx "    sw %s, 0(%s)" src global_addr_reg)
@@ -1565,12 +1725,14 @@ let emit_compare_zero ctx op dst reg zero_on_left =
 let item10_immediate_lowering_enabled () =
   Sys.getenv_opt "TOYC_DISABLE_ITEM10_IMMEDIATE_LOWERING" = None
 
-let item10_div2_lowering_enabled () =
+let item10_pow2_div_lowering_enabled () =
   item10_immediate_lowering_enabled ()
+  && Sys.getenv_opt "TOYC_DISABLE_ITEM10_POW2_DIV_LOWERING" = None
   && Sys.getenv_opt "TOYC_DISABLE_ITEM10_DIV2_LOWERING" = None
 
-let item10_rem2_lowering_enabled () =
+let item10_pow2_rem_lowering_enabled () =
   item10_immediate_lowering_enabled ()
+  && Sys.getenv_opt "TOYC_DISABLE_ITEM10_POW2_REM_LOWERING" = None
   && Sys.getenv_opt "TOYC_DISABLE_ITEM10_REM2_LOWERING" = None
 
 let item10_positive_pow2_shift imm =
@@ -1583,6 +1745,50 @@ let item10_positive_pow2_shift imm =
       else loop (Int64.shift_right_logical value 1) (shift + 1)
     in
     loop imm 0
+
+let item10_emit_signed_div_pow2 ctx dst lhs shift =
+  let lhs_reg = operand_reg ctx "t0" lhs in
+  if shift = 1 then begin
+    (* C/RISC-V signed division truncates toward zero:
+         q = (x + (unsigned(x) >> 31)) >> 1 *)
+    emitf ctx "    srli t1, %s, 31" lhs_reg;
+    emitf ctx "    add t1, %s, t1" lhs_reg;
+    emitf ctx "    srai %s, t1, 1" dst
+  end
+  else begin
+    (* For d = 2^k:
+         signmask = x >> 31                 (0 or -1)
+         bias     = signmask >>> (32-k)     (0 or d-1)
+         q        = (x + bias) >> k
+       This is exact for every int32 x and implements truncation toward zero. *)
+    emitf ctx "    srai t1, %s, 31" lhs_reg;
+    emitf ctx "    srli t1, t1, %d" (32 - shift);
+    emitf ctx "    add t1, %s, t1" lhs_reg;
+    emitf ctx "    srai %s, t1, %d" dst shift
+  end
+
+let item10_emit_signed_rem_pow2 ctx dst lhs shift =
+  let lhs_reg = operand_reg ctx "t0" lhs in
+  if shift = 1 then begin
+    (* Fast signed x % 2, preserving the sign of the dividend. *)
+    emitf ctx "    andi t1, %s, 1" lhs_reg;
+    emitf ctx "    srai t2, %s, 31" lhs_reg;
+    emitf ctx "    xor t1, t1, t2";
+    emitf ctx "    sub %s, t1, t2" dst
+  end
+  else begin
+    (* Standalone signed remainder:
+         q = trunc(x / 2^k)
+         r = x - (q << k)
+       Paired div/rem is handled earlier by quotient sharing, so this path is
+       only for a remainder whose quotient is not already available. *)
+    emitf ctx "    srai t1, %s, 31" lhs_reg;
+    emitf ctx "    srli t1, t1, %d" (32 - shift);
+    emitf ctx "    add t1, %s, t1" lhs_reg;
+    emitf ctx "    srai t1, t1, %d" shift;
+    emitf ctx "    slli t1, t1, %d" shift;
+    emitf ctx "    sub %s, %s, t1" dst lhs_reg
+  end
 
 let item10_emit_compare_imm_rhs ctx op dst lhs imm =
   if not (fits_simm12 imm) then false
@@ -1716,37 +1922,34 @@ let emit_binop_operands ctx op dst lhs rhs =
       let lhs_reg = operand_reg ctx "t0" lhs in
       emitf ctx "    neg %s, %s" dst lhs_reg
 
-  (* Signed division by 2 must truncate toward zero, exactly like C/RISC-V
-     DIV.  Arithmetic right shift alone is wrong for negative odd values:
-       -3 / 2 = -1, but -3 >> 1 = -2.
-     For d = 2:
-       bias = unsigned(x) >> 31          (0 or 1)
-       q    = (x + bias) >> 1
-     The addition is 32-bit wrapping, which is safe for all int32 values. *)
-  | Div, lhs, Tcg.Imm 2L
-    when item10_div2_lowering_enabled () ->
-      let lhs_reg = operand_reg ctx "t0" lhs in
-      emitf ctx "    srli t1, %s, 31" lhs_reg;
-      emitf ctx "    add t1, %s, t1" lhs_reg;
-      emitf ctx "    srai %s, t1, 1" dst
+  | Div, lhs, Tcg.Imm imm
+    when item10_pow2_div_lowering_enabled () ->
+      begin
+        match item10_positive_pow2_shift imm with
+        | Some shift when shift >= 1 ->
+            item10_emit_signed_div_pow2 ctx dst lhs shift
+        | Some _ | None ->
+            let lhs_reg = operand_reg ctx "t0" lhs in
+            let rhs_reg = operand_reg ctx "t1" rhs in
+            emit_binop ctx op dst lhs_reg rhs_reg
+      end
 
   | Mod, _, Tcg.Imm 1L
   | Mod, _, Tcg.Imm (-1L)
     when item10_immediate_lowering_enabled () ->
       emitf ctx "    li %s, 0" dst
 
-  (* Signed remainder by 2 has the sign of the dividend.
-       p = x & 1
-       s = x >> 31                      (0 or -1)
-       r = (p xor s) - s
-     For x >= 0 this is p; for x < 0 this is -p. *)
-  | Mod, lhs, Tcg.Imm 2L
-    when item10_rem2_lowering_enabled () ->
-      let lhs_reg = operand_reg ctx "t0" lhs in
-      emitf ctx "    andi t1, %s, 1" lhs_reg;
-      emitf ctx "    srai t2, %s, 31" lhs_reg;
-      emitf ctx "    xor t1, t1, t2";
-      emitf ctx "    sub %s, t1, t2" dst
+  | Mod, lhs, Tcg.Imm imm
+    when item10_pow2_rem_lowering_enabled () ->
+      begin
+        match item10_positive_pow2_shift imm with
+        | Some shift when shift >= 1 ->
+            item10_emit_signed_rem_pow2 ctx dst lhs shift
+        | Some _ | None ->
+            let lhs_reg = operand_reg ctx "t0" lhs in
+            let rhs_reg = operand_reg ctx "t1" rhs in
+            emit_binop ctx op dst lhs_reg rhs_reg
+      end
 
   | Eq, Tcg.Imm 0L, rhs
   | Ne, Tcg.Imm 0L, rhs
@@ -1782,10 +1985,15 @@ let emit_binop_operands ctx op dst lhs rhs =
 let emit_call_args ctx args =
   List.iteri
     (fun i arg ->
-      if i < 8 then load_operand ctx (Printf.sprintf "a%d" i) arg
-      else (
-        let arg_reg = operand_reg ctx "t0" arg in
-        emitf ctx "    sw %s, %d(sp)" arg_reg ((i - 8) * 4)))
+      if i < 8 then
+        load_operand ctx (Printf.sprintf "a%d" i) arg
+      else
+        match arg with
+        | Tcg.Imm 0L when item10_zero_operand_enabled () ->
+            emitf ctx "    sw x0, %d(sp)" ((i - 8) * 4)
+        | _ ->
+            let arg_reg = operand_reg ctx "t0" arg in
+            emitf ctx "    sw %s, %d(sp)" arg_reg ((i - 8) * 4))
     args
 
 let emit_call ctx callee args =
@@ -1800,6 +2008,13 @@ let replace_temp_operand dst replacement = function
   | operand -> operand
 
 let gen_simple_instr ctx = function
+  | Tcg.Move (dst, Tcg.Imm 0L)
+    when item10_zero_operand_enabled () ->
+      begin
+        match lookup_temp_home ctx.temp_homes dst with
+        | TempReg reg -> emitf ctx "    li %s, 0" reg
+        | TempStack off -> emit_sw_slot ctx "x0" off
+      end
   | Tcg.Move (dst, src) ->
       begin
         match lookup_temp_home ctx.temp_homes dst with
@@ -1841,6 +2056,9 @@ let gen_simple_instr ctx = function
             load_place ctx "t0" place;
             store_temp ctx dst "t0"
       end
+  | Tcg.Store (place, Tcg.Imm 0L)
+    when item10_zero_operand_enabled () ->
+      store_place ctx "x0" place
   | Tcg.Store (place, value) ->
       let value_reg = operand_reg ctx "t0" value in
       store_place ctx value_reg place
@@ -1875,6 +2093,16 @@ let emit_compare_branch ctx op lhs rhs if_true if_false next_label =
     else emit_branch_result ctx reg if_true if_false next_label
   in
   match (op, lhs, rhs) with
+  | ((Eq | Ne | Lt | Gt | Le | Ge) as cmp),
+    Tcg.Imm lhs_imm,
+    Tcg.Imm rhs_imm
+    when item10_const_branch_fold_enabled () ->
+      begin
+        match item10_i32_compare cmp lhs_imm rhs_imm with
+        | Some true -> emit_jump_if_needed ctx next_label if_true
+        | Some false -> emit_jump_if_needed ctx next_label if_false
+        | None -> assert false
+      end
   | Eq, lhs, rhs when lhs = rhs -> emit_jump_if_needed ctx next_label if_true
   | Ne, lhs, rhs when lhs = rhs -> emit_jump_if_needed ctx next_label if_false
   | Lt, lhs, rhs when lhs = rhs -> emit_jump_if_needed ctx next_label if_false
@@ -1893,6 +2121,84 @@ let emit_compare_branch ctx op lhs rhs if_true if_false next_label =
   | Ne, rhs, Tcg.Imm 0L ->
       let reg = operand_reg ctx "t0" rhs in
       direct_zero_branch reg false
+
+  (* Signed boundary canonicalization around zero.
+       x <  1  <=> x <= 0
+       x >= 1  <=> x >  0
+       x <= -1 <=> x <  0
+       x > -1  <=> x >= 0
+     These turn LI +/-1 + branch into one branch against x0. *)
+  | Lt, lhs, Tcg.Imm 1L
+    when item10_branch_boundary_enabled () ->
+      let reg = operand_reg ctx "t0" lhs in
+      emit_binary_branch ctx "bge" "blt" "x0" reg
+        if_true if_false next_label
+  | Ge, lhs, Tcg.Imm 1L
+    when item10_branch_boundary_enabled () ->
+      let reg = operand_reg ctx "t0" lhs in
+      emit_binary_branch ctx "blt" "bge" "x0" reg
+        if_true if_false next_label
+  | Le, lhs, Tcg.Imm (-1L)
+    when item10_branch_boundary_enabled () ->
+      let reg = operand_reg ctx "t0" lhs in
+      emit_binary_branch ctx "blt" "bge" reg "x0"
+        if_true if_false next_label
+  | Gt, lhs, Tcg.Imm (-1L)
+    when item10_branch_boundary_enabled () ->
+      let reg = operand_reg ctx "t0" lhs in
+      emit_binary_branch ctx "bge" "blt" reg "x0"
+        if_true if_false next_label
+
+  (* Mirrored immediate-on-the-left forms. *)
+  | Gt, Tcg.Imm 1L, rhs
+    when item10_branch_boundary_enabled () ->
+      let reg = operand_reg ctx "t0" rhs in
+      emit_binary_branch ctx "bge" "blt" "x0" reg
+        if_true if_false next_label
+  | Le, Tcg.Imm 1L, rhs
+    when item10_branch_boundary_enabled () ->
+      let reg = operand_reg ctx "t0" rhs in
+      emit_binary_branch ctx "blt" "bge" "x0" reg
+        if_true if_false next_label
+  | Ge, Tcg.Imm (-1L), rhs
+    when item10_branch_boundary_enabled () ->
+      let reg = operand_reg ctx "t0" rhs in
+      emit_binary_branch ctx "blt" "bge" reg "x0"
+        if_true if_false next_label
+  | Lt, Tcg.Imm (-1L), rhs
+    when item10_branch_boundary_enabled () ->
+      let reg = operand_reg ctx "t0" rhs in
+      emit_binary_branch ctx "bge" "blt" reg "x0"
+        if_true if_false next_label
+
+  (* Extremal signed-int comparisons that are tautologically true/false.
+     ToyC integers are signed 32-bit and the input is defined-behavior C-like
+     integer code, so these identities are exact. *)
+  | Lt, _, Tcg.Imm (-2147483648L)
+    when item10_branch_boundary_enabled () ->
+      emit_jump_if_needed ctx next_label if_false
+  | Ge, _, Tcg.Imm (-2147483648L)
+    when item10_branch_boundary_enabled () ->
+      emit_jump_if_needed ctx next_label if_true
+  | Gt, _, Tcg.Imm 2147483647L
+    when item10_branch_boundary_enabled () ->
+      emit_jump_if_needed ctx next_label if_false
+  | Le, _, Tcg.Imm 2147483647L
+    when item10_branch_boundary_enabled () ->
+      emit_jump_if_needed ctx next_label if_true
+
+  | Lt, Tcg.Imm 2147483647L, _
+    when item10_branch_boundary_enabled () ->
+      emit_jump_if_needed ctx next_label if_false
+  | Ge, Tcg.Imm 2147483647L, _
+    when item10_branch_boundary_enabled () ->
+      emit_jump_if_needed ctx next_label if_true
+  | Gt, Tcg.Imm (-2147483648L), _
+    when item10_branch_boundary_enabled () ->
+      emit_jump_if_needed ctx next_label if_false
+  | Le, Tcg.Imm (-2147483648L), _
+    when item10_branch_boundary_enabled () ->
+      emit_jump_if_needed ctx next_label if_true
   | Eq, Tcg.Imm imm, rhs when fits_simm12 Int64.(neg imm) ->
       let reg = operand_reg ctx "t0" rhs in
       emitf ctx "    addi t2, %s, %Ld" reg Int64.(neg imm);
@@ -1968,9 +2274,17 @@ let emit_compare_branch ctx op lhs rhs if_true if_false next_label =
 
 let gen_terminator ctx next_label = function
   | Cfg.Jump label -> emit_jump_if_needed ctx next_label label
+  | Cfg.BranchZero (Tcg.Imm value, if_zero, if_nonzero)
+    when item10_const_branch_fold_enabled () ->
+      emit_jump_if_needed ctx next_label
+        (if item10_i32_is_zero value then if_zero else if_nonzero)
   | Cfg.BranchZero (cond, if_zero, if_nonzero) ->
       let cond_reg = operand_reg ctx "t0" cond in
       emit_branch_result ctx cond_reg if_nonzero if_zero next_label
+  | Cfg.BranchNonZero (Tcg.Imm value, if_nonzero, if_zero)
+    when item10_const_branch_fold_enabled () ->
+      emit_jump_if_needed ctx next_label
+        (if item10_i32_is_zero value then if_zero else if_nonzero)
   | Cfg.BranchNonZero (cond, if_nonzero, if_zero) ->
       let cond_reg = operand_reg ctx "t0" cond in
       emit_branch_result ctx cond_reg if_nonzero if_zero next_label
@@ -2027,6 +2341,10 @@ let gen_tail_return_instr ctx (instr : Tcg.simple_instr) =
 
 let gen_tail_branch_instr ctx next_label (instr : Tcg.simple_instr) if_nonzero if_zero =
   match instr with
+  | Tcg.Move (_, Tcg.Imm value)
+    when item10_const_branch_fold_enabled () ->
+      emit_jump_if_needed ctx next_label
+        (if item10_i32_is_zero value then if_zero else if_nonzero)
   | Tcg.Move (_, src) ->
       let reg = operand_reg ctx "t0" src in
       emit_branch_result ctx reg if_nonzero if_zero next_label
@@ -2039,6 +2357,9 @@ let gen_tail_branch_instr ctx next_label (instr : Tcg.simple_instr) if_nonzero i
       match op with
       | Eq | Ne | Lt | Gt | Le | Ge ->
           emit_compare_branch ctx op lhs rhs if_nonzero if_zero next_label
+      | Sub when item10_tail_sub_branch_enabled () ->
+          (* (lhs - rhs) != 0 iff lhs != rhs in RV32 modular arithmetic. *)
+          emit_compare_branch ctx Ne lhs rhs if_nonzero if_zero next_label
       | Add | Sub | Mul | Div | Mod ->
           emit_binop_operands ctx op "t2" lhs rhs;
           emit_branch_result ctx "t2" if_nonzero if_zero next_label
@@ -2055,6 +2376,30 @@ let gen_tail_branch_instr ctx next_label (instr : Tcg.simple_instr) if_nonzero i
 let gen_block ctx next_label (block : Cfg.block) =
   emitf ctx "%s:" block.label;
   match (List.rev block.body, block.term) with
+  | ( Tcg.Move (cond_dst, Tcg.Temp cmp_temp)
+      :: Tcg.Bin (cmp_dst, op, lhs, rhs)
+      :: rev_prefix ),
+    Cfg.BranchZero (Tcg.Temp cond, if_zero, if_nonzero)
+    when item10_tail_compare_move_enabled ()
+         && cond_dst = cond
+         && cmp_dst = cmp_temp
+         && item10_is_compare_binop op
+         && not (temp_live_out ctx block.label cond_dst)
+         && not (temp_live_out ctx block.label cmp_temp) ->
+      List.iter (gen_simple_instr ctx) (List.rev rev_prefix);
+      emit_compare_branch ctx op lhs rhs if_nonzero if_zero next_label
+  | ( Tcg.Move (cond_dst, Tcg.Temp cmp_temp)
+      :: Tcg.Bin (cmp_dst, op, lhs, rhs)
+      :: rev_prefix ),
+    Cfg.BranchNonZero (Tcg.Temp cond, if_nonzero, if_zero)
+    when item10_tail_compare_move_enabled ()
+         && cond_dst = cond
+         && cmp_dst = cmp_temp
+         && item10_is_compare_binop op
+         && not (temp_live_out ctx block.label cond_dst)
+         && not (temp_live_out ctx block.label cmp_temp) ->
+      List.iter (gen_simple_instr ctx) (List.rev rev_prefix);
+      emit_compare_branch ctx op lhs rhs if_nonzero if_zero next_label
   | (last_instr :: rev_prefix), Cfg.Return (Some (Tcg.Temp temp))
     when defs_temp last_instr = Some temp ->
       List.iter (gen_simple_instr ctx) (List.rev rev_prefix);
@@ -2127,9 +2472,154 @@ let can_use_frameless_leaf (f : Cfg.func) (layout : layout) =
   && not (layout_has_stack_homes layout)
   && frameless_params_ready f layout
 
+let item10_divrem_sharing_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_DIVREM_SHARING" = None
+
+let item10_divrem_sharing_debug_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ITEM10_DIVREM_SHARING" <> None
+  && Array.exists (fun arg -> arg = "-opt") Sys.argv
+
+let item10_share_divrem_pairs (f : Cfg.func) =
+  if not (item10_divrem_sharing_enabled ()) then f
+  else
+    let next_temp = ref f.temp_count in
+    let shared_pairs = ref 0 in
+
+    let fresh_temp () =
+      let temp = !next_temp in
+      incr next_temp;
+      temp
+    in
+
+    let rewrite_block (block : Cfg.block) =
+      (* Keyed by (source temp, positive power-of-two divisor). *)
+      let div_by_source_and_divisor = Hashtbl.create 8 in
+      let rev_body = ref [] in
+
+      let append instr =
+        rev_body := instr :: !rev_body
+      in
+
+      let invalidate_temp defined =
+        let doomed = ref [] in
+        Hashtbl.iter
+          (fun ((source, _) as key) quotient ->
+            if source = defined || quotient = defined then
+              doomed := key :: !doomed)
+          div_by_source_and_divisor;
+        List.iter
+          (Hashtbl.remove div_by_source_and_divisor)
+          !doomed
+      in
+
+      List.iter
+        (fun instr ->
+          begin
+            match defs_temp instr with
+            | Some defined -> invalidate_temp defined
+            | None -> ()
+          end;
+
+          match instr with
+          | Tcg.Bin (quotient, Div, Tcg.Temp source, Tcg.Imm divisor)
+            when quotient <> source ->
+              begin
+                match item10_positive_pow2_shift divisor with
+                | Some shift when shift >= 1 ->
+                    append instr;
+                    Hashtbl.replace
+                      div_by_source_and_divisor
+                      (source, divisor)
+                      quotient
+                | Some _ | None ->
+                    append instr
+              end
+
+          | Tcg.Bin
+              (remainder, Mod, Tcg.Temp source, Tcg.Imm divisor) ->
+              begin
+                match item10_positive_pow2_shift divisor with
+                | Some shift when shift >= 1 ->
+                    begin
+                      match
+                        Hashtbl.find_opt
+                          div_by_source_and_divisor
+                          (source, divisor)
+                      with
+                      | Some quotient ->
+                          (* General C identity:
+                               x = (x / d) * d + (x % d)
+                             for d = 2^k > 0 and truncating signed division.
+                             The existing constant-multiply lowering maps
+                             q * d to SLLI q,k. *)
+                          let scaled_q = fresh_temp () in
+                          append
+                            (Tcg.Bin
+                               ( scaled_q,
+                                 Mul,
+                                 Tcg.Temp quotient,
+                                 Tcg.Imm divisor ));
+                          append
+                            (Tcg.Bin
+                               ( remainder,
+                                 Sub,
+                                 Tcg.Temp source,
+                                 Tcg.Temp scaled_q ));
+                          incr shared_pairs
+                      | None ->
+                          append instr
+                    end
+                | Some _ | None ->
+                    append instr
+              end
+
+          | Tcg.Move _
+          | Tcg.Un _
+          | Tcg.Bin _
+          | Tcg.Load _
+          | Tcg.Store _
+          | Tcg.Call _ ->
+              append instr)
+        block.body;
+
+      { block with body = List.rev !rev_body }
+    in
+
+    let blocks = List.map rewrite_block f.blocks in
+    if item10_divrem_sharing_debug_enabled () && !shared_pairs <> 0 then
+      Printf.eprintf
+        "item10-divrem-sharing func=%s pairs=%d new-temps=%d\n%!"
+        f.name !shared_pairs (!next_temp - f.temp_count);
+
+    { f with blocks; temp_count = !next_temp }
+
 let gen_func buf (f : Cfg.func) =
+  let f = item10_share_divrem_pairs f in
   let f = schedule_func_blocks_with_hot_traces f in
-  let layout = compute_layout f in
+  let leaf = not (func_has_call f) in
+  let save_ra =
+    (not (item10_leaf_ra_elision_enabled ())) || not leaf
+  in
+  let compact_frame = item10_frame_compaction_enabled () in
+  let baseline_layout =
+    compute_layout ~reserve_ra:save_ra ~compact_frame f
+  in
+  let layout =
+    if leaf && item10_leaf_caller_regs_enabled () then
+      let candidate =
+        compute_layout
+          ~reserve_ra:save_ra
+          ~compact_frame
+          ~leaf_caller_regs:true
+          f
+      in
+      let adopted =
+        item10_leaf_layout_strictly_better candidate baseline_layout
+      in
+      if adopted then candidate else baseline_layout
+    else
+      baseline_layout
+  in
   let frameless_leaf = can_use_frameless_leaf f layout in
   (* Step5 uses sp-relative addressing for every stack home and incoming
      stack argument, so s0 is never materialized as a frame pointer. *)
@@ -2169,18 +2659,21 @@ let gen_func buf (f : Cfg.func) =
   emit ctx "    .align 2";
   if f.name = "main" then emit ctx "    .globl main";
   emitf ctx "%s:" f.label;
+  let saved_reg_offset i =
+    if compact_frame then
+      let fixed_before_saved = if save_ra then 1 else 0 in
+      layout.frame_size - (4 * (fixed_before_saved + i + 1))
+    else
+      layout.frame_size - (12 + (4 * i))
+  in
   if not frameless_leaf then begin
-    emitf ctx "    addi sp, sp, -%d" layout.frame_size;
-    emitf ctx "    sw ra, %d(sp)" (layout.frame_size - 4);
+    if layout.frame_size <> 0 then
+      emitf ctx "    addi sp, sp, -%d" layout.frame_size;
+    if save_ra then
+      emitf ctx "    sw ra, %d(sp)" (layout.frame_size - 4);
     List.iteri
-      (fun i reg -> emitf ctx "    sw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
+      (fun i reg -> emitf ctx "    sw %s, %d(sp)" reg (saved_reg_offset i))
       layout.saved_regs;
-    Hashtbl.fold (fun label reg acc -> (reg, label) :: acc) layout.global_base_regs []
-    |> List.sort (fun (a_reg, a_label) (b_reg, b_label) ->
-           match compare a_reg b_reg with
-           | 0 -> compare a_label b_label
-           | c -> c)
-    |> List.iter (fun (reg, label) -> emitf ctx "    la %s, %s" reg label);
     List.iteri
       (fun i (param : Tcg.var) ->
         match Hashtbl.find_opt layout.local_homes param.id with
@@ -2195,6 +2688,12 @@ let gen_func buf (f : Cfg.func) =
             else emitf ctx "    lw %s, %d(sp)" reg (layout.frame_size + ((i - 8) * 4)))
       f.params
   end;
+  Hashtbl.fold (fun label reg acc -> (reg, label) :: acc) layout.global_base_regs []
+  |> List.sort (fun (a_reg, a_label) (b_reg, b_label) ->
+         match compare a_reg b_reg with
+         | 0 -> compare a_label b_label
+         | c -> c)
+  |> List.iter (fun (reg, label) -> emitf ctx "    la %s, %s" reg label);
   let rec emit_blocks = function
     | [] -> ()
     | [ block ] -> gen_block ctx None block
@@ -2206,10 +2705,12 @@ let gen_func buf (f : Cfg.func) =
   emitf ctx "%s:" epilogue;
   if not frameless_leaf then begin
     List.iteri
-      (fun i reg -> emitf ctx "    lw %s, %d(sp)" reg (layout.frame_size - (12 + (4 * i))))
+      (fun i reg -> emitf ctx "    lw %s, %d(sp)" reg (saved_reg_offset i))
       layout.saved_regs;
-    emitf ctx "    lw ra, %d(sp)" (layout.frame_size - 4);
-    emitf ctx "    addi sp, sp, %d" layout.frame_size
+    if save_ra then
+      emitf ctx "    lw ra, %d(sp)" (layout.frame_size - 4);
+    if layout.frame_size <> 0 then
+      emitf ctx "    addi sp, sp, %d" layout.frame_size
   end;
   emit ctx "    ret";
   emit ctx ""
@@ -2289,6 +2790,38 @@ let item10_cfg_instr_count (f : Cfg.func) =
       total + List.length block.body + 1)
     0 f.blocks
 
+let item10_dead_global_emission_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_DEAD_GLOBAL_EMISSION" = None
+
+let item10_dead_global_emission_debug_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ITEM10_DEAD_GLOBAL_EMISSION" <> None
+  && Array.exists (fun arg -> arg = "-opt") Sys.argv
+
+let item10_has_main (cfg : Cfg.program) =
+  List.exists (fun (f : Cfg.func) -> f.name = "main") cfg.funcs
+
+let item10_referenced_globals (funcs : Cfg.func list) =
+  List.fold_left
+    (fun globals (f : Cfg.func) ->
+      List.fold_left
+        (fun globals (block : Cfg.block) ->
+          List.fold_left
+            (fun globals instr ->
+              match instr with
+              | Tcg.Load (_, Tcg.Global label)
+              | Tcg.Store (Tcg.Global label, _) ->
+                  LabelSet.add label globals
+              | Tcg.Move _
+              | Tcg.Un _
+              | Tcg.Bin _
+              | Tcg.Load (_, Tcg.Local _)
+              | Tcg.Store (Tcg.Local _, _)
+              | Tcg.Call _ ->
+                  globals)
+            globals block.body)
+        globals f.blocks)
+    LabelSet.empty funcs
+
 let generate (analysis : Semant.analysis) (cfg : Cfg.program) =
   let reachable =
     if item10_reachable_emission_enabled () then
@@ -2303,9 +2836,23 @@ let generate (analysis : Semant.analysis) (cfg : Cfg.program) =
       (fun (f : Cfg.func) -> LabelSet.mem f.label reachable)
       cfg.funcs
   in
+  let emitted_globals =
+    if item10_dead_global_emission_enabled ()
+       && item10_reachable_emission_enabled ()
+       && item10_has_main cfg
+    then
+      let referenced = item10_referenced_globals emitted_funcs in
+      List.filter
+        (fun g -> LabelSet.mem g.Semant.label referenced)
+        analysis.globals
+    else
+      (* Conservative fallback for library-like/no-main inputs or explicit
+         rollback: retain every declared global. *)
+      analysis.globals
+  in
   let buf = Buffer.create 16384 in
   Buffer.add_string buf "    .option nopic\n\n";
-  List.iter (emit_global buf) analysis.globals;
+  List.iter (emit_global buf) emitted_globals;
   List.iter (gen_func buf) emitted_funcs;
   if item10_reachable_emission_debug_enabled () then begin
     let total_cfg_instrs =
@@ -2328,4 +2875,10 @@ let generate (analysis : Semant.analysis) (cfg : Cfg.program) =
       (total_cfg_instrs - emitted_cfg_instrs)
       (Buffer.length buf)
   end;
+  if item10_dead_global_emission_debug_enabled () then
+    Printf.eprintf
+      "item10-dead-global-emission globals-total=%d globals-emitted=%d globals-pruned=%d\n%!"
+      (List.length analysis.globals)
+      (List.length emitted_globals)
+      (List.length analysis.globals - List.length emitted_globals);
   Buffer.contents buf
