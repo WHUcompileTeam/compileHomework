@@ -2127,7 +2127,103 @@ let can_use_frameless_leaf (f : Cfg.func) (layout : layout) =
   && not (layout_has_stack_homes layout)
   && frameless_params_ready f layout
 
+let item10_divrem_sharing_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ITEM10_DIVREM_SHARING" = None
+
+let item10_divrem_sharing_debug_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ITEM10_DIVREM_SHARING" <> None
+  && Array.exists (fun arg -> arg = "-opt") Sys.argv
+
+let item10_share_divrem_pairs (f : Cfg.func) =
+  if not (item10_divrem_sharing_enabled ()) then f
+  else
+    let next_temp = ref f.temp_count in
+    let shared_pairs = ref 0 in
+
+    let fresh_temp () =
+      let temp = !next_temp in
+      incr next_temp;
+      temp
+    in
+
+    let rewrite_block (block : Cfg.block) =
+      (* Map source temp -> quotient temp for an earlier
+         q = source / 2 in this same basic block. *)
+      let div2_by_source = Hashtbl.create 8 in
+      let rev_body = ref [] in
+
+      let append instr =
+        rev_body := instr :: !rev_body
+      in
+
+      List.iter
+        (fun instr ->
+          (* Be conservative if a virtual temp is ever redefined.  Normal
+             TCG is SSA-like, but this keeps the rewrite correct without
+             relying on that stronger invariant. *)
+          begin
+            match defs_temp instr with
+            | Some defined ->
+                Hashtbl.remove div2_by_source defined
+            | None -> ()
+          end;
+
+          match instr with
+          | Tcg.Bin (quotient, Div, Tcg.Temp source, Tcg.Imm 2L)
+            when quotient <> source ->
+              append instr;
+              Hashtbl.replace div2_by_source source quotient
+
+          | Tcg.Bin (remainder, Mod, Tcg.Temp source, Tcg.Imm 2L) ->
+              begin
+                match Hashtbl.find_opt div2_by_source source with
+                | Some quotient ->
+                    (* C signed division/remainder identity:
+                         x = (x / 2) * 2 + (x % 2)
+                       where / truncates toward zero.
+                       Therefore once q = x / 2 already exists:
+                         r = x - 2*q
+                       This is valid for every int32 value, including
+                       negative odd numbers and INT_MIN.
+
+                       Materialize the hidden quotient dependency in TCG
+                       before register allocation so liveness and homes stay
+                       exact.  The existing immediate lowering turns
+                       q * 2 into one SLLI. *)
+                    let twice_q = fresh_temp () in
+                    append
+                      (Tcg.Bin
+                         (twice_q, Mul, Tcg.Temp quotient, Tcg.Imm 2L));
+                    append
+                      (Tcg.Bin
+                         (remainder, Sub, Tcg.Temp source, Tcg.Temp twice_q));
+                    incr shared_pairs
+                | None ->
+                    append instr
+              end
+
+          | Tcg.Move _
+          | Tcg.Un _
+          | Tcg.Bin _
+          | Tcg.Load _
+          | Tcg.Store _
+          | Tcg.Call _ ->
+              append instr)
+        block.body;
+
+      { block with body = List.rev !rev_body }
+    in
+
+    let blocks = List.map rewrite_block f.blocks in
+    if item10_divrem_sharing_debug_enabled () && !shared_pairs <> 0 then
+      Printf.eprintf
+        "item10-divrem-sharing func=%s pairs=%d new-temps=%d\n%!"
+        f.name !shared_pairs (!next_temp - f.temp_count);
+
+    { f with blocks; temp_count = !next_temp }
+
 let gen_func buf (f : Cfg.func) =
+  let f = item10_share_divrem_pairs f in
   let f = schedule_func_blocks_with_hot_traces f in
   let layout = compute_layout f in
   let frameless_leaf = can_use_frameless_leaf f layout in
