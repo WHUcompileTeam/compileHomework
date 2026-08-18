@@ -603,10 +603,15 @@ let stored_globals_in_func (f : Cfg.func) =
 type func_effect_summary = {
   read_globals : PlaceSet.t;
   written_globals : PlaceSet.t;
+  must_written_globals : PlaceSet.t;
 }
 
 let worst_case_effect_summary globals =
-  { read_globals = globals; written_globals = globals }
+  {
+    read_globals = globals;
+    written_globals = globals;
+    must_written_globals = PlaceSet.empty;
+  }
 
 let call_effect_summary summaries globals callee =
   match Hashtbl.find_opt summaries callee with
@@ -619,14 +624,162 @@ let call_read_globals summaries globals callee =
 let call_written_globals summaries globals callee =
   (call_effect_summary summaries globals callee).written_globals
 
+let call_must_written_globals summaries globals callee =
+  (call_effect_summary summaries globals callee).must_written_globals
+
 let call_touched_globals summaries globals callee =
   PlaceSet.union
     (call_read_globals summaries globals callee)
     (call_written_globals summaries globals callee)
 
+let advanced_mustwrite_flush_enabled () =
+  Sys.getenv_opt "TOYC_DISABLE_ADV_MUSTWRITE_FLUSH" = None
+
+let advanced_mustwrite_flush_debug_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ADV_MUSTWRITE_FLUSH" <> None
+
+let call_required_flush_globals summaries globals callee =
+  if not (advanced_mustwrite_flush_enabled ()) then
+    call_touched_globals summaries globals callee
+  else
+    let reads = call_read_globals summaries globals callee in
+    let may_writes = call_written_globals summaries globals callee in
+    let must_writes = call_must_written_globals summaries globals callee in
+    PlaceSet.union
+      reads
+      (PlaceSet.diff may_writes must_writes)
+
 let equal_func_effect_summary a b =
   PlaceSet.equal a.read_globals b.read_globals
   && PlaceSet.equal a.written_globals b.written_globals
+  && PlaceSet.equal a.must_written_globals b.must_written_globals
+
+let summarize_must_written_globals summaries globals (f : Cfg.func) =
+  (* Definite-write analysis over normal-return paths.
+     Entry starts with no definite writes. Other reachable blocks start at TOP
+     ([globals]) and merge predecessors with intersection. Stores and calls to
+     functions with a proven must-write add facts. Unknown callees contribute
+     no must-write facts. The interprocedural fixed point starts from empty
+     must-write summaries, so recursive cycles remain conservative. *)
+  let block_map = Hashtbl.create (max 8 (List.length f.blocks)) in
+  List.iter
+    (fun (block : Cfg.block) ->
+      Hashtbl.replace block_map block.label block)
+    f.blocks;
+  let rec visit reachable label =
+    if LabelSet.mem label reachable then reachable
+    else
+      let reachable = LabelSet.add label reachable in
+      match Hashtbl.find_opt block_map label with
+      | None -> reachable
+      | Some (block : Cfg.block) ->
+          List.fold_left visit reachable (Cfg.successors block.term)
+  in
+  let reachable = visit LabelSet.empty f.entry in
+  let in_sets = Hashtbl.create (max 8 (List.length f.blocks)) in
+  let out_sets = Hashtbl.create (max 8 (List.length f.blocks)) in
+  List.iter
+    (fun (block : Cfg.block) ->
+      if LabelSet.mem block.label reachable then begin
+        Hashtbl.replace in_sets block.label
+          (if block.label = f.entry then PlaceSet.empty else globals);
+        Hashtbl.replace out_sets block.label
+          (if block.label = f.entry then PlaceSet.empty else globals)
+      end)
+    f.blocks;
+  let transfer defs (block : Cfg.block) =
+    List.fold_left
+      (fun defs instr ->
+        match instr with
+        | Tcg.Store ((Tcg.Global _ as place), _) ->
+            PlaceSet.add place defs
+        | Tcg.Call (_, callee, _) ->
+            PlaceSet.union
+              defs
+              (call_must_written_globals summaries globals callee)
+        | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _
+        | Tcg.Load _ | Tcg.Store _ ->
+            defs)
+      defs block.body
+  in
+  let changed = ref true in
+  while !changed do
+    changed := false;
+    List.iter
+      (fun (block : Cfg.block) ->
+        if LabelSet.mem block.label reachable then begin
+          let incoming =
+            if block.label = f.entry then
+              PlaceSet.empty
+            else
+              let reachable_preds =
+                List.filter
+                  (fun pred -> LabelSet.mem pred reachable)
+                  block.preds
+              in
+              match reachable_preds with
+              | [] -> PlaceSet.empty
+              | pred :: rest ->
+                  let first =
+                    Option.value
+                      ~default:PlaceSet.empty
+                      (Hashtbl.find_opt out_sets pred)
+                  in
+                  List.fold_left
+                    (fun acc pred ->
+                      let pred_out =
+                        Option.value
+                          ~default:PlaceSet.empty
+                          (Hashtbl.find_opt out_sets pred)
+                      in
+                      PlaceSet.inter acc pred_out)
+                    first rest
+          in
+          let outgoing = transfer incoming block in
+          let old_in =
+            Option.value
+              ~default:PlaceSet.empty
+              (Hashtbl.find_opt in_sets block.label)
+          in
+          let old_out =
+            Option.value
+              ~default:PlaceSet.empty
+              (Hashtbl.find_opt out_sets block.label)
+          in
+          if
+            not (PlaceSet.equal incoming old_in)
+            || not (PlaceSet.equal outgoing old_out)
+          then begin
+            Hashtbl.replace in_sets block.label incoming;
+            Hashtbl.replace out_sets block.label outgoing;
+            changed := true
+          end
+        end)
+      f.blocks
+  done;
+  let return_sets =
+    List.filter_map
+      (fun (block : Cfg.block) ->
+        if not (LabelSet.mem block.label reachable) then None
+        else
+          match block.term with
+          | Cfg.Return _ ->
+              Some
+                (Option.value
+                   ~default:PlaceSet.empty
+                   (Hashtbl.find_opt out_sets block.label))
+          | Cfg.Jump _
+          | Cfg.BranchZero _
+          | Cfg.BranchNonZero _
+          | Cfg.BranchCompare _ ->
+              None)
+      f.blocks
+  in
+  match return_sets with
+  | [] ->
+      PlaceSet.empty
+  | first :: rest ->
+      List.fold_left PlaceSet.inter first rest
 
 let summarize_func summaries globals (f : Cfg.func) =
   List.fold_left
@@ -641,13 +794,22 @@ let summarize_func summaries globals (f : Cfg.func) =
           | Tcg.Call (_, callee, _) ->
               let callee_summary = call_effect_summary summaries globals callee in
               {
-                read_globals = PlaceSet.union summary.read_globals callee_summary.read_globals;
+                summary with
+                read_globals =
+                  PlaceSet.union summary.read_globals callee_summary.read_globals;
                 written_globals =
-                  PlaceSet.union summary.written_globals callee_summary.written_globals;
+                  PlaceSet.union
+                    summary.written_globals
+                    callee_summary.written_globals;
               }
           | Tcg.Move _ | Tcg.Un _ | Tcg.Bin _ | Tcg.Load _ | Tcg.Store _ -> summary)
         summary block.body)
-    { read_globals = PlaceSet.empty; written_globals = PlaceSet.empty }
+    {
+      read_globals = PlaceSet.empty;
+      written_globals = PlaceSet.empty;
+      must_written_globals =
+        summarize_must_written_globals summaries globals f;
+    }
     f.blocks
 
 (* -------------------------------------------------------------------------- *)
@@ -859,7 +1021,13 @@ let item8_summary_cache_key globals funcs =
 
 let compute_func_summaries_uncached globals funcs =
   let summaries = Hashtbl.create (max 8 (List.length funcs)) in
-  let empty_summary = { read_globals = PlaceSet.empty; written_globals = PlaceSet.empty } in
+  let empty_summary =
+    {
+      read_globals = PlaceSet.empty;
+      written_globals = PlaceSet.empty;
+      must_written_globals = PlaceSet.empty;
+    }
+  in
   List.iter (fun (f : Cfg.func) -> Hashtbl.replace summaries f.label empty_summary) funcs;
   let changed = ref true in
   while !changed do
@@ -1286,7 +1454,6 @@ let advanced_exact_multidef_merge_debug_enabled () =
   Sys.getenv_opt "TOYC_DEBUG_ADV_EXACT_MULTIDEF_MERGE" <> None
 
 let make_linear_analyzer
-    ?(consumer = "unknown")
     (f : Cfg.func) : linear_analyzer =
   (* The analyzer follows only unique definitions.  A multi-def temp is a
      program-point-sensitive value, so it remains an opaque scalar atom.
@@ -1344,8 +1511,7 @@ let make_linear_analyzer
     then begin
       Hashtbl.add exact_merge_reported temp ();
       Printf.eprintf
-        "adv-exact-multidef-merge consumer=%s func=%s temp=%d defs=%d key=%s\n%!"
-        consumer
+        "adv-exact-multidef-merge func=%s temp=%d defs=%d key=%s\n%!"
         f.name
         temp
         (match Hashtbl.find_opt all_def_instrs temp with
@@ -2427,7 +2593,7 @@ let gvn_func summaries globals (f : Cfg.func) =
     item8_final_note_seen item8_final_gvn_seen item8_final_gvn_repeats key
   end;
   if !item8_manager_debug_active then incr item8_manager_gvn_requests;
-  let linear = make_linear_analyzer ~consumer:"gvn" f in
+  let linear = make_linear_analyzer f in
   let in_states =
     match item8_analysis_cache_find gvn_state_cache_table key with
     | Some cached ->
@@ -4680,6 +4846,10 @@ let mem2reg_func ?(optimistic_loop_phi = false) (f : Cfg.func) =
   attempt f all_candidates
 
 let promote_globals_func summaries globals (f : Cfg.func) =
+  let mustwrite_flush_calls = ref 0 in
+  let mustwrite_old_flushes = ref 0 in
+  let mustwrite_new_flushes = ref 0 in
+  let mustwrite_saved_actual = ref 0 in
   let stored_candidates = stored_globals_in_func f in
   let readonly_candidates = PlaceSet.diff (globals_in_func f) stored_candidates in
   let all_candidates = PlaceSet.union stored_candidates readonly_candidates in
@@ -4821,14 +4991,38 @@ let promote_globals_func summaries globals (f : Cfg.func) =
                 | Tcg.Store (place, value) when PlaceSet.mem place candidates ->
                     rewrite (PlaceMap.add place value env) acc rest
                 | Tcg.Call (_, callee, _) as instr ->
-                    let call_flushes =
+                    let old_call_flushes =
                       PlaceSet.inter
                         writeback_candidates
                         (call_touched_globals summaries globals callee)
                     in
-                    let call_kills =
-                      PlaceSet.inter candidates (call_written_globals summaries globals callee)
+                    let call_flushes =
+                      PlaceSet.inter
+                        writeback_candidates
+                        (call_required_flush_globals summaries globals callee)
                     in
+                    let call_kills =
+                      PlaceSet.inter
+                        candidates
+                        (call_written_globals summaries globals callee)
+                    in
+                    if advanced_mustwrite_flush_debug_enabled () then begin
+                      incr mustwrite_flush_calls;
+                      mustwrite_old_flushes :=
+                        !mustwrite_old_flushes
+                        + PlaceSet.cardinal old_call_flushes;
+                      mustwrite_new_flushes :=
+                        !mustwrite_new_flushes
+                        + PlaceSet.cardinal call_flushes;
+                      let removed =
+                        PlaceSet.diff old_call_flushes call_flushes
+                      in
+                      PlaceSet.iter
+                        (fun place ->
+                          if PlaceMap.mem place env then
+                            incr mustwrite_saved_actual)
+                        removed
+                    end;
                     let flushed = flush_env_places call_flushes env in
                     let acc = List.rev_append (flushed @ [ instr ]) acc in
                     rewrite (kill_env_places call_kills env) acc rest
@@ -4888,7 +5082,20 @@ let promote_globals_func summaries globals (f : Cfg.func) =
         Cfg.rebuild_edges { f with temp_count = !next_temp; blocks }
     end
   in
-  attempt all_candidates
+  let result = attempt all_candidates in
+  if
+    advanced_mustwrite_flush_debug_enabled ()
+    && (!mustwrite_flush_calls <> 0
+        || !mustwrite_saved_actual <> 0)
+  then
+    Printf.eprintf
+      "adv-mustwrite-flush func=%s calls=%d old-flush=%d new-flush=%d saved-actual=%d\n%!"
+      f.name
+      !mustwrite_flush_calls
+      !mustwrite_old_flushes
+      !mustwrite_new_flushes
+      !mustwrite_saved_actual;
+  result
 
 let compute_dominators (f : Cfg.func) =
   if !item8_analysis_audit_active then begin
@@ -6994,6 +7201,42 @@ let loop_inv_expr_equal lhs rhs =
   canonical_scalar_key_equal
     (canonical_scalar_form_of_loop_inv_expr lhs)
     (canonical_scalar_form_of_loop_inv_expr rhs)
+
+let rec canonical_scalar_form_of_loop_inv_expr_with
+    (analyze : linear_analyzer)
+    expr =
+  match normalize_loop_inv_expr expr with
+  | LveConst value ->
+      canonical_scalar_const value
+  | LveOperand operand ->
+      analyze operand
+  | LveNeg inner ->
+      canonical_scalar_un
+        UMinus
+        (canonical_scalar_form_of_loop_inv_expr_with
+           analyze inner)
+  | LveAdd (lhs, rhs) ->
+      canonical_scalar_add
+        (canonical_scalar_form_of_loop_inv_expr_with
+           analyze lhs)
+        (canonical_scalar_form_of_loop_inv_expr_with
+           analyze rhs)
+  | LveMul (lhs, rhs) ->
+      canonical_scalar_mul
+        (canonical_scalar_form_of_loop_inv_expr_with
+           analyze lhs)
+        (canonical_scalar_form_of_loop_inv_expr_with
+           analyze rhs)
+
+let loop_inv_expr_semantically_equal_with
+    (analyze : linear_analyzer)
+    lhs
+    rhs =
+  canonical_scalar_key_equal
+    (canonical_scalar_form_of_loop_inv_expr_with
+       analyze lhs)
+    (canonical_scalar_form_of_loop_inv_expr_with
+       analyze rhs)
 
 let rec loop_inv_expr_temps expr =
   match normalize_loop_inv_expr expr with
@@ -24095,7 +24338,7 @@ let temp_use_counts blocks =
 let item6_canonical_adoption_audit (f : Cfg.func) =
   if Sys.getenv_opt "TOYC_DEBUG_ITEM6_ADOPTION" = None then ()
   else
-    let analyze = make_linear_analyzer ~consumer:"item6-adoption-audit" f in
+    let analyze = make_linear_analyzer f in
     let _, _, def_instrs, multi_defs =
       analyze_temp_defs_of_blocks f.temp_count f.blocks
     in
@@ -24234,7 +24477,7 @@ let algebra_canonicalize_func (f : Cfg.func) =
      isolated late-equiv pass below, preserving connected proof-guard chains.
      No pass rebuilds/reassociates expression trees merely to enforce canonical
      physical syntax. *)
-  let semantic_analyze = make_linear_analyzer ~consumer:"algebra" f in
+  let semantic_analyze = make_linear_analyzer f in
   let _, _, def_instrs, multi_defs =
     analyze_temp_defs_of_blocks f.temp_count f.blocks
   in
@@ -24657,7 +24900,7 @@ let algebra_canonicalize_func (f : Cfg.func) =
    no candidate predecessor and no candidate successor (singleton components).
    This preserves proof chains without depending on generated label names. *)
 let semantic_branch_fold_func ?(debug_tag = "late-equiv-isolated") (f : Cfg.func) =
-  let semantic_analyze = make_linear_analyzer ~consumer:"semantic-branch" f in
+  let semantic_analyze = make_linear_analyzer f in
   let _, _, _, multi_defs =
     analyze_temp_defs_of_blocks f.temp_count f.blocks
   in
@@ -24783,7 +25026,7 @@ let semantic_branch_fold_func ?(debug_tag = "late-equiv-isolated") (f : Cfg.func
   else Cfg.rebuild_edges { f with blocks }
 
 let general_linear_canonicalize_func (f : Cfg.func) =
-  let analyze = make_linear_analyzer ~consumer:"general-linear" f in
+  let analyze = make_linear_analyzer f in
   let rewrites = ref 0 in
   let rewrite_instr instr =
     let initial = simplify_simple_instr instr in
@@ -24850,7 +25093,7 @@ let general_linear_canonicalize_func (f : Cfg.func) =
    DCE removes the now-dead earlier multiplication immediately afterwards in
    the normal pipeline. *)
 let factor_common_mul_func (f : Cfg.func) =
-  let canonical_scalar = make_linear_analyzer ~consumer:"factor-common-mul" f in
+  let canonical_scalar = make_linear_analyzer f in
   let canonical_operand_equal lhs rhs =
     canonical_scalar_key_equal
       (canonical_scalar lhs)
@@ -25090,7 +25333,7 @@ let reassociate_loop_adds_func (f : Cfg.func) =
     let get_block = get_block_exn current_blocks in
     let changed = ref false in
     let adoption_reassoc_mid_gap = ref 0 in
-    let adoption_analyze = make_linear_analyzer ~consumer:"loop-reassoc" f in
+    let adoption_analyze = make_linear_analyzer f in
     let adoption_semantic_equal lhs rhs =
       canonical_scalar_key_equal
         (adoption_analyze lhs)
@@ -26413,8 +26656,105 @@ let fold_late_equivalent_diamonds_func (f : Cfg.func) =
    The original loop is deliberately retained as a fallback.  This makes the
    transform profitable for ordinary positive runtime steps without changing
    zero/negative-step or overflow-sensitive behaviour. *)
+let advanced_symbolic_loop_residual_audit_enabled () =
+  Sys.getenv_opt "TOYC_DEBUG_ADV_SYMBOLIC_LOOP_RESIDUAL" <> None
+
+let advanced_string_has_prefix prefix s =
+  let lp = String.length prefix in
+  String.length s >= lp
+  && String.sub s 0 lp = prefix
+
+let advanced_symbolic_reject_category reason =
+  if advanced_string_has_prefix "body-chain-not-linear" reason then
+    "body-chain-not-linear"
+  else if advanced_string_has_prefix "body-chain-does-not-cover-loop" reason then
+    "body-chain-cover"
+  else if advanced_string_has_prefix "affine-body-shape" reason then
+    "affine-body-shape"
+  else if advanced_string_has_prefix "control-candidates" reason then
+    "control-shape"
+  else if advanced_string_has_prefix "effects" reason then
+    "effects"
+  else if advanced_string_has_prefix "self-add-count" reason then
+    "self-add-count"
+  else if reason = "no-symbolic-affine-lt-control-update" then
+    "no-symbolic-control"
+  else if reason = "initial-iv-scev-start-mismatch" then
+    "start-mismatch"
+  else if advanced_string_has_prefix "operand-unavailable" reason then
+    "operand-unavailable"
+  else if reason = "no-runtime-affine-reduction" then
+    "no-affine-reduction"
+  else if advanced_string_has_prefix "bad-liveout" reason then
+    "bad-liveout"
+  else if reason = "preheader-no-longer-reaches-loop" then
+    "preheader-disconnected"
+  else if reason = "outside-predecessor-count" then
+    "outside-pred-count"
+  else
+    "other"
+
+let advanced_lve_step_class expr =
+  match normalize_loop_inv_expr expr with
+  | LveConst _ ->
+      "const"
+  | LveOperand (Tcg.Imm _) ->
+      "const"
+  | LveOperand (Tcg.Temp _) ->
+      "symbolic-operand"
+  | LveNeg (LveOperand (Tcg.Temp _)) ->
+      "symbolic-neg-operand"
+  | LveNeg _
+  | LveAdd _
+  | LveMul _ ->
+      "symbolic-expr"
+
+let advanced_lve_expr_is_symbolic expr =
+  match advanced_lve_step_class expr with
+  | "const" -> false
+  | "symbolic-operand"
+  | "symbolic-neg-operand"
+  | "symbolic-expr" -> true
+  | _ -> true
+
+let advanced_symbolic_trip_spec_is_runtime (spec : symbolic_trip_spec) =
+  List.exists
+    advanced_lve_expr_is_symbolic
+    [ spec.symbolic_trip_start;
+      spec.symbolic_trip_step;
+      spec.symbolic_trip_scale;
+      spec.symbolic_trip_bias;
+      spec.symbolic_trip_bound ]
+
+let advanced_counter_inc table key =
+  let old =
+    Option.value ~default:0 (Hashtbl.find_opt table key)
+  in
+  Hashtbl.replace table key (old + 1)
+
 let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func) =
   let debug = Sys.getenv_opt "TOYC_DEBUG_LVE_SUMMARY" <> None in
+  let residual_audit =
+    advanced_symbolic_loop_residual_audit_enabled ()
+  in
+  let audit_addrec_headers = ref 0 in
+  let audit_symbolic_headers = ref 0 in
+  let audit_addrecs = ref 0 in
+  let audit_symbolic_addrecs = ref 0 in
+  let audit_control_candidates = ref 0 in
+  let audit_symbolic_control_candidates = ref 0 in
+  let audit_trip_specs = ref 0 in
+  let audit_runtime_trip_specs = ref 0 in
+  let audit_applied = ref 0 in
+  let audit_rejects = Hashtbl.create 16 in
+  let audit_symbolic_rejects = Hashtbl.create 16 in
+  let audit_symbolic_loop_info = Hashtbl.create 16 in
+  let audit_semantic_start_recoverable = ref 0 in
+  let audit_semantic_start_unrecoverable = ref 0 in
+  let residual_linear_analyze =
+    if residual_audit then Some (make_linear_analyzer f)
+    else None
+  in
   let _block_map, loops, headers = discover_natural_loops f in
   if headers = [] then f
   else
@@ -26426,6 +26766,110 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
     let update_block (block : Cfg.block) =
       Hashtbl.replace current_blocks block.label block
     in
+    if residual_audit then
+      List.iter
+        (fun header ->
+          let loop =
+            table_find_or_empty loops header LabelSet.empty
+          in
+          let loop_defs, _def_blocks, def_instrs, multi_defs =
+            analyze_temp_defs_of_blocks
+              ~loop f.temp_count f.blocks
+          in
+          let analysis =
+            build_loop_recurrence_analysis
+              header loop get_block
+              loop_defs multi_defs def_instrs
+          in
+          let addrecs =
+            analysis.loop_recurrence_addrecs
+          in
+          let symbolic_addrecs =
+            List.filter
+              (fun (addrec : loop_addrec) ->
+                advanced_lve_expr_is_symbolic
+                  addrec.addrec_step)
+              addrecs
+          in
+          if addrecs <> [] then
+            incr audit_addrec_headers;
+          if symbolic_addrecs <> [] then
+            incr audit_symbolic_headers;
+          audit_addrecs :=
+            !audit_addrecs + List.length addrecs;
+          audit_symbolic_addrecs :=
+            !audit_symbolic_addrecs
+            + List.length symbolic_addrecs;
+          let control =
+            find_recurrence_loop_control_candidate
+              analysis.loop_recurrence_facts
+              multi_defs def_instrs
+          in
+          let trip_spec =
+            Option.bind
+              control
+              (symbolic_trip_spec_of_candidate
+                 analysis.loop_recurrence_facts)
+          in
+          begin
+            match control with
+            | Some candidate ->
+                incr audit_control_candidates;
+                if
+                  advanced_lve_expr_is_symbolic
+                    candidate
+                      .recurrence_control_base
+                      .addrec_step
+                then
+                  incr audit_symbolic_control_candidates
+            | None -> ()
+          end;
+          let runtime_trip =
+            match trip_spec with
+            | Some spec ->
+                incr audit_trip_specs;
+                if advanced_symbolic_trip_spec_is_runtime spec then begin
+                  incr audit_runtime_trip_specs;
+                  true
+                end
+                else false
+            | None ->
+                false
+          in
+          let symbolic_control =
+            match control with
+            | Some candidate ->
+                advanced_lve_expr_is_symbolic
+                  candidate.recurrence_control_base.addrec_step
+            | None ->
+                false
+          in
+          Hashtbl.replace
+            audit_symbolic_loop_info
+            header
+            (List.length symbolic_addrecs, symbolic_control, runtime_trip);
+          Printf.eprintf
+            "adv-symbolic-loop-scan func=%s header=%s blocks=%d addrecs=%d symbolic-addrecs=%d control=%d trip-spec=%d runtime-trip=%d steps={%s}\n%!"
+            f.name
+            header
+            (LabelSet.cardinal loop)
+            (List.length addrecs)
+            (List.length symbolic_addrecs)
+            (if Option.is_some control then 1 else 0)
+            (if Option.is_some trip_spec then 1 else 0)
+            (if runtime_trip then 1 else 0)
+            (String.concat ","
+               (List.map
+                  (fun (addrec : loop_addrec) ->
+                    Printf.sprintf
+                      "t%d:%s:%s"
+                      addrec.addrec_phi_temp
+                      (advanced_lve_step_class
+                         addrec.addrec_step)
+                      (string_of_loop_inv_expr
+                         addrec.addrec_step))
+                  addrecs)))
+        headers;
     let doms = compute_dominators f in
     let live_in_t, _ = compute_liveness summaries globals f in
     let operand_available_at_preheader def_blocks multi_defs preheader_label operand =
@@ -26446,6 +26890,32 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
       Printf.sprintf ".L%s_lve_summary_%d_%s" f.label id suffix
     in
     let reject header reason =
+      if residual_audit then begin
+        let category =
+          advanced_symbolic_reject_category reason
+        in
+        advanced_counter_inc audit_rejects category;
+        let symbolic_addrecs, symbolic_control, runtime_trip =
+          Option.value
+            ~default:(0, false, false)
+            (Hashtbl.find_opt audit_symbolic_loop_info header)
+        in
+        let symbolic_relevant =
+          symbolic_addrecs > 0 || runtime_trip
+        in
+        if symbolic_relevant then
+          advanced_counter_inc audit_symbolic_rejects category;
+        Printf.eprintf
+          "adv-symbolic-loop-reject func=%s header=%s category=%s symbolic-relevant=%d symbolic-addrecs=%d symbolic-control=%d runtime-trip=%d reason=%s\n%!"
+          f.name
+          header
+          category
+          (if symbolic_relevant then 1 else 0)
+          symbolic_addrecs
+          (if symbolic_control then 1 else 0)
+          (if runtime_trip then 1 else 0)
+          reason
+      end;
       if debug then
         Printf.eprintf
           "lve-runtime-summary-reject func=%s header=%s reason=%s\n%!"
@@ -27835,9 +28305,53 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                           | None, _ ->
                               initial_zero
                         in
-                        if not semantic_start_agrees then
+                        if not semantic_start_agrees then begin
+                          if residual_audit then begin
+                            let semantic_recoverable =
+                              match
+                                ( residual_linear_analyze,
+                                  symbolic_trip_spec,
+                                  initial_iv_expr )
+                              with
+                              | Some analyze, Some spec, Some init_expr ->
+                                  loop_inv_expr_semantically_equal_with
+                                    analyze
+                                    spec.symbolic_trip_start
+                                    init_expr
+                              | Some analyze, None, Some init_expr ->
+                                  loop_inv_expr_semantically_equal_with
+                                    analyze
+                                    scalar_inv_zero
+                                    init_expr
+                              | Some _, Some _, None
+                              | Some _, None, None
+                              | None, _, _ ->
+                                  false
+                            in
+                            if semantic_recoverable then
+                              incr audit_semantic_start_recoverable
+                            else
+                              incr audit_semantic_start_unrecoverable;
+                            Printf.eprintf
+                              "adv-symbolic-start-mismatch func=%s header=%s recoverable=%d trip-start=%s init=%s\n%!"
+                              f.name
+                              header
+                              (if semantic_recoverable then 1 else 0)
+                              (match symbolic_trip_spec with
+                               | Some spec ->
+                                   string_of_loop_inv_expr
+                                     spec.symbolic_trip_start
+                               | None ->
+                                   "0")
+                              (match initial_iv_expr with
+                               | Some expr ->
+                                   string_of_loop_inv_expr expr
+                               | None ->
+                                   "<unknown>")
+                          end;
                           reject header
                             "initial-iv-scev-start-mismatch"
+                        end
                         else
                           let proof_control_start_expr =
                             match symbolic_trip_spec with
@@ -29112,6 +29626,30 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                   apply_block ];
 
                                               changed := true;
+                                              if residual_audit then begin
+                                                incr audit_applied;
+                                                Printf.eprintf
+                                                  "adv-symbolic-loop-apply func=%s header=%s iv=t%d step-class=%s step=%s bound=%s trip-mode=%s\n%!"
+                                                  f.name
+                                                  header
+                                                  iv_temp
+                                                  (advanced_lve_step_class
+                                                     step_expr)
+                                                  (string_of_loop_inv_expr
+                                                     step_expr)
+                                                  (string_of_lve_operand
+                                                     bound_operand)
+                                                  (match symbolic_trip_spec with
+                                                   | Some spec
+                                                     when
+                                                       advanced_symbolic_trip_spec_is_runtime
+                                                         spec ->
+                                                       "runtime"
+                                                   | Some _ ->
+                                                       "static"
+                                                   | None ->
+                                                       "legacy")
+                                              end;
                                               if debug then
                                                 Printf.eprintf
                                                   "lve-runtime-invariant-affine-summary func=%s header=%s iv=t%d scale=%s bias=%s control-start=%s acc=t%d reduction=%s step=%s bound=%s fallback=%s\n%!"
@@ -29296,6 +29834,20 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                                   apply_block ];
 
                                               changed := true;
+                                              if residual_audit then begin
+                                                incr audit_applied;
+                                                Printf.eprintf
+                                                  "adv-symbolic-loop-apply func=%s header=%s iv=t%d step-class=%s step=%s bound=%s trip-mode=legacy-runtime\n%!"
+                                                  f.name
+                                                  header
+                                                  iv_temp
+                                                  (advanced_lve_step_class
+                                                     step_expr)
+                                                  (string_of_loop_inv_expr
+                                                     step_expr)
+                                                  (string_of_lve_operand
+                                                     bound_operand)
+                                              end;
                                               if debug then
                                                 Printf.eprintf
                                                   "lve-runtime-summary func=%s header=%s blocks=%d iv=t%d acc=t%d reduction=%s step=%s bound=%s fallback=%s\n%!"
@@ -29326,6 +29878,45 @@ let summarize_runtime_symbolic_affine_loops_func summaries globals (f : Cfg.func
                                              end)
       | _ -> reject header "outside-predecessor-count")
       headers;
+
+    if residual_audit then begin
+      let reject_total =
+        Hashtbl.fold
+          (fun _ count total -> total + count)
+          audit_rejects 0
+      in
+      Printf.eprintf
+        "adv-symbolic-loop-summary func=%s loops=%d addrec-headers=%d symbolic-headers=%d addrecs=%d symbolic-addrecs=%d controls=%d symbolic-controls=%d trip-specs=%d runtime-trip-specs=%d applied=%d rejected=%d symbolic-rejected=%d start-recoverable=%d start-unrecoverable=%d\n%!"
+        f.name
+        (List.length headers)
+        !audit_addrec_headers
+        !audit_symbolic_headers
+        !audit_addrecs
+        !audit_symbolic_addrecs
+        !audit_control_candidates
+        !audit_symbolic_control_candidates
+        !audit_trip_specs
+        !audit_runtime_trip_specs
+        !audit_applied
+        reject_total
+        (Hashtbl.fold
+           (fun _ count total -> total + count)
+           audit_symbolic_rejects 0)
+        !audit_semantic_start_recoverable
+        !audit_semantic_start_unrecoverable;
+      Hashtbl.iter
+        (fun category count ->
+          Printf.eprintf
+            "adv-symbolic-loop-reject-summary func=%s category=%s count=%d\n%!"
+            f.name category count)
+        audit_rejects;
+      Hashtbl.iter
+        (fun category count ->
+          Printf.eprintf
+            "adv-symbolic-focused-reject-summary func=%s category=%s count=%d\n%!"
+            f.name category count)
+        audit_symbolic_rejects
+    end;
 
     if !changed then
       let original_labels =
